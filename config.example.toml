@@ -1,0 +1,28 @@
+# DSM VPN Configuration
+# Copy to /opt/mtun/config.toml and edit
+
+mode = "client"                  # "client" | "server" | "relay"
+server_ip = "203.0.113.1"       # Server public IP
+server_port = 51820             # Server listen port
+listen_port = 51820             # Local listen port
+key_file = "/opt/mtun/identity.enc"  # Encrypted identity key store
+transport = "udp"               # "udp" | "tcp"
+
+# Optional relay chain (empty = direct connection)
+relay_addresses = []
+
+# Server-only: DNS providers (required for server mode)
+# dns_providers = ["https://1.1.1.1/dns-query", "tls://9.9.9.9:853"]
+
+tun_name = "mtun0"
+log_level = "warning"           # "debug" | "info" | "warning" | "error"
+
+# Traffic shaping
+padding_min = 128
+padding_max = 1400
+jitter_ms_min = 1
+jitter_ms_max = 50
+
+# Key rotation
+rotation_packets = 5000         # Rotate after N packets
+rotation_seconds = 600          # Rotate after N seconds (10 min)
