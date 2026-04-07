@@ -49,12 +49,16 @@ class SendScheduler:
         self._jitter_min = jitter_ms_min / 1000.0
         self._jitter_max = jitter_ms_max / 1000.0
         self._queue: list[_ScheduledPacket] = []
+        self._max_queue_size = 2048
         self._running = False
         self._task: asyncio.Task | None = None
         self._event = asyncio.Event()
 
     def enqueue(self, data: bytes, target_size: int) -> None:
         """Enqueue a packet with random jitter delay."""
+        if len(self._queue) >= self._max_queue_size:
+            heapq.heappop(self._queue)  # drop oldest
+            log.warning("scheduler queue full, dropping oldest packet")
         jitter = self._jitter_min + (int.from_bytes(os.urandom(4), "big") / (1 << 32)) * (self._jitter_max - self._jitter_min)
         send_time = time.monotonic() + jitter
         heapq.heappush(self._queue, _ScheduledPacket(send_time, data, target_size))

@@ -1,6 +1,5 @@
 use sha2::{Sha256, Digest};
 use snow::{Builder, HandshakeState, TransportState};
-use zeroize::Zeroizing;
 
 /// Protocol prologue authenticated by both sides.
 /// Format: "DSM" || version(2 bytes) || initiator_role || responder_role
@@ -253,11 +252,8 @@ impl NoiseTransport {
         Ok(buf)
     }
 
-    /// Extract the raw sending and receiving keys for manual AES-GCM usage
-    /// (needed for key rotation where we manage keys outside of snow).
-    pub fn extract_keys(&self) -> Result<(Zeroizing<[u8; 32]>, Zeroizing<[u8; 32]>), String> {
-        Err("key extraction requires key rotation protocol — use transport encrypt/decrypt for initial session".into())
-    }
+    // NOTE: Key extraction from snow TransportState is not supported.
+    // Key rotation uses separate ephemeral DH (see session_keys.rs) instead.
 }
 
 #[cfg(test)]

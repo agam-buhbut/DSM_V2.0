@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Rust
+rust/tuncore/target/
+
+# IDE
+.vscode/
+.idea/
+
+# Environment
+.env
+*.pem
+*.key

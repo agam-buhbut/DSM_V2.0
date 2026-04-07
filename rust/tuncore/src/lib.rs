@@ -8,6 +8,7 @@ pub mod session_keys;
 
 use pyo3::prelude::*;
 use pyo3::exceptions::PyRuntimeError;
+use sha2::{Sha256, Digest};
 
 // ── PyO3 Wrappers ──
 // Raw key bytes never cross the FFI boundary for secret keys.
@@ -45,6 +46,15 @@ impl PyIdentityKeyPair {
             .map_err(|e| PyRuntimeError::new_err(e))?;
         Ok(Self { inner })
     }
+
+    /// Derive an HMAC key from the secret key without exposing raw bytes to Python.
+    fn derive_hmac_key(&self, context: &[u8]) -> Vec<u8> {
+        let mut hasher = Sha256::new();
+        hasher.update(b"dsm-known-hosts-hmac-v2-");
+        hasher.update(self.inner.secret_key());
+        hasher.update(context);
+        hasher.finalize().to_vec()
+    }
 }
 
 /// Python-visible replay window.
@@ -64,6 +74,16 @@ impl PyReplayWindow {
 
     fn check_and_update(&mut self, seq: u64) -> bool {
         self.inner.check_and_update(seq)
+    }
+
+    /// Read-only check: returns true if seq would be accepted.
+    fn check(&self, seq: u64) -> bool {
+        self.inner.check(seq)
+    }
+
+    /// Mark seq as seen. Call only after successful authentication.
+    fn update(&mut self, seq: u64) {
+        self.inner.update(seq)
     }
 
     #[getter]

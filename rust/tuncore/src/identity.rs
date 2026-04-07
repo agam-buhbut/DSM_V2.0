@@ -1,7 +1,7 @@
 use crate::secure_memory::{disable_core_dumps, mlock_slice, munlock_slice, secure_zero};
 use argon2::{Argon2, Algorithm, Version, Params};
 use chacha20poly1305::{
-    aead::{Aead, KeyInit},
+    aead::{Aead, KeyInit, Payload},
     XChaCha20Poly1305, XNonce,
 };
 use rand::RngCore;
@@ -99,8 +99,13 @@ impl IdentityKeyPair {
         rand::thread_rng().fill_bytes(&mut nonce_bytes);
         let nonce = XNonce::from_slice(&nonce_bytes);
 
+        // Authenticate salt and nonce as AAD to prevent metadata tampering
+        let mut aad = Vec::with_capacity(ARGON2_SALT_LEN + XCHACHA_NONCE_LEN);
+        aad.extend_from_slice(&salt);
+        aad.extend_from_slice(&nonce_bytes);
+
         let ciphertext = cipher
-            .encrypt(nonce, self.secret.as_ref())
+            .encrypt(nonce, Payload { msg: self.secret.as_ref(), aad: &aad })
             .map_err(|e| format!("encrypt: {e}"))?;
 
         let mut blob = Vec::with_capacity(ARGON2_SALT_LEN + XCHACHA_NONCE_LEN + ciphertext.len());
@@ -143,9 +148,15 @@ impl IdentityKeyPair {
             .map_err(|e| format!("cipher init: {e}"))?;
 
         let nonce = XNonce::from_slice(nonce_bytes);
+
+        // Authenticate salt and nonce as AAD (must match encryption)
+        let mut aad = Vec::with_capacity(ARGON2_SALT_LEN + XCHACHA_NONCE_LEN);
+        aad.extend_from_slice(salt);
+        aad.extend_from_slice(nonce_bytes);
+
         let plaintext = Zeroizing::new(
             cipher
-                .decrypt(nonce, ciphertext)
+                .decrypt(nonce, Payload { msg: ciphertext, aad: &aad })
                 .map_err(|_| "decryption failed: wrong passphrase or corrupted data".to_string())?,
         );
 

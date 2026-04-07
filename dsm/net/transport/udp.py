@@ -17,7 +17,7 @@ class UDPTransport:
     def __init__(self) -> None:
         self._transport: asyncio.DatagramTransport | None = None
         self._protocol: _UDPProtocol | None = None
-        self._recv_queue: asyncio.Queue[tuple[bytes, tuple[str, int]]] = asyncio.Queue()
+        self._recv_queue: asyncio.Queue[tuple[bytes, tuple[str, int]]] = asyncio.Queue(maxsize=1024)
         self._closed = False
 
     async def bind(self, local_addr: str = "0.0.0.0", local_port: int = 0) -> int:
@@ -52,6 +52,10 @@ class UDPTransport:
         if self._transport and not self._closed:
             self._transport.close()
             self._closed = True
+
+    async def aclose(self) -> None:
+        """Async close (UDP has no pending writes, delegates to sync close)."""
+        self.close()
 
     @property
     def is_open(self) -> bool:

@@ -20,11 +20,15 @@ impl NonceGenerator {
     }
 
     /// Generate the next unique 96-bit nonce.
-    /// Returns None if the counter would overflow (signals key rotation needed).
+    /// Returns None if the counter has exhausted (signals key rotation needed).
+    /// Counter starts at 1; value 0 is reserved and never used as a valid count.
     pub fn next(&self) -> Option<[u8; 12]> {
         let count = self.counter.fetch_add(1, Ordering::SeqCst);
-        if count == 0 || count == u32::MAX {
-            return None; // overflow or wrapped
+        // count is the value BEFORE increment.
+        // - count == u32::MAX means we're about to wrap to 0 → exhausted
+        // - count == 0 should never happen (starts at 1), but guard anyway
+        if count >= u32::MAX || count == 0 {
+            return None;
         }
 
         let mut nonce = [0u8; 12];

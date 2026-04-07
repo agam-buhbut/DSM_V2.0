@@ -1,5 +1,4 @@
 use libc::{mlock, munlock, RLIMIT_CORE, rlimit, setrlimit};
-use std::ptr;
 
 /// Lock a byte slice into physical memory, preventing swap.
 ///
@@ -53,14 +52,11 @@ pub fn disable_core_dumps() -> Result<(), String> {
     }
 }
 
-/// Securely zero a mutable byte slice using a volatile write.
+/// Securely zero a mutable byte slice.
+/// Uses the zeroize crate which guarantees the write is not optimized away.
 pub fn secure_zero(data: &mut [u8]) {
-    for byte in data.iter_mut() {
-        unsafe {
-            ptr::write_volatile(byte, 0);
-        }
-    }
-    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    use zeroize::Zeroize;
+    data.zeroize();
 }
 
 #[cfg(test)]

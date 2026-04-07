@@ -21,7 +21,6 @@ log = logging.getLogger(__name__)
 
 # DNS record types
 A_RECORD = 1
-AAAA_RECORD = 28
 
 # Cache limits
 MAX_CACHE_ENTRIES = 2_000

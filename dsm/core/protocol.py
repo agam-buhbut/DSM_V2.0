@@ -11,10 +11,13 @@ AAD = outer header (seq + nonce, 20 bytes).
 
 from __future__ import annotations
 
+import logging
 import os
 import struct
 from dataclasses import dataclass
 from enum import IntEnum
+
+log = logging.getLogger(__name__)
 
 # Outer header: 8 (seq) + 12 (nonce) = 20 bytes
 OUTER_HEADER_SIZE = 20
@@ -102,6 +105,11 @@ class OuterPacket:
             )
 
         pad_len = target_size - min_size
+        # Invariant: inner padding should size ciphertext to exactly fill the
+        # target, leaving no outer padding. If pad_len > 0, the receiver will
+        # pass ciphertext+padding to decrypt, which breaks GCM tag validation.
+        if pad_len > 0:
+            log.warning("outer padding %d bytes — inner padding sizing mismatch", pad_len)
         padding = os.urandom(pad_len)
         return header + self.ciphertext + padding
 
@@ -127,7 +135,13 @@ class OuterPacket:
         return cls(seq=seq, nonce=nonce, ciphertext=ciphertext)
 
     def aad(self) -> bytes:
-        """Return the Additional Authenticated Data (outer header)."""
+        """Return the Additional Authenticated Data (outer header).
+
+        NOTE: Currently unused — snow's transport mode does not accept AAD.
+        The outer header (seq + nonce) is not bound to the AEAD ciphertext.
+        Noise's internal nonce tracking provides replay protection independently.
+        Retained for future use if transport switches to raw AES-GCM with AAD.
+        """
         return struct.pack("!Q", self.seq) + self.nonce
 
 

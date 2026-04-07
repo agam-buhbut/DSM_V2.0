@@ -54,7 +54,9 @@ impl AesKey {
             .map_err(|_| "decryption failed: authentication tag mismatch".into())
     }
 
-    /// Raw key bytes. Internal use only — do not expose via FFI.
+    /// Raw key bytes for internal crypto operations (e.g. session key derivation).
+    /// Must never cross the FFI boundary.
+    /// Currently unused — will be needed when session key rotation is integrated.
     #[allow(dead_code)]
     pub(crate) fn raw(&self) -> &[u8; 32] {
         &self.key

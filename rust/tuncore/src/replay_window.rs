@@ -20,6 +20,54 @@ impl ReplayWindow {
         }
     }
 
+    /// Read-only check: returns true if seq would be accepted (not replayed, not too old).
+    /// Does NOT mark the sequence number as seen.
+    pub fn check(&self, seq: u64) -> bool {
+        if seq == 0 {
+            return false;
+        }
+        if self.max_seq == 0 {
+            return true; // first packet
+        }
+        if seq > self.max_seq {
+            return true; // ahead of window
+        }
+        let diff = self.max_seq - seq;
+        if diff >= Self::WINDOW_SIZE {
+            return false; // too old
+        }
+        let bit = 1u128 << diff;
+        self.bitmap & bit == 0 // false if already seen
+    }
+
+    /// Mark seq as seen. Caller must have verified check() returned true
+    /// AND that the packet authenticated successfully.
+    pub fn update(&mut self, seq: u64) {
+        if seq == 0 {
+            return;
+        }
+        if self.max_seq == 0 {
+            self.max_seq = seq;
+            self.bitmap = 1;
+            return;
+        }
+        if seq > self.max_seq {
+            let shift = seq - self.max_seq;
+            if shift >= Self::WINDOW_SIZE {
+                self.bitmap = 1;
+            } else {
+                self.bitmap = self.bitmap.checked_shl(shift as u32).unwrap_or(0);
+                self.bitmap |= 1;
+            }
+            self.max_seq = seq;
+        } else {
+            let diff = self.max_seq - seq;
+            if diff < Self::WINDOW_SIZE {
+                self.bitmap |= 1u128 << diff;
+            }
+        }
+    }
+
     /// Check a sequence number and mark it as seen if valid.
     /// Returns true if the packet should be accepted.
     /// Returns false if replayed or too old.
@@ -143,5 +191,31 @@ mod tests {
         let mut w = ReplayWindow::new();
         assert!(w.check_and_update(999999));
         assert_eq!(w.max_seq(), 999999);
+    }
+
+    #[test]
+    fn test_check_does_not_mutate() {
+        let w = ReplayWindow::new();
+        assert!(w.check(42));
+        assert!(w.check(42)); // still accepted — check is read-only
+        assert_eq!(w.max_seq(), 0); // window not advanced
+    }
+
+    #[test]
+    fn test_check_then_update() {
+        let mut w = ReplayWindow::new();
+        assert!(w.check(10));
+        w.update(10);
+        assert!(!w.check(10)); // now seen
+        assert_eq!(w.max_seq(), 10);
+    }
+
+    #[test]
+    fn test_check_rejects_after_window_advance() {
+        let mut w = ReplayWindow::new();
+        w.update(200);
+        assert!(!w.check(50)); // too old (diff=150 >= 128)
+        assert!(w.check(201)); // ahead
+        assert!(w.check(100)); // within window (diff=100 < 128)
     }
 }

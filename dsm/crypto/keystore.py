@@ -70,6 +70,7 @@ class KeyStore:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=self._path.parent)
         try:
+            os.fchmod(fd, 0o600)
             os.write(fd, data)
             os.fsync(fd)
             os.close(fd)

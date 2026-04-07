@@ -67,7 +67,7 @@ async def run_client(config: Config) -> None:
     finally:
         passphrase[:] = b"\x00" * len(passphrase)
         del passphrase
-    log.info("identity loaded: %s", pub.hex()[:16] + "...")
+    log.info("identity loaded")
 
     # Setup components
     nft = NFTablesManager(config.server_ip, config.server_port, config.tun_name)
@@ -121,10 +121,13 @@ async def run_client(config: Config) -> None:
 
     seq_counter = 0
     nonce_gen = tuncore.NonceGenerator(epoch=session_epoch)
+    replay = tuncore.ReplayWindow()
 
     async def send_packet(data: bytes, target_size: int) -> None:
         nonlocal seq_counter
         seq_counter += 1
+        if seq_counter >= 2**64:
+            raise RuntimeError("sequence number overflow — session must be rekeyed")
         # Snow transport manages its own AES-GCM nonces internally.
         # The outer nonce is metadata for the replay window / anti-analysis, not the crypto nonce.
         ct = noise.encrypt(data)
@@ -155,8 +158,53 @@ async def run_client(config: Config) -> None:
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, handle_signal)
 
-    try:
-        # Main loop: read from TUN, encrypt, send
+    async def recv_loop() -> None:
+        """Receive from transport, decrypt, write to TUN."""
+        while not shutdown.is_set():
+            try:
+                if isinstance(transport, UDPTransport):
+                    data, _addr = await asyncio.wait_for(transport.recv(), timeout=0.1)
+                else:
+                    data = await asyncio.wait_for(transport.recv(), timeout=0.1)
+            except asyncio.TimeoutError:
+                continue
+
+            if len(data) < OUTER_HEADER_SIZE:
+                log.debug("packet too short, dropping")
+                continue
+
+            seq = struct.unpack("!Q", data[:8])[0]
+            if not replay.check(seq):
+                log.debug("replay detected, dropping seq=%d", seq)
+                continue
+
+            ciphertext = data[OUTER_HEADER_SIZE:]
+
+            try:
+                plaintext = noise.decrypt(ciphertext)
+            except Exception:
+                log.debug("decrypt failed, dropping packet")
+                continue
+
+            # Commit seq to replay window only after successful authentication
+            replay.update(seq)
+
+            try:
+                inner = InnerPacket.deserialize(plaintext)
+            except ValueError:
+                log.debug("malformed inner packet, dropping")
+                continue
+
+            if inner.ptype == PacketType.CHAFF:
+                continue
+            elif inner.ptype == PacketType.DATA:
+                await tun.awrite(inner.payload)
+            elif inner.ptype == PacketType.SESSION_CLOSE:
+                shutdown.set()
+                break
+
+    async def send_loop() -> None:
+        """Read from TUN, encrypt, send to server."""
         while not shutdown.is_set():
             try:
                 pkt = await asyncio.wait_for(tun.read(), timeout=0.1)
@@ -172,6 +220,8 @@ async def run_client(config: Config) -> None:
             shaper.observe_real_packet(target_size)
             scheduler.enqueue(padded, target_size)
 
+    try:
+        await asyncio.gather(recv_loop(), send_loop())
     except asyncio.CancelledError:
         pass
     finally:
@@ -181,7 +231,7 @@ async def run_client(config: Config) -> None:
         nft.remove()
         tun.close()
         keystore.unload()
-        transport.close()
+        await transport.aclose()
         fsm.transition(State.TEARDOWN)
         fsm.transition(State.IDLE)
 
@@ -205,7 +255,7 @@ async def run_server(config: Config) -> None:
     finally:
         passphrase[:] = b"\x00" * len(passphrase)
         del passphrase
-    log.info("server identity: %s", pub.hex()[:16] + "...")
+    log.info("server identity loaded")
 
     # Transport
     if config.transport == "udp":
@@ -226,7 +276,7 @@ async def run_server(config: Config) -> None:
     noise, client_pub = await server_handshake(transport, keystore.identity)
 
     fsm.transition(State.ESTABLISHED)
-    log.info("client connected: %s", client_pub.hex()[:16] + "...")
+    log.info("client connected")
 
     # Setup DNS resolver
     from dsm.net.dns import DNSResolver
@@ -277,7 +327,7 @@ async def run_server(config: Config) -> None:
                 continue
 
             seq = struct.unpack("!Q", data[:8])[0]
-            if not replay.check_and_update(seq):
+            if not replay.check(seq):
                 log.debug("replay detected, dropping seq=%d", seq)
                 continue
 
@@ -290,7 +340,14 @@ async def run_server(config: Config) -> None:
                 log.debug("decrypt failed, dropping packet")
                 continue
 
-            inner = InnerPacket.deserialize(plaintext)
+            # Commit seq to replay window only after successful authentication
+            replay.update(seq)
+
+            try:
+                inner = InnerPacket.deserialize(plaintext)
+            except ValueError:
+                log.debug("malformed inner packet, dropping")
+                continue
 
             if inner.ptype == PacketType.CHAFF:
                 continue
@@ -304,6 +361,8 @@ async def run_server(config: Config) -> None:
         """Encrypt and send a packet from server to client with proper framing."""
         nonlocal server_seq
         server_seq += 1
+        if server_seq >= 2**64:
+            raise RuntimeError("sequence number overflow — session must be rekeyed")
         ct = noise.encrypt(data)
         nonce_bytes = server_nonce_gen.next()
         outer = OuterPacket(seq=server_seq, nonce=bytes(nonce_bytes), ciphertext=ct)
@@ -349,7 +408,7 @@ async def run_server(config: Config) -> None:
         await server_scheduler.stop()
         tun.close()
         keystore.unload()
-        transport.close()
+        await transport.aclose()
         dns.flush_cache()
         fsm.transition(State.TEARDOWN)
         fsm.transition(State.IDLE)
@@ -383,7 +442,7 @@ def main() -> None:
     elif mode == "server":
         asyncio.run(run_server(config))
     else:
-        print(f"unsupported mode: {mode}", file=sys.stderr)
+        print(f"mode {mode!r} is not yet implemented", file=sys.stderr)
         sys.exit(1)
 
 

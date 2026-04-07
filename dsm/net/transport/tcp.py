@@ -93,6 +93,15 @@ class TCPTransport:
         if self._server:
             self._server.close()
 
+    async def aclose(self) -> None:
+        """Async close with proper TCP teardown."""
+        if self._writer and not self._closed:
+            self._writer.close()
+            await self._writer.wait_closed()
+            self._closed = True
+        if self._server:
+            self._server.close()
+
     @property
     def is_open(self) -> bool:
         return self._writer is not None and not self._closed

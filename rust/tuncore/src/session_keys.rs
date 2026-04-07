@@ -242,17 +242,23 @@ fn derive_rotation_keys(
     let public = PublicKey::from(*remote_pub);
     let shared = secret.diffie_hellman(&public);
 
-    let salt = format!("dsm-v2-rotation-salt-{epoch}");
-    let hk = Hkdf::<Sha256>::new(Some(salt.as_bytes()), shared.as_bytes());
+    // Fixed protocol salt for HKDF. The DH shared secret provides full entropy
+    // as IKM, so a fixed salt is sufficient per RFC 5869 §3.1.
+    // Epoch is encoded in the info parameter for domain separation.
+    let hk = Hkdf::<Sha256>::new(Some(b"dsm-v2-rotation-hkdf-salt"), shared.as_bytes());
 
     let mut send_key = [0u8; 32];
-    let send_info = format!("dsm-rot-send-{epoch}");
-    hk.expand(send_info.as_bytes(), &mut send_key)
+    let mut send_info = Vec::with_capacity(20);
+    send_info.extend_from_slice(b"dsm-rot-send-");
+    send_info.extend_from_slice(&epoch.to_be_bytes());
+    hk.expand(&send_info, &mut send_key)
         .map_err(|e| format!("hkdf send: {e}"))?;
 
     let mut recv_key = [0u8; 32];
-    let recv_info = format!("dsm-rot-recv-{epoch}");
-    hk.expand(recv_info.as_bytes(), &mut recv_key)
+    let mut recv_info = Vec::with_capacity(20);
+    recv_info.extend_from_slice(b"dsm-rot-recv-");
+    recv_info.extend_from_slice(&epoch.to_be_bytes());
+    hk.expand(&recv_info, &mut recv_key)
         .map_err(|e| format!("hkdf recv: {e}"))?;
 
     Ok((send_key, recv_key))

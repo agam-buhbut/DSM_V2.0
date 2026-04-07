@@ -69,25 +69,23 @@ class TunDevice:
     ) -> None:
         """Configure IP address, bring up the interface, and set routing."""
         cmds = [
-            ["ip", "addr", "add", f"{local_ip}/{netmask}", "dev", self._name],
+            ["ip", "addr", "replace", f"{local_ip}/{netmask}", "dev", self._name],
             ["ip", "link", "set", self._name, "mtu", str(mtu)],
             ["ip", "link", "set", self._name, "up"],
             # Routing: use a separate table to route all traffic through TUN
             # except VPN's own traffic (marked with FWMARK)
-            ["ip", "route", "add", "default", "dev", self._name, "table", "100"],
-            [
-                "ip",
-                "rule",
-                "add",
-                "not",
-                "fwmark",
-                str(FWMARK),
-                "table",
-                "100",
-                "priority",
-                "10",
-            ],
+            ["ip", "route", "replace", "default", "dev", self._name, "table", "100"],
         ]
+        # ip rule has no 'replace' — delete first (ignore if absent), then add
+        rule_args = [
+            "not", "fwmark", str(FWMARK), "table", "100", "priority", "10",
+        ]
+        subprocess.run(
+            ["ip", "rule", "del", *rule_args],
+            capture_output=True, timeout=5,
+        )  # ignore errors — rule may not exist yet
+        cmds.append(["ip", "rule", "add", *rule_args])
+
         for cmd in cmds:
             try:
                 subprocess.run(cmd, check=True, capture_output=True, timeout=5)
