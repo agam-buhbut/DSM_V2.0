@@ -68,14 +68,18 @@ async def client_handshake(
     await _send(transport, msg1, server_addr)
 
     # Message 2: <- e, ee, s, es
-    msg2, _ = await _recv(transport)
+    msg2, recv_addr = await _recv(transport)
+    if isinstance(transport, UDPTransport) and recv_addr != server_addr:
+        raise HandshakeError(
+            f"msg2 from unexpected source {recv_addr}, expected {server_addr}"
+        )
     server_static = initiator.read_message_2(msg2)
 
     # Validate server static key against cache (HMAC-protected)
     if known_hosts_path:
         _check_known_host(
             known_hosts_path, server_addr[0], server_static, strict_keys,
-            identity=identity,
+            identity=identity, server_port=server_addr[1],
         )
 
     # Message 3: -> s, se
@@ -179,23 +183,35 @@ def _check_known_host(
     server_static: bytes,
     strict: bool,
     identity: tuncore.IdentityKeyPair,
+    server_port: int = 0,
 ) -> None:
     """TOFU check: verify server static key against HMAC-protected known_hosts."""
+    host_key = f"{server_ip}:{server_port}" if server_port else server_ip
+
     if not path.exists():
-        _save_known_host(path, server_ip, server_static, identity)
-        log.info("TOFU: saved server static key for %s", server_ip)
+        _save_known_host(path, host_key, server_static, identity)
+        log.info("TOFU: saved server static key for %s", host_key)
         return
 
     hosts = _load_known_hosts(path, identity)
-    cached = hosts.get(server_ip)
+    cached = hosts.get(host_key)
+
+    # Migration: check old IP-only key if host:port key not found
+    if cached is None and server_port:
+        cached = hosts.get(server_ip)
+        if cached is not None:
+            log.info("migrating known_hosts entry from %s to %s", server_ip, host_key)
+            hosts[host_key] = cached
+            del hosts[server_ip]
+            _save_known_hosts_dict(path, hosts, identity)
 
     if cached is None:
-        _save_known_host(path, server_ip, server_static, identity)
-        log.info("TOFU: saved server static key for %s", server_ip)
+        _save_known_host(path, host_key, server_static, identity)
+        log.info("TOFU: saved server static key for %s", host_key)
         return
 
     if bytes.fromhex(cached) != server_static:
-        msg = f"SECURITY WARNING: server static key changed for {server_ip}"
+        msg = f"SECURITY WARNING: server static key changed for {host_key}"
         log.critical(msg)
         if strict:
             raise KeyMismatchError(msg)
@@ -255,19 +271,27 @@ def _load_known_hosts(
         raise HandshakeError(f"known_hosts corrupted (invalid JSON): {e}") from e
 
 
-def _save_known_host(
+def _save_known_hosts_dict(
     path: Path,
-    server_ip: str,
-    static_key: bytes,
+    hosts: dict[str, str],
     identity: tuncore.IdentityKeyPair,
 ) -> None:
-    hosts = _load_known_hosts(path, identity)
-    hosts[server_ip] = static_key.hex()
-    path.parent.mkdir(parents=True, exist_ok=True)
-
+    """Write a known_hosts dict to disk with HMAC integrity."""
     import os as _os
+    path.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(hosts).encode()
     key = _hmac_key(identity)
     mac = hmac.new(key, payload, hashlib.sha256).digest()
     path.write_bytes(mac + payload)
     _os.chmod(path, 0o600)
+
+
+def _save_known_host(
+    path: Path,
+    host_key: str,
+    static_key: bytes,
+    identity: tuncore.IdentityKeyPair,
+) -> None:
+    hosts = _load_known_hosts(path, identity)
+    hosts[host_key] = static_key.hex()
+    _save_known_hosts_dict(path, hosts, identity)

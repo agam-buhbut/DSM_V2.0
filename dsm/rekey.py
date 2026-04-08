@@ -26,19 +26,19 @@ async def initiate_rekey(
     shaper: TrafficShaper,
     send_fn: Any,
     last_rekey_time: float | None = None,
-) -> float | None:
+) -> tuple[float | None, int | None]:
     """Start a key rotation: generate ephemeral keypair, send REKEY_INIT.
 
-    Returns the timestamp of the initiated rekey, or last_rekey_time if skipped.
+    Returns (timestamp, new_epoch) on success, or (last_rekey_time, None) if skipped.
     """
     if fsm.state != State.ESTABLISHED:
         log.warning("cannot initiate rekey in state %s", fsm.state.name)
-        return last_rekey_time
+        return last_rekey_time, None
 
     now = time.monotonic()
     if last_rekey_time is not None and (now - last_rekey_time) < MIN_REKEY_INTERVAL:
         log.debug("rekey rate limit: skipping (last rekey %.1fs ago)", now - last_rekey_time)
-        return last_rekey_time
+        return last_rekey_time, None
 
     fsm.transition(State.REKEYING)
     new_epoch, ephemeral_pub = session_keys.initiate_rotation()
@@ -51,7 +51,7 @@ async def initiate_rekey(
     padded, target_size = shaper.pad_packet(inner)
     await send_fn(padded, target_size)
     log.info("rekey initiated, new epoch=%d", new_epoch)
-    return now
+    return now, new_epoch
 
 
 async def handle_rekey_init(
@@ -110,15 +110,25 @@ def handle_rekey_ack(
     payload: bytes,
     session_keys: tuncore.SessionKeyManager,
     fsm: SessionFSM,
+    expected_epoch: int | None = None,
 ) -> float | None:
     """Process a REKEY_ACK: complete rotation as initiator.
 
     Returns the timestamp of completed rekey, or None if failed.
     """
+    if fsm.state != State.REKEYING:
+        log.warning("rekey ack received in state %s, ignoring", fsm.state.name)
+        return None
+
     if len(payload) < REKEY_PAYLOAD_SIZE:
         log.warning("rekey ack payload too short, ignoring")
         return None
-    _new_epoch = struct.unpack("!I", payload[:4])[0]
+
+    ack_epoch = struct.unpack("!I", payload[:4])[0]
+    if expected_epoch is not None and ack_epoch != expected_epoch:
+        log.warning("rekey ack epoch mismatch: got %d, expected %d", ack_epoch, expected_epoch)
+        return None
+
     remote_ephemeral_pub = payload[4:36]
 
     try:

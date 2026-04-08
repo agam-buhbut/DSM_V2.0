@@ -100,6 +100,7 @@ async def run_client(config: Config) -> None:
     replay = tuncore.ReplayWindow()
     rekey_in_progress = False
     last_rekey_time: float | None = None
+    pending_rekey_epoch: int | None = None
 
     async def send_packet(data: bytes, target_size: int) -> None:
         nonlocal seq_counter
@@ -135,11 +136,14 @@ async def run_client(config: Config) -> None:
         loop.add_signal_handler(sig, handle_signal)
 
     async def recv_loop() -> None:
-        nonlocal rekey_in_progress, last_rekey_time
+        nonlocal rekey_in_progress, last_rekey_time, pending_rekey_epoch
         while not shutdown.is_set():
             try:
                 if isinstance(transport, UDPTransport):
-                    data, _addr = await asyncio.wait_for(transport.recv(), timeout=0.1)
+                    data, recv_addr = await asyncio.wait_for(transport.recv(), timeout=0.1)
+                    if recv_addr != server_addr:
+                        log.debug("packet from unexpected source %s, dropping", recv_addr)
+                        continue
                 else:
                     data = await asyncio.wait_for(transport.recv(), timeout=0.1)
             except asyncio.TimeoutError:
@@ -159,12 +163,14 @@ async def run_client(config: Config) -> None:
             ciphertext = data[OUTER_HEADER_SIZE:]
             aad = struct.pack("!Q", seq)
 
+            decrypted_prev_epoch = False
             try:
                 plaintext = session_keys.decrypt(nonce_bytes, ciphertext, aad, seq, False)
             except Exception:
                 if session_keys.has_grace_period:
                     try:
                         plaintext = session_keys.decrypt(nonce_bytes, ciphertext, aad, seq, True)
+                        decrypted_prev_epoch = True
                     except Exception:
                         log.debug("decrypt failed (both epochs), dropping packet")
                         continue
@@ -180,14 +186,27 @@ async def run_client(config: Config) -> None:
                 log.debug("malformed inner packet, dropping")
                 continue
 
+            # Verify epoch_id matches the key epoch used for decryption
+            if inner.ptype != PacketType.CHAFF:
+                if decrypted_prev_epoch:
+                    expected_eid = (session_keys.epoch - 1) & 0x03
+                else:
+                    expected_eid = session_keys.epoch & 0x03
+                if inner.epoch_id != expected_eid:
+                    log.debug("epoch_id mismatch: got %d, expected %d", inner.epoch_id, expected_eid)
+                    continue
+
             if inner.ptype == PacketType.CHAFF:
                 continue
             elif inner.ptype == PacketType.DATA:
                 await tun.awrite(inner.payload)
             elif inner.ptype == PacketType.REKEY_ACK:
-                ts = handle_rekey_ack(inner.payload, session_keys, fsm)
+                ts = handle_rekey_ack(
+                    inner.payload, session_keys, fsm, pending_rekey_epoch,
+                )
                 if ts is not None:
                     last_rekey_time = ts
+                    pending_rekey_epoch = None
                 rekey_in_progress = False
             elif inner.ptype == PacketType.REKEY_INIT:
                 last_rekey_time = await handle_rekey_init(
@@ -199,11 +218,11 @@ async def run_client(config: Config) -> None:
                 break
 
     async def send_loop() -> None:
-        nonlocal rekey_in_progress, last_rekey_time
+        nonlocal rekey_in_progress, last_rekey_time, pending_rekey_epoch
         while not shutdown.is_set():
             if session_keys.needs_rotation() and not rekey_in_progress:
                 rekey_in_progress = True
-                last_rekey_time = await initiate_rekey(
+                last_rekey_time, pending_rekey_epoch = await initiate_rekey(
                     session_keys, fsm, shaper, send_packet, last_rekey_time,
                 )
 

@@ -84,6 +84,7 @@ async def run_server(config: Config) -> None:
     server_seq = 0
     rekey_in_progress = False
     last_rekey_time: float | None = None
+    pending_rekey_epoch: int | None = None
 
     shutdown = asyncio.Event()
     client_addr: tuple[str, int] | None = None
@@ -96,12 +97,12 @@ async def run_server(config: Config) -> None:
         loop.add_signal_handler(sig, handle_signal)
 
     async def recv_loop() -> None:
-        nonlocal client_addr, rekey_in_progress, last_rekey_time
+        nonlocal client_addr, rekey_in_progress, last_rekey_time, pending_rekey_epoch
         while not shutdown.is_set():
+            recv_addr: tuple[str, int] | None = None
             try:
                 if isinstance(transport, UDPTransport):
-                    data, addr = await asyncio.wait_for(transport.recv(), timeout=0.1)
-                    client_addr = addr
+                    data, recv_addr = await asyncio.wait_for(transport.recv(), timeout=0.1)
                 else:
                     data = await asyncio.wait_for(transport.recv(), timeout=0.1)
             except asyncio.TimeoutError:
@@ -121,12 +122,14 @@ async def run_server(config: Config) -> None:
             ciphertext = data[OUTER_HEADER_SIZE:]
             aad = struct.pack("!Q", seq)
 
+            decrypted_prev_epoch = False
             try:
                 plaintext = session_keys.decrypt(nonce_bytes, ciphertext, aad, seq, False)
             except Exception:
                 if session_keys.has_grace_period:
                     try:
                         plaintext = session_keys.decrypt(nonce_bytes, ciphertext, aad, seq, True)
+                        decrypted_prev_epoch = True
                     except Exception:
                         log.debug("decrypt failed (both epochs), dropping packet")
                         continue
@@ -136,11 +139,25 @@ async def run_server(config: Config) -> None:
 
             replay.update(seq)
 
+            # Update peer address only after successful authentication
+            if recv_addr is not None:
+                client_addr = recv_addr
+
             try:
                 inner = InnerPacket.deserialize(plaintext)
             except ValueError:
                 log.debug("malformed inner packet, dropping")
                 continue
+
+            # Verify epoch_id matches the key epoch used for decryption
+            if inner.ptype != PacketType.CHAFF:
+                if decrypted_prev_epoch:
+                    expected_eid = (session_keys.epoch - 1) & 0x03
+                else:
+                    expected_eid = session_keys.epoch & 0x03
+                if inner.epoch_id != expected_eid:
+                    log.debug("epoch_id mismatch: got %d, expected %d", inner.epoch_id, expected_eid)
+                    continue
 
             if inner.ptype == PacketType.CHAFF:
                 continue
@@ -152,9 +169,12 @@ async def run_server(config: Config) -> None:
                     last_rekey_time,
                 )
             elif inner.ptype == PacketType.REKEY_ACK:
-                ts = handle_rekey_ack(inner.payload, session_keys, fsm)
+                ts = handle_rekey_ack(
+                    inner.payload, session_keys, fsm, pending_rekey_epoch,
+                )
                 if ts is not None:
                     last_rekey_time = ts
+                    pending_rekey_epoch = None
                 rekey_in_progress = False
             elif inner.ptype == PacketType.SESSION_CLOSE:
                 shutdown.set()
@@ -185,11 +205,11 @@ async def run_server(config: Config) -> None:
     await server_scheduler.start()
 
     async def tun_to_client() -> None:
-        nonlocal rekey_in_progress, last_rekey_time
+        nonlocal rekey_in_progress, last_rekey_time, pending_rekey_epoch
         while not shutdown.is_set():
             if session_keys.needs_rotation() and not rekey_in_progress:
                 rekey_in_progress = True
-                last_rekey_time = await initiate_rekey(
+                last_rekey_time, pending_rekey_epoch = await initiate_rekey(
                     session_keys, fsm, shaper, server_send_packet, last_rekey_time,
                 )
 

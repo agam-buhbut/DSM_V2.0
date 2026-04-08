@@ -124,19 +124,23 @@ impl SessionKeyManager {
             if let (Some(prev), Some(prev_replay)) =
                 (&self.prev_recv, &mut self.prev_replay)
             {
-                if !prev_replay.check_and_update(seq) {
+                if !prev_replay.check(seq) {
                     return Err("replay detected (prev epoch)".into());
                 }
-                return prev.key.decrypt(nonce, ciphertext, aad);
+                let plaintext = prev.key.decrypt(nonce, ciphertext, aad)?;
+                prev_replay.update(seq);
+                return Ok(plaintext);
             }
             return Err("no previous epoch keys available".into());
         }
 
-        // Current epoch
-        if !self.replay.check_and_update(seq) {
+        // Current epoch: check replay BEFORE decrypt, update AFTER auth succeeds
+        if !self.replay.check(seq) {
             return Err("replay detected".into());
         }
-        self.recv.key.decrypt(nonce, ciphertext, aad)
+        let plaintext = self.recv.key.decrypt(nonce, ciphertext, aad)?;
+        self.replay.update(seq);
+        Ok(plaintext)
     }
 
     /// Check if key rotation is needed.
@@ -461,5 +465,32 @@ mod tests {
         let (nonce, ct, _) = server.encrypt(b"server after rotation", aad).unwrap();
         let pt = client.decrypt(&nonce, &ct, aad, 1, false).unwrap();
         assert_eq!(pt, b"server after rotation");
+    }
+
+    #[test]
+    fn test_failed_decrypt_does_not_advance_replay() {
+        let (mut client, mut server) = make_paired_managers();
+        let aad = b"hdr";
+
+        // Encrypt a legitimate packet at seq=1
+        let (nonce, ct, _) = client.encrypt(b"legit", aad).unwrap();
+
+        // Forge a packet with high seq (999) and invalid ciphertext
+        let bad_ct = vec![0xDE; 32];
+        let bad_nonce = [0u8; 12];
+        let bad_aad = b"hdr";
+
+        // This should fail AEAD authentication
+        assert!(server.decrypt(&bad_nonce, &bad_ct, bad_aad, 999, false).is_err());
+
+        // The replay window must NOT have advanced to 999.
+        // A legitimate packet at seq=1 must still be accepted.
+        let pt = server.decrypt(&nonce, &ct, aad, 1, false).unwrap();
+        assert_eq!(pt, b"legit");
+
+        // Also verify that seq=999 is still fresh (not marked as seen)
+        // Verify seq=999 is still fresh (not marked as seen) — second forged
+        // attempt at same seq should fail on AEAD, not on replay
+        assert!(server.decrypt(&bad_nonce, &bad_ct, bad_aad, 999, false).is_err());
     }
 }
