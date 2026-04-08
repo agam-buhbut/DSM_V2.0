@@ -25,6 +25,8 @@ OUTER_HEADER_SIZE = 20
 INNER_HEADER_SIZE = 4
 # AES-GCM authentication tag
 GCM_TAG_SIZE = 16
+# Maximum inner payload size (MTU-based practical limit)
+MAX_INNER_PAYLOAD = 1500
 
 # Packet size classes for padding (bytes) — more classes reduce fingerprinting
 SIZE_CLASSES = (128, 256, 384, 512, 640, 768, 896, 1024, 1152, 1280, 1400)
@@ -53,8 +55,8 @@ class InnerPacket:
         """Serialize to inner plaintext format."""
         flags = (self.epoch_id & 0x03) << 6  # 2 MSBs = epoch_id
         inner_len = len(self.payload)
-        if inner_len > 0xFFFF:
-            raise ValueError(f"payload too large: {inner_len}")
+        if inner_len > MAX_INNER_PAYLOAD:
+            raise ValueError(f"payload too large: {inner_len} > {MAX_INNER_PAYLOAD}")
         header = struct.pack("!BBH", self.ptype, flags, inner_len)
         return header + self.payload
 
@@ -72,6 +74,8 @@ class InnerPacket:
         # Reserved bits (lower 6) must be zero
         if flags & 0x3F:
             raise ValueError(f"reserved flag bits set: {flags:#x}")
+        if inner_len > MAX_INNER_PAYLOAD:
+            raise ValueError(f"inner payload too large: {inner_len} > {MAX_INNER_PAYLOAD}")
         payload_end = INNER_HEADER_SIZE + inner_len
         if payload_end > len(data):
             raise ValueError("inner length exceeds data")

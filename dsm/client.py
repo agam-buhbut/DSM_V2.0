@@ -99,6 +99,7 @@ async def run_client(config: Config) -> None:
     seq_counter = 0
     replay = tuncore.ReplayWindow()
     rekey_in_progress = False
+    last_rekey_time: float | None = None
 
     async def send_packet(data: bytes, target_size: int) -> None:
         nonlocal seq_counter
@@ -134,7 +135,7 @@ async def run_client(config: Config) -> None:
         loop.add_signal_handler(sig, handle_signal)
 
     async def recv_loop() -> None:
-        nonlocal rekey_in_progress
+        nonlocal rekey_in_progress, last_rekey_time
         while not shutdown.is_set():
             try:
                 if isinstance(transport, UDPTransport):
@@ -184,22 +185,27 @@ async def run_client(config: Config) -> None:
             elif inner.ptype == PacketType.DATA:
                 await tun.awrite(inner.payload)
             elif inner.ptype == PacketType.REKEY_ACK:
-                handle_rekey_ack(inner.payload, session_keys, fsm)
+                ts = handle_rekey_ack(inner.payload, session_keys, fsm)
+                if ts is not None:
+                    last_rekey_time = ts
                 rekey_in_progress = False
             elif inner.ptype == PacketType.REKEY_INIT:
-                await handle_rekey_init(
+                last_rekey_time = await handle_rekey_init(
                     inner.payload, session_keys, fsm, shaper, send_packet,
+                    last_rekey_time,
                 )
             elif inner.ptype == PacketType.SESSION_CLOSE:
                 shutdown.set()
                 break
 
     async def send_loop() -> None:
-        nonlocal rekey_in_progress
+        nonlocal rekey_in_progress, last_rekey_time
         while not shutdown.is_set():
             if session_keys.needs_rotation() and not rekey_in_progress:
                 rekey_in_progress = True
-                await initiate_rekey(session_keys, fsm, shaper, send_packet)
+                last_rekey_time = await initiate_rekey(
+                    session_keys, fsm, shaper, send_packet, last_rekey_time,
+                )
 
             try:
                 pkt = await asyncio.wait_for(tun.read(), timeout=0.1)

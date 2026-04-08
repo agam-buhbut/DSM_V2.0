@@ -76,9 +76,15 @@ class TestInnerPacket(unittest.TestCase):
             InnerPacket.deserialize(raw)
 
     def test_payload_too_large(self) -> None:
-        pkt = InnerPacket(ptype=PacketType.DATA, epoch_id=0, payload=b"\x00" * 0x10000)
+        pkt = InnerPacket(ptype=PacketType.DATA, epoch_id=0, payload=b"\x00" * 1501)
         with self.assertRaises(ValueError):
             pkt.serialize()
+
+    def test_deserialize_payload_too_large(self) -> None:
+        # Craft a raw packet with inner_len = 1501 (exceeds MAX_INNER_PAYLOAD)
+        raw = struct.pack("!BBH", 0x00, 0x00, 1501) + b"\x00" * 1501
+        with self.assertRaises(ValueError):
+            InnerPacket.deserialize(raw)
 
 
 class TestOuterPacket(unittest.TestCase):

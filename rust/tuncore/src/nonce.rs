@@ -1,3 +1,4 @@
+use rand::rngs::OsRng;
 use rand::RngCore;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -35,8 +36,7 @@ impl NonceGenerator {
         nonce[0..4].copy_from_slice(&self.epoch.to_be_bytes());
         nonce[4..8].copy_from_slice(&count.to_be_bytes());
 
-        let mut rng = rand::thread_rng();
-        rng.fill_bytes(&mut nonce[8..12]);
+        OsRng.fill_bytes(&mut nonce[8..12]);
 
         Some(nonce)
     }

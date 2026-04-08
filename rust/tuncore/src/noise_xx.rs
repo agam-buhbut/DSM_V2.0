@@ -28,6 +28,7 @@ fn derive_mask(ephemeral: &[u8]) -> [u8; 2] {
 /// Pack a handshake message: [len_be16^mask || snow_data || random_padding]
 /// Total output is always HANDSHAKE_PAD_SIZE bytes.
 fn pack_handshake(snow_data: &[u8], data_len: usize, mask: &[u8; 2]) -> Vec<u8> {
+    use rand::rngs::OsRng;
     use rand::RngCore;
     let mut out = vec![0u8; HANDSHAKE_PAD_SIZE];
     let len_u16 = data_len as u16;
@@ -36,18 +37,18 @@ fn pack_handshake(snow_data: &[u8], data_len: usize, mask: &[u8; 2]) -> Vec<u8> 
     out[1] = len_bytes[1] ^ mask[1];
     out[LEN_PREFIX..LEN_PREFIX + data_len].copy_from_slice(&snow_data[..data_len]);
     // Fill remainder with random padding
-    rand::thread_rng().fill_bytes(&mut out[LEN_PREFIX + data_len..]);
+    OsRng.fill_bytes(&mut out[LEN_PREFIX + data_len..]);
     out
 }
 
 /// Unpack a handshake message: extract snow data from [len_be16^mask || data || padding].
 fn unpack_handshake<'a>(buf: &'a [u8], mask: &[u8; 2]) -> Result<&'a [u8], String> {
     if buf.len() < LEN_PREFIX {
-        return Err("handshake message too short".into());
+        return Err("invalid handshake message".into());
     }
     let data_len = u16::from_be_bytes([buf[0] ^ mask[0], buf[1] ^ mask[1]]) as usize;
     if LEN_PREFIX + data_len > buf.len() {
-        return Err("handshake length prefix exceeds message".into());
+        return Err("invalid handshake message".into());
     }
     Ok(&buf[LEN_PREFIX..LEN_PREFIX + data_len])
 }

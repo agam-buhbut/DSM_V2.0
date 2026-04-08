@@ -4,6 +4,7 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit, Payload},
     XChaCha20Poly1305, XNonce,
 };
+use rand::rngs::OsRng;
 use rand::RngCore;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroizing;
@@ -28,7 +29,7 @@ impl IdentityKeyPair {
         disable_core_dumps()?;
 
         let mut secret_bytes = Zeroizing::new([0u8; 32]);
-        rand::thread_rng().fill_bytes(secret_bytes.as_mut());
+        OsRng.fill_bytes(secret_bytes.as_mut());
 
         mlock_slice(secret_bytes.as_ref())?;
 
@@ -76,7 +77,7 @@ impl IdentityKeyPair {
         }
 
         let mut salt = [0u8; ARGON2_SALT_LEN];
-        rand::thread_rng().fill_bytes(&mut salt);
+        OsRng.fill_bytes(&mut salt);
 
         let mut derived = Zeroizing::new([0u8; 32]);
         let params = Params::new(
@@ -96,7 +97,7 @@ impl IdentityKeyPair {
             .map_err(|e| format!("cipher init: {e}"))?;
 
         let mut nonce_bytes = [0u8; XCHACHA_NONCE_LEN];
-        rand::thread_rng().fill_bytes(&mut nonce_bytes);
+        OsRng.fill_bytes(&mut nonce_bytes);
         let nonce = XNonce::from_slice(&nonce_bytes);
 
         // Authenticate salt and nonce as AAD to prevent metadata tampering

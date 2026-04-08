@@ -2,6 +2,7 @@ use crate::aes_gcm::AesKey;
 use crate::nonce::NonceGenerator;
 use crate::replay_window::ReplayWindow;
 use hkdf::Hkdf;
+use rand::rngs::OsRng;
 use rand::RngCore;
 use sha2::Sha256;
 use std::time::Instant;
@@ -147,7 +148,7 @@ impl SessionKeyManager {
     /// Initiate key rotation: generate an ephemeral keypair for the new epoch.
     pub fn initiate_rotation(&self) -> Result<RotationInit, String> {
         let mut secret_bytes = Zeroizing::new([0u8; 32]);
-        rand::thread_rng().fill_bytes(secret_bytes.as_mut());
+        OsRng.fill_bytes(secret_bytes.as_mut());
 
         let secret = StaticSecret::from(*secret_bytes);
         let public = PublicKey::from(&secret);
@@ -185,7 +186,7 @@ impl SessionKeyManager {
         }
 
         let mut secret_bytes = Zeroizing::new([0u8; 32]);
-        rand::thread_rng().fill_bytes(secret_bytes.as_mut());
+        OsRng.fill_bytes(secret_bytes.as_mut());
 
         let secret = StaticSecret::from(*secret_bytes);
         let our_pub = *PublicKey::from(&secret).as_bytes();

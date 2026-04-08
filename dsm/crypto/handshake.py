@@ -178,10 +178,9 @@ def _check_known_host(
     server_ip: str,
     server_static: bytes,
     strict: bool,
-    identity: tuncore.IdentityKeyPair | None = None,
+    identity: tuncore.IdentityKeyPair,
 ) -> None:
     """TOFU check: verify server static key against HMAC-protected known_hosts."""
-    import tuncore
     if not path.exists():
         _save_known_host(path, server_ip, server_static, identity)
         log.info("TOFU: saved server static key for %s", server_ip)
@@ -203,24 +202,19 @@ def _check_known_host(
         log.warning("continuing despite key mismatch (strict_keys=False)")
 
 
-def _hmac_key(identity: tuncore.IdentityKeyPair | None) -> bytes:
+def _hmac_key(identity: tuncore.IdentityKeyPair) -> bytes:
     """Derive HMAC key from identity secret key for known_hosts integrity."""
-    import tuncore
-    if identity is not None:
-        return bytes(identity.derive_hmac_key(b"known-hosts"))
-    return hashlib.sha256(b"dsm-known-hosts-hmac-default-insecure").digest()
+    return bytes(identity.derive_hmac_key(b"known-hosts"))
 
 
-def _legacy_hmac_key(identity_pub: bytes | None) -> bytes:
+def _legacy_hmac_key(identity_pub: bytes) -> bytes:
     """Legacy HMAC key derivation (public-key-based). Used for migration only."""
-    base = identity_pub or b"dsm-known-hosts-default"
-    return hashlib.sha256(b"dsm-known-hosts-hmac-" + base).digest()
+    return hashlib.sha256(b"dsm-known-hosts-hmac-" + identity_pub).digest()
 
 
 def _load_known_hosts(
-    path: Path, identity: tuncore.IdentityKeyPair | None = None,
+    path: Path, identity: tuncore.IdentityKeyPair,
 ) -> dict[str, str]:
-    import tuncore
     try:
         raw = path.read_bytes()
     except OSError:
@@ -242,8 +236,7 @@ def _load_known_hosts(
 
     if not hmac.compare_digest(stored_mac, expected_mac):
         # Try legacy (public-key-based) HMAC for one-time migration
-        identity_pub = bytes(identity.public_key) if identity is not None else None
-        legacy_key = _legacy_hmac_key(identity_pub)
+        legacy_key = _legacy_hmac_key(bytes(identity.public_key))
         legacy_mac = hmac.new(legacy_key, payload, hashlib.sha256).digest()
         if hmac.compare_digest(stored_mac, legacy_mac):
             log.warning("known_hosts uses legacy HMAC, migrating to secret-key-based HMAC")
@@ -266,9 +259,8 @@ def _save_known_host(
     path: Path,
     server_ip: str,
     static_key: bytes,
-    identity: tuncore.IdentityKeyPair | None = None,
+    identity: tuncore.IdentityKeyPair,
 ) -> None:
-    import tuncore
     hosts = _load_known_hosts(path, identity)
     hosts[server_ip] = static_key.hex()
     path.parent.mkdir(parents=True, exist_ok=True)
