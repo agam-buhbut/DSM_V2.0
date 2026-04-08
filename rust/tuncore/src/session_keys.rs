@@ -49,6 +49,32 @@ pub struct RotationComplete {
 }
 
 impl SessionKeyManager {
+    /// Create a session key manager from the Noise handshake hash.
+    /// Derives initial send/recv keys via HKDF.
+    /// `is_initiator`: true for client (initiator), false for server (responder).
+    pub fn from_handshake_hash(
+        hash: &[u8],
+        is_initiator: bool,
+        initial_epoch: u32,
+    ) -> Result<Self, String> {
+        let hk = Hkdf::<Sha256>::new(Some(b"dsm-v2-session-init"), hash);
+
+        let mut key_a = [0u8; 32];
+        let mut key_b = [0u8; 32];
+        hk.expand(b"dsm-session-initiator", &mut key_a)
+            .map_err(|e| format!("hkdf key_a: {e}"))?;
+        hk.expand(b"dsm-session-responder", &mut key_b)
+            .map_err(|e| format!("hkdf key_b: {e}"))?;
+
+        let (send_key, recv_key) = if is_initiator {
+            (key_a, key_b) // initiator sends with key_a, receives with key_b
+        } else {
+            (key_b, key_a) // responder sends with key_b, receives with key_a
+        };
+
+        Self::new(send_key, recv_key, initial_epoch)
+    }
+
     /// Create a new session from initial handshake-derived keys.
     pub fn new(send_key: [u8; 32], recv_key: [u8; 32], initial_epoch: u32) -> Result<Self, String> {
         Ok(Self {
@@ -379,5 +405,60 @@ mod tests {
         rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut eph);
         // Try epoch 5 when current is 1 — should fail
         assert!(server.complete_rotation_responder(&eph, 5).is_err());
+    }
+
+    #[test]
+    fn test_from_handshake_hash_roundtrip() {
+        // Simulate both sides deriving keys from the same handshake hash
+        let mut hash = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut hash);
+
+        let mut client = SessionKeyManager::from_handshake_hash(&hash, true, 1).unwrap();
+        let mut server = SessionKeyManager::from_handshake_hash(&hash, false, 1).unwrap();
+        let aad = b"test-aad";
+
+        // Client -> Server
+        let (nonce, ct, epoch) = client.encrypt(b"hello from client", aad).unwrap();
+        assert_eq!(epoch, 1);
+        let pt = server.decrypt(&nonce, &ct, aad, 1, false).unwrap();
+        assert_eq!(pt, b"hello from client");
+
+        // Server -> Client
+        let (nonce, ct, epoch) = server.encrypt(b"hello from server", aad).unwrap();
+        assert_eq!(epoch, 1);
+        let pt = client.decrypt(&nonce, &ct, aad, 1, false).unwrap();
+        assert_eq!(pt, b"hello from server");
+    }
+
+    #[test]
+    fn test_from_handshake_hash_rotation() {
+        let mut hash = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut hash);
+
+        let mut client = SessionKeyManager::from_handshake_hash(&hash, true, 1).unwrap();
+        let mut server = SessionKeyManager::from_handshake_hash(&hash, false, 1).unwrap();
+        let aad = b"rot";
+
+        // Initiate rotation from client
+        let init = client.initiate_rotation().unwrap();
+        let (server_eph_pub, _) = server
+            .complete_rotation_responder(&init.ephemeral_pub, init.new_epoch)
+            .unwrap();
+        client
+            .complete_rotation_initiator(init, &server_eph_pub)
+            .unwrap();
+
+        assert_eq!(client.epoch(), 2);
+        assert_eq!(server.epoch(), 2);
+
+        // Post-rotation: verify communication still works
+        let (nonce, ct, epoch) = client.encrypt(b"after rotation", aad).unwrap();
+        assert_eq!(epoch, 2);
+        let pt = server.decrypt(&nonce, &ct, aad, 1, false).unwrap();
+        assert_eq!(pt, b"after rotation");
+
+        let (nonce, ct, _) = server.encrypt(b"server after rotation", aad).unwrap();
+        let pt = client.decrypt(&nonce, &ct, aad, 1, false).unwrap();
+        assert_eq!(pt, b"server after rotation");
     }
 }

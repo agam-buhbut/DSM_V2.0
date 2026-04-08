@@ -43,7 +43,7 @@ async def client_handshake(
     server_addr: tuple[str, int],
     known_hosts_path: Path | None = None,
     strict_keys: bool = True,
-) -> tuncore.NoiseTransport:
+) -> tuple[tuncore.SessionKeyManager, bytes]:
     """Perform Noise XX handshake as initiator (client).
 
     Args:
@@ -54,7 +54,7 @@ async def client_handshake(
         strict_keys: abort on any key mismatch (vs warn)
 
     Returns:
-        tuncore.NoiseTransport on success
+        (SessionKeyManager, handshake_hash) on success
 
     Raises:
         HandshakeError on failure
@@ -82,20 +82,24 @@ async def client_handshake(
     msg3 = initiator.write_message_3()
     await _send(transport, msg3, server_addr)
 
-    noise_transport = initiator.into_transport()
+    # Derive session keys from handshake hash (replaces Snow transport)
+    handshake_hash = bytes(initiator.get_handshake_hash())
+    session_keys = tuncore.SessionKeyManager.from_handshake_hash(
+        handshake_hash, is_initiator=True, initial_epoch=1,
+    )
     log.info("handshake complete (client)")
-    return noise_transport
+    return session_keys, handshake_hash
 
 
 async def server_handshake(
     transport: UDPTransport | TCPTransport,
     identity: tuncore.IdentityKeyPair,
     client_addr: tuple[str, int] | None = None,
-) -> tuple[tuncore.NoiseTransport, bytes]:
+) -> tuple[tuncore.SessionKeyManager, bytes]:
     """Perform Noise XX handshake as responder (server).
 
     Returns:
-        (tuncore.NoiseTransport, client_static_pubkey)
+        (SessionKeyManager, client_static_pubkey)
     """
     import tuncore
 
@@ -114,9 +118,13 @@ async def server_handshake(
     msg3, _ = await _recv(transport)
     client_static = responder.read_message_3(msg3)
 
-    noise_transport = responder.into_transport()
+    # Derive session keys from handshake hash (replaces Snow transport)
+    handshake_hash = bytes(responder.get_handshake_hash())
+    session_keys = tuncore.SessionKeyManager.from_handshake_hash(
+        handshake_hash, is_initiator=False, initial_epoch=1,
+    )
     log.info("handshake complete (server)")
-    return noise_transport, bytes(client_static)
+    return session_keys, bytes(client_static)
 
 
 class HandshakeError(Exception):

@@ -177,6 +177,16 @@ impl PyNoiseInitiator {
             inner: Some(transport),
         })
     }
+
+    /// Get the handshake hash for deriving session keys.
+    /// Must be called after handshake completes, before into_transport().
+    fn get_handshake_hash(&self) -> PyResult<Vec<u8>> {
+        Ok(self
+            .inner
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("already consumed"))?
+            .get_handshake_hash())
+    }
 }
 
 /// Python-visible Noise XX responder.
@@ -230,6 +240,16 @@ impl PyNoiseResponder {
             inner: Some(transport),
         })
     }
+
+    /// Get the handshake hash for deriving session keys.
+    /// Must be called after handshake completes, before into_transport().
+    fn get_handshake_hash(&self) -> PyResult<Vec<u8>> {
+        Ok(self
+            .inner
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("already consumed"))?
+            .get_handshake_hash())
+    }
 }
 
 /// Python-visible Noise transport (post-handshake).
@@ -254,6 +274,136 @@ impl PyNoiseTransport {
             .ok_or_else(|| PyRuntimeError::new_err("transport closed"))?
             .decrypt(ciphertext)
             .map_err(|e| PyRuntimeError::new_err(e))
+    }
+}
+
+/// Python-visible session key manager with key rotation support.
+#[pyclass(name = "SessionKeyManager")]
+struct PySessionKeyManager {
+    inner: session_keys::SessionKeyManager,
+    pending_rotation: Option<session_keys::RotationInit>,
+}
+
+#[pymethods]
+impl PySessionKeyManager {
+    /// Create a session key manager from the Noise handshake hash.
+    #[staticmethod]
+    fn from_handshake_hash(hash: &[u8], is_initiator: bool, initial_epoch: u32) -> PyResult<Self> {
+        let inner = session_keys::SessionKeyManager::from_handshake_hash(
+            hash,
+            is_initiator,
+            initial_epoch,
+        )
+        .map_err(|e| PyRuntimeError::new_err(e))?;
+        Ok(Self {
+            inner,
+            pending_rotation: None,
+        })
+    }
+
+    /// Encrypt a packet. Returns (nonce, ciphertext, epoch).
+    fn encrypt(&mut self, plaintext: &[u8], aad: &[u8]) -> PyResult<(Vec<u8>, Vec<u8>, u32)> {
+        let (nonce, ciphertext, epoch) = self
+            .inner
+            .encrypt(plaintext, aad)
+            .map_err(|e| PyRuntimeError::new_err(e))?;
+        Ok((nonce.to_vec(), ciphertext, epoch))
+    }
+
+    /// Decrypt a packet. Returns plaintext.
+    fn decrypt(
+        &mut self,
+        nonce: &[u8],
+        ciphertext: &[u8],
+        aad: &[u8],
+        seq: u64,
+        is_prev_epoch: bool,
+    ) -> PyResult<Vec<u8>> {
+        if nonce.len() != 12 {
+            return Err(PyRuntimeError::new_err("nonce must be 12 bytes"));
+        }
+        let mut n = [0u8; 12];
+        n.copy_from_slice(nonce);
+        self.inner
+            .decrypt(&n, ciphertext, aad, seq, is_prev_epoch)
+            .map_err(|e| PyRuntimeError::new_err(e))
+    }
+
+    /// Check if key rotation is needed (packet count or time threshold).
+    fn needs_rotation(&self) -> bool {
+        self.inner.needs_rotation()
+    }
+
+    /// Initiate key rotation. Returns (new_epoch, ephemeral_pub).
+    /// Stores the ephemeral secret internally for `complete_rotation_initiator`.
+    fn initiate_rotation(&mut self) -> PyResult<(u32, Vec<u8>)> {
+        if self.pending_rotation.is_some() {
+            return Err(PyRuntimeError::new_err("rotation already in progress"));
+        }
+        let init = self
+            .inner
+            .initiate_rotation()
+            .map_err(|e| PyRuntimeError::new_err(e))?;
+        let new_epoch = init.new_epoch;
+        let ephemeral_pub = init.ephemeral_pub.to_vec();
+        self.pending_rotation = Some(init);
+        Ok((new_epoch, ephemeral_pub))
+    }
+
+    /// Complete rotation as the initiator after receiving the responder's ACK.
+    fn complete_rotation_initiator(&mut self, remote_ephemeral_pub: &[u8]) -> PyResult<u32> {
+        let init = self
+            .pending_rotation
+            .take()
+            .ok_or_else(|| PyRuntimeError::new_err("no pending rotation"))?;
+        if remote_ephemeral_pub.len() != 32 {
+            return Err(PyRuntimeError::new_err("ephemeral pub must be 32 bytes"));
+        }
+        let mut pub_bytes = [0u8; 32];
+        pub_bytes.copy_from_slice(remote_ephemeral_pub);
+        let complete = self
+            .inner
+            .complete_rotation_initiator(init, &pub_bytes)
+            .map_err(|e| PyRuntimeError::new_err(e))?;
+        Ok(complete.new_epoch)
+    }
+
+    /// Complete rotation as the responder. Returns (our_ephemeral_pub, new_epoch).
+    fn complete_rotation_responder(
+        &mut self,
+        remote_ephemeral_pub: &[u8],
+        new_epoch: u32,
+    ) -> PyResult<(Vec<u8>, u32)> {
+        if remote_ephemeral_pub.len() != 32 {
+            return Err(PyRuntimeError::new_err("ephemeral pub must be 32 bytes"));
+        }
+        let mut pub_bytes = [0u8; 32];
+        pub_bytes.copy_from_slice(remote_ephemeral_pub);
+        let (our_pub, complete) = self
+            .inner
+            .complete_rotation_responder(&pub_bytes, new_epoch)
+            .map_err(|e| PyRuntimeError::new_err(e))?;
+        Ok((our_pub.to_vec(), complete.new_epoch))
+    }
+
+    /// Call periodically to clean up expired grace period keys.
+    fn tick(&mut self) {
+        self.inner.tick();
+    }
+
+    #[getter]
+    fn epoch(&self) -> u32 {
+        self.inner.epoch()
+    }
+
+    #[getter]
+    fn packets_sent(&self) -> u64 {
+        self.inner.packets_sent()
+    }
+
+    #[getter]
+    fn has_grace_period(&self) -> bool {
+        self.inner.has_grace_period()
     }
 }
 
@@ -305,6 +455,7 @@ fn tuncore(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyNoiseInitiator>()?;
     m.add_class::<PyNoiseResponder>()?;
     m.add_class::<PyNoiseTransport>()?;
+    m.add_class::<PySessionKeyManager>()?;
     m.add_class::<PyAesKey>()?;
     m.add_function(wrap_pyfunction!(disable_core_dumps, m)?)?;
     Ok(())

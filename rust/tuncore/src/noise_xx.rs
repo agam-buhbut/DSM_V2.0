@@ -83,6 +83,12 @@ impl NoiseInitiator {
         Ok(Self { state, mask: None })
     }
 
+    /// Get the handshake hash. Must be called after handshake completes,
+    /// before `into_transport()`. Used to derive initial session keys.
+    pub fn get_handshake_hash(&self) -> Vec<u8> {
+        self.state.get_handshake_hash().to_vec()
+    }
+
     /// Message 1: -> e
     /// Returns 1400 bytes. No mask on wire — mask is derived from the ephemeral
     /// public key embedded in the Snow payload.
@@ -159,6 +165,12 @@ impl NoiseResponder {
             .map_err(|e| format!("build responder: {e}"))?;
 
         Ok(Self { state, mask: None })
+    }
+
+    /// Get the handshake hash. Must be called after handshake completes,
+    /// before `into_transport()`. Used to derive initial session keys.
+    pub fn get_handshake_hash(&self) -> Vec<u8> {
+        self.state.get_handshake_hash().to_vec()
     }
 
     /// Message 1: -> e
@@ -391,5 +403,35 @@ mod tests {
             let decrypted = st.decrypt(&encrypted).unwrap();
             assert_eq!(decrypted, msg.as_bytes());
         }
+    }
+
+    #[test]
+    fn test_handshake_hash_to_session_keys() {
+        use crate::session_keys::SessionKeyManager;
+
+        let k1 = gen_keypair();
+        let k2 = gen_keypair();
+
+        let (initiator, responder) = do_handshake(&k1, &k2);
+
+        // Both sides derive session keys from the same handshake hash
+        let client_hash = initiator.get_handshake_hash();
+        let server_hash = responder.get_handshake_hash();
+        assert_eq!(client_hash, server_hash);
+
+        let mut client_keys =
+            SessionKeyManager::from_handshake_hash(&client_hash, true, 1).unwrap();
+        let mut server_keys =
+            SessionKeyManager::from_handshake_hash(&server_hash, false, 1).unwrap();
+
+        // Bidirectional communication works
+        let aad = b"e2e";
+        let (nonce, ct, _) = client_keys.encrypt(b"client msg", aad).unwrap();
+        let pt = server_keys.decrypt(&nonce, &ct, aad, 1, false).unwrap();
+        assert_eq!(pt, b"client msg");
+
+        let (nonce, ct, _) = server_keys.encrypt(b"server msg", aad).unwrap();
+        let pt = client_keys.decrypt(&nonce, &ct, aad, 1, false).unwrap();
+        assert_eq!(pt, b"server msg");
     }
 }
