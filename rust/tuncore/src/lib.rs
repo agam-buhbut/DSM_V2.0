@@ -14,6 +14,23 @@ use sha2::{Sha256, Digest};
 // Raw key bytes never cross the FFI boundary for secret keys.
 // Python receives opaque handles and public keys only.
 
+/// Get a mutable reference to the inner `Option`, returning a PyErr if already consumed.
+macro_rules! require_inner {
+    ($self:expr, $msg:expr) => {
+        $self.inner.as_mut().ok_or_else(|| PyRuntimeError::new_err($msg))?
+    };
+}
+
+/// Parse a Python byte slice into a fixed 12-byte nonce array.
+fn nonce_from_slice(nonce: &[u8]) -> PyResult<[u8; 12]> {
+    if nonce.len() != 12 {
+        return Err(PyRuntimeError::new_err("nonce must be 12 bytes"));
+    }
+    let mut n = [0u8; 12];
+    n.copy_from_slice(nonce);
+    Ok(n)
+}
+
 /// Python-visible identity keypair.
 #[pyclass(name = "IdentityKeyPair")]
 struct PyIdentityKeyPair {
@@ -142,25 +159,19 @@ impl PyNoiseInitiator {
     }
 
     fn write_message_1(&mut self) -> PyResult<Vec<u8>> {
-        self.inner
-            .as_mut()
-            .ok_or_else(|| PyRuntimeError::new_err("already consumed"))?
+        require_inner!(self, "already consumed")
             .write_message_1()
             .map_err(|e| PyRuntimeError::new_err(e))
     }
 
     fn read_message_2(&mut self, msg: &[u8]) -> PyResult<Vec<u8>> {
-        self.inner
-            .as_mut()
-            .ok_or_else(|| PyRuntimeError::new_err("already consumed"))?
+        require_inner!(self, "already consumed")
             .read_message_2(msg)
             .map_err(|e| PyRuntimeError::new_err(e))
     }
 
     fn write_message_3(&mut self) -> PyResult<Vec<u8>> {
-        self.inner
-            .as_mut()
-            .ok_or_else(|| PyRuntimeError::new_err("already consumed"))?
+        require_inner!(self, "already consumed")
             .write_message_3()
             .map_err(|e| PyRuntimeError::new_err(e))
     }
@@ -205,25 +216,19 @@ impl PyNoiseResponder {
     }
 
     fn read_message_1(&mut self, msg: &[u8]) -> PyResult<()> {
-        self.inner
-            .as_mut()
-            .ok_or_else(|| PyRuntimeError::new_err("already consumed"))?
+        require_inner!(self, "already consumed")
             .read_message_1(msg)
             .map_err(|e| PyRuntimeError::new_err(e))
     }
 
     fn write_message_2(&mut self) -> PyResult<Vec<u8>> {
-        self.inner
-            .as_mut()
-            .ok_or_else(|| PyRuntimeError::new_err("already consumed"))?
+        require_inner!(self, "already consumed")
             .write_message_2()
             .map_err(|e| PyRuntimeError::new_err(e))
     }
 
     fn read_message_3(&mut self, msg: &[u8]) -> PyResult<Vec<u8>> {
-        self.inner
-            .as_mut()
-            .ok_or_else(|| PyRuntimeError::new_err("already consumed"))?
+        require_inner!(self, "already consumed")
             .read_message_3(msg)
             .map_err(|e| PyRuntimeError::new_err(e))
     }
@@ -261,17 +266,13 @@ struct PyNoiseTransport {
 #[pymethods]
 impl PyNoiseTransport {
     fn encrypt(&mut self, plaintext: &[u8]) -> PyResult<Vec<u8>> {
-        self.inner
-            .as_mut()
-            .ok_or_else(|| PyRuntimeError::new_err("transport closed"))?
+        require_inner!(self, "transport closed")
             .encrypt(plaintext)
             .map_err(|e| PyRuntimeError::new_err(e))
     }
 
     fn decrypt(&mut self, ciphertext: &[u8]) -> PyResult<Vec<u8>> {
-        self.inner
-            .as_mut()
-            .ok_or_else(|| PyRuntimeError::new_err("transport closed"))?
+        require_inner!(self, "transport closed")
             .decrypt(ciphertext)
             .map_err(|e| PyRuntimeError::new_err(e))
     }
@@ -319,11 +320,7 @@ impl PySessionKeyManager {
         seq: u64,
         is_prev_epoch: bool,
     ) -> PyResult<Vec<u8>> {
-        if nonce.len() != 12 {
-            return Err(PyRuntimeError::new_err("nonce must be 12 bytes"));
-        }
-        let mut n = [0u8; 12];
-        n.copy_from_slice(nonce);
+        let n = nonce_from_slice(nonce)?;
         self.inner
             .decrypt(&n, ciphertext, aad, seq, is_prev_epoch)
             .map_err(|e| PyRuntimeError::new_err(e))
@@ -419,22 +416,14 @@ impl PyAesKey {
     // PyAesKey instances are only produced by Rust-side key derivation.
 
     fn encrypt(&self, nonce: &[u8], plaintext: &[u8], aad: &[u8]) -> PyResult<Vec<u8>> {
-        if nonce.len() != 12 {
-            return Err(PyRuntimeError::new_err("nonce must be 12 bytes"));
-        }
-        let mut n = [0u8; 12];
-        n.copy_from_slice(nonce);
+        let n = nonce_from_slice(nonce)?;
         self.inner
             .encrypt(&n, plaintext, aad)
             .map_err(|e| PyRuntimeError::new_err(e))
     }
 
     fn decrypt(&self, nonce: &[u8], ciphertext: &[u8], aad: &[u8]) -> PyResult<Vec<u8>> {
-        if nonce.len() != 12 {
-            return Err(PyRuntimeError::new_err("nonce must be 12 bytes"));
-        }
-        let mut n = [0u8; 12];
-        n.copy_from_slice(nonce);
+        let n = nonce_from_slice(nonce)?;
         self.inner
             .decrypt(&n, ciphertext, aad)
             .map_err(|e| PyRuntimeError::new_err(e))

@@ -72,39 +72,11 @@ impl ReplayWindow {
     /// Returns true if the packet should be accepted.
     /// Returns false if replayed or too old.
     pub fn check_and_update(&mut self, seq: u64) -> bool {
-        if seq == 0 {
-            return false; // 0 is never valid
+        if !self.check(seq) {
+            return false;
         }
-
-        if self.max_seq == 0 {
-            // First packet
-            self.max_seq = seq;
-            self.bitmap = 1;
-            return true;
-        }
-
-        if seq > self.max_seq {
-            let shift = seq - self.max_seq;
-            if shift >= Self::WINDOW_SIZE {
-                self.bitmap = 1;
-            } else {
-                self.bitmap = self.bitmap.checked_shl(shift as u32).unwrap_or(0);
-                self.bitmap |= 1;
-            }
-            self.max_seq = seq;
-            true
-        } else {
-            let diff = self.max_seq - seq;
-            if diff >= Self::WINDOW_SIZE {
-                return false; // too old
-            }
-            let bit = 1u128 << diff;
-            if self.bitmap & bit != 0 {
-                return false; // replay
-            }
-            self.bitmap |= bit;
-            true
-        }
+        self.update(seq);
+        true
     }
 
     pub fn max_seq(&self) -> u64 {

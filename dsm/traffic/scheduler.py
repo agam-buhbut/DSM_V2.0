@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import heapq
 import logging
-import os
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Awaitable
@@ -59,7 +58,8 @@ class SendScheduler:
         if len(self._queue) >= self._max_queue_size:
             heapq.heappop(self._queue)  # drop oldest
             log.warning("scheduler queue full, dropping oldest packet")
-        jitter = self._jitter_min + (int.from_bytes(os.urandom(4), "big") / (1 << 32)) * (self._jitter_max - self._jitter_min)
+        from dsm.core.rand import csprng_float
+        jitter = self._jitter_min + csprng_float() * (self._jitter_max - self._jitter_min)
         send_time = time.monotonic() + jitter
         heapq.heappush(self._queue, _ScheduledPacket(send_time, data, target_size))
         self._event.set()
@@ -92,10 +92,10 @@ class SendScheduler:
                 except Exception:
                     log.exception("send failed")
 
-            # Check if chaff should be injected
+            # Inject chaff independently of queue state to avoid leaking
+            # traffic activity via chaff-only / no-chaff timing patterns.
             if (
-                not self._queue
-                and self._chaff_fn
+                self._chaff_fn
                 and self._should_chaff_fn
                 and self._should_chaff_fn()
             ):

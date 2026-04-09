@@ -278,19 +278,19 @@ fn derive_rotation_keys(
     // Epoch is encoded in the info parameter for domain separation.
     let hk = Hkdf::<Sha256>::new(Some(b"dsm-v2-rotation-hkdf-salt"), shared.as_bytes());
 
-    let mut send_key = [0u8; 32];
-    let mut send_info = Vec::with_capacity(20);
-    send_info.extend_from_slice(b"dsm-rot-send-");
-    send_info.extend_from_slice(&epoch.to_be_bytes());
-    hk.expand(&send_info, &mut send_key)
-        .map_err(|e| format!("hkdf send: {e}"))?;
+    let epoch_bytes = epoch.to_be_bytes();
+    let expand_key = |label: &[u8], dir: &str| -> Result<[u8; 32], String> {
+        let mut info = Vec::with_capacity(label.len() + epoch_bytes.len());
+        info.extend_from_slice(label);
+        info.extend_from_slice(&epoch_bytes);
+        let mut key = [0u8; 32];
+        hk.expand(&info, &mut key)
+            .map_err(|e| format!("hkdf {dir}: {e}"))?;
+        Ok(key)
+    };
 
-    let mut recv_key = [0u8; 32];
-    let mut recv_info = Vec::with_capacity(20);
-    recv_info.extend_from_slice(b"dsm-rot-recv-");
-    recv_info.extend_from_slice(&epoch.to_be_bytes());
-    hk.expand(&recv_info, &mut recv_key)
-        .map_err(|e| format!("hkdf recv: {e}"))?;
+    let send_key = expand_key(b"dsm-rot-send-", "send")?;
+    let recv_key = expand_key(b"dsm-rot-recv-", "recv")?;
 
     Ok((send_key, recv_key))
 }

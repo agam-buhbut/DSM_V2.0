@@ -15,6 +15,33 @@ const ARGON2_TIME_COST: u32 = 4;
 const ARGON2_PARALLELISM: u32 = 2;
 const XCHACHA_NONCE_LEN: usize = 24;
 
+/// Derive an encryption key from a passphrase and salt using Argon2id.
+fn derive_argon2_key(passphrase: &[u8], salt: &[u8]) -> Result<Zeroizing<[u8; 32]>, String> {
+    let mut derived = Zeroizing::new([0u8; 32]);
+    let params = Params::new(
+        ARGON2_MEM_COST_KIB,
+        ARGON2_TIME_COST,
+        ARGON2_PARALLELISM,
+        Some(32),
+    )
+    .map_err(|e| format!("argon2 params: {e}"))?;
+
+    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    argon2
+        .hash_password_into(passphrase, salt, derived.as_mut())
+        .map_err(|e| format!("argon2 hash: {e}"))?;
+
+    Ok(derived)
+}
+
+/// Build AAD for identity store encryption: salt || nonce.
+fn build_store_aad(salt: &[u8], nonce: &[u8]) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(salt.len() + nonce.len());
+    aad.extend_from_slice(salt);
+    aad.extend_from_slice(nonce);
+    aad
+}
+
 /// Static X25519 identity keypair for Noise XX handshake.
 /// Private key is mlock'd and zeroized on drop.
 pub struct IdentityKeyPair {
@@ -79,19 +106,7 @@ impl IdentityKeyPair {
         let mut salt = [0u8; ARGON2_SALT_LEN];
         OsRng.fill_bytes(&mut salt);
 
-        let mut derived = Zeroizing::new([0u8; 32]);
-        let params = Params::new(
-            ARGON2_MEM_COST_KIB,
-            ARGON2_TIME_COST,
-            ARGON2_PARALLELISM,
-            Some(32),
-        )
-        .map_err(|e| format!("argon2 params: {e}"))?;
-
-        let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-        argon2
-            .hash_password_into(passphrase, &salt, derived.as_mut())
-            .map_err(|e| format!("argon2 hash: {e}"))?;
+        let derived = derive_argon2_key(passphrase, &salt)?;
 
         let cipher = XChaCha20Poly1305::new_from_slice(derived.as_ref())
             .map_err(|e| format!("cipher init: {e}"))?;
@@ -100,10 +115,7 @@ impl IdentityKeyPair {
         OsRng.fill_bytes(&mut nonce_bytes);
         let nonce = XNonce::from_slice(&nonce_bytes);
 
-        // Authenticate salt and nonce as AAD to prevent metadata tampering
-        let mut aad = Vec::with_capacity(ARGON2_SALT_LEN + XCHACHA_NONCE_LEN);
-        aad.extend_from_slice(&salt);
-        aad.extend_from_slice(&nonce_bytes);
+        let aad = build_store_aad(&salt, &nonce_bytes);
 
         let ciphertext = cipher
             .encrypt(nonce, Payload { msg: self.secret.as_ref(), aad: &aad })
@@ -131,29 +143,14 @@ impl IdentityKeyPair {
         let nonce_bytes = &blob[ARGON2_SALT_LEN..ARGON2_SALT_LEN + XCHACHA_NONCE_LEN];
         let ciphertext = &blob[ARGON2_SALT_LEN + XCHACHA_NONCE_LEN..];
 
-        let mut derived = Zeroizing::new([0u8; 32]);
-        let params = Params::new(
-            ARGON2_MEM_COST_KIB,
-            ARGON2_TIME_COST,
-            ARGON2_PARALLELISM,
-            Some(32),
-        )
-        .map_err(|e| format!("argon2 params: {e}"))?;
-
-        let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-        argon2
-            .hash_password_into(passphrase, salt, derived.as_mut())
-            .map_err(|e| format!("argon2 hash: {e}"))?;
+        let derived = derive_argon2_key(passphrase, salt)?;
 
         let cipher = XChaCha20Poly1305::new_from_slice(derived.as_ref())
             .map_err(|e| format!("cipher init: {e}"))?;
 
         let nonce = XNonce::from_slice(nonce_bytes);
 
-        // Authenticate salt and nonce as AAD (must match encryption)
-        let mut aad = Vec::with_capacity(ARGON2_SALT_LEN + XCHACHA_NONCE_LEN);
-        aad.extend_from_slice(salt);
-        aad.extend_from_slice(nonce_bytes);
+        let aad = build_store_aad(salt, nonce_bytes);
 
         let plaintext = Zeroizing::new(
             cipher

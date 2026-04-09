@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import struct
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Awaitable, Callable
 
 from dsm.core.fsm import SessionFSM, State
 from dsm.core.protocol import InnerPacket, PacketType
@@ -20,11 +20,14 @@ REKEY_PAYLOAD_SIZE = 36  # 4 (epoch) + 32 (ephemeral pub)
 MIN_REKEY_INTERVAL = 60  # seconds — minimum time between rekey operations
 
 
+SendFn = Callable[[bytes, int], Awaitable[None]]
+
+
 async def initiate_rekey(
     session_keys: tuncore.SessionKeyManager,
     fsm: SessionFSM,
     shaper: TrafficShaper,
-    send_fn: Any,
+    send_fn: SendFn,
     last_rekey_time: float | None = None,
 ) -> tuple[float | None, int | None]:
     """Start a key rotation: generate ephemeral keypair, send REKEY_INIT.
@@ -59,7 +62,7 @@ async def handle_rekey_init(
     session_keys: tuncore.SessionKeyManager,
     fsm: SessionFSM,
     shaper: TrafficShaper,
-    send_fn: Any,
+    send_fn: SendFn,
     last_rekey_time: float | None = None,
 ) -> float | None:
     """Process a REKEY_INIT: complete rotation as responder, send REKEY_ACK.
@@ -120,12 +123,16 @@ def handle_rekey_ack(
         log.warning("rekey ack received in state %s, ignoring", fsm.state.name)
         return None
 
+    if expected_epoch is None:
+        log.warning("rekey ack received but no rekey was initiated, ignoring")
+        return None
+
     if len(payload) < REKEY_PAYLOAD_SIZE:
         log.warning("rekey ack payload too short, ignoring")
         return None
 
     ack_epoch = struct.unpack("!I", payload[:4])[0]
-    if expected_epoch is not None and ack_epoch != expected_epoch:
+    if ack_epoch != expected_epoch:
         log.warning("rekey ack epoch mismatch: got %d, expected %d", ack_epoch, expected_epoch)
         return None
 

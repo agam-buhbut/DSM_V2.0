@@ -141,10 +141,9 @@ class OuterPacket:
     def aad(self) -> bytes:
         """Return the Additional Authenticated Data (outer header).
 
-        NOTE: Currently unused — snow's transport mode does not accept AAD.
-        The outer header (seq + nonce) is not bound to the AEAD ciphertext.
-        Noise's internal nonce tracking provides replay protection independently.
-        Retained for future use if transport switches to raw AES-GCM with AAD.
+        The sequence number is passed as AAD to AES-GCM in session.py,
+        binding it cryptographically to the ciphertext.  The nonce is
+        inherently bound as the GCM IV.
         """
         return struct.pack("!Q", self.seq) + self.nonce
 

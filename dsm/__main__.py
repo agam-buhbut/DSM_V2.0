@@ -9,12 +9,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import dataclasses
 import sys
 from pathlib import Path
 
 from dsm.core import log as dsm_log
-from dsm.core.config import Config, load
+from dataclasses import replace
+
+from dsm.core.config import load
 
 
 def main() -> None:
@@ -34,7 +35,7 @@ def main() -> None:
 
     config = load(args.config)
     if args.mode:
-        config = Config(**{**dataclasses.asdict(config), "mode": args.mode})
+        config = replace(config, mode=args.mode)
 
     dsm_log.configure(config.log_level)
 

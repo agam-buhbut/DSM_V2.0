@@ -12,6 +12,8 @@ import math
 import os
 import secrets
 import time
+
+from dsm.core.rand import csprng_float
 from collections import deque
 from dataclasses import dataclass, field
 
@@ -60,7 +62,7 @@ class SizeTracker:
 
     def sample(self) -> int:
         """Sample a size class from the current distribution."""
-        r = int.from_bytes(os.urandom(4), "big") / (1 << 32)
+        r = csprng_float()
         cumulative = 0.0
         for sc, w in zip(SIZE_CLASSES, self._weights):
             cumulative += w
@@ -132,7 +134,7 @@ class TrafficShaper:
         if time_since_real < IDLE_THRESHOLD:
             # Active mode: probability-based interleaving
             self._maybe_resample(now)
-            return (int.from_bytes(os.urandom(4), "big") / (1 << 32)) < (0.3 * self._chaff_rate_multiplier)
+            return (csprng_float()) < (0.3 * self._chaff_rate_multiplier)
 
         # Idle mode: burst pattern
         return self._idle_burst_check(now)
@@ -141,7 +143,7 @@ class TrafficShaper:
         """Generate a chaff packet with perturbed size distribution to prevent correlation."""
         size_class = self._size_tracker.sample()
         # Perturb size class ±1 with 30% probability to decorrelate from real traffic
-        r = int.from_bytes(os.urandom(4), "big") / (1 << 32)
+        r = csprng_float()
         if r < 0.15:
             idx = _size_class_index(size_class)
             if idx + 1 < len(SIZE_CLASSES):
@@ -162,8 +164,8 @@ class TrafficShaper:
         """Re-sample chaff rate multiplier periodically."""
         if now < self._next_resample:
             return
-        self._chaff_rate_multiplier = 0.5 + (int.from_bytes(os.urandom(4), "big") / (1 << 32))
-        self._next_resample = now + RESAMPLE_MIN + (int.from_bytes(os.urandom(4), "big") / (1 << 32)) * (RESAMPLE_MAX - RESAMPLE_MIN)
+        self._chaff_rate_multiplier = 0.5 + (csprng_float())
+        self._next_resample = now + RESAMPLE_MIN + (csprng_float()) * (RESAMPLE_MAX - RESAMPLE_MIN)
 
     def _idle_burst_check(self, now: float) -> bool:
         """Idle mode: emit chaff in bursts mimicking browsing patterns."""
@@ -175,7 +177,7 @@ class TrafficShaper:
             # Start a new burst
             self._idle_burst_remaining = IDLE_BURST_MIN + secrets.randbelow(IDLE_BURST_MAX - IDLE_BURST_MIN + 1)
             # Schedule next burst with exponential gap (CSPRNG-based)
-            u = max(1e-10, int.from_bytes(os.urandom(4), "big") / (1 << 32))
+            u = max(1e-10, csprng_float())
             gap = -IDLE_GAP_LAMBDA * math.log(u)
             gap = max(0.5, min(gap, 5.0))  # Clamp to 0.5-5s
             self._next_idle_burst = now + gap
@@ -183,6 +185,13 @@ class TrafficShaper:
             return True
 
         return False
+
+
+async def make_chaff_packet(shaper: TrafficShaper) -> tuple[bytes, int]:
+    """Generate a padded chaff packet ready for encryption."""
+    chaff = shaper.make_chaff()
+    padded, target = shaper.pad_packet(chaff)
+    return padded, target
 
 
 def _size_class_index(size: int) -> int:

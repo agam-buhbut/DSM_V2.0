@@ -1,13 +1,14 @@
 """Tests for dsm.core.config — Config validation."""
 
 import unittest
+from typing import Any
 
 from dsm.core.config import Config
 
 
-def _base(**overrides: object) -> dict[str, object]:
+def _base(**overrides: Any) -> dict[str, Any]:
     """Return a valid base config dict, with optional overrides."""
-    defaults: dict[str, object] = {
+    defaults: dict[str, Any] = {
         "mode": "client",
         "server_ip": "10.0.0.1",
         "server_port": 51820,

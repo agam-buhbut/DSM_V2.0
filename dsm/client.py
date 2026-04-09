@@ -3,31 +3,24 @@
 from __future__ import annotations
 
 import asyncio
-import getpass
 import logging
 import signal
-import struct
 from pathlib import Path
 
 from dsm.core.config import Config
 from dsm.core.fsm import SessionFSM, State
-from dsm.core.protocol import InnerPacket, OuterPacket, PacketType, OUTER_HEADER_SIZE
 from dsm.crypto.keystore import KeyStore
 from dsm.net.nftables import NFTablesManager
 from dsm.net.tunnel import TunDevice
 from dsm.net.transport.udp import UDPTransport
 from dsm.net.transport.tcp import TCPTransport
-from dsm.traffic.shaper import TrafficShaper
+from dsm.session import (
+    RekeyState, decrypt_packet, dispatch_inner, make_send_fn, tun_send_loop,
+)
+from dsm.traffic.shaper import TrafficShaper, make_chaff_packet
 from dsm.traffic.scheduler import SendScheduler
-from dsm.rekey import initiate_rekey, handle_rekey_init, handle_rekey_ack
 
 log = logging.getLogger(__name__)
-
-
-async def _make_chaff(shaper: TrafficShaper) -> tuple[bytes, int]:
-    chaff = shaper.make_chaff()
-    padded, target = shaper.pad_packet(chaff)
-    return padded, target
 
 
 async def run_client(config: Config) -> None:
@@ -40,17 +33,7 @@ async def run_client(config: Config) -> None:
 
     # Load identity
     keystore = KeyStore(config.key_file)
-    passphrase = bytearray(getpass.getpass("Key passphrase: ").encode())
-    try:
-        if keystore.exists():
-            pub = keystore.load(bytes(passphrase))
-        else:
-            pub = keystore.generate(bytes(passphrase))
-            log.info("generated new identity keypair")
-    finally:
-        passphrase[:] = b"\x00" * len(passphrase)
-        del passphrase
-    log.info("identity loaded")
+    keystore.load_or_generate_interactive()
 
     # Setup components
     nft = NFTablesManager(config.server_ip, config.server_port, config.tun_name)
@@ -96,29 +79,15 @@ async def run_client(config: Config) -> None:
 
     log.info("tunnel established")
 
-    seq_counter = 0
+    seq = [0]
     replay = tuncore.ReplayWindow()
-    rekey_in_progress = False
-    last_rekey_time: float | None = None
-    pending_rekey_epoch: int | None = None
+    rekey = RekeyState()
 
-    async def send_packet(data: bytes, target_size: int) -> None:
-        nonlocal seq_counter
-        seq_counter += 1
-        if seq_counter >= 2**64:
-            raise RuntimeError("sequence number overflow — session must be rekeyed")
-        aad = struct.pack("!Q", seq_counter)
-        nonce, ct, _epoch = session_keys.encrypt(data, aad)
-        outer = OuterPacket(seq=seq_counter, nonce=bytes(nonce), ciphertext=ct)
-        wire = outer.serialize(target_size)
-        if isinstance(transport, UDPTransport):
-            await transport.send(wire, server_addr)
-        else:
-            await transport.send(wire)
+    send_packet = make_send_fn(session_keys, transport, lambda: server_addr, seq)
 
     scheduler = SendScheduler(
         send_fn=send_packet,
-        chaff_fn=lambda: _make_chaff(shaper),
+        chaff_fn=lambda: make_chaff_packet(shaper),
         should_chaff_fn=shaper.should_send_chaff,
         jitter_ms_min=config.jitter_ms_min,
         jitter_ms_max=config.jitter_ms_max,
@@ -136,7 +105,6 @@ async def run_client(config: Config) -> None:
         loop.add_signal_handler(sig, handle_signal)
 
     async def recv_loop() -> None:
-        nonlocal rekey_in_progress, last_rekey_time, pending_rekey_epoch
         while not shutdown.is_set():
             try:
                 if isinstance(transport, UDPTransport):
@@ -150,98 +118,22 @@ async def run_client(config: Config) -> None:
                 session_keys.tick()
                 continue
 
-            if len(data) < OUTER_HEADER_SIZE:
-                log.debug("packet too short, dropping")
+            result = decrypt_packet(data, session_keys, replay)
+            if result is None:
                 continue
 
-            seq = struct.unpack("!Q", data[:8])[0]
-            if not replay.check(seq):
-                log.debug("replay detected, dropping seq=%d", seq)
-                continue
-
-            nonce_bytes = data[8:20]
-            ciphertext = data[OUTER_HEADER_SIZE:]
-            aad = struct.pack("!Q", seq)
-
-            decrypted_prev_epoch = False
-            try:
-                plaintext = session_keys.decrypt(nonce_bytes, ciphertext, aad, seq, False)
-            except Exception:
-                if session_keys.has_grace_period:
-                    try:
-                        plaintext = session_keys.decrypt(nonce_bytes, ciphertext, aad, seq, True)
-                        decrypted_prev_epoch = True
-                    except Exception:
-                        log.debug("decrypt failed (both epochs), dropping packet")
-                        continue
-                else:
-                    log.debug("decrypt failed, dropping packet")
-                    continue
-
-            replay.update(seq)
-
-            try:
-                inner = InnerPacket.deserialize(plaintext)
-            except ValueError:
-                log.debug("malformed inner packet, dropping")
-                continue
-
-            # Verify epoch_id matches the key epoch used for decryption
-            if inner.ptype != PacketType.CHAFF:
-                if decrypted_prev_epoch:
-                    expected_eid = (session_keys.epoch - 1) & 0x03
-                else:
-                    expected_eid = session_keys.epoch & 0x03
-                if inner.epoch_id != expected_eid:
-                    log.debug("epoch_id mismatch: got %d, expected %d", inner.epoch_id, expected_eid)
-                    continue
-
-            if inner.ptype == PacketType.CHAFF:
-                continue
-            elif inner.ptype == PacketType.DATA:
-                await tun.awrite(inner.payload)
-            elif inner.ptype == PacketType.REKEY_ACK:
-                ts = handle_rekey_ack(
-                    inner.payload, session_keys, fsm, pending_rekey_epoch,
-                )
-                if ts is not None:
-                    last_rekey_time = ts
-                    pending_rekey_epoch = None
-                rekey_in_progress = False
-            elif inner.ptype == PacketType.REKEY_INIT:
-                last_rekey_time = await handle_rekey_init(
-                    inner.payload, session_keys, fsm, shaper, send_packet,
-                    last_rekey_time,
-                )
-            elif inner.ptype == PacketType.SESSION_CLOSE:
-                shutdown.set()
-                break
-
-    async def send_loop() -> None:
-        nonlocal rekey_in_progress, last_rekey_time, pending_rekey_epoch
-        while not shutdown.is_set():
-            if session_keys.needs_rotation() and not rekey_in_progress:
-                rekey_in_progress = True
-                last_rekey_time, pending_rekey_epoch = await initiate_rekey(
-                    session_keys, fsm, shaper, send_packet, last_rekey_time,
-                )
-
-            try:
-                pkt = await asyncio.wait_for(tun.read(), timeout=0.1)
-            except asyncio.TimeoutError:
-                continue
-
-            inner = InnerPacket(
-                ptype=PacketType.DATA,
-                epoch_id=session_keys.epoch & 0x03,
-                payload=pkt,
+            inner, _prev_epoch = result
+            await dispatch_inner(
+                inner, tun, session_keys, fsm, shaper, send_packet, rekey, shutdown,
             )
-            padded, target_size = shaper.pad_packet(inner)
-            shaper.observe_real_packet(target_size)
-            scheduler.enqueue(padded, target_size)
 
     try:
-        await asyncio.gather(recv_loop(), send_loop())
+        await asyncio.gather(
+            recv_loop(),
+            tun_send_loop(
+                tun, session_keys, fsm, shaper, send_packet, scheduler, rekey, shutdown,
+            ),
+        )
     except asyncio.CancelledError:
         pass
     finally:

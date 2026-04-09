@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import getpass
+import logging
 import os
 import tempfile
 from pathlib import Path
@@ -9,6 +11,8 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     import tuncore
+
+log = logging.getLogger(__name__)
 
 
 class KeyStore:
@@ -64,6 +68,24 @@ class KeyStore:
 
     def exists(self) -> bool:
         return self._path.is_file()
+
+    def load_or_generate_interactive(self) -> bytes:
+        """Prompt for passphrase and load or generate identity.
+
+        Returns the public key bytes. Zeroizes the passphrase after use.
+        """
+        passphrase = bytearray(getpass.getpass("Key passphrase: ").encode())
+        try:
+            if self.exists():
+                pub = self.load(bytes(passphrase))
+            else:
+                pub = self.generate(bytes(passphrase))
+                log.info("generated new identity keypair")
+        finally:
+            passphrase[:] = b"\x00" * len(passphrase)
+            del passphrase
+        log.info("identity loaded")
+        return pub
 
     def _atomic_write(self, data: bytes) -> None:
         """Write data atomically to prevent partial writes on crash."""
