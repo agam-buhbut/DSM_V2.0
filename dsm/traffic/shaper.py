@@ -15,7 +15,6 @@ import time
 
 from dsm.core.rand import csprng_float
 from collections import deque
-from dataclasses import dataclass, field
 
 from dsm.core.protocol import (
     INNER_HEADER_SIZE,
@@ -39,17 +38,17 @@ IDLE_BURST_MAX = 15
 IDLE_GAP_LAMBDA = 1.5  # Exponential distribution parameter (mean gap ~1.5s)
 
 
-@dataclass
 class SizeTracker:
     """Track real traffic size class distribution via EMA."""
 
-    _weights: list[float] = field(
-        default_factory=lambda: [1.0 / len(SIZE_CLASSES)] * len(SIZE_CLASSES)
-    )
+    def __init__(self, classes: tuple[int, ...] | None = None) -> None:
+        self._classes = classes or SIZE_CLASSES
+        n = len(self._classes)
+        self._weights: list[float] = [1.0 / n] * n
 
     def observe(self, size_class: int) -> None:
         """Update the distribution based on an observed real packet size class."""
-        idx = _size_class_index(size_class)
+        idx = self.class_index(size_class)
         for i in range(len(self._weights)):
             if i == idx:
                 self._weights[i] = (1 - EMA_ALPHA) * self._weights[i] + EMA_ALPHA
@@ -64,11 +63,18 @@ class SizeTracker:
         """Sample a size class from the current distribution."""
         r = csprng_float()
         cumulative = 0.0
-        for sc, w in zip(SIZE_CLASSES, self._weights):
+        for sc, w in zip(self._classes, self._weights):
             cumulative += w
             if r < cumulative:
                 return sc
-        return SIZE_CLASSES[-1]
+        return self._classes[-1]
+
+    def class_index(self, size: int) -> int:
+        """Find the index of the matching or next-larger class."""
+        for i, sc in enumerate(self._classes):
+            if sc >= size:
+                return i
+        return len(self._classes) - 1
 
 
 class TrafficShaper:
@@ -77,7 +83,15 @@ class TrafficShaper:
     def __init__(self, padding_min: int = 128, padding_max: int = 1400) -> None:
         self._padding_min = padding_min
         self._padding_max = padding_max
-        self._size_tracker = SizeTracker()
+        # Filter SIZE_CLASSES to the configured range so that
+        # padding_min/padding_max actually constrain packet sizes.
+        self._active_classes = tuple(
+            sc for sc in SIZE_CLASSES if padding_min <= sc <= padding_max
+        )
+        if not self._active_classes:
+            # Fallback: use the smallest class >= padding_min
+            self._active_classes = (min(sc for sc in SIZE_CLASSES if sc >= padding_min),)
+        self._size_tracker = SizeTracker(self._active_classes)
 
         # Rate tracking
         self._real_packet_times: deque[float] = deque(maxlen=100)
@@ -103,9 +117,9 @@ class TrafficShaper:
         # ciphertext = inner_plaintext + GCM_TAG
         min_outer = OUTER_HEADER_SIZE + len(serialized) + GCM_TAG_SIZE
         while target_outer < min_outer:
-            idx = _size_class_index(target_outer)
-            if idx + 1 < len(SIZE_CLASSES):
-                target_outer = SIZE_CLASSES[idx + 1]
+            idx = self._size_tracker.class_index(target_outer)
+            if idx + 1 < len(self._active_classes):
+                target_outer = self._active_classes[idx + 1]
             else:
                 target_outer = min_outer
                 break
@@ -139,24 +153,25 @@ class TrafficShaper:
         # Idle mode: burst pattern
         return self._idle_burst_check(now)
 
-    def make_chaff(self) -> InnerPacket:
+    def make_chaff(self, epoch_id: int = 0) -> InnerPacket:
         """Generate a chaff packet with perturbed size distribution to prevent correlation."""
         size_class = self._size_tracker.sample()
         # Perturb size class ±1 with 30% probability to decorrelate from real traffic
         r = csprng_float()
+        classes = self._active_classes
         if r < 0.15:
-            idx = _size_class_index(size_class)
-            if idx + 1 < len(SIZE_CLASSES):
-                size_class = SIZE_CLASSES[idx + 1]
+            idx = self._size_tracker.class_index(size_class)
+            if idx + 1 < len(classes):
+                size_class = classes[idx + 1]
         elif r < 0.30:
-            idx = _size_class_index(size_class)
+            idx = self._size_tracker.class_index(size_class)
             if idx > 0:
-                size_class = SIZE_CLASSES[idx - 1]
+                size_class = classes[idx - 1]
         # Chaff payload is random bytes sized to fill the target
         payload_len = max(0, size_class - OUTER_HEADER_SIZE - GCM_TAG_SIZE - INNER_HEADER_SIZE)
         return InnerPacket(
             ptype=PacketType.CHAFF,
-            epoch_id=0,
+            epoch_id=epoch_id,
             payload=os.urandom(payload_len),
         )
 
@@ -187,16 +202,8 @@ class TrafficShaper:
         return False
 
 
-async def make_chaff_packet(shaper: TrafficShaper) -> tuple[bytes, int]:
+async def make_chaff_packet(shaper: TrafficShaper, epoch_id: int = 0) -> tuple[bytes, int]:
     """Generate a padded chaff packet ready for encryption."""
-    chaff = shaper.make_chaff()
+    chaff = shaper.make_chaff(epoch_id)
     padded, target = shaper.pad_packet(chaff)
     return padded, target
-
-
-def _size_class_index(size: int) -> int:
-    """Find the index of the matching or next-larger size class."""
-    for i, sc in enumerate(SIZE_CLASSES):
-        if sc >= size:
-            return i
-    return len(SIZE_CLASSES) - 1

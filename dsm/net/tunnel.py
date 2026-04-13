@@ -98,6 +98,11 @@ class TunDevice:
             # Routing: use a separate table to route all traffic through TUN
             # except VPN's own traffic (marked with FWMARK)
             ["ip", "route", "replace", "default", "dev", self._name, "table", "100"],
+            # Disable IPv6 on non-TUN interfaces to prevent dual-stack leaks.
+            # The nftables rules also block IPv6, but disabling at sysctl level
+            # prevents any IPv6 traffic from being generated in the first place.
+            ["sysctl", "-w", "net.ipv6.conf.all.disable_ipv6=1"],
+            ["sysctl", "-w", f"net.ipv6.conf.{self._name}.disable_ipv6=0"],
         ]
         # ip rule has no 'replace' — delete first (ignore if absent), then add
         rule_args = [
@@ -120,6 +125,8 @@ class TunDevice:
                 ["ip", "rule", "del", "not", "fwmark", str(FWMARK), "table", "100"],
                 ["ip", "route", "del", "default", "dev", self._name, "table", "100"],
                 ["ip", "link", "set", self._name, "down"],
+                # Re-enable IPv6 on teardown
+                ["sysctl", "-w", "net.ipv6.conf.all.disable_ipv6=0"],
             ],
             strict=False,
         )

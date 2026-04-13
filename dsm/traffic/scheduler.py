@@ -105,12 +105,15 @@ class SendScheduler:
                 except Exception:
                     log.exception("chaff generation failed")
 
-            # Sleep until next packet or a short poll interval
+            # Sleep until next packet or a jittered poll interval.
+            # Jitter prevents a fixed 50ms cadence from fingerprinting the scheduler.
+            from dsm.core.rand import csprng_float
+            poll_jitter = 0.03 + csprng_float() * 0.04  # 30-70ms
             if self._queue:
                 wait_time = max(0, self._queue[0].send_time - time.monotonic())
-                wait_time = min(wait_time, 0.05)  # Cap at 50ms
+                wait_time = min(wait_time, poll_jitter)
             else:
-                wait_time = 0.05  # Poll interval for chaff
+                wait_time = poll_jitter
 
             self._event.clear()
             try:

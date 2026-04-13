@@ -6,7 +6,7 @@ Outer packet (visible to observer):
 Inner plaintext (after AEAD decryption):
     [Type: 1 byte][Epoch|Flags: 1 byte][Inner Length: 2 bytes][Payload][Inner Padding]
 
-AAD = outer header (seq + nonce, 20 bytes).
+AAD = sequence number (8 bytes).  Nonce is bound as the GCM IV.
 """
 
 from __future__ import annotations
@@ -14,7 +14,8 @@ from __future__ import annotations
 import logging
 import os
 import struct
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from enum import IntEnum
 
 log = logging.getLogger(__name__)
@@ -139,13 +140,14 @@ class OuterPacket:
         return cls(seq=seq, nonce=nonce, ciphertext=ciphertext)
 
     def aad(self) -> bytes:
-        """Return the Additional Authenticated Data (outer header).
+        """Return the Additional Authenticated Data for this packet.
 
-        The sequence number is passed as AAD to AES-GCM in session.py,
-        binding it cryptographically to the ciphertext.  The nonce is
-        inherently bound as the GCM IV.
+        AAD = sequence number (8 bytes).  The nonce is NOT included
+        because it is inherently bound as the GCM IV — including it
+        in AAD would be redundant.  This matches the actual AAD
+        construction in session.py encrypt/decrypt paths.
         """
-        return struct.pack("!Q", self.seq) + self.nonce
+        return struct.pack("!Q", self.seq)
 
 
 def _pick_size_class(min_size: int) -> int:
@@ -200,3 +202,78 @@ class Fragment:
             raise ValueError(f"fragment index {idx} >= total {total}")
         data = payload[FRAGMENT_HEADER_SIZE:]
         return cls(fragment_id=fid, index=idx, total=total, data=data)
+
+
+# ── Fragment reassembly ──
+
+REASSEMBLY_MAX_PENDING = 256
+REASSEMBLY_TIMEOUT_S = 5.0
+
+
+@dataclass
+class _PendingReassembly:
+    """Tracks fragments for a single fragment_id."""
+    total: int
+    received: dict[int, bytes] = field(default_factory=lambda: {})
+    first_seen: float = field(default_factory=time.monotonic)
+
+
+class ReassemblyBuffer:
+    """Fragment reassembly with timeout and capacity limits.
+
+    Prevents memory exhaustion from incomplete fragment sets (DoS) by
+    capping pending entries and expiring stale ones.
+    """
+
+    def __init__(
+        self,
+        max_pending: int = REASSEMBLY_MAX_PENDING,
+        timeout_s: float = REASSEMBLY_TIMEOUT_S,
+    ) -> None:
+        self._pending: dict[int, _PendingReassembly] = {}
+        self._max_pending = max_pending
+        self._timeout_s = timeout_s
+
+    def add_fragment(self, frag: Fragment) -> bytes | None:
+        """Add a fragment. Returns reassembled payload if complete, else None."""
+        self._cleanup_expired()
+
+        fid = frag.fragment_id
+
+        if fid not in self._pending:
+            if len(self._pending) >= self._max_pending:
+                log.debug("reassembly buffer full, dropping fragment_id=%d", fid)
+                return None
+            self._pending[fid] = _PendingReassembly(total=frag.total)
+
+        entry = self._pending[fid]
+
+        # Validate consistency
+        if entry.total != frag.total:
+            log.debug("fragment total mismatch for id=%d: %d != %d", fid, frag.total, entry.total)
+            return None
+
+        # Duplicate check
+        if frag.index in entry.received:
+            return None
+
+        entry.received[frag.index] = frag.data
+
+        # Check if complete
+        if len(entry.received) == entry.total:
+            payload = b"".join(entry.received[i] for i in range(entry.total))
+            del self._pending[fid]
+            return payload
+
+        return None
+
+    def _cleanup_expired(self) -> None:
+        """Remove entries that have timed out."""
+        now = time.monotonic()
+        expired = [
+            fid for fid, e in self._pending.items()
+            if now - e.first_seen > self._timeout_s
+        ]
+        for fid in expired:
+            log.debug("reassembly timeout for fragment_id=%d", fid)
+            del self._pending[fid]

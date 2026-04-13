@@ -11,6 +11,7 @@ from dsm.crypto.keystore import KeyStore
 from dsm.net.tunnel import TunDevice
 from dsm.net.transport.udp import UDPTransport
 from dsm.net.transport.tcp import TCPTransport
+from dsm.core.protocol import ReassemblyBuffer
 from dsm.session import (
     RekeyState, decrypt_packet, dispatch_inner, make_send_fn,
     setup_signal_handlers, tun_send_loop,
@@ -67,6 +68,7 @@ async def run_server(config: Config) -> None:
 
     seq = [0]
     rekey = RekeyState()
+    reassembly = ReassemblyBuffer()
 
     shutdown = asyncio.Event()
     setup_signal_handlers(shutdown)
@@ -76,10 +78,15 @@ async def run_server(config: Config) -> None:
         session_keys, transport, lambda: client_addr[0], seq,
     )
 
+    # Guard chaff generation until client_addr is known — the scheduler
+    # starts immediately but chaff requires a destination for UDP.
+    def _should_chaff() -> bool:
+        return client_addr[0] is not None and shaper.should_send_chaff()
+
     server_scheduler = SendScheduler(
         send_fn=send_packet,
-        chaff_fn=lambda: make_chaff_packet(shaper),
-        should_chaff_fn=shaper.should_send_chaff,
+        chaff_fn=lambda: make_chaff_packet(shaper, session_keys.epoch & 0x03),
+        should_chaff_fn=_should_chaff,
         jitter_ms_min=config.jitter_ms_min,
         jitter_ms_max=config.jitter_ms_max,
     )
@@ -108,6 +115,7 @@ async def run_server(config: Config) -> None:
             inner, _prev_epoch = result
             await dispatch_inner(
                 inner, tun, session_keys, fsm, shaper, send_packet, rekey, shutdown,
+                reassembly,
             )
 
     try:

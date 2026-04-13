@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import socket
 
 log = logging.getLogger(__name__)
+
+# Must match FWMARK in tunnel.py — VPN traffic is exempted from TUN routing.
+_SO_MARK = 0x1
 
 # Maximum UDP payload (Ethernet MTU - IP header - UDP header)
 MAX_DATAGRAM = 1472
@@ -29,6 +33,11 @@ class UDPTransport:
             lambda: protocol,
             local_addr=(local_addr, local_port),
         )
+        # Mark VPN traffic so ip-rule skips the TUN routing table,
+        # preventing routing loops.
+        sock = transport.get_extra_info("socket")
+        if sock is not None:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_MARK, _SO_MARK)
         self._transport = transport
         actual_port = transport.get_extra_info("sockname")[1]
         log.debug("UDP bound to %s:%d", local_addr, actual_port)

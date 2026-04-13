@@ -116,8 +116,8 @@ class TestOuterPacket(unittest.TestCase):
     def test_aad_format(self) -> None:
         pkt = OuterPacket(seq=123, nonce=b"\x00" * 12, ciphertext=b"")
         aad = pkt.aad()
-        self.assertEqual(len(aad), OUTER_HEADER_SIZE)
-        seq_from_aad = struct.unpack("!Q", aad[:8])[0]
+        self.assertEqual(len(aad), 8)  # AAD = seq only (nonce bound as GCM IV)
+        seq_from_aad = struct.unpack("!Q", aad)[0]
         self.assertEqual(seq_from_aad, 123)
 
 

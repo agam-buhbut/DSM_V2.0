@@ -7,6 +7,7 @@ No DNS traffic ever leaves the client machine directly.
 from __future__ import annotations
 
 import asyncio
+import heapq
 import ipaddress
 import logging
 import os
@@ -16,6 +17,7 @@ import struct
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 log = logging.getLogger(__name__)
 
@@ -50,7 +52,10 @@ class DNSResolver:
         ]
         self._hosts_file = Path(hosts_file)
         self._cache: dict[str, _CacheEntry] = {}
+        # Min-heap of (expires, hostname) for O(log n) eviction.
+        self._cache_heap: list[tuple[float, str]] = []
         self._static_hosts: dict[str, str] = {}
+        self._http_client: Any = None  # lazy httpx.AsyncClient
         self._load_hosts_file()
 
     def _load_hosts_file(self) -> None:
@@ -108,25 +113,32 @@ class DNSResolver:
         log.error("all DNS providers failed for %s", hostname)
         return []
 
+    def _get_http_client(self) -> Any:
+        """Return a reusable httpx.AsyncClient (created on first use)."""
+        if self._http_client is None:
+            import httpx  # type: ignore[import-untyped]
+            self._http_client = httpx.AsyncClient(  # pyright: ignore[reportUnknownMemberType]
+                verify=True, timeout=DOH_TIMEOUT,
+            )
+        return self._http_client  # pyright: ignore[reportUnknownMemberType,reportUnknownVariableType]
+
     async def _resolve_doh(self, url: str, hostname: str) -> list[str]:
         """DNS-over-HTTPS query (wire format POST)."""
-        import httpx  # type: ignore[import-untyped]
-
         query = _build_dns_query(hostname, A_RECORD)
-        async with httpx.AsyncClient(verify=True, timeout=DOH_TIMEOUT) as client:  # pyright: ignore[reportUnknownMemberType,reportUnknownVariableType]
-            resp = await client.post(  # pyright: ignore[reportUnknownMemberType,reportUnknownVariableType]
-                url,
-                content=query,
-                headers={
-                    "Content-Type": "application/dns-message",
-                    "Accept": "application/dns-message",
-                },
-            )
-            resp.raise_for_status()  # pyright: ignore[reportUnknownMemberType]
-            addresses, ttl = _parse_dns_response(resp.content)  # pyright: ignore[reportUnknownMemberType,reportUnknownArgumentType]
-            if addresses:
-                self._cache_result(hostname, addresses, ttl)
-            return addresses
+        client = self._get_http_client()
+        resp = await client.post(
+            url,
+            content=query,
+            headers={
+                "Content-Type": "application/dns-message",
+                "Accept": "application/dns-message",
+            },
+        )
+        resp.raise_for_status()
+        addresses, ttl = _parse_dns_response(resp.content)
+        if addresses:
+            self._cache_result(hostname, addresses, ttl)
+        return addresses
 
     async def _resolve_dot(self, provider: str, hostname: str) -> list[str]:
         """DNS-over-TLS query."""
@@ -166,20 +178,34 @@ class DNSResolver:
 
     def _cache_result(self, hostname: str, addresses: list[str], ttl: int = 300) -> None:
         """Cache DNS results with TTL enforcement."""
-        # Evict if at capacity (TTL-based: remove entry closest to expiration)
-        if len(self._cache) >= MAX_CACHE_ENTRIES:
-            oldest_key = min(self._cache, key=lambda k: self._cache[k].expires)
-            del self._cache[oldest_key]
+        # Evict expired or soonest-expiring entries via min-heap (O(log n)).
+        while len(self._cache) >= MAX_CACHE_ENTRIES and self._cache_heap:
+            exp, key = heapq.heappop(self._cache_heap)
+            entry = self._cache.get(key)
+            # Only delete if this heap entry matches the current cache entry
+            # (avoids deleting a newer entry for the same hostname).
+            if entry is not None and entry.expires == exp:
+                del self._cache[key]
+                break
 
         clamped_ttl = max(MIN_TTL, min(MAX_TTL, ttl))
+        expires = time.monotonic() + clamped_ttl
         self._cache[hostname] = _CacheEntry(
             addresses=addresses,
-            expires=time.monotonic() + clamped_ttl,
+            expires=expires,
         )
+        heapq.heappush(self._cache_heap, (expires, hostname))
 
     def flush_cache(self) -> None:
         """Flush the entire DNS cache."""
         self._cache.clear()
+        self._cache_heap.clear()
+
+    async def close(self) -> None:
+        """Close the shared HTTP client (if any)."""
+        if self._http_client is not None:
+            await self._http_client.aclose()
+            self._http_client = None
 
 
 def _build_dns_query(hostname: str, qtype: int) -> bytes:

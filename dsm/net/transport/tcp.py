@@ -7,9 +7,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import socket
 import struct
 
 log = logging.getLogger(__name__)
+
+# Must match FWMARK in tunnel.py — VPN traffic is exempted from TUN routing.
+_SO_MARK = 0x1
 
 MAX_FRAME_SIZE = 65536
 LEN_PREFIX_SIZE = 4
@@ -30,6 +34,7 @@ class TCPTransport:
             asyncio.open_connection(host, port),
             timeout=timeout,
         )
+        self._apply_fwmark()
         log.debug("TCP connected to %s:%d", host, port)
 
     async def listen(
@@ -53,8 +58,17 @@ class TCPTransport:
         log.debug("TCP listening on %s:%d", host, actual_port)
 
         self._reader, self._writer = await accepted
+        self._apply_fwmark()
         self._server.close()
         return actual_port
+
+    def _apply_fwmark(self) -> None:
+        """Mark the socket so ip-rule skips the TUN routing table."""
+        if self._writer is None:
+            return
+        sock = self._writer.get_extra_info("socket")
+        if sock is not None:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_MARK, _SO_MARK)
 
     async def send(self, data: bytes) -> None:
         """Send a length-prefixed frame."""

@@ -20,6 +20,9 @@ import hashlib
 import hmac
 import json
 import logging
+import os
+import tempfile
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -68,7 +71,11 @@ async def client_handshake(
     await _send(transport, msg1, server_addr)
 
     # Message 2: <- e, ee, s, es
-    msg2, recv_addr = await _recv(transport)
+    # Retransmit msg1 on timeout so the server gets another chance to respond
+    async def _retransmit_msg1() -> None:
+        await _send(transport, msg1, server_addr)
+
+    msg2, recv_addr = await _recv(transport, retransmit=_retransmit_msg1)
     if isinstance(transport, UDPTransport) and recv_addr != server_addr:
         raise HandshakeError(
             f"msg2 from unexpected source {recv_addr}, expected {server_addr}"
@@ -118,8 +125,16 @@ async def server_handshake(
     msg2 = responder.write_message_2()
     await _send(transport, msg2, addr)
 
-    # Message 3: -> s, se
-    msg3, _ = await _recv(transport)
+    # Message 3: -> s, se (validate source matches msg1 sender for UDP)
+    # Retransmit msg2 on timeout so the client gets another chance to respond
+    async def _retransmit_msg2() -> None:
+        await _send(transport, msg2, addr)
+
+    msg3, msg3_addr = await _recv(transport, retransmit=_retransmit_msg2)
+    if isinstance(transport, UDPTransport) and addr is not None and msg3_addr != addr:
+        raise HandshakeError(
+            f"msg3 from unexpected source {msg3_addr}, expected {addr}"
+        )
     client_static = responder.read_message_3(msg3)
 
     # Derive session keys from handshake hash (replaces Snow transport)
@@ -150,8 +165,15 @@ async def _send(transport: UDPTransport | TCPTransport, data: bytes, addr: tuple
 
 async def _recv(
     transport: UDPTransport | TCPTransport,
+    retransmit: Callable[[], Awaitable[None]] | None = None,
 ) -> tuple[bytes, tuple[str, int] | None]:
     """Receive via UDP or TCP transport with retry + exponential backoff.
+
+    Args:
+        transport: UDP or TCP transport
+        retransmit: optional async callback to resend the last outgoing message
+            before each retry, so the peer gets another chance to respond if
+            the original send was lost.
 
     Returns:
         (data, addr) where addr is the sender address for UDP, None for TCP.
@@ -173,6 +195,9 @@ async def _recv(
             log.warning("handshake recv timeout, retry %d/%d in %.1fs",
                         attempt + 1, MAX_RETRIES, delay)
             await asyncio.sleep(delay)
+            if retransmit is not None:
+                log.debug("retransmitting last handshake message (attempt %d)", attempt + 1)
+                await retransmit()
 
     raise HandshakeError("handshake recv failed")
 
@@ -223,11 +248,6 @@ def _hmac_key(identity: tuncore.IdentityKeyPair) -> bytes:
     return bytes(identity.derive_hmac_key(b"known-hosts"))
 
 
-def _legacy_hmac_key(identity_pub: bytes) -> bytes:
-    """Legacy HMAC key derivation (public-key-based). Used for migration only."""
-    return hashlib.sha256(b"dsm-known-hosts-hmac-" + identity_pub).digest()
-
-
 def _load_known_hosts(
     path: Path, identity: tuncore.IdentityKeyPair,
 ) -> dict[str, str]:
@@ -251,24 +271,36 @@ def _load_known_hosts(
     expected_mac = hmac.new(key, payload, hashlib.sha256).digest()
 
     if not hmac.compare_digest(stored_mac, expected_mac):
-        # Try legacy (public-key-based) HMAC for one-time migration
-        legacy_key = _legacy_hmac_key(bytes(identity.public_key))
-        legacy_mac = hmac.new(legacy_key, payload, hashlib.sha256).digest()
-        if hmac.compare_digest(stored_mac, legacy_mac):
-            log.warning("known_hosts uses legacy HMAC, migrating to secret-key-based HMAC")
-            # Re-save with new HMAC
-            new_mac = hmac.new(key, payload, hashlib.sha256).digest()
-            path.write_bytes(new_mac + payload)
-        else:
-            raise HandshakeError(
-                f"known_hosts HMAC verification failed for {path}. "
-                "File may have been tampered with. Delete the file manually to reset trust."
-            )
+        raise HandshakeError(
+            f"known_hosts HMAC verification failed for {path}. "
+            "File may have been tampered with. Delete the file manually to reset trust."
+        )
 
     try:
         return json.loads(payload)
     except json.JSONDecodeError as e:
         raise HandshakeError(f"known_hosts corrupted (invalid JSON): {e}") from e
+
+
+def _atomic_write_file(path: Path, data: bytes) -> None:
+    """Write data atomically: tmpfile → fchmod → fsync → rename."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        os.write(fd, data)
+        os.fsync(fd)
+        os.close(fd)
+        fd = -1
+        os.rename(tmp, path)
+    except BaseException:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _save_known_hosts_dict(
@@ -277,13 +309,10 @@ def _save_known_hosts_dict(
     identity: tuncore.IdentityKeyPair,
 ) -> None:
     """Write a known_hosts dict to disk with HMAC integrity."""
-    import os as _os
-    path.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(hosts).encode()
     key = _hmac_key(identity)
     mac = hmac.new(key, payload, hashlib.sha256).digest()
-    path.write_bytes(mac + payload)
-    _os.chmod(path, 0o600)
+    _atomic_write_file(path, mac + payload)
 
 
 def _save_known_host(

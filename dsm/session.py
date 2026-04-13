@@ -13,7 +13,10 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
 
 from dsm.core.fsm import SessionFSM
-from dsm.core.protocol import InnerPacket, OuterPacket, PacketType, OUTER_HEADER_SIZE, SIZE_CLASSES
+from dsm.core.protocol import (
+    Fragment, InnerPacket, OuterPacket, PacketType, ReassemblyBuffer,
+    OUTER_HEADER_SIZE, SIZE_CLASSES,
+)
 from dsm.net.transport.udp import UDPTransport
 from dsm.net.transport.tcp import TCPTransport
 from dsm.net.tunnel import TunDevice
@@ -68,7 +71,8 @@ def make_send_fn(
         wire = outer.serialize(target_size)
         if isinstance(transport, UDPTransport):
             addr = dest_addr()
-            assert addr is not None, "UDP requires destination address"
+            if addr is None:
+                raise RuntimeError("UDP send requires destination address")
             await transport.send(wire, addr)
         else:
             await transport.send(wire)
@@ -166,12 +170,25 @@ async def dispatch_inner(
     send_fn: SendFn,
     rekey: RekeyState,
     shutdown: asyncio.Event,
+    reassembly: ReassemblyBuffer | None = None,
 ) -> None:
     """Dispatch a decrypted inner packet to the appropriate handler."""
     if inner.ptype == PacketType.CHAFF:
         return
     elif inner.ptype == PacketType.DATA:
         await tun.awrite(inner.payload)
+    elif inner.ptype == PacketType.FRAGMENT:
+        if reassembly is None:
+            log.warning("received fragment but no reassembly buffer configured")
+            return
+        try:
+            frag = Fragment.deserialize(inner.payload)
+        except ValueError:
+            log.debug("malformed fragment, dropping")
+            return
+        payload = reassembly.add_fragment(frag)
+        if payload is not None:
+            await tun.awrite(payload)
     elif inner.ptype == PacketType.REKEY_INIT:
         rekey.last_time = await handle_rekey_init(
             inner.payload, session_keys, fsm, shaper, send_fn,
