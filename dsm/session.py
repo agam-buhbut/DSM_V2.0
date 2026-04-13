@@ -9,10 +9,10 @@ import asyncio
 import logging
 import os
 import struct
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Awaitable, Callable
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Callable
 
-from dsm.core.fsm import SessionFSM, State
+from dsm.core.fsm import SessionFSM
 from dsm.core.protocol import InnerPacket, OuterPacket, PacketType, OUTER_HEADER_SIZE, SIZE_CLASSES
 from dsm.net.transport.udp import UDPTransport
 from dsm.net.transport.tcp import TCPTransport
@@ -25,6 +25,15 @@ if TYPE_CHECKING:
     import tuncore
 
 log = logging.getLogger(__name__)
+
+
+def setup_signal_handlers(shutdown: asyncio.Event) -> None:
+    """Register SIGINT/SIGTERM to set the shutdown event."""
+    import signal
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, shutdown.set)
 
 
 def make_send_fn(
@@ -67,6 +76,30 @@ def make_send_fn(
     return send_packet
 
 
+def _decrypt_with_fallback(
+    session_keys: tuncore.SessionKeyManager,
+    nonce: bytes,
+    ciphertext: bytes,
+    aad: bytes,
+    seq: int,
+) -> tuple[bytes, bool] | None:
+    """Try current-epoch decrypt, then previous-epoch if in grace period.
+
+    Returns (plaintext, used_prev_epoch) or None on failure.
+    """
+    try:
+        return session_keys.decrypt(nonce, ciphertext, aad, seq, False), False
+    except Exception:
+        pass
+    if session_keys.has_grace_period:
+        try:
+            return session_keys.decrypt(nonce, ciphertext, aad, seq, True), True
+        except Exception:
+            pass
+    log.debug("decrypt failed, dropping packet")
+    return None
+
+
 def decrypt_packet(
     data: bytes,
     session_keys: tuncore.SessionKeyManager,
@@ -90,20 +123,10 @@ def decrypt_packet(
     ciphertext = data[OUTER_HEADER_SIZE:]
     aad = struct.pack("!Q", seq)
 
-    decrypted_prev_epoch = False
-    try:
-        plaintext = session_keys.decrypt(nonce_bytes, ciphertext, aad, seq, False)
-    except Exception:
-        if session_keys.has_grace_period:
-            try:
-                plaintext = session_keys.decrypt(nonce_bytes, ciphertext, aad, seq, True)
-                decrypted_prev_epoch = True
-            except Exception:
-                log.debug("decrypt failed (both epochs), dropping packet")
-                return None
-        else:
-            log.debug("decrypt failed, dropping packet")
-            return None
+    result = _decrypt_with_fallback(session_keys, nonce_bytes, ciphertext, aad, seq)
+    if result is None:
+        return None
+    plaintext, decrypted_prev_epoch = result
 
     replay.update(seq)
 

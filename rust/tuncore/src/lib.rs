@@ -17,18 +17,33 @@ use sha2::{Sha256, Digest};
 /// Get a mutable reference to the inner `Option`, returning a PyErr if already consumed.
 macro_rules! require_inner {
     ($self:expr, $msg:expr) => {
-        $self.inner.as_mut().ok_or_else(|| PyRuntimeError::new_err($msg))?
+        $self.inner.as_mut().ok_or_else(|| py_err($msg))?
     };
+}
+
+/// Convert a Rust error into a PyRuntimeError.
+fn py_err(e: impl std::fmt::Display) -> PyErr {
+    PyRuntimeError::new_err(e.to_string())
 }
 
 /// Parse a Python byte slice into a fixed 12-byte nonce array.
 fn nonce_from_slice(nonce: &[u8]) -> PyResult<[u8; 12]> {
     if nonce.len() != 12 {
-        return Err(PyRuntimeError::new_err("nonce must be 12 bytes"));
+        return Err(py_err("nonce must be 12 bytes"));
     }
     let mut n = [0u8; 12];
     n.copy_from_slice(nonce);
     Ok(n)
+}
+
+/// Parse a Python byte slice into a fixed 32-byte public key array.
+fn pub_key_from_slice(data: &[u8]) -> PyResult<[u8; 32]> {
+    if data.len() != 32 {
+        return Err(py_err("public key must be 32 bytes"));
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(data);
+    Ok(arr)
 }
 
 /// Python-visible identity keypair.
@@ -42,7 +57,7 @@ impl PyIdentityKeyPair {
     #[staticmethod]
     fn generate() -> PyResult<Self> {
         let inner = identity::IdentityKeyPair::generate()
-            .map_err(|e| PyRuntimeError::new_err(e))?;
+            .map_err(py_err)?;
         Ok(Self { inner })
     }
 
@@ -54,13 +69,13 @@ impl PyIdentityKeyPair {
     fn encrypt_to_store(&self, passphrase: &[u8]) -> PyResult<Vec<u8>> {
         self.inner
             .encrypt_to_store(passphrase)
-            .map_err(|e| PyRuntimeError::new_err(e))
+            .map_err(py_err)
     }
 
     #[staticmethod]
     fn decrypt_from_store(blob: &[u8], passphrase: &[u8]) -> PyResult<Self> {
         let inner = identity::IdentityKeyPair::decrypt_from_store(blob, passphrase)
-            .map_err(|e| PyRuntimeError::new_err(e))?;
+            .map_err(py_err)?;
         Ok(Self { inner })
     }
 
@@ -128,7 +143,7 @@ impl PyNonceGenerator {
         self.inner
             .next()
             .map(|n| n.to_vec())
-            .ok_or_else(|| PyRuntimeError::new_err("nonce counter exhausted"))
+            .ok_or_else(|| py_err("nonce counter exhausted"))
     }
 
     #[getter]
@@ -154,36 +169,36 @@ impl PyNoiseInitiator {
     #[new]
     fn new(identity: &PyIdentityKeyPair) -> PyResult<Self> {
         let init = noise_xx::NoiseInitiator::new(identity.inner.secret_key())
-            .map_err(|e| PyRuntimeError::new_err(e))?;
+            .map_err(py_err)?;
         Ok(Self { inner: Some(init) })
     }
 
     fn write_message_1(&mut self) -> PyResult<Vec<u8>> {
         require_inner!(self, "already consumed")
             .write_message_1()
-            .map_err(|e| PyRuntimeError::new_err(e))
+            .map_err(py_err)
     }
 
     fn read_message_2(&mut self, msg: &[u8]) -> PyResult<Vec<u8>> {
         require_inner!(self, "already consumed")
             .read_message_2(msg)
-            .map_err(|e| PyRuntimeError::new_err(e))
+            .map_err(py_err)
     }
 
     fn write_message_3(&mut self) -> PyResult<Vec<u8>> {
         require_inner!(self, "already consumed")
             .write_message_3()
-            .map_err(|e| PyRuntimeError::new_err(e))
+            .map_err(py_err)
     }
 
     fn into_transport(&mut self) -> PyResult<PyNoiseTransport> {
         let init = self
             .inner
             .take()
-            .ok_or_else(|| PyRuntimeError::new_err("already consumed"))?;
+            .ok_or_else(|| py_err("already consumed"))?;
         let transport = init
             .into_transport()
-            .map_err(|e| PyRuntimeError::new_err(e))?;
+            .map_err(py_err)?;
         Ok(PyNoiseTransport {
             inner: Some(transport),
         })
@@ -195,7 +210,7 @@ impl PyNoiseInitiator {
         Ok(self
             .inner
             .as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("already consumed"))?
+            .ok_or_else(|| py_err("already consumed"))?
             .get_handshake_hash())
     }
 }
@@ -211,36 +226,36 @@ impl PyNoiseResponder {
     #[new]
     fn new(identity: &PyIdentityKeyPair) -> PyResult<Self> {
         let resp = noise_xx::NoiseResponder::new(identity.inner.secret_key())
-            .map_err(|e| PyRuntimeError::new_err(e))?;
+            .map_err(py_err)?;
         Ok(Self { inner: Some(resp) })
     }
 
     fn read_message_1(&mut self, msg: &[u8]) -> PyResult<()> {
         require_inner!(self, "already consumed")
             .read_message_1(msg)
-            .map_err(|e| PyRuntimeError::new_err(e))
+            .map_err(py_err)
     }
 
     fn write_message_2(&mut self) -> PyResult<Vec<u8>> {
         require_inner!(self, "already consumed")
             .write_message_2()
-            .map_err(|e| PyRuntimeError::new_err(e))
+            .map_err(py_err)
     }
 
     fn read_message_3(&mut self, msg: &[u8]) -> PyResult<Vec<u8>> {
         require_inner!(self, "already consumed")
             .read_message_3(msg)
-            .map_err(|e| PyRuntimeError::new_err(e))
+            .map_err(py_err)
     }
 
     fn into_transport(&mut self) -> PyResult<PyNoiseTransport> {
         let resp = self
             .inner
             .take()
-            .ok_or_else(|| PyRuntimeError::new_err("already consumed"))?;
+            .ok_or_else(|| py_err("already consumed"))?;
         let transport = resp
             .into_transport()
-            .map_err(|e| PyRuntimeError::new_err(e))?;
+            .map_err(py_err)?;
         Ok(PyNoiseTransport {
             inner: Some(transport),
         })
@@ -252,7 +267,7 @@ impl PyNoiseResponder {
         Ok(self
             .inner
             .as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("already consumed"))?
+            .ok_or_else(|| py_err("already consumed"))?
             .get_handshake_hash())
     }
 }
@@ -268,13 +283,13 @@ impl PyNoiseTransport {
     fn encrypt(&mut self, plaintext: &[u8]) -> PyResult<Vec<u8>> {
         require_inner!(self, "transport closed")
             .encrypt(plaintext)
-            .map_err(|e| PyRuntimeError::new_err(e))
+            .map_err(py_err)
     }
 
     fn decrypt(&mut self, ciphertext: &[u8]) -> PyResult<Vec<u8>> {
         require_inner!(self, "transport closed")
             .decrypt(ciphertext)
-            .map_err(|e| PyRuntimeError::new_err(e))
+            .map_err(py_err)
     }
 }
 
@@ -295,7 +310,7 @@ impl PySessionKeyManager {
             is_initiator,
             initial_epoch,
         )
-        .map_err(|e| PyRuntimeError::new_err(e))?;
+        .map_err(py_err)?;
         Ok(Self {
             inner,
             pending_rotation: None,
@@ -307,7 +322,7 @@ impl PySessionKeyManager {
         let (nonce, ciphertext, epoch) = self
             .inner
             .encrypt(plaintext, aad)
-            .map_err(|e| PyRuntimeError::new_err(e))?;
+            .map_err(py_err)?;
         Ok((nonce.to_vec(), ciphertext, epoch))
     }
 
@@ -323,7 +338,7 @@ impl PySessionKeyManager {
         let n = nonce_from_slice(nonce)?;
         self.inner
             .decrypt(&n, ciphertext, aad, seq, is_prev_epoch)
-            .map_err(|e| PyRuntimeError::new_err(e))
+            .map_err(py_err)
     }
 
     /// Check if key rotation is needed (packet count or time threshold).
@@ -335,12 +350,12 @@ impl PySessionKeyManager {
     /// Stores the ephemeral secret internally for `complete_rotation_initiator`.
     fn initiate_rotation(&mut self) -> PyResult<(u32, Vec<u8>)> {
         if self.pending_rotation.is_some() {
-            return Err(PyRuntimeError::new_err("rotation already in progress"));
+            return Err(py_err("rotation already in progress"));
         }
         let init = self
             .inner
             .initiate_rotation()
-            .map_err(|e| PyRuntimeError::new_err(e))?;
+            .map_err(py_err)?;
         let new_epoch = init.new_epoch;
         let ephemeral_pub = init.ephemeral_pub.to_vec();
         self.pending_rotation = Some(init);
@@ -352,16 +367,12 @@ impl PySessionKeyManager {
         let init = self
             .pending_rotation
             .take()
-            .ok_or_else(|| PyRuntimeError::new_err("no pending rotation"))?;
-        if remote_ephemeral_pub.len() != 32 {
-            return Err(PyRuntimeError::new_err("ephemeral pub must be 32 bytes"));
-        }
-        let mut pub_bytes = [0u8; 32];
-        pub_bytes.copy_from_slice(remote_ephemeral_pub);
+            .ok_or_else(|| py_err("no pending rotation"))?;
+        let pub_bytes = pub_key_from_slice(remote_ephemeral_pub)?;
         let complete = self
             .inner
             .complete_rotation_initiator(init, &pub_bytes)
-            .map_err(|e| PyRuntimeError::new_err(e))?;
+            .map_err(py_err)?;
         Ok(complete.new_epoch)
     }
 
@@ -371,15 +382,11 @@ impl PySessionKeyManager {
         remote_ephemeral_pub: &[u8],
         new_epoch: u32,
     ) -> PyResult<(Vec<u8>, u32)> {
-        if remote_ephemeral_pub.len() != 32 {
-            return Err(PyRuntimeError::new_err("ephemeral pub must be 32 bytes"));
-        }
-        let mut pub_bytes = [0u8; 32];
-        pub_bytes.copy_from_slice(remote_ephemeral_pub);
+        let pub_bytes = pub_key_from_slice(remote_ephemeral_pub)?;
         let (our_pub, complete) = self
             .inner
             .complete_rotation_responder(&pub_bytes, new_epoch)
-            .map_err(|e| PyRuntimeError::new_err(e))?;
+            .map_err(py_err)?;
         Ok((our_pub.to_vec(), complete.new_epoch))
     }
 
@@ -419,21 +426,21 @@ impl PyAesKey {
         let n = nonce_from_slice(nonce)?;
         self.inner
             .encrypt(&n, plaintext, aad)
-            .map_err(|e| PyRuntimeError::new_err(e))
+            .map_err(py_err)
     }
 
     fn decrypt(&self, nonce: &[u8], ciphertext: &[u8], aad: &[u8]) -> PyResult<Vec<u8>> {
         let n = nonce_from_slice(nonce)?;
         self.inner
             .decrypt(&n, ciphertext, aad)
-            .map_err(|e| PyRuntimeError::new_err(e))
+            .map_err(py_err)
     }
 }
 
 /// Disable core dumps (call once at startup).
 #[pyfunction]
 fn disable_core_dumps() -> PyResult<()> {
-    secure_memory::disable_core_dumps().map_err(|e| PyRuntimeError::new_err(e))
+    secure_memory::disable_core_dumps().map_err(py_err)
 }
 
 #[pymodule]

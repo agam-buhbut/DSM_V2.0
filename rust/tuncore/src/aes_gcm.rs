@@ -20,37 +20,30 @@ impl AesKey {
         Ok(Self { key, locked: true })
     }
 
+    /// Initialize cipher from the stored key.
+    fn cipher(&self) -> Result<Aes256Gcm, String> {
+        Aes256Gcm::new_from_slice(self.key.as_ref()).map_err(|e| format!("cipher: {e}"))
+    }
+
     /// Encrypt plaintext with the given 96-bit nonce and additional authenticated data.
     /// Returns ciphertext || 16-byte GCM tag.
     pub fn encrypt(&self, nonce: &[u8; 12], plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, String> {
-        let cipher =
-            Aes256Gcm::new_from_slice(self.key.as_ref()).map_err(|e| format!("cipher: {e}"))?;
-        let gcm_nonce = Nonce::from_slice(nonce);
-
-        let payload = aes_gcm::aead::Payload {
-            msg: plaintext,
-            aad,
-        };
-
-        cipher
-            .encrypt(gcm_nonce, payload)
+        self.cipher()?
+            .encrypt(
+                Nonce::from_slice(nonce),
+                aes_gcm::aead::Payload { msg: plaintext, aad },
+            )
             .map_err(|e| format!("encrypt: {e}"))
     }
 
     /// Decrypt ciphertext (with appended GCM tag) using the given nonce and AAD.
     /// Returns plaintext, or error if authentication fails.
     pub fn decrypt(&self, nonce: &[u8; 12], ciphertext: &[u8], aad: &[u8]) -> Result<Vec<u8>, String> {
-        let cipher =
-            Aes256Gcm::new_from_slice(self.key.as_ref()).map_err(|e| format!("cipher: {e}"))?;
-        let gcm_nonce = Nonce::from_slice(nonce);
-
-        let payload = aes_gcm::aead::Payload {
-            msg: ciphertext,
-            aad,
-        };
-
-        cipher
-            .decrypt(gcm_nonce, payload)
+        self.cipher()?
+            .decrypt(
+                Nonce::from_slice(nonce),
+                aes_gcm::aead::Payload { msg: ciphertext, aad },
+            )
             .map_err(|_| "decryption failed: authentication tag mismatch".into())
     }
 

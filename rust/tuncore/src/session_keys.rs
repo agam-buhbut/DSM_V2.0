@@ -20,6 +20,22 @@ struct DirectionKeys {
     nonce_gen: NonceGenerator,
 }
 
+impl DirectionKeys {
+    fn new(key_bytes: [u8; 32], epoch: u32) -> Result<Self, String> {
+        Ok(Self {
+            key: AesKey::new(key_bytes)?,
+            nonce_gen: NonceGenerator::new(epoch),
+        })
+    }
+}
+
+/// Generate a fresh ephemeral X25519 secret from CSPRNG.
+fn gen_ephemeral_secret() -> Zeroizing<[u8; 32]> {
+    let mut secret_bytes = Zeroizing::new([0u8; 32]);
+    OsRng.fill_bytes(secret_bytes.as_mut());
+    secret_bytes
+}
+
 /// Full session key state managing current and previous epoch keys,
 /// replay protection, and rotation lifecycle.
 pub struct SessionKeyManager {
@@ -80,14 +96,8 @@ impl SessionKeyManager {
     pub fn new(send_key: [u8; 32], recv_key: [u8; 32], initial_epoch: u32) -> Result<Self, String> {
         Ok(Self {
             epoch: initial_epoch,
-            send: DirectionKeys {
-                key: AesKey::new(send_key)?,
-                nonce_gen: NonceGenerator::new(initial_epoch),
-            },
-            recv: DirectionKeys {
-                key: AesKey::new(recv_key)?,
-                nonce_gen: NonceGenerator::new(initial_epoch),
-            },
+            send: DirectionKeys::new(send_key, initial_epoch)?,
+            recv: DirectionKeys::new(recv_key, initial_epoch)?,
             replay: ReplayWindow::new(),
             prev_recv: None,
             prev_replay: None,
@@ -151,9 +161,7 @@ impl SessionKeyManager {
 
     /// Initiate key rotation: generate an ephemeral keypair for the new epoch.
     pub fn initiate_rotation(&self) -> Result<RotationInit, String> {
-        let mut secret_bytes = Zeroizing::new([0u8; 32]);
-        OsRng.fill_bytes(secret_bytes.as_mut());
-
+        let secret_bytes = gen_ephemeral_secret();
         let secret = StaticSecret::from(*secret_bytes);
         let public = PublicKey::from(&secret);
 
@@ -189,9 +197,7 @@ impl SessionKeyManager {
             ));
         }
 
-        let mut secret_bytes = Zeroizing::new([0u8; 32]);
-        OsRng.fill_bytes(secret_bytes.as_mut());
-
+        let secret_bytes = gen_ephemeral_secret();
         let secret = StaticSecret::from(*secret_bytes);
         let our_pub = *PublicKey::from(&secret).as_bytes();
 
@@ -211,25 +217,19 @@ impl SessionKeyManager {
         new_recv_key: [u8; 32],
         new_epoch: u32,
     ) -> Result<RotationComplete, String> {
+        // Pre-construct new keys before replacing (fail early on AesKey::new error)
+        let new_recv = DirectionKeys::new(new_recv_key, new_epoch)?;
+        let new_send = DirectionKeys::new(new_send_key, new_epoch)?;
+
         // Move current recv to previous for grace period
-        let old_recv = std::mem::replace(
-            &mut self.recv,
-            DirectionKeys {
-                key: AesKey::new(new_recv_key)?,
-                nonce_gen: NonceGenerator::new(new_epoch),
-            },
-        );
+        let old_recv = std::mem::replace(&mut self.recv, new_recv);
         let old_replay = std::mem::replace(&mut self.replay, ReplayWindow::new());
 
         self.prev_recv = Some(old_recv);
         self.prev_replay = Some(old_replay);
         self.grace_start = Some(Instant::now());
 
-        // Replace send key
-        self.send = DirectionKeys {
-            key: AesKey::new(new_send_key)?,
-            nonce_gen: NonceGenerator::new(new_epoch),
-        };
+        self.send = new_send;
 
         self.epoch = new_epoch;
         self.packets_sent = 0;

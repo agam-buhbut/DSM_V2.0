@@ -110,11 +110,11 @@ class DNSResolver:
 
     async def _resolve_doh(self, url: str, hostname: str) -> list[str]:
         """DNS-over-HTTPS query (wire format POST)."""
-        import httpx
+        import httpx  # type: ignore[import-untyped]
 
         query = _build_dns_query(hostname, A_RECORD)
-        async with httpx.AsyncClient(verify=True, timeout=DOH_TIMEOUT) as client:
-            resp = await client.post(
+        async with httpx.AsyncClient(verify=True, timeout=DOH_TIMEOUT) as client:  # pyright: ignore[reportUnknownMemberType,reportUnknownVariableType]
+            resp = await client.post(  # pyright: ignore[reportUnknownMemberType,reportUnknownVariableType]
                 url,
                 content=query,
                 headers={
@@ -122,8 +122,8 @@ class DNSResolver:
                     "Accept": "application/dns-message",
                 },
             )
-            resp.raise_for_status()
-            addresses, ttl = _parse_dns_response(resp.content)
+            resp.raise_for_status()  # pyright: ignore[reportUnknownMemberType]
+            addresses, ttl = _parse_dns_response(resp.content)  # pyright: ignore[reportUnknownMemberType,reportUnknownArgumentType]
             if addresses:
                 self._cache_result(hostname, addresses, ttl)
             return addresses

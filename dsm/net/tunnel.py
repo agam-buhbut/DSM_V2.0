@@ -24,6 +24,29 @@ IFF_NO_PI = 0x1000  # No packet info header
 FWMARK = 0x1
 
 
+def _run_commands(cmds: list[list[str]], *, strict: bool = True) -> None:
+    """Run a sequence of shell commands.
+
+    Args:
+        cmds: list of command argument lists
+        strict: if True, raise on failure; if False, ignore errors (best-effort)
+    """
+    for cmd in cmds:
+        try:
+            subprocess.run(cmd, check=strict, capture_output=True, timeout=5)
+        except subprocess.TimeoutExpired:
+            if strict:
+                log.error("cmd timed out: %s", " ".join(cmd))
+                raise RuntimeError(f"TUN configure timed out: {' '.join(cmd)}")
+        except subprocess.CalledProcessError as e:
+            if strict:
+                log.error("cmd failed: %s — %s", " ".join(cmd), e.stderr.decode(errors="replace"))
+                raise RuntimeError(f"TUN configure failed: {' '.join(cmd)}")
+        except Exception:
+            if strict:
+                raise
+
+
 class TunDevice:
     """Linux TUN device for VPN packet routing."""
 
@@ -86,30 +109,20 @@ class TunDevice:
         )  # ignore errors — rule may not exist yet
         cmds.append(["ip", "rule", "add", *rule_args])
 
-        for cmd in cmds:
-            try:
-                subprocess.run(cmd, check=True, capture_output=True, timeout=5)
-            except subprocess.TimeoutExpired:
-                log.error("cmd timed out: %s", " ".join(cmd))
-                raise RuntimeError(f"TUN configure timed out: {' '.join(cmd)}")
-            except subprocess.CalledProcessError as e:
-                log.error("cmd failed: %s — %s", " ".join(cmd), e.stderr.decode(errors="replace"))
-                raise RuntimeError(f"TUN configure failed: {' '.join(cmd)}")
+        _run_commands(cmds)
 
         log.info("TUN %s configured: %s/%d mtu=%d", self._name, local_ip, netmask, mtu)
 
     def deconfigure(self) -> None:
         """Remove routing rules and bring down the interface."""
-        cmds = [
-            ["ip", "rule", "del", "not", "fwmark", str(FWMARK), "table", "100"],
-            ["ip", "route", "del", "default", "dev", self._name, "table", "100"],
-            ["ip", "link", "set", self._name, "down"],
-        ]
-        for cmd in cmds:
-            try:
-                subprocess.run(cmd, capture_output=True, timeout=5)
-            except Exception:
-                pass  # Best-effort cleanup
+        _run_commands(
+            [
+                ["ip", "rule", "del", "not", "fwmark", str(FWMARK), "table", "100"],
+                ["ip", "route", "del", "default", "dev", self._name, "table", "100"],
+                ["ip", "link", "set", self._name, "down"],
+            ],
+            strict=False,
+        )
 
     async def read(self, bufsize: int = 2048) -> bytes:
         """Read a packet from the TUN device (async)."""

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import signal
 
 from dsm.core.config import Config
 from dsm.core.fsm import SessionFSM, State
@@ -13,7 +12,8 @@ from dsm.net.tunnel import TunDevice
 from dsm.net.transport.udp import UDPTransport
 from dsm.net.transport.tcp import TCPTransport
 from dsm.session import (
-    RekeyState, decrypt_packet, dispatch_inner, make_send_fn, tun_send_loop,
+    RekeyState, decrypt_packet, dispatch_inner, make_send_fn,
+    setup_signal_handlers, tun_send_loop,
 )
 from dsm.traffic.shaper import TrafficShaper, make_chaff_packet
 from dsm.traffic.scheduler import SendScheduler
@@ -49,7 +49,7 @@ async def run_server(config: Config) -> None:
     fsm.transition(State.CONNECTING)
     fsm.transition(State.HANDSHAKING)
 
-    session_keys, client_pub = await server_handshake(transport, keystore.identity)
+    session_keys, _client_pub = await server_handshake(transport, keystore.identity)
 
     fsm.transition(State.ESTABLISHED)
     log.info("client connected")
@@ -69,14 +69,8 @@ async def run_server(config: Config) -> None:
     rekey = RekeyState()
 
     shutdown = asyncio.Event()
+    setup_signal_handlers(shutdown)
     client_addr: list[tuple[str, int] | None] = [None]
-
-    def handle_signal() -> None:
-        shutdown.set()
-
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, handle_signal)
 
     send_packet = make_send_fn(
         session_keys, transport, lambda: client_addr[0], seq,

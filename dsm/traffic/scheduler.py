@@ -50,7 +50,7 @@ class SendScheduler:
         self._queue: list[_ScheduledPacket] = []
         self._max_queue_size = 2048
         self._running = False
-        self._task: asyncio.Task | None = None
+        self._task: asyncio.Task[None] | None = None
         self._event = asyncio.Event()
 
     def enqueue(self, data: bytes, target_size: int) -> None:

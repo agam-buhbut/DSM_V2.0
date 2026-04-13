@@ -8,6 +8,15 @@ from typing import Literal
 
 CONFIG_PATH = Path("/opt/mtun/config.toml")
 
+# Validation bounds
+MIN_PORT = 1
+MAX_PORT = 65535
+MIN_PADDING = 64
+MAX_PADDING = 1500
+MAX_JITTER_MS = 1000
+MIN_ROTATION_PACKETS = 100
+MIN_ROTATION_SECONDS = 60
+
 
 @dataclass(frozen=True, slots=True)
 class Config:
@@ -17,8 +26,8 @@ class Config:
     listen_port: int
     key_file: str
     transport: Literal["udp", "tcp"] = "udp"
-    relay_addresses: list[str] = field(default_factory=list)
-    dns_providers: list[str] = field(default_factory=list)
+    relay_addresses: list[str] = field(default_factory=list[str])
+    dns_providers: list[str] = field(default_factory=list[str])
     tun_name: str = "mtun0"
     log_level: Literal["debug", "info", "warning", "error"] = "warning"
     padding_min: int = 128
@@ -45,8 +54,8 @@ def _validate(c: Config) -> None:
 
     # ports
     for name, val in [("server_port", c.server_port), ("listen_port", c.listen_port)]:
-        if not isinstance(val, int) or not (1 <= val <= 65535):
-            raise ValueError(f"{name} must be 1-65535, got {val}")
+        if not (MIN_PORT <= val <= MAX_PORT):
+            raise ValueError(f"{name} must be {MIN_PORT}-{MAX_PORT}, got {val}")
 
     # key_file must be a path
     if not c.key_file:
@@ -67,23 +76,23 @@ def _validate(c: Config) -> None:
         raise ValueError("server mode requires at least one dns_providers entry")
 
     # padding
-    if not (64 <= c.padding_min <= c.padding_max <= 1500):
+    if not (MIN_PADDING <= c.padding_min <= c.padding_max <= MAX_PADDING):
         raise ValueError(
             f"padding_min ({c.padding_min}) and padding_max ({c.padding_max}) "
-            "must satisfy 64 <= min <= max <= 1500"
+            f"must satisfy {MIN_PADDING} <= min <= max <= {MAX_PADDING}"
         )
 
     # jitter
-    if not (0 <= c.jitter_ms_min <= c.jitter_ms_max <= 1000):
+    if not (0 <= c.jitter_ms_min <= c.jitter_ms_max <= MAX_JITTER_MS):
         raise ValueError(
             f"jitter_ms_min ({c.jitter_ms_min}) and jitter_ms_max ({c.jitter_ms_max}) "
-            "must satisfy 0 <= min <= max <= 1000"
+            f"must satisfy 0 <= min <= max <= {MAX_JITTER_MS}"
         )
 
     # rotation
-    if c.rotation_packets < 100:
+    if c.rotation_packets < MIN_ROTATION_PACKETS:
         raise ValueError(f"rotation_packets too low: {c.rotation_packets}")
-    if c.rotation_seconds < 60:
+    if c.rotation_seconds < MIN_ROTATION_SECONDS:
         raise ValueError(f"rotation_seconds too low: {c.rotation_seconds}")
 
     # log_level
@@ -100,7 +109,7 @@ def _validate_host_port(addr: str, field_name: str) -> None:
         port = int(port_str)
     except ValueError as e:
         raise ValueError(f"{field_name} invalid port: {addr!r}") from e
-    if not (1 <= port <= 65535):
+    if not (MIN_PORT <= port <= MAX_PORT):
         raise ValueError(f"{field_name} port out of range: {addr!r}")
     # Validate host is an IP
     try:

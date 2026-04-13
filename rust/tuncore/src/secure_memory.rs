@@ -1,5 +1,14 @@
 use libc::{mlock, munlock, RLIMIT_CORE, rlimit, setrlimit};
 
+/// Check a libc return code, mapping non-zero to a descriptive error.
+fn syscall_check(ret: i32, name: &str) -> Result<(), String> {
+    if ret != 0 {
+        Err(format!("{name} failed: {}", std::io::Error::last_os_error()))
+    } else {
+        Ok(())
+    }
+}
+
 /// Lock a byte slice into physical memory, preventing swap.
 ///
 /// # Safety
@@ -8,15 +17,10 @@ pub fn mlock_slice(data: &[u8]) -> Result<(), String> {
     if data.is_empty() {
         return Ok(());
     }
-    let ret = unsafe { mlock(data.as_ptr() as *const libc::c_void, data.len()) };
-    if ret != 0 {
-        Err(format!(
-            "mlock failed: {}",
-            std::io::Error::last_os_error()
-        ))
-    } else {
-        Ok(())
-    }
+    syscall_check(
+        unsafe { mlock(data.as_ptr() as *const libc::c_void, data.len()) },
+        "mlock",
+    )
 }
 
 /// Unlock a previously locked byte slice.
@@ -24,15 +28,10 @@ pub fn munlock_slice(data: &[u8]) -> Result<(), String> {
     if data.is_empty() {
         return Ok(());
     }
-    let ret = unsafe { munlock(data.as_ptr() as *const libc::c_void, data.len()) };
-    if ret != 0 {
-        Err(format!(
-            "munlock failed: {}",
-            std::io::Error::last_os_error()
-        ))
-    } else {
-        Ok(())
-    }
+    syscall_check(
+        unsafe { munlock(data.as_ptr() as *const libc::c_void, data.len()) },
+        "munlock",
+    )
 }
 
 /// Disable core dumps to prevent key material from being written to disk.
@@ -41,15 +40,10 @@ pub fn disable_core_dumps() -> Result<(), String> {
         rlim_cur: 0,
         rlim_max: 0,
     };
-    let ret = unsafe { setrlimit(RLIMIT_CORE, &rlim) };
-    if ret != 0 {
-        Err(format!(
-            "setrlimit failed: {}",
-            std::io::Error::last_os_error()
-        ))
-    } else {
-        Ok(())
-    }
+    syscall_check(
+        unsafe { setrlimit(RLIMIT_CORE, &rlim) },
+        "setrlimit",
+    )
 }
 
 /// Securely zero a mutable byte slice.

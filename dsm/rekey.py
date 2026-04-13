@@ -23,6 +23,17 @@ MIN_REKEY_INTERVAL = 60  # seconds — minimum time between rekey operations
 SendFn = Callable[[bytes, int], Awaitable[None]]
 
 
+def _is_rate_limited(last_rekey_time: float | None) -> bool:
+    """Return True if a rekey should be skipped due to rate limiting."""
+    if last_rekey_time is None:
+        return False
+    elapsed = time.monotonic() - last_rekey_time
+    if elapsed < MIN_REKEY_INTERVAL:
+        log.debug("rekey rate limit: skipping (last rekey %.1fs ago)", elapsed)
+        return True
+    return False
+
+
 async def initiate_rekey(
     session_keys: tuncore.SessionKeyManager,
     fsm: SessionFSM,
@@ -38,9 +49,7 @@ async def initiate_rekey(
         log.warning("cannot initiate rekey in state %s", fsm.state.name)
         return last_rekey_time, None
 
-    now = time.monotonic()
-    if last_rekey_time is not None and (now - last_rekey_time) < MIN_REKEY_INTERVAL:
-        log.debug("rekey rate limit: skipping (last rekey %.1fs ago)", now - last_rekey_time)
+    if _is_rate_limited(last_rekey_time):
         return last_rekey_time, None
 
     fsm.transition(State.REKEYING)
@@ -54,7 +63,7 @@ async def initiate_rekey(
     padded, target_size = shaper.pad_packet(inner)
     await send_fn(padded, target_size)
     log.info("rekey initiated, new epoch=%d", new_epoch)
-    return now, new_epoch
+    return time.monotonic(), new_epoch
 
 
 async def handle_rekey_init(
@@ -73,10 +82,7 @@ async def handle_rekey_init(
         log.warning("rekey init received in state %s, ignoring", fsm.state.name)
         return last_rekey_time
 
-    now = time.monotonic()
-    if last_rekey_time is not None and (now - last_rekey_time) < MIN_REKEY_INTERVAL:
-        log.warning("rekey rate limit: ignoring REKEY_INIT (last rekey %.1fs ago)",
-                     now - last_rekey_time)
+    if _is_rate_limited(last_rekey_time):
         return last_rekey_time
 
     if len(payload) < REKEY_PAYLOAD_SIZE:
@@ -106,7 +112,7 @@ async def handle_rekey_init(
     await send_fn(padded, target_size)
     fsm.transition(State.ESTABLISHED)
     log.info("rekey completed as responder, epoch=%d", completed_epoch)
-    return now
+    return time.monotonic()
 
 
 def handle_rekey_ack(
