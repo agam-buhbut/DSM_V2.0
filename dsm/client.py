@@ -10,7 +10,7 @@ from pathlib import Path
 from dsm.core.config import Config
 from dsm.core.fsm import SessionFSM, State
 from dsm.crypto.keystore import KeyStore
-from dsm.net.nftables import NFTablesManager
+from dsm.net.nftables import NFTablesManager, TcpTimestampsDisabler
 from dsm.net.resolv_conf import ResolvConfManager
 from dsm.net.tunnel import TunDevice
 from dsm.net.transport.udp import UDPTransport
@@ -19,8 +19,9 @@ from dsm.net.transport.tcp import TCPTransport
 VPN_DNS_SERVER = "10.8.0.1"  # server's TUN address; DNS proxy listens there
 from dsm.core.protocol import ReassemblyBuffer
 from dsm.session import (
-    LivenessState, RekeyState, decrypt_packet, dispatch_inner, liveness_loop,
-    make_send_fn, setup_signal_handlers, tun_send_loop,
+    DataPathContext, LivenessState, RekeyState, SequenceCounter, decrypt_packet,
+    dispatch_inner, liveness_loop, make_send_fn, setup_signal_handlers,
+    tun_send_loop,
 )
 from dsm.traffic.shaper import TrafficShaper, make_chaff_packet
 from dsm.traffic.scheduler import SendScheduler
@@ -32,7 +33,7 @@ async def run_client(config: Config) -> None:
     """Run DSM in client mode."""
     import tuncore
 
-    tuncore.disable_core_dumps()
+    tuncore.harden_process()
 
     fsm = SessionFSM()
 
@@ -42,6 +43,7 @@ async def run_client(config: Config) -> None:
 
     # Setup components
     nft = NFTablesManager(config.server_ip, config.server_port, config.tun_name)
+    tcp_ts = TcpTimestampsDisabler()
     tun = TunDevice(config.tun_name)
     shaper = TrafficShaper(config.padding_min, config.padding_max)
 
@@ -85,6 +87,7 @@ async def run_client(config: Config) -> None:
     tun.open()
     tun.configure()
     nft.apply()
+    tcp_ts.apply()
 
     # Swap /etc/resolv.conf so apps resolve via the server's tunneled DoH/DoT
     # proxy. Must be after nft.apply() so the kill switch is already up when
@@ -95,7 +98,7 @@ async def run_client(config: Config) -> None:
 
     log.info("tunnel established")
 
-    seq = [0]
+    seq = SequenceCounter()
     replay = tuncore.ReplayWindow()
     rekey = RekeyState()
     liveness = LivenessState()
@@ -116,6 +119,19 @@ async def run_client(config: Config) -> None:
 
     shutdown = asyncio.Event()
     setup_signal_handlers(shutdown)
+
+    ctx = DataPathContext(
+        tun=tun,
+        session_keys=session_keys,
+        fsm=fsm,
+        shaper=shaper,
+        send_fn=send_packet,
+        scheduler=scheduler,
+        rekey=rekey,
+        liveness=liveness,
+        shutdown=shutdown,
+        reassembly=reassembly,
+    )
 
     async def recv_loop() -> None:
         while not shutdown.is_set():
@@ -138,18 +154,13 @@ async def run_client(config: Config) -> None:
             liveness.last_recv_time = time.monotonic()
 
             inner, _prev_epoch = result
-            await dispatch_inner(
-                inner, tun, session_keys, fsm, shaper, send_packet, rekey, shutdown,
-                reassembly,
-            )
+            await dispatch_inner(ctx, inner)
 
     try:
         await asyncio.gather(
             recv_loop(),
-            tun_send_loop(
-                tun, session_keys, fsm, shaper, send_packet, scheduler, rekey, shutdown,
-            ),
-            liveness_loop(session_keys, shaper, scheduler, liveness, shutdown),
+            tun_send_loop(ctx),
+            liveness_loop(ctx),
         )
     except asyncio.CancelledError:
         pass
@@ -160,6 +171,7 @@ async def run_client(config: Config) -> None:
         # briefly has a working resolver + no kill switch rather than
         # a kill switch + a dangling 10.8.0.1 nameserver.
         resolv.remove()
+        tcp_ts.remove()
         nft.remove()
         tun.close()
         keystore.unload()

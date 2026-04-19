@@ -8,12 +8,11 @@ Chaff is adaptive — not static-rate:
 
 from __future__ import annotations
 
-import math
 import os
 import secrets
 import time
 
-from dsm.core.rand import csprng_float
+from dsm.core.rand import csprng_exponential, csprng_float
 from collections import deque
 
 from dsm.core.protocol import (
@@ -37,6 +36,13 @@ IDLE_BURST_MIN = 3
 IDLE_BURST_MAX = 15
 IDLE_GAP_LAMBDA = 1.5  # Exponential distribution parameter (mean gap ~1.5s)
 
+# Burst-edge smoothing: on every idle→active transition, apply a small random
+# delay to each real packet for SMOOTHING_WINDOW seconds. Chaff tracks the EMA
+# of real traffic, which lags the rate step at the edge of a burst; injecting
+# jitter on the first ~2s of an active burst masks the transition itself.
+SMOOTHING_WINDOW = 2.0
+SMOOTHING_LAMBDA = 0.010  # mean ≈10ms; clamped to [1ms, 25ms]
+
 
 class SizeTracker:
     """Track real traffic size class distribution via EMA."""
@@ -49,12 +55,10 @@ class SizeTracker:
     def observe(self, size_class: int) -> None:
         """Update the distribution based on an observed real packet size class."""
         idx = self.class_index(size_class)
-        for i in range(len(self._weights)):
-            if i == idx:
-                self._weights[i] = (1 - EMA_ALPHA) * self._weights[i] + EMA_ALPHA
-            else:
-                self._weights[i] = (1 - EMA_ALPHA) * self._weights[i]
-        # Renormalize
+        self._weights = [
+            (1 - EMA_ALPHA) * w + (EMA_ALPHA if i == idx else 0.0)
+            for i, w in enumerate(self._weights)
+        ]
         total = sum(self._weights)
         if total > 0:
             self._weights = [w / total for w in self._weights]
@@ -103,6 +107,8 @@ class TrafficShaper:
         self._idle_burst_remaining = 0
         self._next_idle_burst = 0.0
 
+        self._burst_smoothing_until: float = 0.0
+
     def pad_packet(self, inner: InnerPacket) -> tuple[bytes, int]:
         """Serialize and pad an inner packet to a size class.
 
@@ -136,9 +142,19 @@ class TrafficShaper:
     def observe_real_packet(self, size_class: int) -> None:
         """Track a real outgoing packet for adaptive chaff."""
         now = time.monotonic()
+        if self._last_real_time is None or (now - self._last_real_time) > IDLE_THRESHOLD:
+            # Arm the burst-smoothing window — subsequent real packets within
+            # SMOOTHING_WINDOW will get a geometric delay applied before send.
+            self._burst_smoothing_until = now + SMOOTHING_WINDOW
         self._real_packet_times.append(now)
         self._last_real_time = now
         self._size_tracker.observe(size_class)
+
+    def burst_smoothing_delay(self) -> float | None:
+        """Geometric delay within the burst-smoothing window, else None."""
+        if time.monotonic() >= self._burst_smoothing_until:
+            return None
+        return csprng_exponential(SMOOTHING_LAMBDA, 0.001, 0.025)
 
     def should_send_chaff(self) -> bool:
         """Determine if a chaff packet should be sent now."""
@@ -191,10 +207,7 @@ class TrafficShaper:
         if now >= self._next_idle_burst:
             # Start a new burst
             self._idle_burst_remaining = IDLE_BURST_MIN + secrets.randbelow(IDLE_BURST_MAX - IDLE_BURST_MIN + 1)
-            # Schedule next burst with exponential gap (CSPRNG-based)
-            u = max(1e-10, csprng_float())
-            gap = -IDLE_GAP_LAMBDA * math.log(u)
-            gap = max(0.5, min(gap, 5.0))  # Clamp to 0.5-5s
+            gap = csprng_exponential(IDLE_GAP_LAMBDA, 0.5, 5.0)
             self._next_idle_burst = now + gap
             self._idle_burst_remaining -= 1
             return True

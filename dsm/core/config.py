@@ -38,6 +38,7 @@ class Config:
     jitter_ms_max: int = 50
     rotation_packets: int = 5000
     rotation_seconds: int = 600
+    debug_dns: bool = False
 
     def __post_init__(self) -> None:
         _validate(self)
@@ -86,7 +87,7 @@ def _validate(c: Config) -> None:
                 f"at least one SPKI SHA-256 hash"
             )
         for pin in pins:
-            if not isinstance(pin, str) or len(pin) != 64:
+            if len(pin) != 64:
                 raise ValueError(
                     f"dns_provider_pins[{provider!r}] entry {pin!r} must be a "
                     f"64-char hex SPKI SHA-256 hash"

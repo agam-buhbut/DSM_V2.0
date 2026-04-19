@@ -10,14 +10,19 @@ import asyncio
 import heapq
 import ipaddress
 import logging
-import os
-import socket
-import ssl
 import struct
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from collections.abc import Iterable
+from typing import Any, cast
+
+import dns.exception
+import dns.message
+import dns.rcode
+import dns.rdata
+import dns.rdatatype
+import dns.rdtypes.IN.A
 
 log = logging.getLogger(__name__)
 
@@ -30,6 +35,11 @@ MIN_TTL = 60
 MAX_TTL = 3600
 DOH_TIMEOUT = 2.0
 DOT_TIMEOUT = 2.0
+
+# RFC 8467 §4.1: block-length policy. Clients pad queries to the next
+# multiple of 128 bytes. Makes query size a coarse lattice a passive TLS
+# observer can no longer use to fingerprint individual qnames.
+EDNS_PADDING_BLOCK = 128
 
 
 @dataclass(slots=True)
@@ -249,69 +259,42 @@ class DNSResolver:
 
 
 def _build_dns_query(hostname: str, qtype: int) -> bytes:
-    """Build a minimal DNS query message."""
-    # Header: ID=random, flags=0x0100 (recursion desired), 1 question
-    msg_id = int.from_bytes(os.urandom(2), "big")
-    header = struct.pack("!HHHHHH", msg_id, 0x0100, 1, 0, 0, 0)
+    """Build a DNS query padded per RFC 7830 / RFC 8467.
 
-    # Question: encoded hostname + type + class
-    question = b""
-    for label in hostname.split("."):
-        encoded = label.encode("ascii")
-        if len(encoded) > 63:
-            raise ValueError(f"DNS label too long: {label}")
-        question += bytes([len(encoded)]) + encoded
-    question += b"\x00"  # Root label
-    question += struct.pack("!HH", qtype, 1)  # Type, Class IN
-
-    return header + question
+    The query carries an EDNS(0) OPT record with a Padding option sized so
+    that the total wire length is a multiple of EDNS_PADDING_BLOCK. This
+    masks qname length from a passive observer who sees the encrypted
+    TLS record.
+    """
+    msg = dns.message.make_query(
+        hostname,
+        dns.rdatatype.RdataType(qtype),
+        use_edns=0,
+        pad=EDNS_PADDING_BLOCK,
+    )
+    return msg.to_wire()
 
 
 def _parse_dns_response(data: bytes) -> tuple[list[str], int]:
     """Parse DNS response and extract A record addresses + minimum TTL."""
-    if len(data) < 12:
+    try:
+        msg = dns.message.from_wire(data)
+    except dns.exception.DNSException:
         return [], 300
 
-    # Skip header
-    flags = struct.unpack("!H", data[2:4])[0]
-    rcode = flags & 0x0F
-    if rcode != 0:
+    if msg.rcode() != dns.rcode.NOERROR:
         return [], 300
 
-    qdcount = struct.unpack("!H", data[4:6])[0]
-    ancount = struct.unpack("!H", data[6:8])[0]
-
-    # Skip questions
-    offset = 12
-    for _ in range(qdcount):
-        offset = _skip_name(data, offset)
-        offset += 4  # type + class
-
-    # Parse answers
     addresses: list[str] = []
     min_ttl = 300
-    for _ in range(ancount):
-        offset = _skip_name(data, offset)
-        if offset + 10 > len(data):
-            break
-        rtype, _, ttl, rdlength = struct.unpack("!HHIH", data[offset : offset + 10])
-        offset += 10
-        if rtype == A_RECORD and rdlength == 4:
-            ip = socket.inet_ntoa(data[offset : offset + 4])
-            addresses.append(ip)
-            min_ttl = min(min_ttl, ttl)
-        offset += rdlength
+    for rrset in msg.answer:
+        if rrset.rdtype != dns.rdatatype.A:
+            continue
+        min_ttl = min(min_ttl, rrset.ttl)
+        # dnspython's Rdataset.__iter__ is untyped; cast expresses the
+        # guarantee (RRset yields Rdata) so pyright strict can narrow.
+        for rdata in cast(Iterable[dns.rdata.Rdata], rrset):
+            if isinstance(rdata, dns.rdtypes.IN.A.A):
+                addresses.append(rdata.address)
 
     return addresses, min_ttl
-
-
-def _skip_name(data: bytes, offset: int) -> int:
-    """Skip a DNS name in wire format (handles compression pointers)."""
-    while offset < len(data):
-        length = data[offset]
-        if length == 0:
-            return offset + 1
-        if (length & 0xC0) == 0xC0:
-            return offset + 2  # Compression pointer
-        offset += 1 + length
-    return offset

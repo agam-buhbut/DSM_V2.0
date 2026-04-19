@@ -13,6 +13,7 @@ instead of a timeout).
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 from typing import Any
 
@@ -31,13 +32,30 @@ log = logging.getLogger(__name__)
 DEFAULT_CACHED_TTL = 60
 
 
-class LocalDNSProxy:
-    """UDP DNS listener that resolves via the pinned DoH/DoT client."""
+def _redact_qname(qname: str) -> str:
+    """Return a short, stable pseudonym for a qname (truncated SHA-256 hex)."""
+    return hashlib.sha256(qname.encode("utf-8", "replace")).hexdigest()[:16]
 
-    def __init__(self, resolver: DNSResolver, bind_ip: str, bind_port: int = 53) -> None:
+
+class LocalDNSProxy:
+    """UDP DNS listener that resolves via the pinned DoH/DoT client.
+
+    ``debug_dns`` controls whether resolve-failure logs include the plaintext
+    qname. Default is ``False`` so a local log reader learns only an opaque
+    hash, not the user's browsing history.
+    """
+
+    def __init__(
+        self,
+        resolver: DNSResolver,
+        bind_ip: str,
+        bind_port: int = 53,
+        debug_dns: bool = False,
+    ) -> None:
         self._resolver = resolver
         self._bind_ip = bind_ip
         self._bind_port = bind_port
+        self._debug_dns = debug_dns
         self._transport: asyncio.DatagramTransport | None = None
         self._tasks: set[asyncio.Task[None]] = set()
 
@@ -92,7 +110,8 @@ class LocalDNSProxy:
         try:
             addresses = await self._resolver.resolve(qname)
         except Exception as e:
-            log.warning("DNS resolve failed for %s: %s", qname, type(e).__name__)
+            log_qname = qname if self._debug_dns else f"qname-sha256={_redact_qname(qname)}"
+            log.warning("DNS resolve failed for %s: %s", log_qname, type(e).__name__)
             send(_make_error(query, dns.rcode.SERVFAIL), addr)
             return
 
@@ -131,7 +150,7 @@ class _ProxyProtocol(asyncio.DatagramProtocol):
         log.warning("DNS proxy socket error: %s", type(exc).__name__)
 
 
-def _make_error(query: dns.message.Message, rcode: int) -> bytes:
+def _make_error(query: dns.message.Message, rcode: dns.rcode.Rcode) -> bytes:
     resp = dns.message.make_response(query)
     resp.set_rcode(rcode)
     resp.flags |= dns.flags.RA

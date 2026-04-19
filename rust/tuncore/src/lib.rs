@@ -455,6 +455,12 @@ fn disable_core_dumps() -> PyResult<()> {
     secure_memory::disable_core_dumps().map_err(py_err)
 }
 
+/// Harden the process: no core dumps, non-dumpable, no-new-privs.
+#[pyfunction]
+fn harden_process() -> PyResult<()> {
+    secure_memory::harden_process().map_err(py_err)
+}
+
 #[pymodule]
 fn tuncore(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyIdentityKeyPair>()?;
@@ -466,5 +472,6 @@ fn tuncore(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PySessionKeyManager>()?;
     m.add_class::<PyAesKey>()?;
     m.add_function(wrap_pyfunction!(disable_core_dumps, m)?)?;
+    m.add_function(wrap_pyfunction!(harden_process, m)?)?;
     Ok(())
 }

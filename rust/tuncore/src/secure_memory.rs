@@ -47,6 +47,27 @@ pub fn disable_core_dumps() -> Result<(), String> {
     )
 }
 
+/// Harden the process against memory inspection and privilege elevation.
+///
+/// - ``RLIMIT_CORE = 0`` — no core dumps (avoids keys-on-disk).
+/// - ``PR_SET_DUMPABLE = 0`` — refuses ptrace from the same user and makes
+///   the process non-dumpable. Under default ``ptrace_scope=1`` this is what
+///   actually prevents a same-uid attacker from attaching.
+/// - ``PR_SET_NO_NEW_PRIVS = 1`` — any child ``exec`` cannot gain privileges
+///   via setuid binaries or file capabilities. Defense-in-depth.
+pub fn harden_process() -> Result<(), String> {
+    disable_core_dumps()?;
+    syscall_check(
+        unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) as i32 },
+        "prctl(PR_SET_DUMPABLE)",
+    )?;
+    syscall_check(
+        unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) as i32 },
+        "prctl(PR_SET_NO_NEW_PRIVS)",
+    )?;
+    Ok(())
+}
+
 /// Securely zero a mutable byte slice.
 /// Uses the zeroize crate which guarantees the write is not optimized away.
 pub fn secure_zero(data: &mut [u8]) {
@@ -136,5 +157,12 @@ mod tests {
     #[test]
     fn test_disable_core_dumps() {
         disable_core_dumps().expect("disable_core_dumps should succeed");
+    }
+
+    #[test]
+    fn test_harden_process_sets_dumpable_zero() {
+        harden_process().expect("harden_process should succeed");
+        let dumpable = unsafe { libc::prctl(libc::PR_GET_DUMPABLE) };
+        assert_eq!(dumpable, 0, "PR_GET_DUMPABLE should report 0 after harden_process");
     }
 }

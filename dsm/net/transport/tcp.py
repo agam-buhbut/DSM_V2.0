@@ -7,13 +7,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import socket
 import struct
 
-log = logging.getLogger(__name__)
+from dsm.net.transport._fwmark import apply_so_mark
 
-# Must match FWMARK in tunnel.py — VPN traffic is exempted from TUN routing.
-_SO_MARK = 0x1
+log = logging.getLogger(__name__)
 
 MAX_FRAME_SIZE = 65536
 LEN_PREFIX_SIZE = 4
@@ -63,12 +61,9 @@ class TCPTransport:
         return actual_port
 
     def _apply_fwmark(self) -> None:
-        """Mark the socket so ip-rule skips the TUN routing table."""
         if self._writer is None:
             return
-        sock = self._writer.get_extra_info("socket")
-        if sock is not None:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_MARK, _SO_MARK)
+        apply_so_mark(self._writer.get_extra_info("socket"))
 
     async def send(self, data: bytes) -> None:
         """Send a length-prefixed frame."""

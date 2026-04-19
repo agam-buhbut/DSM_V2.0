@@ -21,12 +21,15 @@ import hmac
 import json
 import logging
 import os
-import stat
-import tempfile
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from dsm.core.atomic_io import atomic_write
+from dsm.core.path_security import (
+    InsecureFilePermissionsError,
+    check_user_file_permissions,
+)
 from dsm.net.transport.tcp import TCPTransport
 from dsm.net.transport.udp import UDPTransport
 
@@ -41,6 +44,36 @@ MAX_RETRIES = 3
 BACKOFF_BASE = 1.0  # seconds; retry delays: 1s, 2s, 4s
 
 DEFAULT_KNOWN_HOSTS_PATH = Path("/opt/mtun/known_hosts.json")
+
+# Pad every handshake message to this size so the three Noise XX messages are
+# indistinguishable from data packets (which are also 1400B) on the wire.
+# Otherwise a DPI rule can flag the (~32, ~96, ~64) size triple as Noise XX.
+HANDSHAKE_FRAME_SIZE = 1400
+_HANDSHAKE_LEN_PREFIX = 2
+_HANDSHAKE_MAX_PAYLOAD = HANDSHAKE_FRAME_SIZE - _HANDSHAKE_LEN_PREFIX
+
+
+def _pad_handshake(msg: bytes) -> bytes:
+    """Frame a Noise message into a fixed-size padded envelope."""
+    if len(msg) > _HANDSHAKE_MAX_PAYLOAD:
+        raise HandshakeError(
+            f"handshake message too large: {len(msg)} > {_HANDSHAKE_MAX_PAYLOAD}"
+        )
+    prefix = len(msg).to_bytes(_HANDSHAKE_LEN_PREFIX, "big")
+    pad = os.urandom(HANDSHAKE_FRAME_SIZE - _HANDSHAKE_LEN_PREFIX - len(msg))
+    return prefix + msg + pad
+
+
+def _unpad_handshake(blob: bytes) -> bytes:
+    """Strip the fixed-size envelope and return the inner Noise message."""
+    if len(blob) != HANDSHAKE_FRAME_SIZE:
+        raise HandshakeError(
+            f"handshake frame wrong size: {len(blob)} != {HANDSHAKE_FRAME_SIZE}"
+        )
+    length = int.from_bytes(blob[:_HANDSHAKE_LEN_PREFIX], "big")
+    if length > _HANDSHAKE_MAX_PAYLOAD:
+        raise HandshakeError(f"handshake inner length out of range: {length}")
+    return blob[_HANDSHAKE_LEN_PREFIX : _HANDSHAKE_LEN_PREFIX + length]
 
 
 async def client_handshake(
@@ -158,19 +191,20 @@ class KeyMismatchError(HandshakeError):
 
 
 async def _send(transport: UDPTransport | TCPTransport, data: bytes, addr: tuple[str, int] | None) -> None:
-    """Send via UDP or TCP transport."""
+    """Send a Noise message via UDP or TCP, padded to the fixed handshake size."""
+    framed = _pad_handshake(data)
     if isinstance(transport, UDPTransport):
         assert addr is not None, "UDP transport requires addr"
-        await transport.send(data, addr)
+        await transport.send(framed, addr)
     else:
-        await transport.send(data)
+        await transport.send(framed)
 
 
 async def _recv(
     transport: UDPTransport | TCPTransport,
     retransmit: Callable[[], Awaitable[None]] | None = None,
 ) -> tuple[bytes, tuple[str, int] | None]:
-    """Receive via UDP or TCP transport with retry + exponential backoff.
+    """Receive a padded handshake frame, return the inner Noise message.
 
     Args:
         transport: UDP or TCP transport
@@ -184,11 +218,11 @@ async def _recv(
     for attempt in range(MAX_RETRIES):
         try:
             if isinstance(transport, UDPTransport):
-                data, addr = await asyncio.wait_for(transport.recv(), HANDSHAKE_TIMEOUT)
-                return data, addr
+                frame, addr = await asyncio.wait_for(transport.recv(), HANDSHAKE_TIMEOUT)
+                return _unpad_handshake(frame), addr
             else:
-                data = await asyncio.wait_for(transport.recv(), HANDSHAKE_TIMEOUT)
-                return data, None
+                frame = await asyncio.wait_for(transport.recv(), HANDSHAKE_TIMEOUT)
+                return _unpad_handshake(frame), None
         except asyncio.TimeoutError:
             if attempt == MAX_RETRIES - 1:
                 raise HandshakeError(
@@ -246,31 +280,16 @@ def _hmac_key(identity: tuncore.IdentityKeyPair) -> bytes:
     return bytes(identity.derive_hmac_key(b"known-hosts"))
 
 
-def _check_path_permissions(path: Path) -> None:
-    """Reject known_hosts file if owned by another user or group/world-accessible."""
-    try:
-        st = path.stat()
-    except OSError as e:
-        raise HandshakeError(f"cannot stat known_hosts {path}: {e}") from e
-    if st.st_uid != os.getuid():
-        raise HandshakeError(
-            f"known_hosts {path} owned by uid {st.st_uid}, expected {os.getuid()}. "
-            "Refusing to trust a file owned by another user."
-        )
-    if st.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
-        raise HandshakeError(
-            f"known_hosts {path} has group/world permissions "
-            f"(mode={st.st_mode & 0o777:o}). Run: chmod 600 {path}"
-        )
-
-
 def _load_known_hosts(
     path: Path, identity: tuncore.IdentityKeyPair,
 ) -> dict[str, str]:
     if not path.exists():
         return {}
 
-    _check_path_permissions(path)
+    try:
+        check_user_file_permissions(path)
+    except InsecureFilePermissionsError as e:
+        raise HandshakeError(str(e)) from e
 
     try:
         raw = path.read_bytes()
@@ -303,27 +322,6 @@ def _load_known_hosts(
         raise HandshakeError(f"known_hosts corrupted (invalid JSON): {e}") from e
 
 
-def _atomic_write_file(path: Path, data: bytes) -> None:
-    """Write data atomically: tmpfile → fchmod → fsync → rename."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=path.parent)
-    try:
-        os.fchmod(fd, 0o600)
-        os.write(fd, data)
-        os.fsync(fd)
-        os.close(fd)
-        fd = -1
-        os.rename(tmp, path)
-    except BaseException:
-        if fd >= 0:
-            os.close(fd)
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
-
-
 def _save_known_hosts_dict(
     path: Path,
     hosts: dict[str, str],
@@ -333,7 +331,7 @@ def _save_known_hosts_dict(
     payload = json.dumps(hosts).encode()
     key = _hmac_key(identity)
     mac = hmac.new(key, payload, hashlib.sha256).digest()
-    _atomic_write_file(path, mac + payload)
+    atomic_write(path, mac + payload)
 
 
 def _save_known_host(

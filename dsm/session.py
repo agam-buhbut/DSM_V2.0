@@ -10,6 +10,7 @@ import logging
 import os
 import struct
 import time
+from collections.abc import Awaitable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable
 
@@ -56,39 +57,43 @@ def setup_signal_handlers(shutdown: asyncio.Event) -> None:
         loop.add_signal_handler(sig, shutdown.set)
 
 
+@dataclass
+class SequenceCounter:
+    """Monotonic 64-bit outer-packet sequence counter.
+
+    Kept as a dataclass so every caller mutates the same instance — a plain
+    ``int`` closed over by ``send_packet`` cannot be incremented in place.
+    """
+    value: int = 0
+
+    def next(self) -> int:
+        self.value += 1
+        if self.value >= 2**64:
+            raise RuntimeError("sequence number overflow — session must be rekeyed")
+        return self.value
+
+
 def make_send_fn(
     session_keys: tuncore.SessionKeyManager,
     transport: UDPTransport | TCPTransport,
     dest_addr: Callable[[], tuple[str, int] | None],
-    seq: list[int],
+    seq: SequenceCounter,
     liveness: LivenessState | None = None,
 ) -> SendFn:
-    """Create a send_packet closure.
-
-    Args:
-        session_keys: session key manager for encryption
-        transport: UDP or TCP transport
-        dest_addr: callable returning the current destination address (for UDP)
-        seq: mutable single-element list holding the sequence counter
-        liveness: optional liveness state; last_send_time updates after each
-            wire transmission so the keepalive emitter can tell when to
-            stay quiet.
-    """
+    """Create a send_packet closure."""
 
     # For TCP, always use max size class so the length-prefix is constant,
     # preventing passive traffic analysis via frame sizes.
     tcp_fixed_size = SIZE_CLASSES[-1] if isinstance(transport, TCPTransport) else 0
 
     async def send_packet(data: bytes, target_size: int) -> None:
-        seq[0] += 1
-        if seq[0] >= 2**64:
-            raise RuntimeError("sequence number overflow — session must be rekeyed")
+        n = seq.next()
         if tcp_fixed_size and tcp_fixed_size > target_size:
             data = data + os.urandom(tcp_fixed_size - target_size)
             target_size = tcp_fixed_size
-        aad = struct.pack("!Q", seq[0])
+        aad = struct.pack("!Q", n)
         nonce, ct, _epoch = session_keys.encrypt(data, aad)
-        outer = OuterPacket(seq=seq[0], nonce=bytes(nonce), ciphertext=ct)
+        outer = OuterPacket(seq=n, nonce=bytes(nonce), ciphertext=ct)
         wire = outer.serialize(target_size)
         if isinstance(transport, UDPTransport):
             addr = dest_addr()
@@ -184,123 +189,144 @@ class RekeyState:
     pending_epoch: int | None = None
 
 
-async def dispatch_inner(
-    inner: InnerPacket,
-    tun: TunDevice,
-    session_keys: tuncore.SessionKeyManager,
-    fsm: SessionFSM,
-    shaper: TrafficShaper,
-    send_fn: SendFn,
-    rekey: RekeyState,
-    shutdown: asyncio.Event,
-    reassembly: ReassemblyBuffer | None = None,
-) -> None:
+@dataclass
+class DataPathContext:
+    """State shared across the per-connection data-path loops.
+
+    Bundles the long-lived objects that ``dispatch_inner``, ``tun_send_loop``
+    and ``liveness_loop`` all need. Built once after the handshake
+    completes, then passed around instead of being threaded as 8+ args.
+    """
+    tun: TunDevice
+    session_keys: tuncore.SessionKeyManager
+    fsm: SessionFSM
+    shaper: TrafficShaper
+    send_fn: SendFn
+    scheduler: SendScheduler
+    rekey: RekeyState
+    liveness: LivenessState
+    shutdown: asyncio.Event
+    reassembly: ReassemblyBuffer | None = None
+
+
+async def _handle_data(ctx: DataPathContext, inner: InnerPacket) -> None:
+    await ctx.tun.awrite(inner.payload)
+
+
+async def _handle_fragment(ctx: DataPathContext, inner: InnerPacket) -> None:
+    if ctx.reassembly is None:
+        log.warning("received fragment but no reassembly buffer configured")
+        return
+    try:
+        frag = Fragment.deserialize(inner.payload)
+    except ValueError:
+        log.debug("malformed fragment, dropping")
+        return
+    payload = ctx.reassembly.add_fragment(frag)
+    if payload is not None:
+        await ctx.tun.awrite(payload)
+
+
+async def _handle_rekey_init(ctx: DataPathContext, inner: InnerPacket) -> None:
+    ctx.rekey.last_time = await handle_rekey_init(
+        inner.payload, ctx.session_keys, ctx.fsm, ctx.shaper, ctx.send_fn,
+        ctx.rekey.last_time,
+    )
+
+
+async def _handle_rekey_ack(ctx: DataPathContext, inner: InnerPacket) -> None:
+    ts = handle_rekey_ack(
+        inner.payload, ctx.session_keys, ctx.fsm, ctx.rekey.pending_epoch,
+    )
+    if ts is not None:
+        ctx.rekey.last_time = ts
+        ctx.rekey.pending_epoch = None
+    ctx.rekey.in_progress = False
+
+
+async def _handle_session_close(ctx: DataPathContext, inner: InnerPacket) -> None:
+    ctx.shutdown.set()
+
+
+async def _handle_noop(ctx: DataPathContext, inner: InnerPacket) -> None:
+    """No-op for CHAFF and KEEPALIVE — liveness is accounted in recv_loop."""
+
+
+_DISPATCH: dict[PacketType, Callable[[DataPathContext, InnerPacket], Awaitable[None]]] = {
+    PacketType.CHAFF: _handle_noop,
+    PacketType.KEEPALIVE: _handle_noop,
+    PacketType.DATA: _handle_data,
+    PacketType.FRAGMENT: _handle_fragment,
+    PacketType.REKEY_INIT: _handle_rekey_init,
+    PacketType.REKEY_ACK: _handle_rekey_ack,
+    PacketType.SESSION_CLOSE: _handle_session_close,
+}
+
+
+async def dispatch_inner(ctx: DataPathContext, inner: InnerPacket) -> None:
     """Dispatch a decrypted inner packet to the appropriate handler."""
-    if inner.ptype == PacketType.CHAFF:
+    handler = _DISPATCH.get(inner.ptype)
+    if handler is None:
         return
-    elif inner.ptype == PacketType.DATA:
-        await tun.awrite(inner.payload)
-    elif inner.ptype == PacketType.FRAGMENT:
-        if reassembly is None:
-            log.warning("received fragment but no reassembly buffer configured")
-            return
-        try:
-            frag = Fragment.deserialize(inner.payload)
-        except ValueError:
-            log.debug("malformed fragment, dropping")
-            return
-        payload = reassembly.add_fragment(frag)
-        if payload is not None:
-            await tun.awrite(payload)
-    elif inner.ptype == PacketType.REKEY_INIT:
-        rekey.last_time = await handle_rekey_init(
-            inner.payload, session_keys, fsm, shaper, send_fn,
-            rekey.last_time,
-        )
-    elif inner.ptype == PacketType.REKEY_ACK:
-        ts = handle_rekey_ack(
-            inner.payload, session_keys, fsm, rekey.pending_epoch,
-        )
-        if ts is not None:
-            rekey.last_time = ts
-            rekey.pending_epoch = None
-        rekey.in_progress = False
-    elif inner.ptype == PacketType.KEEPALIVE:
-        # Liveness accounting happens in the recv_loop on successful decrypt;
-        # the KEEPALIVE packet itself carries no payload action.
-        return
-    elif inner.ptype == PacketType.SESSION_CLOSE:
-        shutdown.set()
+    await handler(ctx, inner)
 
 
-async def liveness_loop(
-    session_keys: tuncore.SessionKeyManager,
-    shaper: TrafficShaper,
-    scheduler: SendScheduler,
-    liveness: LivenessState,
-    shutdown: asyncio.Event,
-) -> None:
+async def liveness_loop(ctx: DataPathContext) -> None:
     """Emit KEEPALIVE while send-idle; shut down on dead-peer timeout.
 
     The check cadence is ``LIVENESS_CHECK_INTERVAL`` — well below both
     ``KEEPALIVE_SEND_INTERVAL`` and ``DEAD_PEER_TIMEOUT`` so there is slack
     for the scheduler's jitter and for a single missed keepalive round.
     """
-    while not shutdown.is_set():
+    while not ctx.shutdown.is_set():
         try:
-            await asyncio.wait_for(shutdown.wait(), timeout=LIVENESS_CHECK_INTERVAL)
+            await asyncio.wait_for(ctx.shutdown.wait(), timeout=LIVENESS_CHECK_INTERVAL)
             return
         except asyncio.TimeoutError:
             pass
 
         now = time.monotonic()
-        recv_idle = now - liveness.last_recv_time
+        recv_idle = now - ctx.liveness.last_recv_time
         if recv_idle > DEAD_PEER_TIMEOUT:
             log.warning(
                 "dead peer: no packets received for %.1fs, tearing down session",
                 recv_idle,
             )
-            shutdown.set()
+            ctx.shutdown.set()
             return
 
-        if now - liveness.last_send_time > KEEPALIVE_SEND_INTERVAL:
+        if now - ctx.liveness.last_send_time > KEEPALIVE_SEND_INTERVAL:
             inner = InnerPacket(
                 ptype=PacketType.KEEPALIVE,
-                epoch_id=session_keys.epoch & 0x03,
+                epoch_id=ctx.session_keys.epoch & 0x03,
                 payload=b"",
             )
-            padded, target_size = shaper.pad_packet(inner)
-            scheduler.enqueue(padded, target_size)
+            padded, target_size = ctx.shaper.pad_packet(inner)
+            ctx.scheduler.enqueue(padded, target_size)
 
 
-async def tun_send_loop(
-    tun: TunDevice,
-    session_keys: tuncore.SessionKeyManager,
-    fsm: SessionFSM,
-    shaper: TrafficShaper,
-    send_fn: SendFn,
-    scheduler: SendScheduler,
-    rekey: RekeyState,
-    shutdown: asyncio.Event,
-) -> None:
+async def tun_send_loop(ctx: DataPathContext) -> None:
     """Read from TUN, pad, enqueue for sending. Initiates rekey when needed."""
-    while not shutdown.is_set():
-        if session_keys.needs_rotation() and not rekey.in_progress:
-            rekey.in_progress = True
-            rekey.last_time, rekey.pending_epoch = await initiate_rekey(
-                session_keys, fsm, shaper, send_fn, rekey.last_time,
+    while not ctx.shutdown.is_set():
+        if ctx.session_keys.needs_rotation() and not ctx.rekey.in_progress:
+            ctx.rekey.in_progress = True
+            ctx.rekey.last_time, ctx.rekey.pending_epoch = await initiate_rekey(
+                ctx.session_keys, ctx.fsm, ctx.shaper, ctx.send_fn, ctx.rekey.last_time,
             )
 
         try:
-            pkt = await asyncio.wait_for(tun.read(), timeout=0.1)
+            pkt = await asyncio.wait_for(ctx.tun.read(), timeout=0.1)
         except asyncio.TimeoutError:
             continue
 
         inner = InnerPacket(
             ptype=PacketType.DATA,
-            epoch_id=session_keys.epoch & 0x03,
+            epoch_id=ctx.session_keys.epoch & 0x03,
             payload=pkt,
         )
-        padded, target_size = shaper.pad_packet(inner)
-        shaper.observe_real_packet(target_size)
-        scheduler.enqueue(padded, target_size)
+        smoothing_delay = ctx.shaper.burst_smoothing_delay()
+        if smoothing_delay is not None:
+            await asyncio.sleep(smoothing_delay)
+        padded, target_size = ctx.shaper.pad_packet(inner)
+        ctx.shaper.observe_real_packet(target_size)
+        ctx.scheduler.enqueue(padded, target_size)

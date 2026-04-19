@@ -11,13 +11,15 @@ from dsm.core.fsm import SessionFSM, State
 from dsm.crypto.keystore import KeyStore
 from dsm.net.dns import DNSResolver
 from dsm.net.dns_proxy import LocalDNSProxy
+from dsm.net.nftables import ServerRateLimitManager, TcpTimestampsDisabler
 from dsm.net.tunnel import TunDevice
 from dsm.net.transport.udp import UDPTransport
 from dsm.net.transport.tcp import TCPTransport
 from dsm.core.protocol import ReassemblyBuffer
 from dsm.session import (
-    LivenessState, RekeyState, decrypt_packet, dispatch_inner, liveness_loop,
-    make_send_fn, setup_signal_handlers, tun_send_loop,
+    DataPathContext, LivenessState, RekeyState, SequenceCounter, decrypt_packet,
+    dispatch_inner, liveness_loop, make_send_fn, setup_signal_handlers,
+    tun_send_loop,
 )
 from dsm.traffic.shaper import TrafficShaper, make_chaff_packet
 from dsm.traffic.scheduler import SendScheduler
@@ -31,13 +33,18 @@ async def run_server(config: Config) -> None:
     """Run DSM in server mode."""
     import tuncore
 
-    tuncore.disable_core_dumps()
+    tuncore.harden_process()
 
     fsm = SessionFSM()
 
     # Load identity
     keystore = KeyStore(config.key_file)
     keystore.load_or_generate_interactive()
+
+    rate_limiter = ServerRateLimitManager(config.listen_port)
+    rate_limiter.apply()
+    tcp_ts = TcpTimestampsDisabler()
+    tcp_ts.apply()
 
     # Transport
     if config.transport == "udp":
@@ -71,13 +78,15 @@ async def run_server(config: Config) -> None:
         providers=config.dns_providers,
         provider_pins=config.dns_provider_pins,
     )
-    dns_proxy = LocalDNSProxy(resolver, bind_ip=SERVER_TUN_IP, bind_port=53)
+    dns_proxy = LocalDNSProxy(
+        resolver, bind_ip=SERVER_TUN_IP, bind_port=53, debug_dns=config.debug_dns,
+    )
     await dns_proxy.start()
 
     shaper = TrafficShaper(config.padding_min, config.padding_max)
     replay = tuncore.ReplayWindow()
 
-    seq = [0]
+    seq = SequenceCounter()
     rekey = RekeyState()
     liveness = LivenessState()
     reassembly = ReassemblyBuffer()
@@ -95,6 +104,9 @@ async def run_server(config: Config) -> None:
     def _should_chaff() -> bool:
         return client_addr[0] is not None and shaper.should_send_chaff()
 
+    # Scheduler+shaper params must mirror the client's — divergence here
+    # reintroduces a direction-correlation fingerprint. See
+    # tests/test_symmetric_shaping.py for the regression lock.
     server_scheduler = SendScheduler(
         send_fn=send_packet,
         chaff_fn=lambda: make_chaff_packet(shaper, session_keys.epoch & 0x03),
@@ -103,6 +115,19 @@ async def run_server(config: Config) -> None:
         jitter_ms_max=config.jitter_ms_max,
     )
     await server_scheduler.start()
+
+    ctx = DataPathContext(
+        tun=tun,
+        session_keys=session_keys,
+        fsm=fsm,
+        shaper=shaper,
+        send_fn=send_packet,
+        scheduler=server_scheduler,
+        rekey=rekey,
+        liveness=liveness,
+        shutdown=shutdown,
+        reassembly=reassembly,
+    )
 
     async def recv_loop() -> None:
         while not shutdown.is_set():
@@ -127,21 +152,13 @@ async def run_server(config: Config) -> None:
                 client_addr[0] = recv_addr
 
             inner, _prev_epoch = result
-            await dispatch_inner(
-                inner, tun, session_keys, fsm, shaper, send_packet, rekey, shutdown,
-                reassembly,
-            )
+            await dispatch_inner(ctx, inner)
 
     try:
         await asyncio.gather(
             recv_loop(),
-            tun_send_loop(
-                tun, session_keys, fsm, shaper, send_packet, server_scheduler,
-                rekey, shutdown,
-            ),
-            liveness_loop(
-                session_keys, shaper, server_scheduler, liveness, shutdown,
-            ),
+            tun_send_loop(ctx),
+            liveness_loop(ctx),
         )
     except asyncio.CancelledError:
         pass
@@ -153,5 +170,7 @@ async def run_server(config: Config) -> None:
         tun.close()
         keystore.unload()
         await transport.aclose()
+        tcp_ts.remove()
+        rate_limiter.remove()
         fsm.transition(State.TEARDOWN)
         fsm.transition(State.IDLE)

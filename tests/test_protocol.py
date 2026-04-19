@@ -14,7 +14,6 @@ from dsm.core.protocol import (
     InnerPacket,
     OuterPacket,
     PacketType,
-    _pick_size_class,
     pick_random_size_class,
 )
 
@@ -152,16 +151,6 @@ class TestFragment(unittest.TestCase):
 
 
 class TestSizeClasses(unittest.TestCase):
-    def test_pick_smallest(self) -> None:
-        self.assertEqual(_pick_size_class(50), 128)
-
-    def test_pick_exact(self) -> None:
-        self.assertEqual(_pick_size_class(256), 256)
-
-    def test_pick_larger_than_all(self) -> None:
-        result = _pick_size_class(2000)
-        self.assertGreaterEqual(result, 2000)
-
     def test_random_size_class_in_range(self) -> None:
         for _ in range(100):
             sc = pick_random_size_class()

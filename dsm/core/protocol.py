@@ -12,7 +12,6 @@ AAD = sequence number (8 bytes).  Nonce is bound as the GCM IV.
 from __future__ import annotations
 
 import logging
-import os
 import secrets
 import struct
 import time
@@ -146,14 +145,6 @@ class OuterPacket:
         construction in session.py encrypt/decrypt paths.
         """
         return struct.pack("!Q", self.seq)
-
-
-def _pick_size_class(min_size: int) -> int:
-    """Pick the smallest size class that can hold the data."""
-    for sc in SIZE_CLASSES:
-        if sc >= min_size:
-            return sc
-    return max(min_size, SIZE_CLASSES[-1])
 
 
 def pick_random_size_class() -> int:

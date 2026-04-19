@@ -57,13 +57,18 @@ def verify_pin_on_ssl_object(ssl_obj: Any, expected_pins: list[bytes], provider:
 
 
 def build_pinned_ssl_context() -> ssl.SSLContext:
-    """Standard CA-verifying SSL context.
+    """Standard CA-verifying SSL context, TLS 1.3 only.
 
     Pinning is enforced separately by inspecting the peer cert after handshake;
     CA verification still runs so that a forged cert with a matching SPKI (via
     key compromise + issued-under-trusted-CA) is also bound to a trusted issuer.
+
+    TLS 1.3 only: earlier versions have known downgrade and analysis surface,
+    and TLS 1.3 is required for the DoH/DoT resolvers we pin.
     """
     ctx = ssl.create_default_context()
     ctx.check_hostname = True
     ctx.verify_mode = ssl.CERT_REQUIRED
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+    ctx.maximum_version = ssl.TLSVersion.TLSv1_3
     return ctx

@@ -15,8 +15,9 @@ from __future__ import annotations
 
 import logging
 import os
-import tempfile
 from pathlib import Path
+
+from dsm.core.atomic_io import atomic_write
 
 log = logging.getLogger(__name__)
 
@@ -50,7 +51,7 @@ class ResolvConfManager:
             f"nameserver {self._nameserver}\n"
             f"options edns0 trust-ad\n"
         ).encode()
-        _atomic_write(RESOLV_CONF, payload, mode=0o644)
+        atomic_write(RESOLV_CONF, payload, mode=0o644, mkdir=False)
 
         self._applied = True
         log.info("resolv.conf -> nameserver %s", self._nameserver)
@@ -67,7 +68,7 @@ class ResolvConfManager:
             if self._original_symlink_target is not None:
                 os.symlink(self._original_symlink_target, RESOLV_CONF)
             elif self._original_contents is not None:
-                _atomic_write(RESOLV_CONF, self._original_contents, mode=0o644)
+                atomic_write(RESOLV_CONF, self._original_contents, mode=0o644, mkdir=False)
             # else: no original to restore; leaving it absent matches the
             # pre-apply state.
         except OSError as e:
@@ -77,23 +78,3 @@ class ResolvConfManager:
             self._original_contents = None
             self._original_symlink_target = None
             log.info("resolv.conf restored")
-
-
-def _atomic_write(path: Path, data: bytes, mode: int) -> None:
-    """Write atomically via tmpfile in the same directory, then rename."""
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".resolv.", suffix=".tmp")
-    try:
-        os.fchmod(fd, mode)
-        os.write(fd, data)
-        os.fsync(fd)
-        os.close(fd)
-        fd = -1
-        os.rename(tmp, path)
-    except BaseException:
-        if fd >= 0:
-            os.close(fd)
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise

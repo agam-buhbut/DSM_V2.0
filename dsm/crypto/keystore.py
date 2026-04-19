@@ -6,10 +6,12 @@ import ctypes
 import logging
 import os
 import sys
-import tempfile
 import termios
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+from dsm.core.atomic_io import atomic_write
+from dsm.core.path_security import check_user_file_permissions
 
 if TYPE_CHECKING:
     import tuncore
@@ -118,7 +120,7 @@ class KeyStore:
 
         kp = tuncore.IdentityKeyPair.generate()
         blob = kp.encrypt_to_store(bytes(passphrase))
-        self._atomic_write(blob)
+        atomic_write(self._path, blob)
         self._identity = kp
         return bytes(kp.public_key)
 
@@ -127,8 +129,13 @@ class KeyStore:
 
         See ``generate`` for notes on ``bytearray`` passphrase handling.
 
+        Refuses to read the key file unless it is owned by the current user
+        and carries no group/world permission bits.
+
         Returns the public key bytes.
         """
+        check_user_file_permissions(self._path)
+
         import tuncore
 
         blob = self._path.read_bytes()
@@ -172,22 +179,3 @@ class KeyStore:
         log.info("identity loaded")
         return pub
 
-    def _atomic_write(self, data: bytes) -> None:
-        """Write data atomically to prevent partial writes on crash."""
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=self._path.parent)
-        try:
-            os.fchmod(fd, 0o600)
-            os.write(fd, data)
-            os.fsync(fd)
-            os.close(fd)
-            fd = -1
-            os.rename(tmp, self._path)
-        except BaseException:
-            if fd >= 0:
-                os.close(fd)
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
