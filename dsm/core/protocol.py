@@ -94,29 +94,26 @@ class OuterPacket:
     ciphertext: bytes  # includes GCM tag
 
     def serialize(self, target_size: int | None = None) -> bytes:
-        """Serialize with random outer padding to target_size.
+        """Serialize to wire format: header || ciphertext.
 
-        If target_size is None, picks the smallest size class that fits.
+        Callers that want size-class shaping must size the ciphertext (via
+        inner padding inside the AEAD envelope) so the wire output lands on
+        the desired size. Outer padding is never added here because it would
+        be unauthenticated and would be included by the receiver in the
+        ciphertext passed to AEAD, breaking tag validation.
+
+        If `target_size` is supplied, the final wire length must equal it;
+        any mismatch means inner-padding sizing is wrong and is reported as
+        a programming error rather than silently papered over.
         """
         header = struct.pack("!Q", self.seq) + self.nonce
-        min_size = len(header) + len(self.ciphertext)
+        wire_size = len(header) + len(self.ciphertext)
 
-        if target_size is None:
-            target_size = _pick_size_class(min_size)
-
-        if target_size < min_size:
+        if target_size is not None and target_size != wire_size:
             raise ValueError(
-                f"target_size {target_size} too small for {min_size} bytes"
+                f"ciphertext sizing mismatch: wire={wire_size}, target={target_size}"
             )
-
-        pad_len = target_size - min_size
-        # Invariant: inner padding should size ciphertext to exactly fill the
-        # target, leaving no outer padding. If pad_len > 0, the receiver will
-        # pass ciphertext+padding to decrypt, which breaks GCM tag validation.
-        if pad_len > 0:
-            log.warning("outer padding %d bytes — inner padding sizing mismatch", pad_len)
-        padding = os.urandom(pad_len)
-        return header + self.ciphertext + padding
+        return header + self.ciphertext
 
     @classmethod
     def deserialize(cls, data: bytes, ciphertext_len: int) -> OuterPacket:

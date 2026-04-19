@@ -9,7 +9,8 @@ import asyncio
 import logging
 import os
 import struct
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable
 
 from dsm.core.fsm import SessionFSM
@@ -29,6 +30,22 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+# Liveness parameters (seconds)
+KEEPALIVE_SEND_INTERVAL = 15.0   # emit KEEPALIVE if send-idle for this long
+DEAD_PEER_TIMEOUT = 60.0         # tear down if recv-idle for this long
+LIVENESS_CHECK_INTERVAL = 5.0    # cadence at which liveness_loop wakes
+
+
+@dataclass
+class LivenessState:
+    """Tracks peer liveness via most-recent send/recv timestamps.
+
+    Seeded with ``time.monotonic()`` so a freshly-established session is
+    not flagged dead before the first packet arrives.
+    """
+    last_recv_time: float = field(default_factory=time.monotonic)
+    last_send_time: float = field(default_factory=time.monotonic)
+
 
 def setup_signal_handlers(shutdown: asyncio.Event) -> None:
     """Register SIGINT/SIGTERM to set the shutdown event."""
@@ -44,6 +61,7 @@ def make_send_fn(
     transport: UDPTransport | TCPTransport,
     dest_addr: Callable[[], tuple[str, int] | None],
     seq: list[int],
+    liveness: LivenessState | None = None,
 ) -> SendFn:
     """Create a send_packet closure.
 
@@ -52,6 +70,9 @@ def make_send_fn(
         transport: UDP or TCP transport
         dest_addr: callable returning the current destination address (for UDP)
         seq: mutable single-element list holding the sequence counter
+        liveness: optional liveness state; last_send_time updates after each
+            wire transmission so the keepalive emitter can tell when to
+            stay quiet.
     """
 
     # For TCP, always use max size class so the length-prefix is constant,
@@ -76,6 +97,8 @@ def make_send_fn(
             await transport.send(wire, addr)
         else:
             await transport.send(wire)
+        if liveness is not None:
+            liveness.last_send_time = time.monotonic()
 
     return send_packet
 
@@ -202,8 +225,52 @@ async def dispatch_inner(
             rekey.last_time = ts
             rekey.pending_epoch = None
         rekey.in_progress = False
+    elif inner.ptype == PacketType.KEEPALIVE:
+        # Liveness accounting happens in the recv_loop on successful decrypt;
+        # the KEEPALIVE packet itself carries no payload action.
+        return
     elif inner.ptype == PacketType.SESSION_CLOSE:
         shutdown.set()
+
+
+async def liveness_loop(
+    session_keys: tuncore.SessionKeyManager,
+    shaper: TrafficShaper,
+    scheduler: SendScheduler,
+    liveness: LivenessState,
+    shutdown: asyncio.Event,
+) -> None:
+    """Emit KEEPALIVE while send-idle; shut down on dead-peer timeout.
+
+    The check cadence is ``LIVENESS_CHECK_INTERVAL`` — well below both
+    ``KEEPALIVE_SEND_INTERVAL`` and ``DEAD_PEER_TIMEOUT`` so there is slack
+    for the scheduler's jitter and for a single missed keepalive round.
+    """
+    while not shutdown.is_set():
+        try:
+            await asyncio.wait_for(shutdown.wait(), timeout=LIVENESS_CHECK_INTERVAL)
+            return
+        except asyncio.TimeoutError:
+            pass
+
+        now = time.monotonic()
+        recv_idle = now - liveness.last_recv_time
+        if recv_idle > DEAD_PEER_TIMEOUT:
+            log.warning(
+                "dead peer: no packets received for %.1fs, tearing down session",
+                recv_idle,
+            )
+            shutdown.set()
+            return
+
+        if now - liveness.last_send_time > KEEPALIVE_SEND_INTERVAL:
+            inner = InnerPacket(
+                ptype=PacketType.KEEPALIVE,
+                epoch_id=session_keys.epoch & 0x03,
+                payload=b"",
+            )
+            padded, target_size = shaper.pad_packet(inner)
+            scheduler.enqueue(padded, target_size)
 
 
 async def tun_send_loop(

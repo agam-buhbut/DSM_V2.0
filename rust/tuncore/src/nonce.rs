@@ -1,6 +1,6 @@
 use rand::rngs::OsRng;
 use rand::RngCore;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 /// Structured 96-bit nonce: epoch(32) || counter(32) || random(32).
 ///
@@ -10,6 +10,11 @@ use std::sync::atomic::{AtomicU32, Ordering};
 pub struct NonceGenerator {
     epoch: u32,
     counter: AtomicU32,
+    // Latches to true the first time the counter reaches its upper bound.
+    // Without this, a wrapped fetch_add would re-issue counter=1 and cause
+    // catastrophic AES-GCM nonce reuse if the caller kept invoking next()
+    // past the exhaustion error.
+    exhausted: AtomicBool,
 }
 
 impl NonceGenerator {
@@ -17,6 +22,7 @@ impl NonceGenerator {
         Self {
             epoch,
             counter: AtomicU32::new(1), // 0 is reserved / never valid
+            exhausted: AtomicBool::new(false),
         }
     }
 
@@ -24,11 +30,17 @@ impl NonceGenerator {
     /// Returns None if the counter has exhausted (signals key rotation needed).
     /// Counter starts at 1; value 0 is reserved and never used as a valid count.
     pub fn next(&self) -> Option<[u8; 12]> {
+        if self.exhausted.load(Ordering::SeqCst) {
+            return None;
+        }
+
         let count = self.counter.fetch_add(1, Ordering::SeqCst);
         // count is the value BEFORE increment.
         // - count == u32::MAX means we're about to wrap to 0 → exhausted
-        // - count == 0 should never happen (starts at 1), but guard anyway
+        // - count == 0 means a previous fetch_add already wrapped the counter;
+        //   poison permanently so subsequent calls cannot reissue used values
         if count >= u32::MAX || count == 0 {
+            self.exhausted.store(true, Ordering::SeqCst);
             return None;
         }
 
@@ -101,5 +113,34 @@ mod tests {
         assert_eq!(gen.count(), 1);
         gen.next().unwrap();
         assert_eq!(gen.count(), 2);
+    }
+
+    #[test]
+    fn test_exhaustion_is_sticky_no_nonce_reuse() {
+        // Regression: when the atomic counter hits u32::MAX the raw fetch_add
+        // would wrap through 0 back to 1 on subsequent calls and hand out a
+        // nonce equal to the generator's very first output. Verify the
+        // generator latches into the exhausted state instead.
+        let gen = NonceGenerator::new(7);
+        let first = gen.next().unwrap();
+
+        // Jump the counter to u32::MAX so the next fetch_add wraps.
+        gen.counter.store(u32::MAX, Ordering::SeqCst);
+        assert!(gen.next().is_none(), "MAX call must not yield a nonce");
+
+        // After wrap, further calls must stay exhausted and never emit the
+        // nonce that reuses count=1.
+        for _ in 0..4 {
+            assert!(gen.next().is_none(), "post-exhaustion must stay None");
+        }
+
+        // And the first nonce is still unique — nothing reissued it.
+        let gen2 = NonceGenerator::new(7);
+        let first_again = gen2.next().unwrap();
+        // Epoch and counter bytes match by construction; the random tail must
+        // still differ with overwhelming probability (sanity check).
+        assert_eq!(&first[0..8], &first_again[0..8]);
+        // But we specifically never reissued `first` from the exhausted gen.
+        assert!(gen.next().is_none());
     }
 }

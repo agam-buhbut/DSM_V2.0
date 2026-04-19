@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 
 from dsm.core.config import Config
 from dsm.core.fsm import SessionFSM, State
@@ -13,8 +14,8 @@ from dsm.net.transport.udp import UDPTransport
 from dsm.net.transport.tcp import TCPTransport
 from dsm.core.protocol import ReassemblyBuffer
 from dsm.session import (
-    RekeyState, decrypt_packet, dispatch_inner, make_send_fn,
-    setup_signal_handlers, tun_send_loop,
+    LivenessState, RekeyState, decrypt_packet, dispatch_inner, liveness_loop,
+    make_send_fn, setup_signal_handlers, tun_send_loop,
 )
 from dsm.traffic.shaper import TrafficShaper, make_chaff_packet
 from dsm.traffic.scheduler import SendScheduler
@@ -68,6 +69,7 @@ async def run_server(config: Config) -> None:
 
     seq = [0]
     rekey = RekeyState()
+    liveness = LivenessState()
     reassembly = ReassemblyBuffer()
 
     shutdown = asyncio.Event()
@@ -75,7 +77,7 @@ async def run_server(config: Config) -> None:
     client_addr: list[tuple[str, int] | None] = [None]
 
     send_packet = make_send_fn(
-        session_keys, transport, lambda: client_addr[0], seq,
+        session_keys, transport, lambda: client_addr[0], seq, liveness=liveness,
     )
 
     # Guard chaff generation until client_addr is known — the scheduler
@@ -108,6 +110,8 @@ async def run_server(config: Config) -> None:
             if result is None:
                 continue
 
+            liveness.last_recv_time = time.monotonic()
+
             # Update peer address only after successful authentication
             if recv_addr is not None:
                 client_addr[0] = recv_addr
@@ -124,6 +128,9 @@ async def run_server(config: Config) -> None:
             tun_send_loop(
                 tun, session_keys, fsm, shaper, send_packet, server_scheduler,
                 rekey, shutdown,
+            ),
+            liveness_loop(
+                session_keys, shaper, server_scheduler, liveness, shutdown,
             ),
         )
     except asyncio.CancelledError:

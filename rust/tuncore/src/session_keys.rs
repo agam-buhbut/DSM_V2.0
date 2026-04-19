@@ -1,13 +1,13 @@
 use crate::aes_gcm::AesKey;
 use crate::nonce::NonceGenerator;
 use crate::replay_window::ReplayWindow;
+use crate::secure_memory::LockedKey32;
 use hkdf::Hkdf;
 use rand::rngs::OsRng;
 use rand::RngCore;
 use sha2::Sha256;
 use std::time::Instant;
 use x25519_dalek::{PublicKey, StaticSecret};
-use zeroize::Zeroizing;
 
 /// Rotation thresholds.
 const ROTATION_PACKET_THRESHOLD: u64 = 5000;
@@ -21,19 +21,20 @@ struct DirectionKeys {
 }
 
 impl DirectionKeys {
-    fn new(key_bytes: [u8; 32], epoch: u32) -> Result<Self, String> {
+    fn new(key: LockedKey32, epoch: u32) -> Result<Self, String> {
         Ok(Self {
-            key: AesKey::new(key_bytes)?,
+            key: AesKey::from_locked(key)?,
             nonce_gen: NonceGenerator::new(epoch),
         })
     }
 }
 
-/// Generate a fresh ephemeral X25519 secret from CSPRNG.
-fn gen_ephemeral_secret() -> Zeroizing<[u8; 32]> {
-    let mut secret_bytes = Zeroizing::new([0u8; 32]);
-    OsRng.fill_bytes(secret_bytes.as_mut());
-    secret_bytes
+/// Generate a fresh ephemeral X25519 secret from CSPRNG, written directly
+/// into a mlock'd heap buffer.
+fn gen_ephemeral_secret() -> Result<LockedKey32, String> {
+    let mut secret = LockedKey32::zeroed()?;
+    OsRng.fill_bytes(secret.as_mut());
+    Ok(secret)
 }
 
 /// Full session key state managing current and previous epoch keys,
@@ -57,7 +58,7 @@ pub struct SessionKeyManager {
 pub struct RotationInit {
     pub new_epoch: u32,
     pub ephemeral_pub: [u8; 32],
-    ephemeral_secret: Zeroizing<[u8; 32]>,
+    ephemeral_secret: LockedKey32,
 }
 
 /// Result of processing a rotation acknowledgment.
@@ -67,7 +68,8 @@ pub struct RotationComplete {
 
 impl SessionKeyManager {
     /// Create a session key manager from the Noise handshake hash.
-    /// Derives initial send/recv keys via HKDF.
+    /// Derives initial send/recv keys via HKDF, written directly into
+    /// mlock'd heap buffers (no transient stack copies of key material).
     /// `is_initiator`: true for client (initiator), false for server (responder).
     pub fn from_handshake_hash(
         hash: &[u8],
@@ -76,11 +78,11 @@ impl SessionKeyManager {
     ) -> Result<Self, String> {
         let hk = Hkdf::<Sha256>::new(Some(b"dsm-v2-session-init"), hash);
 
-        let mut key_a = [0u8; 32];
-        let mut key_b = [0u8; 32];
-        hk.expand(b"dsm-session-initiator", &mut key_a)
+        let mut key_a = LockedKey32::zeroed()?;
+        let mut key_b = LockedKey32::zeroed()?;
+        hk.expand(b"dsm-session-initiator", key_a.as_mut())
             .map_err(|e| format!("hkdf key_a: {e}"))?;
-        hk.expand(b"dsm-session-responder", &mut key_b)
+        hk.expand(b"dsm-session-responder", key_b.as_mut())
             .map_err(|e| format!("hkdf key_b: {e}"))?;
 
         let (send_key, recv_key) = if is_initiator {
@@ -93,7 +95,11 @@ impl SessionKeyManager {
     }
 
     /// Create a new session from initial handshake-derived keys.
-    pub fn new(send_key: [u8; 32], recv_key: [u8; 32], initial_epoch: u32) -> Result<Self, String> {
+    pub fn new(
+        send_key: LockedKey32,
+        recv_key: LockedKey32,
+        initial_epoch: u32,
+    ) -> Result<Self, String> {
         Ok(Self {
             epoch: initial_epoch,
             send: DirectionKeys::new(send_key, initial_epoch)?,
@@ -161,14 +167,15 @@ impl SessionKeyManager {
 
     /// Initiate key rotation: generate an ephemeral keypair for the new epoch.
     pub fn initiate_rotation(&self) -> Result<RotationInit, String> {
-        let secret_bytes = gen_ephemeral_secret();
-        let secret = StaticSecret::from(*secret_bytes);
-        let public = PublicKey::from(&secret);
+        let secret = gen_ephemeral_secret()?;
+        let static_secret = StaticSecret::from(*secret.as_array());
+        let public = PublicKey::from(&static_secret);
 
+        let new_epoch = self.epoch.checked_add(1).ok_or("epoch overflow")?;
         Ok(RotationInit {
-            new_epoch: self.epoch + 1,
+            new_epoch,
             ephemeral_pub: *public.as_bytes(),
-            ephemeral_secret: secret_bytes,
+            ephemeral_secret: secret,
         })
     }
 
@@ -178,8 +185,11 @@ impl SessionKeyManager {
         init: RotationInit,
         remote_ephemeral_pub: &[u8; 32],
     ) -> Result<RotationComplete, String> {
-        let (new_send, new_recv) =
-            derive_rotation_keys(&init.ephemeral_secret, remote_ephemeral_pub, init.new_epoch)?;
+        let (new_send, new_recv) = derive_rotation_keys(
+            init.ephemeral_secret.as_array(),
+            remote_ephemeral_pub,
+            init.new_epoch,
+        )?;
         self.apply_rotation(new_send, new_recv, init.new_epoch)
     }
 
@@ -190,21 +200,21 @@ impl SessionKeyManager {
         remote_ephemeral_pub: &[u8; 32],
         new_epoch: u32,
     ) -> Result<([u8; 32], RotationComplete), String> {
-        if new_epoch != self.epoch + 1 {
+        let expected = self.epoch.checked_add(1).ok_or("epoch overflow")?;
+        if new_epoch != expected {
             return Err(format!(
-                "unexpected epoch: expected {}, got {new_epoch}",
-                self.epoch + 1
+                "unexpected epoch: expected {expected}, got {new_epoch}"
             ));
         }
 
-        let secret_bytes = gen_ephemeral_secret();
-        let secret = StaticSecret::from(*secret_bytes);
-        let our_pub = *PublicKey::from(&secret).as_bytes();
+        let secret = gen_ephemeral_secret()?;
+        let static_secret = StaticSecret::from(*secret.as_array());
+        let our_pub = *PublicKey::from(&static_secret).as_bytes();
 
         // Responder's send = initiator's recv and vice versa,
         // so we swap the derive direction
         let (new_recv, new_send) =
-            derive_rotation_keys(&secret_bytes, remote_ephemeral_pub, new_epoch)?;
+            derive_rotation_keys(secret.as_array(), remote_ephemeral_pub, new_epoch)?;
 
         let complete = self.apply_rotation(new_send, new_recv, new_epoch)?;
         Ok((our_pub, complete))
@@ -213,11 +223,11 @@ impl SessionKeyManager {
     /// Apply new keys, keeping old recv key for grace period.
     fn apply_rotation(
         &mut self,
-        new_send_key: [u8; 32],
-        new_recv_key: [u8; 32],
+        new_send_key: LockedKey32,
+        new_recv_key: LockedKey32,
         new_epoch: u32,
     ) -> Result<RotationComplete, String> {
-        // Pre-construct new keys before replacing (fail early on AesKey::new error)
+        // Pre-construct new keys before replacing (fail early on AesKey error)
         let new_recv = DirectionKeys::new(new_recv_key, new_epoch)?;
         let new_send = DirectionKeys::new(new_send_key, new_epoch)?;
 
@@ -263,15 +273,23 @@ impl SessionKeyManager {
 }
 
 /// Derive send and recv keys from an ephemeral DH shared secret.
-/// Returns (initiator_send_key, initiator_recv_key).
+/// Returns (initiator_send_key, initiator_recv_key) — each derived directly
+/// into a mlock'd heap buffer.
 fn derive_rotation_keys(
     our_secret: &[u8; 32],
     remote_pub: &[u8; 32],
     epoch: u32,
-) -> Result<([u8; 32], [u8; 32]), String> {
+) -> Result<(LockedKey32, LockedKey32), String> {
     let secret = StaticSecret::from(*our_secret);
     let public = PublicKey::from(*remote_pub);
     let shared = secret.diffie_hellman(&public);
+
+    // Reject low-order points: a malicious peer presenting a small-subgroup
+    // public key would yield a known/zero shared secret, defeating forward
+    // secrecy from rotation. x25519-dalek does not reject these by default.
+    if !shared.was_contributory() {
+        return Err("rotation DH: non-contributory shared secret (low-order public key)".into());
+    }
 
     // Fixed protocol salt for HKDF. The DH shared secret provides full entropy
     // as IKM, so a fixed salt is sufficient per RFC 5869 §3.1.
@@ -279,12 +297,12 @@ fn derive_rotation_keys(
     let hk = Hkdf::<Sha256>::new(Some(b"dsm-v2-rotation-hkdf-salt"), shared.as_bytes());
 
     let epoch_bytes = epoch.to_be_bytes();
-    let expand_key = |label: &[u8], dir: &str| -> Result<[u8; 32], String> {
+    let expand_key = |label: &[u8], dir: &str| -> Result<LockedKey32, String> {
         let mut info = Vec::with_capacity(label.len() + epoch_bytes.len());
         info.extend_from_slice(label);
         info.extend_from_slice(&epoch_bytes);
-        let mut key = [0u8; 32];
-        hk.expand(&info, &mut key)
+        let mut key = LockedKey32::zeroed()?;
+        hk.expand(&info, key.as_mut())
             .map_err(|e| format!("hkdf {dir}: {e}"))?;
         Ok(key)
     };
@@ -300,15 +318,25 @@ mod tests {
     use super::*;
 
     fn make_paired_managers() -> (SessionKeyManager, SessionKeyManager) {
-        let mut send_key = [0u8; 32];
-        let mut recv_key = [0u8; 32];
-        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut send_key);
-        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut recv_key);
+        let mut send_bytes = [0u8; 32];
+        let mut recv_bytes = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut send_bytes);
+        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut recv_bytes);
 
-        // Client sends with send_key, server receives with send_key
-        // Server sends with recv_key, client receives with recv_key
-        let client = SessionKeyManager::new(send_key, recv_key, 1).unwrap();
-        let server = SessionKeyManager::new(recv_key, send_key, 1).unwrap();
+        // Client sends with send_bytes, server receives with send_bytes
+        // Server sends with recv_bytes, client receives with recv_bytes
+        let client = SessionKeyManager::new(
+            LockedKey32::from_array(send_bytes).unwrap(),
+            LockedKey32::from_array(recv_bytes).unwrap(),
+            1,
+        )
+        .unwrap();
+        let server = SessionKeyManager::new(
+            LockedKey32::from_array(recv_bytes).unwrap(),
+            LockedKey32::from_array(send_bytes).unwrap(),
+            1,
+        )
+        .unwrap();
         (client, server)
     }
 
@@ -465,6 +493,21 @@ mod tests {
         let (nonce, ct, _) = server.encrypt(b"server after rotation", aad).unwrap();
         let pt = client.decrypt(&nonce, &ct, aad, 1, false).unwrap();
         assert_eq!(pt, b"server after rotation");
+    }
+
+    #[test]
+    fn test_rotation_rejects_low_order_pub() {
+        // The 8 low-order X25519 points produce a non-contributory (all-zero)
+        // shared secret and must be rejected to preserve forward secrecy.
+        // Canonical all-zeros point — one of the standard small-order points.
+        let low_order: [u8; 32] = [0u8; 32];
+
+        let (_, mut server) = make_paired_managers();
+        let result = server.complete_rotation_responder(&low_order, 2);
+        assert!(
+            result.is_err(),
+            "rotation must reject low-order remote ephemeral"
+        );
     }
 
     #[test]

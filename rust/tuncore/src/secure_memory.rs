@@ -1,4 +1,5 @@
 use libc::{mlock, munlock, RLIMIT_CORE, rlimit, setrlimit};
+use zeroize::Zeroizing;
 
 /// Check a libc return code, mapping non-zero to a descriptive error.
 fn syscall_check(ret: i32, name: &str) -> Result<(), String> {
@@ -51,6 +52,60 @@ pub fn disable_core_dumps() -> Result<(), String> {
 pub fn secure_zero(data: &mut [u8]) {
     use zeroize::Zeroize;
     data.zeroize();
+}
+
+/// A 32-byte secret pinned to a stable heap address, mlock'd for its
+/// lifetime and zeroized before deallocation.
+///
+/// The indirection via `Box` matters: a bare `Zeroizing<[u8; 32]>` is a
+/// value type, so moving the owner (e.g. returning from a constructor,
+/// handing off to PyO3's `#[pyclass]` boxing) memcpys the 32 bytes to a
+/// new address. Any `mlock` applied to the source is then stranded on a
+/// stack frame that will be reused, and the moved-from bytes are never
+/// zeroized because Rust does not run `Drop` on move sources. Putting the
+/// `Zeroizing<[u8; 32]>` behind a `Box` makes the key bytes live at a
+/// heap address that is stable across every move of the wrapping type.
+///
+/// Prefer `LockedKey32::zeroed()` followed by direct writes through
+/// `as_mut()` when you are about to produce fresh key material — that
+/// avoids any transient stack copy of the secret.
+pub struct LockedKey32 {
+    bytes: Box<Zeroizing<[u8; 32]>>,
+}
+
+impl LockedKey32 {
+    /// Allocate a zeroed, mlock'd 32-byte heap buffer. Subsequent writes
+    /// via `as_mut()` go straight to the locked heap address.
+    pub fn zeroed() -> Result<Self, String> {
+        let bytes = Box::new(Zeroizing::new([0u8; 32]));
+        mlock_slice(&**bytes)?;
+        Ok(Self { bytes })
+    }
+
+    /// Move an existing 32-byte array into a mlock'd heap location.
+    /// Incurs a transient stack copy of `src` before it reaches the heap;
+    /// prefer `zeroed()` + direct writes whenever the key originates here.
+    pub fn from_array(src: [u8; 32]) -> Result<Self, String> {
+        let bytes = Box::new(Zeroizing::new(src));
+        mlock_slice(&**bytes)?;
+        Ok(Self { bytes })
+    }
+
+    pub fn as_array(&self) -> &[u8; 32] {
+        &**self.bytes
+    }
+
+    pub fn as_mut(&mut self) -> &mut [u8; 32] {
+        &mut **self.bytes
+    }
+}
+
+impl Drop for LockedKey32 {
+    fn drop(&mut self) {
+        // munlock before Box drops, so the kernel still has the mapping.
+        // Zeroize + deallocation are handled by Box<Zeroizing<..>>'s drop.
+        let _ = munlock_slice(&**self.bytes);
+    }
 }
 
 #[cfg(test)]

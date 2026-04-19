@@ -92,22 +92,27 @@ class TestOuterPacket(unittest.TestCase):
         ct = os.urandom(48)
         pkt = OuterPacket(seq=42, nonce=os.urandom(12), ciphertext=ct)
         wire = pkt.serialize()
+        self.assertEqual(len(wire), OUTER_HEADER_SIZE + len(ct))
         got = OuterPacket.deserialize(wire, ciphertext_len=len(ct))
         self.assertEqual(got.seq, 42)
         self.assertEqual(got.nonce, pkt.nonce)
         self.assertEqual(got.ciphertext, ct)
 
-    def test_serialize_picks_size_class(self) -> None:
-        ct = os.urandom(20)
+    def test_serialize_matches_explicit_target(self) -> None:
+        ct = os.urandom(48)
         pkt = OuterPacket(seq=1, nonce=os.urandom(12), ciphertext=ct)
-        wire = pkt.serialize()
-        self.assertIn(len(wire), SIZE_CLASSES)
+        wire = pkt.serialize(target_size=OUTER_HEADER_SIZE + len(ct))
+        self.assertEqual(len(wire), OUTER_HEADER_SIZE + len(ct))
 
-    def test_target_size_too_small(self) -> None:
+    def test_target_size_mismatch_raises(self) -> None:
+        # Sizing is the shaper's responsibility; OuterPacket must not silently
+        # pad with unauthenticated bytes to reach a larger target.
         ct = os.urandom(200)
         pkt = OuterPacket(seq=1, nonce=os.urandom(12), ciphertext=ct)
         with self.assertRaises(ValueError):
             pkt.serialize(target_size=10)
+        with self.assertRaises(ValueError):
+            pkt.serialize(target_size=OUTER_HEADER_SIZE + len(ct) + 32)
 
     def test_too_short_deserialize(self) -> None:
         with self.assertRaises(ValueError):

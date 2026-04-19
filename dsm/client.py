@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from pathlib import Path
 
 from dsm.core.config import Config
@@ -15,8 +16,8 @@ from dsm.net.transport.udp import UDPTransport
 from dsm.net.transport.tcp import TCPTransport
 from dsm.core.protocol import ReassemblyBuffer
 from dsm.session import (
-    RekeyState, decrypt_packet, dispatch_inner, make_send_fn,
-    setup_signal_handlers, tun_send_loop,
+    LivenessState, RekeyState, decrypt_packet, dispatch_inner, liveness_loop,
+    make_send_fn, setup_signal_handlers, tun_send_loop,
 )
 from dsm.traffic.shaper import TrafficShaper, make_chaff_packet
 from dsm.traffic.scheduler import SendScheduler
@@ -83,9 +84,12 @@ async def run_client(config: Config) -> None:
     seq = [0]
     replay = tuncore.ReplayWindow()
     rekey = RekeyState()
+    liveness = LivenessState()
     reassembly = ReassemblyBuffer()
 
-    send_packet = make_send_fn(session_keys, transport, lambda: server_addr, seq)
+    send_packet = make_send_fn(
+        session_keys, transport, lambda: server_addr, seq, liveness=liveness,
+    )
 
     scheduler = SendScheduler(
         send_fn=send_packet,
@@ -117,6 +121,8 @@ async def run_client(config: Config) -> None:
             if result is None:
                 continue
 
+            liveness.last_recv_time = time.monotonic()
+
             inner, _prev_epoch = result
             await dispatch_inner(
                 inner, tun, session_keys, fsm, shaper, send_packet, rekey, shutdown,
@@ -129,6 +135,7 @@ async def run_client(config: Config) -> None:
             tun_send_loop(
                 tun, session_keys, fsm, shaper, send_packet, scheduler, rekey, shutdown,
             ),
+            liveness_loop(session_keys, shaper, scheduler, liveness, shutdown),
         )
     except asyncio.CancelledError:
         pass

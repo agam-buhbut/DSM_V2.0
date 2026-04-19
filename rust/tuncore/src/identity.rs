@@ -1,4 +1,4 @@
-use crate::secure_memory::{disable_core_dumps, mlock_slice, munlock_slice, secure_zero};
+use crate::secure_memory::LockedKey32;
 use argon2::{Argon2, Algorithm, Version, Params};
 use chacha20poly1305::{
     aead::{Aead, KeyInit, Payload},
@@ -15,9 +15,11 @@ const ARGON2_TIME_COST: u32 = 4;
 const ARGON2_PARALLELISM: u32 = 2;
 const XCHACHA_NONCE_LEN: usize = 24;
 
-/// Derive an encryption key from a passphrase and salt using Argon2id.
-fn derive_argon2_key(passphrase: &[u8], salt: &[u8]) -> Result<Zeroizing<[u8; 32]>, String> {
-    let mut derived = Zeroizing::new([0u8; 32]);
+/// Derive a passphrase-encryption key via Argon2id into a locked 32-byte heap
+/// buffer. Expansion writes directly into the heap, so no transient copy of
+/// the derived key ever lands on the stack.
+fn derive_argon2_key(passphrase: &[u8], salt: &[u8]) -> Result<LockedKey32, String> {
+    let mut derived = LockedKey32::zeroed()?;
     let params = Params::new(
         ARGON2_MEM_COST_KIB,
         ARGON2_TIME_COST,
@@ -43,47 +45,37 @@ fn build_store_aad(salt: &[u8], nonce: &[u8]) -> Vec<u8> {
 }
 
 /// Static X25519 identity keypair for Noise XX handshake.
-/// Private key is mlock'd and zeroized on drop.
+/// Secret is pinned on the mlock'd heap and zeroized on drop via `LockedKey32`.
 pub struct IdentityKeyPair {
-    secret: Zeroizing<[u8; 32]>,
+    secret: LockedKey32,
     public: [u8; 32],
-    locked: bool,
 }
 
 impl IdentityKeyPair {
-    /// Generate a new random identity keypair.
+    /// Generate a new random identity keypair. The secret is written directly
+    /// into a mlock'd heap buffer via `OsRng`.
     pub fn generate() -> Result<Self, String> {
-        disable_core_dumps()?;
+        let mut secret = LockedKey32::zeroed()?;
+        OsRng.fill_bytes(secret.as_mut());
 
-        let mut secret_bytes = Zeroizing::new([0u8; 32]);
-        OsRng.fill_bytes(secret_bytes.as_mut());
-
-        mlock_slice(secret_bytes.as_ref())?;
-
-        let secret = StaticSecret::from(*secret_bytes);
-        let public = PublicKey::from(&secret);
+        let static_secret = StaticSecret::from(*secret.as_array());
+        let public = PublicKey::from(&static_secret);
 
         Ok(Self {
-            secret: secret_bytes,
+            secret,
             public: *public.as_bytes(),
-            locked: true,
         })
     }
 
-    /// Reconstruct from raw secret bytes (e.g. after decryption from store).
-    fn from_secret(secret_bytes: Zeroizing<[u8; 32]>) -> Result<Self, String> {
-        disable_core_dumps()?;
-        mlock_slice(secret_bytes.as_ref())?;
+    /// Build from a pre-populated `LockedKey32` (e.g. after decryption from
+    /// disk). Derives the public key.
+    fn from_locked(secret: LockedKey32) -> Result<Self, String> {
+        let static_secret = StaticSecret::from(*secret.as_array());
+        let public = PublicKey::from(&static_secret);
 
-        let secret = StaticSecret::from(*secret_bytes);
-        let public = PublicKey::from(&secret);
-        let pub_bytes = *public.as_bytes();
-
-        // Re-derive done; secret_bytes already holds the key
         Ok(Self {
-            secret: secret_bytes,
-            public: pub_bytes,
-            locked: true,
+            secret,
+            public: *public.as_bytes(),
         })
     }
 
@@ -93,7 +85,7 @@ impl IdentityKeyPair {
 
     /// Access the secret key bytes. Caller must not persist or copy.
     pub fn secret_key(&self) -> &[u8; 32] {
-        &self.secret
+        self.secret.as_array()
     }
 
     /// Encrypt the keypair to a blob using a passphrase (Argon2id + XChaCha20-Poly1305).
@@ -108,7 +100,7 @@ impl IdentityKeyPair {
 
         let derived = derive_argon2_key(passphrase, &salt)?;
 
-        let cipher = XChaCha20Poly1305::new_from_slice(derived.as_ref())
+        let cipher = XChaCha20Poly1305::new_from_slice(derived.as_array())
             .map_err(|e| format!("cipher init: {e}"))?;
 
         let mut nonce_bytes = [0u8; XCHACHA_NONCE_LEN];
@@ -118,7 +110,7 @@ impl IdentityKeyPair {
         let aad = build_store_aad(&salt, &nonce_bytes);
 
         let ciphertext = cipher
-            .encrypt(nonce, Payload { msg: self.secret.as_ref(), aad: &aad })
+            .encrypt(nonce, Payload { msg: self.secret.as_array(), aad: &aad })
             .map_err(|e| format!("encrypt: {e}"))?;
 
         let mut blob = Vec::with_capacity(ARGON2_SALT_LEN + XCHACHA_NONCE_LEN + ciphertext.len());
@@ -145,13 +137,15 @@ impl IdentityKeyPair {
 
         let derived = derive_argon2_key(passphrase, salt)?;
 
-        let cipher = XChaCha20Poly1305::new_from_slice(derived.as_ref())
+        let cipher = XChaCha20Poly1305::new_from_slice(derived.as_array())
             .map_err(|e| format!("cipher init: {e}"))?;
 
         let nonce = XNonce::from_slice(nonce_bytes);
 
         let aad = build_store_aad(salt, nonce_bytes);
 
+        // AEAD decrypt returns a heap Vec<u8> — wrap in Zeroizing so the
+        // plaintext copy is scrubbed after we move it into the locked buffer.
         let plaintext = Zeroizing::new(
             cipher
                 .decrypt(nonce, Payload { msg: ciphertext, aad: &aad })
@@ -162,20 +156,10 @@ impl IdentityKeyPair {
             return Err("decrypted key has wrong length".into());
         }
 
-        let mut secret_bytes = Zeroizing::new([0u8; 32]);
-        secret_bytes.copy_from_slice(&plaintext);
+        let mut secret = LockedKey32::zeroed()?;
+        secret.as_mut().copy_from_slice(&plaintext);
 
-        Self::from_secret(secret_bytes)
-    }
-}
-
-impl Drop for IdentityKeyPair {
-    fn drop(&mut self) {
-        if self.locked {
-            let _ = munlock_slice(self.secret.as_ref());
-        }
-        // Zeroizing handles zeroing of self.secret
-        secure_zero(&mut self.public);
+        Self::from_locked(secret)
     }
 }
 

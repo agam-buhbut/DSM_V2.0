@@ -14,12 +14,13 @@ NON-GOALS
 ARCHITECTURE
 
 Flow:
-Client -> Optional Relay(s) -> Client-Owned Server -> Destination
+Client -> Client-Owned Server -> Destination
+(Optional relay hop is reserved in the protocol/config but not implemented yet.)
 
 Components:
 - Client: initiates handshake, encrypts traffic, generates chaff
-- Relay (optional): forwards opaque packets without decryption
 - Server: completes handshake, decrypts and forwards traffic
+- Relay: config mode accepted; forwarding logic not yet implemented
 
 State Model:
 - Session-based finite state machine (6 states)
@@ -33,18 +34,25 @@ NETWORKING
 
 Transport:
 - UDP (default)
-- TCP (fallback, with length-prefix framing)
+- TCP (fallback, with 4-byte big-endian length-prefix framing; all frames
+  padded to the max size class so the length prefix is constant on the wire)
 
 Connection:
-- Single client per server instance
+- Single client per server instance (server binds one socket and, for TCP,
+  accepts a single connection; for UDP the server locks onto the first
+  authenticated peer address)
 - Session-based with graceful shutdown (SESSION_CLOSE packet)
 
 Reliability:
-- Handshake retransmission with exponential backoff (3 retries, 1s/2s/4s)
+- Handshake retransmission with exponential backoff (3 attempts, 1s/2s/4s)
 - No application-level retransmission for data packets (relies on inner protocol or TCP)
 
 Fragmentation:
-- Packet type defined but not yet implemented
+- FRAGMENT packet type (0x07) defined
+- Receive-side reassembly implemented (capacity-bounded, 5-second timeout,
+  max 16 fragments per ID) and wired into the data path
+- Send-side fragmenter not yet implemented (MAX_INNER_PAYLOAD caps inner
+  payload at 1500 bytes)
 
 CRYPTOGRAPHY
 
@@ -52,12 +60,14 @@ Key Exchange:
 - Noise XX pattern (X25519 + AES-256-GCM + SHA-256)
 - Prologue-tagged: "DSM\x00\x01\x00\x01"
 - Handshake messages padded to 1400 bytes (constant size)
-- Trust-on-first-use (TOFU) server key pinning with HMAC-SHA256 integrity
+- Trust-on-first-use (TOFU) server key pinning, keyed by "host:port",
+  stored in a file whose contents are authenticated with HMAC-SHA256
+  using a key derived from the client identity
 
 Key Rotation:
 - Every 5000 packets or 600 seconds (configurable)
 - Ephemeral X25519 DH per rotation
-- HKDF-SHA256 key derivation with direction-specific labels
+- HKDF-SHA256 key derivation with direction-specific labels and epoch in info
 - 5-second grace period for in-flight packets from previous epoch
 - Rate-limited to one rotation per 60 seconds
 
@@ -66,12 +76,14 @@ Encryption:
 
 Nonce Strategy:
 - Structured 96-bit nonce: epoch(32) || counter(32) || random(32)
-- Counter provides uniqueness guarantee within epoch
+- Counter provides uniqueness guarantee within an epoch
 - Random component prevents predictability
 - Epoch separation prevents cross-rotation collisions
+- Counter is poisoned on exhaustion (returns None permanently) to prevent
+  nonce reuse if a session is somehow continued past 2^32 packets
 
 Replay Protection:
-- 128-bit sliding window bitmap
+- 128-bit sliding window bitmap (separate window per epoch during grace)
 - Check-before-decrypt, update-after-authentication
 
 Key Storage:
@@ -80,20 +92,23 @@ Key Storage:
 - Memory locked (mlock) during use
 - Single-pass zeroization via Rust zeroize crate on drop
 - Core dumps disabled at startup (setrlimit RLIMIT_CORE)
-- Atomic file writes with 0600 permissions
+- Atomic file writes with 0600 permissions (tmpfile -> fchmod -> fsync -> rename)
 
 ANONYMITY AND TRAFFIC RESISTANCE
 
 Padding:
 - 11 size classes: 128, 256, 384, 512, 640, 768, 896, 1024, 1152, 1280, 1400 bytes
-- Inner padding fills encrypted envelope to size class boundary
+- Inner padding fills the AEAD envelope to the target class boundary so no
+  unauthenticated outer padding remains on the wire
 - TCP frames padded to max size class (1400) for constant wire size
 
 Chaff:
 - Adaptive chaff generation mirroring real traffic patterns
-- Active mode: rate tracks real traffic (0.5x-1.5x, resampled every 1-3s)
+- Active mode: rate tracks real traffic (0.5x-1.5x multiplier, resampled
+  every 1-3s)
 - Idle mode: burst patterns mimicking browsing (exponential inter-burst gaps)
-- Size distribution mirrors observed real traffic via exponential moving average
+- Size distribution mirrors observed real traffic via exponential moving
+  average; chaff size occasionally perturbed ±1 class to decorrelate
 
 Timing:
 - Configurable jitter (default 1-50ms) on all outgoing packets
@@ -101,12 +116,14 @@ Timing:
 
 Leak Prevention:
 - nftables kill switch blocks all non-VPN traffic
-- mDNS and LLMNR blocked to prevent LAN enumeration
-- DNS on non-TUN interfaces blocked except to server IP
+- mDNS (5353) and LLMNR (5355) blocked to prevent LAN enumeration
+- DNS (53, 853) on non-TUN interfaces blocked except to server IP
+- VPN sockets marked with SO_MARK=0x1 so the ip-rule skips the TUN table
+  and avoids routing loops
 
 DNS:
 - Resolution module implemented (DoH, DoT, static hosts file, caching)
-- Not yet wired into the data path (TODO)
+- Not yet wired into the data path (TODO on the server recv loop)
 
 THREAT MODEL
 
@@ -139,7 +156,7 @@ Rust crate (tuncore):
 - Noise XX handshake (via snow crate)
 - HKDF-SHA256 key derivation
 - Argon2id password hashing
-- Nonce generation with structured uniqueness
+- Nonce generation with structured uniqueness and exhaustion poisoning
 - Replay window (128-bit bitmap)
 - Secure memory (mlock, zeroize, core dump disable)
 - Identity key storage (XChaCha20-Poly1305)
@@ -154,11 +171,11 @@ Format: TOML
 Path: /opt/mtun/config.toml
 
 Parameters:
-- mode: client | server | relay
+- mode: client | server | relay  (relay is accepted but not yet functional)
 - server_ip, server_port, listen_port
 - key_file: path to encrypted identity key
 - transport: udp | tcp (default: udp)
-- relay_addresses: list of relay IPs:ports
+- relay_addresses: list of relay IPs:ports (unused until relay is implemented)
 - dns_providers: DoH/DoT URLs (server mode)
 - tun_name: TUN device name (default: mtun0)
 - log_level: debug | info | warning | error (default: warning)
@@ -193,7 +210,7 @@ Production:
 TESTING
 
 - 55 Python unit tests (unittest)
-- 49 Rust unit tests (cargo test)
+- 50 Rust unit tests (cargo test)
 - Covers: protocol serialization, FSM transitions, config validation,
-  replay window, nonce generation, key rotation, AES-GCM, identity storage,
-  Noise XX handshake
+  replay window, nonce generation (including exhaustion), key rotation,
+  AES-GCM, identity storage, Noise XX handshake

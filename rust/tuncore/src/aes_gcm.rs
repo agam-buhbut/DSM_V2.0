@@ -2,27 +2,33 @@ use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
 };
-use crate::secure_memory::{mlock_slice, munlock_slice};
-use zeroize::Zeroizing;
+use crate::secure_memory::LockedKey32;
 
 /// Opaque AES-256-GCM key handle. Key bytes never cross FFI boundary.
-/// mlock'd in memory, zeroized on drop.
+/// The key lives at a stable heap address via `LockedKey32` — mlock'd and
+/// zeroized on drop, resilient to ownership moves.
 pub struct AesKey {
-    key: Zeroizing<[u8; 32]>,
-    locked: bool,
+    key: LockedKey32,
 }
 
 impl AesKey {
-    /// Create a new AES key from raw bytes and lock it in memory.
-    pub fn new(key_bytes: [u8; 32]) -> Result<Self, String> {
-        let key = Zeroizing::new(key_bytes);
-        mlock_slice(key.as_ref())?;
-        Ok(Self { key, locked: true })
+    /// Build an `AesKey` from a pre-allocated locked heap buffer. Preferred
+    /// when the caller can write key material directly into the heap
+    /// (e.g. via HKDF expand into `LockedKey32::zeroed().as_mut()`).
+    pub fn from_locked(key: LockedKey32) -> Result<Self, String> {
+        Ok(Self { key })
+    }
+
+    /// Convenience constructor: accepts a 32-byte array by value. Incurs
+    /// a transient stack copy of the key before it reaches the heap — use
+    /// `from_locked` to avoid that where possible.
+    pub fn from_array(key_bytes: [u8; 32]) -> Result<Self, String> {
+        Ok(Self { key: LockedKey32::from_array(key_bytes)? })
     }
 
     /// Initialize cipher from the stored key.
     fn cipher(&self) -> Result<Aes256Gcm, String> {
-        Aes256Gcm::new_from_slice(self.key.as_ref()).map_err(|e| format!("cipher: {e}"))
+        Aes256Gcm::new_from_slice(self.key.as_array()).map_err(|e| format!("cipher: {e}"))
     }
 
     /// Encrypt plaintext with the given 96-bit nonce and additional authenticated data.
@@ -46,22 +52,6 @@ impl AesKey {
             )
             .map_err(|_| "decryption failed: authentication tag mismatch".into())
     }
-
-    /// Raw key bytes for internal crypto operations (e.g. session key derivation).
-    /// Must never cross the FFI boundary.
-    /// Currently unused — will be needed when session key rotation is integrated.
-    #[allow(dead_code)]
-    pub(crate) fn raw(&self) -> &[u8; 32] {
-        &self.key
-    }
-}
-
-impl Drop for AesKey {
-    fn drop(&mut self) {
-        if self.locked {
-            let _ = munlock_slice(self.key.as_ref());
-        }
-    }
 }
 
 #[cfg(test)]
@@ -69,9 +59,9 @@ mod tests {
     use super::*;
 
     fn test_key() -> AesKey {
-        let mut bytes = [0u8; 32];
-        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut bytes);
-        AesKey::new(bytes).unwrap()
+        let mut locked = LockedKey32::zeroed().unwrap();
+        rand::RngCore::fill_bytes(&mut rand::thread_rng(), locked.as_mut());
+        AesKey::from_locked(locked).unwrap()
     }
 
     #[test]

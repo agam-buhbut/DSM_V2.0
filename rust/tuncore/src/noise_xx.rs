@@ -1,5 +1,9 @@
+use rand::rngs::OsRng;
+use rand::RngCore;
 use sha2::{Sha256, Digest};
 use snow::{Builder, HandshakeState, TransportState};
+use x25519_dalek::{PublicKey, StaticSecret};
+use zeroize::Zeroizing;
 
 /// Protocol prologue authenticated by both sides.
 /// Format: "DSM" || version(2 bytes) || initiator_role || responder_role
@@ -23,6 +27,36 @@ const EPHEMERAL_SIZE: usize = 32;
 fn derive_mask(ephemeral: &[u8]) -> [u8; 2] {
     let hash = Sha256::digest(ephemeral);
     [hash[0], hash[1]]
+}
+
+/// Reject an ephemeral X25519 public key that lies in a small subgroup.
+///
+/// X25519 static-secret scalars are clamped to multiples of 8 by the
+/// dalek library, so any point whose order divides 8 (the full set of
+/// canonical low-order points) multiplied by a clamped scalar lands at
+/// the identity — which `SharedSecret::was_contributory()` reports as
+/// non-contributory. Probing with a fresh clamped scalar detects all
+/// such points reliably and is ~100µs of overhead per handshake.
+///
+/// Snow (the Noise implementation) does not perform this check, and
+/// accepting a low-order ephemeral would cause `ee` to produce a
+/// known / zero shared secret, destroying the secrecy of the session.
+fn validate_ephemeral_not_low_order(pub_bytes: &[u8]) -> Result<(), String> {
+    if pub_bytes.len() != EPHEMERAL_SIZE {
+        return Err("ephemeral public key wrong length".into());
+    }
+    let mut pk_arr = [0u8; 32];
+    pk_arr.copy_from_slice(pub_bytes);
+
+    let mut probe = [0u8; 32];
+    OsRng.fill_bytes(&mut probe);
+    let probe_secret = StaticSecret::from(probe);
+    let public = PublicKey::from(pk_arr);
+    let shared = probe_secret.diffie_hellman(&public);
+    if !shared.was_contributory() {
+        return Err("rejected low-order ephemeral public key".into());
+    }
+    Ok(())
 }
 
 /// Pack a handshake message: [len_be16^mask || snow_data || random_padding]
@@ -94,7 +128,7 @@ impl NoiseInitiator {
     /// Returns 1400 bytes. No mask on wire — mask is derived from the ephemeral
     /// public key embedded in the Snow payload.
     pub fn write_message_1(&mut self) -> Result<Vec<u8>, String> {
-        let mut buf = vec![0u8; HANDSHAKE_PAD_SIZE];
+        let mut buf = Zeroizing::new(vec![0u8; HANDSHAKE_PAD_SIZE]);
         let len = self
             .state
             .write_message(&[], &mut buf)
@@ -115,6 +149,15 @@ impl NoiseInitiator {
     pub fn read_message_2(&mut self, msg: &[u8]) -> Result<Vec<u8>, String> {
         let mask = self.mask.ok_or("mask not set — call write_message_1 first")?;
         let snow_data = unpack_handshake(msg, &mask)?;
+
+        // Noise XX msg2 starts with the responder's ephemeral public key (32
+        // bytes), followed by encrypted static and tags. Reject low-order
+        // points before `ee` mixes them into the handshake state.
+        if snow_data.len() < EPHEMERAL_SIZE {
+            return Err("msg2 too short for ephemeral".into());
+        }
+        validate_ephemeral_not_low_order(&snow_data[..EPHEMERAL_SIZE])?;
+
         let mut payload = vec![0u8; HANDSHAKE_PAD_SIZE];
         let _len = self
             .state
@@ -134,7 +177,7 @@ impl NoiseInitiator {
     /// Returns a fixed-size padded message (1400 bytes).
     pub fn write_message_3(&mut self) -> Result<Vec<u8>, String> {
         let mask = self.mask.ok_or("mask not set — call write_message_1 first")?;
-        let mut buf = vec![0u8; HANDSHAKE_PAD_SIZE];
+        let mut buf = Zeroizing::new(vec![0u8; HANDSHAKE_PAD_SIZE]);
         let len = self
             .state
             .write_message(&[], &mut buf)
@@ -185,6 +228,11 @@ impl NoiseResponder {
 
         // The ephemeral key is at a fixed offset (after the 2-byte length prefix)
         let ephemeral = &msg[LEN_PREFIX..LEN_PREFIX + EPHEMERAL_SIZE];
+
+        // Reject a small-subgroup ephemeral before the snow state mixes it
+        // via `ee`. See `validate_ephemeral_not_low_order` for rationale.
+        validate_ephemeral_not_low_order(ephemeral)?;
+
         let mask = derive_mask(ephemeral);
         self.mask = Some(mask);
 
@@ -200,7 +248,7 @@ impl NoiseResponder {
     /// Returns a fixed-size padded message (1400 bytes).
     pub fn write_message_2(&mut self) -> Result<Vec<u8>, String> {
         let mask = self.mask.ok_or("mask not set — call read_message_1 first")?;
-        let mut buf = vec![0u8; HANDSHAKE_PAD_SIZE];
+        let mut buf = Zeroizing::new(vec![0u8; HANDSHAKE_PAD_SIZE]);
         let len = self
             .state
             .write_message(&[], &mut buf)
@@ -272,7 +320,6 @@ impl NoiseTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use x25519_dalek::{PublicKey, StaticSecret};
 
     fn gen_keypair() -> [u8; 32] {
         let mut key = [0u8; 32];
@@ -404,6 +451,23 @@ mod tests {
             let decrypted = st.decrypt(&encrypted).unwrap();
             assert_eq!(decrypted, msg.as_bytes());
         }
+    }
+
+    #[test]
+    fn test_handshake_rejects_low_order_ephemeral_in_msg1() {
+        // The all-zeros X25519 public key is one of the canonical small-order
+        // points; a clamped-scalar DH with it produces a non-contributory
+        // shared secret, so the responder must refuse to process the message.
+        let server_secret = gen_keypair();
+        let mut responder = NoiseResponder::new(&server_secret).unwrap();
+
+        // Fake msg1: zero length prefix + zero ephemeral + zero padding.
+        let msg = vec![0u8; HANDSHAKE_PAD_SIZE];
+        let err = responder.read_message_1(&msg).unwrap_err();
+        assert!(
+            err.contains("low-order"),
+            "expected low-order rejection, got: {err}"
+        );
     }
 
     #[test]

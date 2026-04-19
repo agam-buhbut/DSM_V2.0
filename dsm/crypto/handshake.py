@@ -221,16 +221,11 @@ def _check_known_host(
     hosts = _load_known_hosts(path, identity)
     cached = hosts.get(host_key)
 
-    # Migration: check old IP-only key if host:port key not found
-    if cached is None and server_port:
-        cached = hosts.get(server_ip)
-        if cached is not None:
-            log.info("migrating known_hosts entry from %s to %s", server_ip, host_key)
-            hosts[host_key] = cached
-            del hosts[server_ip]
-            _save_known_hosts_dict(path, hosts, identity)
-
     if cached is None:
+        # No entry under the canonical host:port key. Do fresh TOFU, even if
+        # a stale entry exists under an older key format (e.g. bare IP). We
+        # do NOT migrate the trust relationship from an older format, since
+        # the old entry's provenance can't be re-verified here.
         _save_known_host(path, host_key, server_static, identity)
         log.info("TOFU: saved server static key for %s", host_key)
         return

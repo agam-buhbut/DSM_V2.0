@@ -56,7 +56,9 @@ impl ReplayWindow {
             if shift >= Self::WINDOW_SIZE {
                 self.bitmap = 1;
             } else {
-                self.bitmap = self.bitmap.checked_shl(shift as u32).unwrap_or(0);
+                // shift < WINDOW_SIZE (= 128) holds in this branch, so the
+                // u128 left-shift is well-defined and cannot panic.
+                self.bitmap <<= shift as u32;
                 self.bitmap |= 1;
             }
             self.max_seq = seq;
