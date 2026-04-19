@@ -89,8 +89,8 @@ class SendScheduler:
                 pkt = heapq.heappop(self._queue)
                 try:
                     await self._send_fn(pkt.data, pkt.target_size)
-                except Exception:
-                    log.exception("send failed")
+                except Exception as e:
+                    log.warning("send failed: %s", type(e).__name__)
 
             # Inject chaff independently of queue state to avoid leaking
             # traffic activity via chaff-only / no-chaff timing patterns.
@@ -102,8 +102,8 @@ class SendScheduler:
                 try:
                     chaff_data, chaff_size = await self._chaff_fn()
                     self.enqueue(chaff_data, chaff_size)
-                except Exception:
-                    log.exception("chaff generation failed")
+                except Exception as e:
+                    log.warning("chaff generation failed: %s", type(e).__name__)
 
             # Sleep until next packet or a jittered poll interval.
             # Jitter prevents a fixed 50ms cadence from fingerprinting the scheduler.

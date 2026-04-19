@@ -39,17 +39,31 @@ class _CacheEntry:
 
 
 class DNSResolver:
-    """Async DNS resolver with DoH/DoT and local cache."""
+    """Async DNS resolver with DoH/DoT and local cache.
+
+    Every provider must carry one or more SPKI SHA-256 pins. Connections are
+    rejected when the peer's SubjectPublicKeyInfo does not match. No default
+    pins are shipped — operators supply them via config so stale hardcoded
+    pins can never degrade to unpinned traffic.
+    """
 
     def __init__(
         self,
-        providers: list[str] | None = None,
+        providers: list[str],
+        provider_pins: dict[str, list[str]],
         hosts_file: str = "/opt/mtun/hosts.txt",
     ) -> None:
-        self._providers = providers or [
-            "https://1.1.1.1/dns-query",
-            "tls://9.9.9.9:853",
-        ]
+        if not providers:
+            raise ValueError("DNSResolver requires at least one provider")
+        self._pins: dict[str, list[bytes]] = {}
+        for provider in providers:
+            hex_pins = provider_pins.get(provider)
+            if not hex_pins:
+                raise ValueError(
+                    f"DNSResolver: no SPKI pins configured for provider {provider!r}"
+                )
+            self._pins[provider] = [bytes.fromhex(h) for h in hex_pins]
+        self._providers = list(providers)
         self._hosts_file = Path(hosts_file)
         self._cache: dict[str, _CacheEntry] = {}
         # Min-heap of (expires, hostname) for O(log n) eviction.
@@ -117,16 +131,21 @@ class DNSResolver:
         """Return a reusable httpx.AsyncClient (created on first use)."""
         if self._http_client is None:
             import httpx  # type: ignore[import-untyped]
+            from dsm.net.dns_pinning import build_pinned_ssl_context
             self._http_client = httpx.AsyncClient(  # pyright: ignore[reportUnknownMemberType]
-                verify=True, timeout=DOH_TIMEOUT,
+                verify=build_pinned_ssl_context(),
+                timeout=DOH_TIMEOUT,
             )
         return self._http_client  # pyright: ignore[reportUnknownMemberType,reportUnknownVariableType]
 
     async def _resolve_doh(self, url: str, hostname: str) -> list[str]:
-        """DNS-over-HTTPS query (wire format POST)."""
+        """DNS-over-HTTPS query (wire format POST) with SPKI pin check."""
+        from dsm.net.dns_pinning import verify_pin_on_ssl_object
+
         query = _build_dns_query(hostname, A_RECORD)
         client = self._get_http_client()
-        resp = await client.post(
+        req = client.build_request(
+            "POST",
             url,
             content=query,
             headers={
@@ -134,14 +153,29 @@ class DNSResolver:
                 "Accept": "application/dns-message",
             },
         )
-        resp.raise_for_status()
-        addresses, ttl = _parse_dns_response(resp.content)
+        # Stream so we can inspect the live TLS object before the stream
+        # is released back to the connection pool.
+        resp = await client.send(req, stream=True)
+        try:
+            resp.raise_for_status()
+            network_stream = resp.extensions.get("network_stream")
+            ssl_obj = network_stream.get_extra_info("ssl_object") if network_stream else None
+            if ssl_obj is None:
+                raise RuntimeError(f"DoH connection to {url} did not negotiate TLS")
+            verify_pin_on_ssl_object(ssl_obj, self._pins[url], url)
+            body = await resp.aread()
+        finally:
+            await resp.aclose()
+
+        addresses, ttl = _parse_dns_response(body)
         if addresses:
             self._cache_result(hostname, addresses, ttl)
         return addresses
 
     async def _resolve_dot(self, provider: str, hostname: str) -> list[str]:
-        """DNS-over-TLS query."""
+        """DNS-over-TLS query with SPKI pin check."""
+        from dsm.net.dns_pinning import build_pinned_ssl_context, verify_pin
+
         # Parse "tls://host:port"
         addr = provider.removeprefix("tls://")
         parts = addr.rsplit(":", 1)
@@ -154,12 +188,18 @@ class DNSResolver:
         # DoT uses TCP with 2-byte length prefix
         framed = struct.pack("!H", len(query)) + query
 
-        ctx = ssl.create_default_context()
+        ctx = build_pinned_ssl_context()
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(host, port, ssl=ctx),
             timeout=DOT_TIMEOUT,
         )
         try:
+            ssl_obj = writer.get_extra_info("ssl_object")
+            der = ssl_obj.getpeercert(binary_form=True) if ssl_obj else None
+            if not der:
+                raise RuntimeError(f"DoT connection to {provider} did not negotiate TLS")
+            verify_pin(der, self._pins[provider], provider)
+
             writer.write(framed)
             await writer.drain()
 

@@ -8,6 +8,8 @@ version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
     "httpx>=0.27,<1.0",
+    "cryptography>=42,<46",
+    "dnspython>=2.6,<3.0",
 ]
 
 [project.scripts]

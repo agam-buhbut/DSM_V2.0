@@ -21,6 +21,7 @@ import hmac
 import json
 import logging
 import os
+import stat
 import tempfile
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -38,6 +39,8 @@ log = logging.getLogger(__name__)
 HANDSHAKE_TIMEOUT = 5.0
 MAX_RETRIES = 3
 BACKOFF_BASE = 1.0  # seconds; retry delays: 1s, 2s, 4s
+
+DEFAULT_KNOWN_HOSTS_PATH = Path("/opt/mtun/known_hosts.json")
 
 
 async def client_handshake(
@@ -230,7 +233,7 @@ def _check_known_host(
         log.info("TOFU: saved server static key for %s", host_key)
         return
 
-    if bytes.fromhex(cached) != server_static:
+    if not hmac.compare_digest(bytes.fromhex(cached), server_static):
         msg = f"SECURITY WARNING: server static key changed for {host_key}"
         log.critical(msg)
         if strict:
@@ -243,9 +246,32 @@ def _hmac_key(identity: tuncore.IdentityKeyPair) -> bytes:
     return bytes(identity.derive_hmac_key(b"known-hosts"))
 
 
+def _check_path_permissions(path: Path) -> None:
+    """Reject known_hosts file if owned by another user or group/world-accessible."""
+    try:
+        st = path.stat()
+    except OSError as e:
+        raise HandshakeError(f"cannot stat known_hosts {path}: {e}") from e
+    if st.st_uid != os.getuid():
+        raise HandshakeError(
+            f"known_hosts {path} owned by uid {st.st_uid}, expected {os.getuid()}. "
+            "Refusing to trust a file owned by another user."
+        )
+    if st.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+        raise HandshakeError(
+            f"known_hosts {path} has group/world permissions "
+            f"(mode={st.st_mode & 0o777:o}). Run: chmod 600 {path}"
+        )
+
+
 def _load_known_hosts(
     path: Path, identity: tuncore.IdentityKeyPair,
 ) -> dict[str, str]:
+    if not path.exists():
+        return {}
+
+    _check_path_permissions(path)
+
     try:
         raw = path.read_bytes()
     except OSError:

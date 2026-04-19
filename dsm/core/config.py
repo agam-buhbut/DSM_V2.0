@@ -28,6 +28,8 @@ class Config:
     transport: Literal["udp", "tcp"] = "udp"
     relay_addresses: list[str] = field(default_factory=list[str])
     dns_providers: list[str] = field(default_factory=list[str])
+    dns_provider_pins: dict[str, list[str]] = field(default_factory=dict[str, list[str]])
+    known_hosts_path: str | None = None
     tun_name: str = "mtun0"
     log_level: Literal["debug", "info", "warning", "error"] = "warning"
     padding_min: int = 128
@@ -74,6 +76,36 @@ def _validate(c: Config) -> None:
     # dns providers
     if c.mode == "server" and not c.dns_providers:
         raise ValueError("server mode requires at least one dns_providers entry")
+
+    # dns provider pins: any user-supplied provider must have SPKI pins configured
+    for provider in c.dns_providers:
+        pins = c.dns_provider_pins.get(provider)
+        if not pins:
+            raise ValueError(
+                f"dns_provider {provider!r} requires dns_provider_pins entry with "
+                f"at least one SPKI SHA-256 hash"
+            )
+        for pin in pins:
+            if not isinstance(pin, str) or len(pin) != 64:
+                raise ValueError(
+                    f"dns_provider_pins[{provider!r}] entry {pin!r} must be a "
+                    f"64-char hex SPKI SHA-256 hash"
+                )
+            try:
+                bytes.fromhex(pin)
+            except ValueError as e:
+                raise ValueError(
+                    f"dns_provider_pins[{provider!r}] entry {pin!r} is not valid hex"
+                ) from e
+
+    # known_hosts_path (client only; optional — falls back to built-in default)
+    if c.known_hosts_path is not None:
+        if not c.known_hosts_path:
+            raise ValueError("known_hosts_path must not be empty")
+        if not Path(c.known_hosts_path).is_absolute():
+            raise ValueError(
+                f"known_hosts_path must be absolute, got {c.known_hosts_path!r}"
+            )
 
     # padding
     if not (MIN_PADDING <= c.padding_min <= c.padding_max <= MAX_PADDING):

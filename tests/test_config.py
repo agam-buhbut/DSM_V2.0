@@ -26,8 +26,40 @@ class TestConfigValidation(unittest.TestCase):
         self.assertEqual(c.mode, "client")
 
     def test_valid_server(self) -> None:
-        c = Config(**_base(mode="server", dns_providers=["8.8.8.8"]))
+        c = Config(**_base(
+            mode="server",
+            dns_providers=["8.8.8.8"],
+            dns_provider_pins={"8.8.8.8": ["a" * 64]},
+        ))
         self.assertEqual(c.mode, "server")
+
+    def test_server_requires_pin_for_each_provider(self) -> None:
+        with self.assertRaises(ValueError):
+            Config(**_base(mode="server", dns_providers=["8.8.8.8"]))
+
+    def test_pin_must_be_hex(self) -> None:
+        with self.assertRaises(ValueError):
+            Config(**_base(
+                mode="server",
+                dns_providers=["8.8.8.8"],
+                dns_provider_pins={"8.8.8.8": ["nothex" * 10 + "abcd"]},
+            ))
+
+    def test_pin_must_be_64_chars(self) -> None:
+        with self.assertRaises(ValueError):
+            Config(**_base(
+                mode="server",
+                dns_providers=["8.8.8.8"],
+                dns_provider_pins={"8.8.8.8": ["deadbeef"]},
+            ))
+
+    def test_known_hosts_path_must_be_absolute(self) -> None:
+        with self.assertRaises(ValueError):
+            Config(**_base(known_hosts_path="relative/path"))
+
+    def test_known_hosts_path_optional(self) -> None:
+        c = Config(**_base(known_hosts_path="/opt/mtun/kh.json"))
+        self.assertEqual(c.known_hosts_path, "/opt/mtun/kh.json")
 
     def test_invalid_mode(self) -> None:
         with self.assertRaises(ValueError):

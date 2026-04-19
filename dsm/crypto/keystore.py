@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import logging
 import os
 import sys
@@ -57,8 +58,7 @@ def _read_passphrase_into_bytearray(prompt: str) -> bytearray:
     except BaseException:
         # Wipe anything we collected before re-raising so a partial read
         # doesn't leave a plaintext fragment behind.
-        for i in range(len(buf)):
-            buf[i] = 0
+        _wipe(buf)
         raise
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
@@ -69,9 +69,16 @@ def _read_passphrase_into_bytearray(prompt: str) -> bytearray:
 
 
 def _wipe(buf: bytearray) -> None:
-    """Zero a bytearray in place."""
-    for i in range(len(buf)):
-        buf[i] = 0
+    """Zero a bytearray in place via a single libc memset.
+
+    Using ``ctypes.memset`` avoids the per-byte Python loop (which is
+    interpreted and interruptible mid-wipe) and sidesteps any future
+    bytecode-level optimization that might elide a trivial zero loop.
+    """
+    if not buf:
+        return
+    addr = (ctypes.c_char * len(buf)).from_buffer(buf)
+    ctypes.memset(ctypes.addressof(addr), 0, len(buf))
 
 
 class KeyStore:
@@ -130,8 +137,15 @@ class KeyStore:
         return bytes(kp.public_key)
 
     def unload(self) -> None:
-        """Zeroize and unload the identity from memory."""
-        self._identity = None
+        """Zeroize and unload the identity from memory.
+
+        Calls the Rust-side explicit zeroize before releasing the Python
+        reference so any stale reference elsewhere also sees a scrubbed
+        key, instead of relying on refcount-driven drop ordering.
+        """
+        if self._identity is not None:
+            self._identity.zeroize()
+            self._identity = None
 
     def exists(self) -> bool:
         return self._path.is_file()

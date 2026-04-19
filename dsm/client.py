@@ -11,9 +11,12 @@ from dsm.core.config import Config
 from dsm.core.fsm import SessionFSM, State
 from dsm.crypto.keystore import KeyStore
 from dsm.net.nftables import NFTablesManager
+from dsm.net.resolv_conf import ResolvConfManager
 from dsm.net.tunnel import TunDevice
 from dsm.net.transport.udp import UDPTransport
 from dsm.net.transport.tcp import TCPTransport
+
+VPN_DNS_SERVER = "10.8.0.1"  # server's TUN address; DNS proxy listens there
 from dsm.core.protocol import ReassemblyBuffer
 from dsm.session import (
     LivenessState, RekeyState, decrypt_packet, dispatch_inner, liveness_loop,
@@ -56,14 +59,18 @@ async def run_client(config: Config) -> None:
     fsm.transition(State.CONNECTING)
     fsm.transition(State.HANDSHAKING)
 
-    from dsm.crypto.handshake import client_handshake
+    from dsm.crypto.handshake import DEFAULT_KNOWN_HOSTS_PATH, client_handshake
+
+    known_hosts_path = (
+        Path(config.known_hosts_path) if config.known_hosts_path else DEFAULT_KNOWN_HOSTS_PATH
+    )
 
     try:
         session_keys, _handshake_hash = await client_handshake(
             transport,
             keystore.identity,
             server_addr,
-            known_hosts_path=Path("/opt/mtun/known_hosts.json"),
+            known_hosts_path=known_hosts_path,
         )
     except Exception as e:
         log.error("handshake failed: %s", e)
@@ -78,6 +85,13 @@ async def run_client(config: Config) -> None:
     tun.open()
     tun.configure()
     nft.apply()
+
+    # Swap /etc/resolv.conf so apps resolve via the server's tunneled DoH/DoT
+    # proxy. Must be after nft.apply() so the kill switch is already up when
+    # the new resolver becomes visible — any in-flight DNS to the old resolver
+    # is dropped, not leaked.
+    resolv = ResolvConfManager(nameserver=VPN_DNS_SERVER)
+    resolv.apply()
 
     log.info("tunnel established")
 
@@ -142,6 +156,10 @@ async def run_client(config: Config) -> None:
     finally:
         log.info("shutting down")
         await scheduler.stop()
+        # Restore resolv.conf before tearing down nftables, so the host
+        # briefly has a working resolver + no kill switch rather than
+        # a kill switch + a dangling 10.8.0.1 nameserver.
+        resolv.remove()
         nft.remove()
         tun.close()
         keystore.unload()

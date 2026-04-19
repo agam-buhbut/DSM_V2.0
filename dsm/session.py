@@ -116,12 +116,12 @@ def _decrypt_with_fallback(
     """
     try:
         return session_keys.decrypt(nonce, ciphertext, aad, seq, False), False
-    except Exception:
+    except RuntimeError:
         pass
     if session_keys.has_grace_period:
         try:
             return session_keys.decrypt(nonce, ciphertext, aad, seq, True), True
-        except Exception:
+        except RuntimeError:
             pass
     log.debug("decrypt failed, dropping packet")
     return None

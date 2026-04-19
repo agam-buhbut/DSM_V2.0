@@ -9,6 +9,8 @@ import time
 from dsm.core.config import Config
 from dsm.core.fsm import SessionFSM, State
 from dsm.crypto.keystore import KeyStore
+from dsm.net.dns import DNSResolver
+from dsm.net.dns_proxy import LocalDNSProxy
 from dsm.net.tunnel import TunDevice
 from dsm.net.transport.udp import UDPTransport
 from dsm.net.transport.tcp import TCPTransport
@@ -19,6 +21,8 @@ from dsm.session import (
 )
 from dsm.traffic.shaper import TrafficShaper, make_chaff_packet
 from dsm.traffic.scheduler import SendScheduler
+
+SERVER_TUN_IP = "10.8.0.1"
 
 log = logging.getLogger(__name__)
 
@@ -56,13 +60,19 @@ async def run_server(config: Config) -> None:
     fsm.transition(State.ESTABLISHED)
     log.info("client connected")
 
-    # TODO: integrate DNS proxying — intercept DNS queries from TUN, resolve, return answers.
-    # DNS resolver is not yet wired into the data path.
-
     # TUN device
     tun = TunDevice(config.tun_name)
     tun.open()
-    tun.configure(local_ip="10.8.0.1")
+    tun.configure(local_ip=SERVER_TUN_IP)
+
+    # DNS proxy: listen on the TUN address for DNS queries arriving from
+    # clients through the tunnel. Forwards to the pinned DoH/DoT resolver.
+    resolver = DNSResolver(
+        providers=config.dns_providers,
+        provider_pins=config.dns_provider_pins,
+    )
+    dns_proxy = LocalDNSProxy(resolver, bind_ip=SERVER_TUN_IP, bind_port=53)
+    await dns_proxy.start()
 
     shaper = TrafficShaper(config.padding_min, config.padding_max)
     replay = tuncore.ReplayWindow()
@@ -137,6 +147,8 @@ async def run_server(config: Config) -> None:
         pass
     finally:
         log.info("server shutting down")
+        dns_proxy.stop()
+        await resolver.close()
         await server_scheduler.stop()
         tun.close()
         keystore.unload()

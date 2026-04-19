@@ -6,9 +6,10 @@ pub mod replay_window;
 pub mod secure_memory;
 pub mod session_keys;
 
+use hkdf::Hkdf;
 use pyo3::prelude::*;
 use pyo3::exceptions::PyRuntimeError;
-use sha2::{Sha256, Digest};
+use sha2::Sha256;
 
 // ── PyO3 Wrappers ──
 // Raw key bytes never cross the FFI boundary for secret keys.
@@ -80,12 +81,23 @@ impl PyIdentityKeyPair {
     }
 
     /// Derive an HMAC key from the secret key without exposing raw bytes to Python.
-    fn derive_hmac_key(&self, context: &[u8]) -> Vec<u8> {
-        let mut hasher = Sha256::new();
-        hasher.update(b"dsm-known-hosts-hmac-v2-");
-        hasher.update(self.inner.secret_key());
-        hasher.update(context);
-        hasher.finalize().to_vec()
+    /// Uses HKDF-SHA256 with the domain separator as salt, the secret key as IKM,
+    /// and the caller's context as info. Output: 32 bytes.
+    fn derive_hmac_key(&self, context: &[u8]) -> PyResult<Vec<u8>> {
+        let hkdf = Hkdf::<Sha256>::new(
+            Some(b"dsm-known-hosts-hmac-v3-"),
+            self.inner.secret_key(),
+        );
+        let mut out = vec![0u8; 32];
+        hkdf.expand(context, &mut out)
+            .map_err(|e| py_err(format!("hkdf expand: {e}")))?;
+        Ok(out)
+    }
+
+    /// Zeroize the secret key in place. After this call, the keypair is unusable.
+    /// Safe to call multiple times.
+    fn zeroize(&mut self) {
+        self.inner.zeroize();
     }
 }
 

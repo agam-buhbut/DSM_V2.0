@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import os
+import secrets
 import struct
 import time
 from dataclasses import dataclass, field
@@ -162,7 +163,7 @@ def pick_random_size_class() -> int:
     if len(weights) != len(SIZE_CLASSES):
         raise ValueError("weights must match SIZE_CLASSES")
     total = sum(weights)
-    r = int.from_bytes(os.urandom(4), "big") % total
+    r = secrets.randbelow(total)
     cumulative = 0
     for sc, w in zip(SIZE_CLASSES, weights):
         cumulative += w

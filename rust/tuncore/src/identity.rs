@@ -88,6 +88,13 @@ impl IdentityKeyPair {
         self.secret.as_array()
     }
 
+    /// Overwrite the secret and public key with zeros. Safe to call multiple
+    /// times; the keypair is unusable afterwards.
+    pub fn zeroize(&mut self) {
+        self.secret.as_mut().fill(0);
+        self.public.fill(0);
+    }
+
     /// Encrypt the keypair to a blob using a passphrase (Argon2id + XChaCha20-Poly1305).
     /// Format: salt(32) || nonce(24) || ciphertext+tag
     pub fn encrypt_to_store(&self, passphrase: &[u8]) -> Result<Vec<u8>, String> {
@@ -210,6 +217,19 @@ mod tests {
     #[test]
     fn test_truncated_blob_rejected() {
         assert!(IdentityKeyPair::decrypt_from_store(&[0u8; 10], b"pass").is_err());
+    }
+
+    #[test]
+    fn test_zeroize_clears_secret_and_public() {
+        let mut kp = IdentityKeyPair::generate().unwrap();
+        assert_ne!(kp.secret_key(), &[0u8; 32]);
+        assert_ne!(kp.public_key(), &[0u8; 32]);
+        kp.zeroize();
+        assert_eq!(kp.secret_key(), &[0u8; 32]);
+        assert_eq!(kp.public_key(), &[0u8; 32]);
+        // Idempotent
+        kp.zeroize();
+        assert_eq!(kp.secret_key(), &[0u8; 32]);
     }
 
     #[test]
