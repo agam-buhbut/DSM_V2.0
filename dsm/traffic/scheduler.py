@@ -14,7 +14,15 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Awaitable
 
+from dsm.core.rand import csprng_float
+
 log = logging.getLogger(__name__)
+
+# Bounded queue. Sized for low-RAM targets: 512 * ~1500B ≈ 768 KiB
+# worst-case. Drop policy is drop-oldest regardless of packet type,
+# which preserves anonymity (real/chaff indistinguishable on the wire,
+# so drop-oldest does not reveal traffic shape).
+MAX_QUEUE_SIZE = 512
 
 
 @dataclass(order=True)
@@ -48,7 +56,7 @@ class SendScheduler:
         self._jitter_min = jitter_ms_min / 1000.0
         self._jitter_max = jitter_ms_max / 1000.0
         self._queue: list[_ScheduledPacket] = []
-        self._max_queue_size = 2048
+        self._max_queue_size = MAX_QUEUE_SIZE
         self._running = False
         self._task: asyncio.Task[None] | None = None
         self._event = asyncio.Event()
@@ -58,7 +66,6 @@ class SendScheduler:
         if len(self._queue) >= self._max_queue_size:
             heapq.heappop(self._queue)  # drop oldest
             log.warning("scheduler queue full, dropping oldest packet")
-        from dsm.core.rand import csprng_float
         jitter = self._jitter_min + csprng_float() * (self._jitter_max - self._jitter_min)
         send_time = time.monotonic() + jitter
         heapq.heappush(self._queue, _ScheduledPacket(send_time, data, target_size))
@@ -107,7 +114,6 @@ class SendScheduler:
 
             # Sleep until next packet or a jittered poll interval.
             # Jitter prevents a fixed 50ms cadence from fingerprinting the scheduler.
-            from dsm.core.rand import csprng_float
             poll_jitter = 0.03 + csprng_float() * 0.04  # 30-70ms
             if self._queue:
                 wait_time = max(0, self._queue[0].send_time - time.monotonic())

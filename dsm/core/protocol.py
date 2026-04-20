@@ -32,6 +32,13 @@ MAX_INNER_PAYLOAD = 1500
 # Packet size classes for padding (bytes) — more classes reduce fingerprinting
 SIZE_CLASSES = (128, 256, 384, 512, 640, 768, 896, 1024, 1152, 1280, 1400)
 
+# Module-level Struct instances — avoid per-packet format-string parsing on
+# the hot path. `pack_into` writes into a caller-owned buffer, saving an
+# intermediate bytes allocation per serialize.
+INNER_STRUCT = struct.Struct("!BBH")
+SEQ_STRUCT = struct.Struct("!Q")
+FRAG_STRUCT = struct.Struct("!HBB")
+
 
 class PacketType(IntEnum):
     DATA = 0x00
@@ -58,15 +65,17 @@ class InnerPacket:
         inner_len = len(self.payload)
         if inner_len > MAX_INNER_PAYLOAD:
             raise ValueError(f"payload too large: {inner_len} > {MAX_INNER_PAYLOAD}")
-        header = struct.pack("!BBH", self.ptype, flags, inner_len)
-        return header + self.payload
+        buf = bytearray(INNER_HEADER_SIZE + inner_len)
+        INNER_STRUCT.pack_into(buf, 0, self.ptype, flags, inner_len)
+        buf[INNER_HEADER_SIZE:] = self.payload
+        return bytes(buf)
 
     @classmethod
     def deserialize(cls, data: bytes) -> InnerPacket:
         """Deserialize from inner plaintext."""
         if len(data) < INNER_HEADER_SIZE:
             raise ValueError("inner packet too short")
-        ptype_raw, flags, inner_len = struct.unpack("!BBH", data[:INNER_HEADER_SIZE])
+        ptype_raw, flags, inner_len = INNER_STRUCT.unpack_from(data)
         try:
             ptype = PacketType(ptype_raw)
         except ValueError:
@@ -106,14 +115,17 @@ class OuterPacket:
         any mismatch means inner-padding sizing is wrong and is reported as
         a programming error rather than silently papered over.
         """
-        header = struct.pack("!Q", self.seq) + self.nonce
-        wire_size = len(header) + len(self.ciphertext)
+        wire_size = OUTER_HEADER_SIZE + len(self.ciphertext)
 
         if target_size is not None and target_size != wire_size:
             raise ValueError(
                 f"ciphertext sizing mismatch: wire={wire_size}, target={target_size}"
             )
-        return header + self.ciphertext
+        buf = bytearray(wire_size)
+        SEQ_STRUCT.pack_into(buf, 0, self.seq)
+        buf[8:OUTER_HEADER_SIZE] = self.nonce
+        buf[OUTER_HEADER_SIZE:] = self.ciphertext
+        return bytes(buf)
 
     @classmethod
     def deserialize(cls, data: bytes, ciphertext_len: int) -> OuterPacket:
@@ -128,7 +140,7 @@ class OuterPacket:
         """
         if len(data) < OUTER_HEADER_SIZE:
             raise ValueError("outer packet too short")
-        seq = struct.unpack("!Q", data[:8])[0]
+        seq = SEQ_STRUCT.unpack_from(data)[0]
         nonce = data[8:20]
         ct_end = OUTER_HEADER_SIZE + ciphertext_len
         if ct_end > len(data):
@@ -144,7 +156,7 @@ class OuterPacket:
         in AAD would be redundant.  This matches the actual AAD
         construction in session.py encrypt/decrypt paths.
         """
-        return struct.pack("!Q", self.seq)
+        return SEQ_STRUCT.pack(self.seq)
 
 
 def pick_random_size_class() -> int:
@@ -178,13 +190,16 @@ class Fragment:
     data: bytes
 
     def serialize(self) -> bytes:
-        return struct.pack("!HBB", self.fragment_id, self.index, self.total) + self.data
+        buf = bytearray(FRAGMENT_HEADER_SIZE + len(self.data))
+        FRAG_STRUCT.pack_into(buf, 0, self.fragment_id, self.index, self.total)
+        buf[FRAGMENT_HEADER_SIZE:] = self.data
+        return bytes(buf)
 
     @classmethod
     def deserialize(cls, payload: bytes) -> Fragment:
         if len(payload) < FRAGMENT_HEADER_SIZE:
             raise ValueError("fragment too short")
-        fid, idx, total = struct.unpack("!HBB", payload[:FRAGMENT_HEADER_SIZE])
+        fid, idx, total = FRAG_STRUCT.unpack_from(payload)
         if total == 0 or total > MAX_FRAGMENTS:
             raise ValueError(f"invalid total fragments: {total}")
         if idx >= total:

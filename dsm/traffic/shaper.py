@@ -18,6 +18,8 @@ from collections import deque
 from dsm.core.protocol import (
     INNER_HEADER_SIZE,
     GCM_TAG_SIZE,
+    INNER_STRUCT,
+    MAX_INNER_PAYLOAD,
     OUTER_HEADER_SIZE,
     SIZE_CLASSES,
     InnerPacket,
@@ -55,13 +57,18 @@ class SizeTracker:
     def observe(self, size_class: int) -> None:
         """Update the distribution based on an observed real packet size class."""
         idx = self.class_index(size_class)
-        self._weights = [
-            (1 - EMA_ALPHA) * w + (EMA_ALPHA if i == idx else 0.0)
-            for i, w in enumerate(self._weights)
-        ]
-        total = sum(self._weights)
+        # In-place EMA: avoids building two intermediate lists per observation.
+        w = self._weights
+        decay = 1 - EMA_ALPHA
+        total = 0.0
+        for i in range(len(w)):
+            updated = decay * w[i] + (EMA_ALPHA if i == idx else 0.0)
+            w[i] = updated
+            total += updated
         if total > 0:
-            self._weights = [w / total for w in self._weights]
+            inv = 1.0 / total
+            for i in range(len(w)):
+                w[i] *= inv
 
     def sample(self) -> int:
         """Sample a size class from the current distribution."""
@@ -113,15 +120,19 @@ class TrafficShaper:
         """Serialize and pad an inner packet to a size class.
 
         Returns (inner_plaintext_with_padding, target_outer_size).
-        """
-        serialized = inner.serialize()
-        # Choose size class
-        target_outer = self._size_tracker.sample()
 
-        # Ensure target can fit the data
-        # outer = OUTER_HEADER + ciphertext + outer_padding
-        # ciphertext = inner_plaintext + GCM_TAG
-        min_outer = OUTER_HEADER_SIZE + len(serialized) + GCM_TAG_SIZE
+        Builds the header + payload + random padding into a single
+        pre-sized bytearray to avoid the intermediate `serialized` copy
+        and the concat's temporary buffer. Padding entropy is still a
+        fresh `os.urandom` read — security-equivalent to prior behavior.
+        """
+        payload_len = len(inner.payload)
+        if payload_len > MAX_INNER_PAYLOAD:
+            raise ValueError(f"payload too large: {payload_len} > {MAX_INNER_PAYLOAD}")
+        serialized_len = INNER_HEADER_SIZE + payload_len
+
+        target_outer = self._size_tracker.sample()
+        min_outer = OUTER_HEADER_SIZE + serialized_len + GCM_TAG_SIZE
         while target_outer < min_outer:
             idx = self._size_tracker.class_index(target_outer)
             if idx + 1 < len(self._active_classes):
@@ -130,14 +141,16 @@ class TrafficShaper:
                 target_outer = min_outer
                 break
 
-        # Add inner padding to fill the encrypted envelope
-        # target ciphertext size = target_outer - OUTER_HEADER_SIZE - (outer padding will be added later)
-        # Inner padding fills: target_ciphertext - GCM_TAG - len(serialized)
         target_ct = target_outer - OUTER_HEADER_SIZE
-        inner_pad_len = max(0, target_ct - GCM_TAG_SIZE - len(serialized))
-        padded = serialized + os.urandom(inner_pad_len)
+        inner_pad_len = max(0, target_ct - GCM_TAG_SIZE - serialized_len)
 
-        return padded, target_outer
+        buf = bytearray(serialized_len + inner_pad_len)
+        flags = (inner.epoch_id & 0x03) << 6
+        INNER_STRUCT.pack_into(buf, 0, inner.ptype, flags, payload_len)
+        buf[INNER_HEADER_SIZE:INNER_HEADER_SIZE + payload_len] = inner.payload
+        if inner_pad_len > 0:
+            buf[INNER_HEADER_SIZE + payload_len:] = os.urandom(inner_pad_len)
+        return bytes(buf), target_outer
 
     def observe_real_packet(self, size_class: int) -> None:
         """Track a real outgoing packet for adaptive chaff."""

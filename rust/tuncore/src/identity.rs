@@ -4,10 +4,15 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit, Payload},
     XChaCha20Poly1305, XNonce,
 };
+use hkdf::Hkdf;
+use hmac::{Hmac, Mac as _};
 use rand::rngs::OsRng;
 use rand::RngCore;
+use sha2::Sha256;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroizing;
+
+type HmacSha256 = Hmac<Sha256>;
 
 const ARGON2_SALT_LEN: usize = 32;
 const ARGON2_MEM_COST_KIB: u32 = 524_288; // 512 MiB
@@ -88,11 +93,33 @@ impl IdentityKeyPair {
         self.secret.as_array()
     }
 
-    /// Overwrite the secret and public key with zeros. Safe to call multiple
-    /// times; the keypair is unusable afterwards.
+    /// Overwrite the secret key with zeros. Safe to call multiple times;
+    /// the keypair is unusable afterwards. The public key is not sensitive
+    /// (derivable from secret only, never secret itself) so it is left intact.
     pub fn zeroize(&mut self) {
         self.secret.as_mut().fill(0);
-        self.public.fill(0);
+    }
+
+    /// Compute HMAC-SHA256 over `data` using a key derived from this
+    /// identity's secret via HKDF-SHA256 (info = `context`). The derived key
+    /// is scoped to this call, zeroized on drop, and never leaves Rust —
+    /// callers receive only the 32-byte tag.
+    pub fn compute_hmac(&self, context: &[u8], data: &[u8]) -> Result<[u8; 32], String> {
+        let hkdf = Hkdf::<Sha256>::new(
+            Some(b"dsm-known-hosts-hmac-v3-"),
+            self.secret.as_array(),
+        );
+        let mut key = Zeroizing::new([0u8; 32]);
+        hkdf.expand(context, key.as_mut())
+            .map_err(|e| format!("hkdf expand: {e}"))?;
+
+        let mut mac = <HmacSha256 as hmac::Mac>::new_from_slice(&*key)
+            .map_err(|e| format!("hmac init: {e}"))?;
+        hmac::Mac::update(&mut mac, data);
+        let tag = mac.finalize().into_bytes();
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&tag);
+        Ok(out)
     }
 
     /// Encrypt the keypair to a blob using a passphrase (Argon2id + XChaCha20-Poly1305).
@@ -220,16 +247,25 @@ mod tests {
     }
 
     #[test]
-    fn test_zeroize_clears_secret_and_public() {
+    fn test_zeroize_clears_secret() {
         let mut kp = IdentityKeyPair::generate().unwrap();
         assert_ne!(kp.secret_key(), &[0u8; 32]);
-        assert_ne!(kp.public_key(), &[0u8; 32]);
         kp.zeroize();
         assert_eq!(kp.secret_key(), &[0u8; 32]);
-        assert_eq!(kp.public_key(), &[0u8; 32]);
+        // Public key is not sensitive and is left intact
         // Idempotent
         kp.zeroize();
         assert_eq!(kp.secret_key(), &[0u8; 32]);
+    }
+
+    #[test]
+    fn test_compute_hmac_deterministic_and_context_bound() {
+        let kp = IdentityKeyPair::generate().unwrap();
+        let tag1 = kp.compute_hmac(b"ctx-a", b"hello").unwrap();
+        let tag2 = kp.compute_hmac(b"ctx-a", b"hello").unwrap();
+        let tag3 = kp.compute_hmac(b"ctx-b", b"hello").unwrap();
+        assert_eq!(tag1, tag2);
+        assert_ne!(tag1, tag3);
     }
 
     #[test]

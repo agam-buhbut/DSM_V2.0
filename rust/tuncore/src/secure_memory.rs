@@ -104,8 +104,17 @@ impl LockedKey32 {
     }
 
     /// Move an existing 32-byte array into a mlock'd heap location.
-    /// Incurs a transient stack copy of `src` before it reaches the heap;
-    /// prefer `zeroed()` + direct writes whenever the key originates here.
+    ///
+    /// **Caller contract (audit M4):** `src` is copied by value, which leaves
+    /// a transient stack copy at the caller's frame that this function cannot
+    /// zeroize. Callers MUST either:
+    ///   (a) pass a `[u8; 32]` materialized only for this call and let it go
+    ///       out of scope immediately afterwards, OR
+    ///   (b) pass `*zeroizing.deref()` where `zeroizing: Zeroizing<[u8; 32]>`
+    ///       so the owned copy is scrubbed on drop.
+    ///
+    /// Prefer `LockedKey32::zeroed()` + direct writes for key-generation paths
+    /// so no transient stack copy of the key ever exists.
     pub fn from_array(src: [u8; 32]) -> Result<Self, String> {
         let bytes = Box::new(Zeroizing::new(src));
         mlock_slice(&**bytes)?;

@@ -1,7 +1,7 @@
 use rand::rngs::OsRng;
 use rand::RngCore;
-use sha2::{Sha256, Digest};
 use snow::{Builder, HandshakeState, TransportState};
+use subtle::ConstantTimeEq;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroizing;
 
@@ -15,19 +15,18 @@ const NOISE_PATTERN: &str = "Noise_XX_25519_AESGCM_SHA256";
 /// Maximum handshake message size (padded to hide message lengths).
 pub const HANDSHAKE_PAD_SIZE: usize = 1400;
 
-/// 2-byte length prefix for handshake framing (XOR-obfuscated).
-const LEN_PREFIX: usize = 2;
+/// Exact Snow payload sizes for Noise_XX_25519_AESGCM_SHA256 with empty payloads.
+/// These are protocol-constant — binding them out of band eliminates the
+/// previously-unauthenticated length prefix (audit finding H1).
+///   msg1 = e(32)
+///   msg2 = e(32) + ENC(s)(48) + ENC(empty)(16) = 96
+///   msg3 = ENC(s)(48) + ENC(empty)(16) = 64
+const MSG1_SNOW_LEN: usize = 32;
+const MSG2_SNOW_LEN: usize = 96;
+const MSG3_SNOW_LEN: usize = 64;
 
 /// Size of the X25519 ephemeral public key in Noise XX msg1.
 const EPHEMERAL_SIZE: usize = 32;
-
-/// Derive a 2-byte XOR mask from the ephemeral public key in msg1.
-/// The ephemeral is random per session, so the mask varies per session.
-/// Both sides can compute this from the wire data — no extra bytes on wire.
-fn derive_mask(ephemeral: &[u8]) -> [u8; 2] {
-    let hash = Sha256::digest(ephemeral);
-    [hash[0], hash[1]]
-}
 
 /// Reject an ephemeral X25519 public key that lies in a small subgroup.
 ///
@@ -41,6 +40,10 @@ fn derive_mask(ephemeral: &[u8]) -> [u8; 2] {
 /// Snow (the Noise implementation) does not perform this check, and
 /// accepting a low-order ephemeral would cause `ee` to produce a
 /// known / zero shared secret, destroying the secrecy of the session.
+///
+/// The probe DH is run unconditionally and the contributory result is
+/// evaluated in constant time (via `subtle::ConstantTimeEq`) so that
+/// the accept/reject decision does not leak through branch timing.
 fn validate_ephemeral_not_low_order(pub_bytes: &[u8]) -> Result<(), String> {
     if pub_bytes.len() != EPHEMERAL_SIZE {
         return Err("ephemeral public key wrong length".into());
@@ -53,52 +56,49 @@ fn validate_ephemeral_not_low_order(pub_bytes: &[u8]) -> Result<(), String> {
     let probe_secret = StaticSecret::from(probe);
     let public = PublicKey::from(pk_arr);
     let shared = probe_secret.diffie_hellman(&public);
-    if !shared.was_contributory() {
+
+    // Constant-time comparison of the full shared secret against the
+    // all-zero point. `was_contributory()` internally checks this, but we
+    // re-implement via `subtle` to make the comparison observably uniform
+    // regardless of where the first differing byte lies.
+    let zero = [0u8; 32];
+    let is_zero: u8 = shared.as_bytes().ct_eq(&zero).unwrap_u8();
+    // is_zero == 1 → non-contributory → reject
+    if is_zero == 1 {
         return Err("rejected low-order ephemeral public key".into());
     }
     Ok(())
 }
 
-/// Pack a handshake message: [len_be16^mask || snow_data || random_padding]
-/// Total output is always HANDSHAKE_PAD_SIZE bytes.
-fn pack_handshake(snow_data: &[u8], data_len: usize, mask: &[u8; 2]) -> Vec<u8> {
-    use rand::rngs::OsRng;
-    use rand::RngCore;
+/// Pack a handshake message: [snow_data || random_padding].
+/// Snow data is always placed at offset 0 with a protocol-constant length;
+/// the remainder is uniform random padding. No length field on the wire.
+fn pack_handshake(snow_data: &[u8], expected_len: usize) -> Result<Vec<u8>, String> {
+    if snow_data.len() < expected_len {
+        return Err("snow produced shorter payload than expected".into());
+    }
     let mut out = vec![0u8; HANDSHAKE_PAD_SIZE];
-    let len_u16 = data_len as u16;
-    let len_bytes = len_u16.to_be_bytes();
-    out[0] = len_bytes[0] ^ mask[0];
-    out[1] = len_bytes[1] ^ mask[1];
-    out[LEN_PREFIX..LEN_PREFIX + data_len].copy_from_slice(&snow_data[..data_len]);
-    // Fill remainder with random padding
-    OsRng.fill_bytes(&mut out[LEN_PREFIX + data_len..]);
-    out
+    out[..expected_len].copy_from_slice(&snow_data[..expected_len]);
+    OsRng.fill_bytes(&mut out[expected_len..]);
+    Ok(out)
 }
 
-/// Unpack a handshake message: extract snow data from [len_be16^mask || data || padding].
-fn unpack_handshake<'a>(buf: &'a [u8], mask: &[u8; 2]) -> Result<&'a [u8], String> {
-    if buf.len() < LEN_PREFIX {
+/// Unpack a handshake message: extract the protocol-constant prefix.
+fn unpack_handshake<'a>(buf: &'a [u8], expected_len: usize) -> Result<&'a [u8], String> {
+    if buf.len() < expected_len {
         return Err("invalid handshake message".into());
     }
-    let data_len = u16::from_be_bytes([buf[0] ^ mask[0], buf[1] ^ mask[1]]) as usize;
-    if LEN_PREFIX + data_len > buf.len() {
-        return Err("invalid handshake message".into());
-    }
-    Ok(&buf[LEN_PREFIX..LEN_PREFIX + data_len])
+    Ok(&buf[..expected_len])
 }
 
 /// Initiator (client) side of the Noise XX handshake.
 pub struct NoiseInitiator {
     state: HandshakeState,
-    /// Per-session mask derived from the ephemeral key in msg1.
-    mask: Option<[u8; 2]>,
 }
 
 /// Responder (server) side of the Noise XX handshake.
 pub struct NoiseResponder {
     state: HandshakeState,
-    /// Per-session mask derived from the ephemeral key in msg1.
-    mask: Option<[u8; 2]>,
 }
 
 /// Completed handshake result: a transport-mode cipher pair.
@@ -115,7 +115,7 @@ impl NoiseInitiator {
             .build_initiator()
             .map_err(|e| format!("build initiator: {e}"))?;
 
-        Ok(Self { state, mask: None })
+        Ok(Self { state })
     }
 
     /// Get the handshake hash. Must be called after handshake completes,
@@ -125,37 +125,26 @@ impl NoiseInitiator {
     }
 
     /// Message 1: -> e
-    /// Returns 1400 bytes. No mask on wire — mask is derived from the ephemeral
-    /// public key embedded in the Snow payload.
     pub fn write_message_1(&mut self) -> Result<Vec<u8>, String> {
         let mut buf = Zeroizing::new(vec![0u8; HANDSHAKE_PAD_SIZE]);
         let len = self
             .state
             .write_message(&[], &mut buf)
             .map_err(|e| format!("write msg1: {e}"))?;
-
-        // Derive mask from the ephemeral key (first 32 bytes of snow output)
-        if len < EPHEMERAL_SIZE {
-            return Err("msg1 snow data too short for ephemeral".into());
+        if len != MSG1_SNOW_LEN {
+            return Err(format!("msg1 length mismatch: got {len}, expected {MSG1_SNOW_LEN}"));
         }
-        let mask = derive_mask(&buf[..EPHEMERAL_SIZE]);
-        self.mask = Some(mask);
-
-        Ok(pack_handshake(&buf, len, &mask))
+        pack_handshake(&buf, MSG1_SNOW_LEN)
     }
 
     /// Message 2: <- e, ee, s, es
     /// Returns the server's static public key.
     pub fn read_message_2(&mut self, msg: &[u8]) -> Result<Vec<u8>, String> {
-        let mask = self.mask.ok_or("mask not set — call write_message_1 first")?;
-        let snow_data = unpack_handshake(msg, &mask)?;
+        let snow_data = unpack_handshake(msg, MSG2_SNOW_LEN)?;
 
         // Noise XX msg2 starts with the responder's ephemeral public key (32
-        // bytes), followed by encrypted static and tags. Reject low-order
-        // points before `ee` mixes them into the handshake state.
-        if snow_data.len() < EPHEMERAL_SIZE {
-            return Err("msg2 too short for ephemeral".into());
-        }
+        // bytes). Reject low-order points before `ee` mixes them into the
+        // handshake state.
         validate_ephemeral_not_low_order(&snow_data[..EPHEMERAL_SIZE])?;
 
         let mut payload = vec![0u8; HANDSHAKE_PAD_SIZE];
@@ -174,15 +163,16 @@ impl NoiseInitiator {
     }
 
     /// Message 3: -> s, se
-    /// Returns a fixed-size padded message (1400 bytes).
     pub fn write_message_3(&mut self) -> Result<Vec<u8>, String> {
-        let mask = self.mask.ok_or("mask not set — call write_message_1 first")?;
         let mut buf = Zeroizing::new(vec![0u8; HANDSHAKE_PAD_SIZE]);
         let len = self
             .state
             .write_message(&[], &mut buf)
             .map_err(|e| format!("write msg3: {e}"))?;
-        Ok(pack_handshake(&buf, len, &mask))
+        if len != MSG3_SNOW_LEN {
+            return Err(format!("msg3 length mismatch: got {len}, expected {MSG3_SNOW_LEN}"));
+        }
+        pack_handshake(&buf, MSG3_SNOW_LEN)
     }
 
     /// Transition to transport mode after handshake completion.
@@ -208,7 +198,7 @@ impl NoiseResponder {
             .build_responder()
             .map_err(|e| format!("build responder: {e}"))?;
 
-        Ok(Self { state, mask: None })
+        Ok(Self { state })
     }
 
     /// Get the handshake hash. Must be called after handshake completes,
@@ -218,25 +208,14 @@ impl NoiseResponder {
     }
 
     /// Message 1: -> e
-    /// Input is 1400 bytes. Derives mask from the ephemeral key at fixed offset.
-    /// In Noise XX msg1, the ephemeral public key is the first 32 bytes of Snow data,
-    /// located at buf[LEN_PREFIX..LEN_PREFIX+32].
+    /// The ephemeral public key occupies the first 32 bytes of the message.
     pub fn read_message_1(&mut self, msg: &[u8]) -> Result<(), String> {
-        if msg.len() < LEN_PREFIX + EPHEMERAL_SIZE {
-            return Err("message 1 too short for ephemeral".into());
-        }
+        let snow_data = unpack_handshake(msg, MSG1_SNOW_LEN)?;
+        let ephemeral = &snow_data[..EPHEMERAL_SIZE];
 
-        // The ephemeral key is at a fixed offset (after the 2-byte length prefix)
-        let ephemeral = &msg[LEN_PREFIX..LEN_PREFIX + EPHEMERAL_SIZE];
-
-        // Reject a small-subgroup ephemeral before the snow state mixes it
-        // via `ee`. See `validate_ephemeral_not_low_order` for rationale.
+        // Reject a small-subgroup ephemeral before snow mixes it via `ee`.
         validate_ephemeral_not_low_order(ephemeral)?;
 
-        let mask = derive_mask(ephemeral);
-        self.mask = Some(mask);
-
-        let snow_data = unpack_handshake(msg, &mask)?;
         let mut payload = vec![0u8; HANDSHAKE_PAD_SIZE];
         self.state
             .read_message(snow_data, &mut payload)
@@ -245,22 +224,22 @@ impl NoiseResponder {
     }
 
     /// Message 2: <- e, ee, s, es
-    /// Returns a fixed-size padded message (1400 bytes).
     pub fn write_message_2(&mut self) -> Result<Vec<u8>, String> {
-        let mask = self.mask.ok_or("mask not set — call read_message_1 first")?;
         let mut buf = Zeroizing::new(vec![0u8; HANDSHAKE_PAD_SIZE]);
         let len = self
             .state
             .write_message(&[], &mut buf)
             .map_err(|e| format!("write msg2: {e}"))?;
-        Ok(pack_handshake(&buf, len, &mask))
+        if len != MSG2_SNOW_LEN {
+            return Err(format!("msg2 length mismatch: got {len}, expected {MSG2_SNOW_LEN}"));
+        }
+        pack_handshake(&buf, MSG2_SNOW_LEN)
     }
 
     /// Message 3: -> s, se
     /// Returns the initiator's static public key.
     pub fn read_message_3(&mut self, msg: &[u8]) -> Result<Vec<u8>, String> {
-        let mask = self.mask.ok_or("mask not set — call read_message_1 first")?;
-        let snow_data = unpack_handshake(msg, &mask)?;
+        let snow_data = unpack_handshake(msg, MSG3_SNOW_LEN)?;
         let mut payload = vec![0u8; HANDSHAKE_PAD_SIZE];
         let _len = self
             .state
@@ -323,7 +302,7 @@ mod tests {
 
     fn gen_keypair() -> [u8; 32] {
         let mut key = [0u8; 32];
-        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut key);
+        OsRng.fill_bytes(&mut key);
         key
     }
 
@@ -354,12 +333,10 @@ mod tests {
         let mut initiator = NoiseInitiator::new(&client_secret).unwrap();
         let mut responder = NoiseResponder::new(&server_secret).unwrap();
 
-        // Message 1: -> e (1400 bytes, no mask prefix on wire)
         let msg1 = initiator.write_message_1().unwrap();
         assert_eq!(msg1.len(), HANDSHAKE_PAD_SIZE);
         responder.read_message_1(&msg1).unwrap();
 
-        // Message 2: <- e, ee, s, es (1400 bytes)
         let msg2 = responder.write_message_2().unwrap();
         assert_eq!(msg2.len(), HANDSHAKE_PAD_SIZE);
         let server_static = initiator.read_message_2(&msg2).unwrap();
@@ -367,7 +344,6 @@ mod tests {
         let expected_server_pub = PublicKey::from(&StaticSecret::from(server_secret));
         assert_eq!(server_static, expected_server_pub.as_bytes());
 
-        // Message 3: -> s, se (1400 bytes)
         let msg3 = initiator.write_message_3().unwrap();
         assert_eq!(msg3.len(), HANDSHAKE_PAD_SIZE);
         let client_static = responder.read_message_3(&msg3).unwrap();
@@ -381,7 +357,6 @@ mod tests {
         let mut client_transport = initiator.into_transport().unwrap();
         let mut server_transport = responder.into_transport().unwrap();
 
-        // Bidirectional transport
         let ct = client_transport.encrypt(b"hello server").unwrap();
         let pt = server_transport.decrypt(&ct).unwrap();
         assert_eq!(pt, b"hello server");
@@ -408,16 +383,6 @@ mod tests {
         initiator.read_message_2(&msg2).unwrap();
         let msg3 = initiator.write_message_3().unwrap();
         assert_eq!(msg3.len(), HANDSHAKE_PAD_SIZE);
-    }
-
-    #[test]
-    fn test_mask_derived_from_ephemeral() {
-        // Verify that the mask is set after write_message_1
-        let k1 = gen_keypair();
-        let mut initiator = NoiseInitiator::new(&k1).unwrap();
-        assert!(initiator.mask.is_none());
-        initiator.write_message_1().unwrap();
-        assert!(initiator.mask.is_some());
     }
 
     #[test]
@@ -455,19 +420,34 @@ mod tests {
 
     #[test]
     fn test_handshake_rejects_low_order_ephemeral_in_msg1() {
-        // The all-zeros X25519 public key is one of the canonical small-order
-        // points; a clamped-scalar DH with it produces a non-contributory
-        // shared secret, so the responder must refuse to process the message.
         let server_secret = gen_keypair();
         let mut responder = NoiseResponder::new(&server_secret).unwrap();
 
-        // Fake msg1: zero length prefix + zero ephemeral + zero padding.
+        // Fake msg1: zero ephemeral + zero padding (all-zeros is a low-order point).
         let msg = vec![0u8; HANDSHAKE_PAD_SIZE];
         let err = responder.read_message_1(&msg).unwrap_err();
         assert!(
             err.contains("low-order"),
             "expected low-order rejection, got: {err}"
         );
+    }
+
+    #[test]
+    fn test_handshake_tampered_msg2_fails() {
+        // msg2 is AEAD-authenticated (ee, s, es) — tampering any byte in
+        // the fixed snow-payload prefix must cause the initiator to fail.
+        let client_secret = gen_keypair();
+        let server_secret = gen_keypair();
+
+        let mut initiator = NoiseInitiator::new(&client_secret).unwrap();
+        let mut responder = NoiseResponder::new(&server_secret).unwrap();
+
+        let msg1 = initiator.write_message_1().unwrap();
+        responder.read_message_1(&msg1).unwrap();
+        let mut msg2 = responder.write_message_2().unwrap();
+        // Flip a byte inside the encrypted static block (past the ephemeral)
+        msg2[40] ^= 0xFF;
+        assert!(initiator.read_message_2(&msg2).is_err());
     }
 
     #[test]
@@ -479,18 +459,17 @@ mod tests {
 
         let (initiator, responder) = do_handshake(&k1, &k2);
 
-        // Both sides derive session keys from the same handshake hash
         let client_hash = initiator.get_handshake_hash();
         let server_hash = responder.get_handshake_hash();
         assert_eq!(client_hash, server_hash);
 
         let mut client_keys =
-            SessionKeyManager::from_handshake_hash(&client_hash, true, 1).unwrap();
+            SessionKeyManager::from_handshake_hash(&client_hash, true).unwrap();
         let mut server_keys =
-            SessionKeyManager::from_handshake_hash(&server_hash, false, 1).unwrap();
+            SessionKeyManager::from_handshake_hash(&server_hash, false).unwrap();
 
-        // Bidirectional communication works
         let aad = b"e2e";
+        let initial_epoch = client_keys.epoch();
         let (nonce, ct, _) = client_keys.encrypt(b"client msg", aad).unwrap();
         let pt = server_keys.decrypt(&nonce, &ct, aad, 1, false).unwrap();
         assert_eq!(pt, b"client msg");
@@ -498,5 +477,9 @@ mod tests {
         let (nonce, ct, _) = server_keys.encrypt(b"server msg", aad).unwrap();
         let pt = client_keys.decrypt(&nonce, &ct, aad, 1, false).unwrap();
         assert_eq!(pt, b"server msg");
+
+        // Initial epoch derived from handshake hash is the same on both sides
+        // but not deterministically "1".
+        assert_eq!(initial_epoch, server_keys.epoch());
     }
 }

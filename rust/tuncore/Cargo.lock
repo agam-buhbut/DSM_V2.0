@@ -194,6 +194,7 @@ dependencies = [
  "argon2",
  "chacha20poly1305",
  "hkdf",
+ "hmac",
  "libc",
  "pyo3",
  "rand",
@@ -201,6 +202,7 @@ dependencies = [
  "serde",
  "sha2",
  "snow",
+ "subtle",
  "x25519-dalek",
  "zeroize",
 ]

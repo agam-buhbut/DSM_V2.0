@@ -6,10 +6,8 @@ pub mod replay_window;
 pub mod secure_memory;
 pub mod session_keys;
 
-use hkdf::Hkdf;
 use pyo3::prelude::*;
 use pyo3::exceptions::PyRuntimeError;
-use sha2::Sha256;
 
 // ── PyO3 Wrappers ──
 // Raw key bytes never cross the FFI boundary for secret keys.
@@ -80,18 +78,14 @@ impl PyIdentityKeyPair {
         Ok(Self { inner })
     }
 
-    /// Derive an HMAC key from the secret key without exposing raw bytes to Python.
-    /// Uses HKDF-SHA256 with the domain separator as salt, the secret key as IKM,
-    /// and the caller's context as info. Output: 32 bytes.
-    fn derive_hmac_key(&self, context: &[u8]) -> PyResult<Vec<u8>> {
-        let hkdf = Hkdf::<Sha256>::new(
-            Some(b"dsm-known-hosts-hmac-v3-"),
-            self.inner.secret_key(),
-        );
-        let mut out = vec![0u8; 32];
-        hkdf.expand(context, &mut out)
-            .map_err(|e| py_err(format!("hkdf expand: {e}")))?;
-        Ok(out)
+    /// Compute HMAC-SHA256 over `data` using a key derived from this identity's
+    /// secret key. The derived key never crosses the FFI boundary — Python
+    /// receives only the 32-byte tag. `context` is HKDF info (domain separator).
+    fn compute_hmac(&self, context: &[u8], data: &[u8]) -> PyResult<Vec<u8>> {
+        self.inner
+            .compute_hmac(context, data)
+            .map(|tag| tag.to_vec())
+            .map_err(py_err)
     }
 
     /// Zeroize the secret key in place. After this call, the keypair is unusable.
@@ -315,12 +309,13 @@ struct PySessionKeyManager {
 #[pymethods]
 impl PySessionKeyManager {
     /// Create a session key manager from the Noise handshake hash.
+    /// The initial epoch is derived from the handshake hash (same on both
+    /// peers) to avoid the deterministic "start at 1" linkability.
     #[staticmethod]
-    fn from_handshake_hash(hash: &[u8], is_initiator: bool, initial_epoch: u32) -> PyResult<Self> {
+    fn from_handshake_hash(hash: &[u8], is_initiator: bool) -> PyResult<Self> {
         let inner = session_keys::SessionKeyManager::from_handshake_hash(
             hash,
             is_initiator,
-            initial_epoch,
         )
         .map_err(py_err)?;
         Ok(Self {

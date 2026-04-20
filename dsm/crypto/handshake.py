@@ -16,7 +16,6 @@ Server (responder):
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import hmac
 import json
 import logging
@@ -132,7 +131,7 @@ async def client_handshake(
     # Derive session keys from handshake hash (replaces Snow transport)
     handshake_hash = bytes(initiator.get_handshake_hash())
     session_keys = tuncore.SessionKeyManager.from_handshake_hash(
-        handshake_hash, is_initiator=True, initial_epoch=1,
+        handshake_hash, is_initiator=True,
     )
     log.info("handshake complete (client)")
     return session_keys, handshake_hash
@@ -176,7 +175,7 @@ async def server_handshake(
     # Derive session keys from handshake hash (replaces Snow transport)
     handshake_hash = bytes(responder.get_handshake_hash())
     session_keys = tuncore.SessionKeyManager.from_handshake_hash(
-        handshake_hash, is_initiator=False, initial_epoch=1,
+        handshake_hash, is_initiator=False,
     )
     log.info("handshake complete (server)")
     return session_keys, bytes(client_static)
@@ -275,9 +274,10 @@ def _check_known_host(
         log.warning("continuing despite key mismatch (strict_keys=False)")
 
 
-def _hmac_key(identity: tuncore.IdentityKeyPair) -> bytes:
-    """Derive HMAC key from identity secret key for known_hosts integrity."""
-    return bytes(identity.derive_hmac_key(b"known-hosts"))
+def _known_hosts_hmac(identity: tuncore.IdentityKeyPair, payload: bytes) -> bytes:
+    """Compute HMAC-SHA256 over payload using a key derived from the identity's
+    secret. The derived key never crosses the FFI boundary (audit H2)."""
+    return bytes(identity.compute_hmac(b"known-hosts", payload))
 
 
 def _load_known_hosts(
@@ -307,8 +307,7 @@ def _load_known_hosts(
     payload = raw[32:]
 
     # Try current (secret-key-based) HMAC first
-    key = _hmac_key(identity)
-    expected_mac = hmac.new(key, payload, hashlib.sha256).digest()
+    expected_mac = _known_hosts_hmac(identity, payload)
 
     if not hmac.compare_digest(stored_mac, expected_mac):
         raise HandshakeError(
@@ -329,8 +328,7 @@ def _save_known_hosts_dict(
 ) -> None:
     """Write a known_hosts dict to disk with HMAC integrity."""
     payload = json.dumps(hosts).encode()
-    key = _hmac_key(identity)
-    mac = hmac.new(key, payload, hashlib.sha256).digest()
+    mac = _known_hosts_hmac(identity, payload)
     atomic_write(path, mac + payload)
 
 

@@ -59,8 +59,10 @@ mod tests {
     use super::*;
 
     fn test_key() -> AesKey {
+        use rand::rngs::OsRng;
+        use rand::RngCore;
         let mut locked = LockedKey32::zeroed().unwrap();
-        rand::RngCore::fill_bytes(&mut rand::thread_rng(), locked.as_mut());
+        OsRng.fill_bytes(locked.as_mut());
         AesKey::from_locked(locked).unwrap()
     }
 

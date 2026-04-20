@@ -8,7 +8,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import struct
 import time
 from collections.abc import Awaitable
 from dataclasses import dataclass, field
@@ -17,7 +16,7 @@ from typing import TYPE_CHECKING, Callable
 from dsm.core.fsm import SessionFSM
 from dsm.core.protocol import (
     Fragment, InnerPacket, OuterPacket, PacketType, ReassemblyBuffer,
-    OUTER_HEADER_SIZE, SIZE_CLASSES,
+    OUTER_HEADER_SIZE, SEQ_STRUCT, SIZE_CLASSES,
 )
 from dsm.net.transport.udp import UDPTransport
 from dsm.net.transport.tcp import TCPTransport
@@ -89,11 +88,18 @@ def make_send_fn(
     async def send_packet(data: bytes, target_size: int) -> None:
         n = seq.next()
         if tcp_fixed_size and tcp_fixed_size > target_size:
-            data = data + os.urandom(tcp_fixed_size - target_size)
+            # Fixed-size TCP framing: extend in place to avoid the
+            # intermediate concat buffer on the send hot path. Entropy
+            # source is still `os.urandom`, unchanged.
+            pad_len = tcp_fixed_size - target_size
+            buf = bytearray(tcp_fixed_size)
+            buf[:target_size] = data
+            buf[target_size:] = os.urandom(pad_len)
+            data = bytes(buf)
             target_size = tcp_fixed_size
-        aad = struct.pack("!Q", n)
+        aad = SEQ_STRUCT.pack(n)
         nonce, ct, _epoch = session_keys.encrypt(data, aad)
-        outer = OuterPacket(seq=n, nonce=bytes(nonce), ciphertext=ct)
+        outer = OuterPacket(seq=n, nonce=nonce, ciphertext=ct)
         wire = outer.serialize(target_size)
         if isinstance(transport, UDPTransport):
             addr = dest_addr()
@@ -146,14 +152,14 @@ def decrypt_packet(
         log.debug("packet too short, dropping")
         return None
 
-    seq = struct.unpack("!Q", data[:8])[0]
+    seq = SEQ_STRUCT.unpack_from(data)[0]
     if not replay.check(seq):
         log.debug("replay detected, dropping seq=%d", seq)
         return None
 
     nonce_bytes = data[8:20]
     ciphertext = data[OUTER_HEADER_SIZE:]
-    aad = struct.pack("!Q", seq)
+    aad = SEQ_STRUCT.pack(seq)
 
     result = _decrypt_with_fallback(session_keys, nonce_bytes, ciphertext, aad, seq)
     if result is None:

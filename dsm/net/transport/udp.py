@@ -11,6 +11,11 @@ log = logging.getLogger(__name__)
 
 # Maximum UDP payload (Ethernet MTU - IP header - UDP header)
 MAX_DATAGRAM = 1472
+# Bounded recv queue. Sized for low-RAM targets: 256 * ~1500B ≈ 384 KiB
+# worst-case. Overflow drops at the kernel→protocol boundary, never at
+# the user-packet boundary, so anonymity is unchanged (attacker cannot
+# distinguish a drop from loss on the link).
+RECV_QUEUE_SIZE = 256
 
 
 class UDPTransport:
@@ -19,7 +24,9 @@ class UDPTransport:
     def __init__(self) -> None:
         self._transport: asyncio.DatagramTransport | None = None
         self._protocol: _UDPProtocol | None = None
-        self._recv_queue: asyncio.Queue[tuple[bytes, tuple[str, int]]] = asyncio.Queue(maxsize=1024)
+        self._recv_queue: asyncio.Queue[tuple[bytes, tuple[str, int]]] = asyncio.Queue(
+            maxsize=RECV_QUEUE_SIZE,
+        )
         self._closed = False
 
     async def bind(self, local_addr: str = "0.0.0.0", local_port: int = 0) -> int:

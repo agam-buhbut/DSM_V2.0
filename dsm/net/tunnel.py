@@ -157,9 +157,20 @@ class TunDevice:
         return os.write(self.fd, data)
 
     async def awrite(self, data: bytes) -> int:
-        """Write a packet to the TUN device (async, avoids blocking event loop)."""
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, os.write, self.fd, data)
+        """Write a packet to the TUN device (async, avoids blocking event loop).
+
+        TUN has a kernel-side buffer; a non-blocking write almost always
+        succeeds immediately. Try the sync write first to skip the thread
+        hop on the common path; only on ``EAGAIN`` do we fall back to
+        the executor. This cuts per-packet latency meaningfully on the
+        send-from-recv-loop hot path and avoids needless thread-pool
+        churn on low-RAM targets.
+        """
+        try:
+            return os.write(self.fd, data)
+        except BlockingIOError:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(None, os.write, self.fd, data)
 
     def close(self) -> None:
         """Close the TUN device."""
