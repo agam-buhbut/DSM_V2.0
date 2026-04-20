@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from collections.abc import Iterable
 from typing import Any, cast
+from urllib.parse import urlparse
 
 import dns.exception
 import dns.message
@@ -186,13 +187,14 @@ class DNSResolver:
         """DNS-over-TLS query with SPKI pin check."""
         from dsm.net.dns_pinning import build_pinned_ssl_context, verify_pin
 
-        # Parse "tls://host:port"
-        addr = provider.removeprefix("tls://")
-        parts = addr.rsplit(":", 1)
-        if len(parts) != 2:
+        # Parse "tls://host:port" or "tls://[ipv6]:port"
+        parsed = urlparse(provider)
+        if parsed.scheme != "tls":
             raise ValueError(f"invalid DoT provider format: {provider!r}")
-        host, port_str = parts
-        port = int(port_str)
+        host = parsed.hostname
+        port = parsed.port
+        if not host or not port:
+            raise ValueError(f"invalid DoT provider format: {provider!r}")
 
         query = _build_dns_query(hostname, A_RECORD)
         # DoT uses TCP with 2-byte length prefix
