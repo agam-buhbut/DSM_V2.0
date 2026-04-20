@@ -128,11 +128,28 @@ async def client_handshake(
     msg3 = initiator.write_message_3()
     await _send(transport, msg3, server_addr)
 
-    # Derive session keys from handshake hash (replaces Snow transport)
-    handshake_hash = bytes(initiator.get_handshake_hash())
-    session_keys = tuncore.SessionKeyManager.from_handshake_hash(
-        handshake_hash, is_initiator=True,
+    # Transition to Noise transport and perform ephemeral DH bootstrap
+    # to derive keys from SECRET material (not public handshake hash).
+    noise_transport = initiator.into_transport()
+    client_secret, client_public = tuncore.generate_ephemeral()
+
+    # Send client ephemeral public via Noise transport (encrypted)
+    bootstrap_init = noise_transport.encrypt(bytes(client_public))
+    await _send(transport, bootstrap_init, server_addr)
+
+    # Receive server ephemeral public
+    bootstrap_resp, _ = await _recv(transport)
+    server_public = noise_transport.decrypt(bootstrap_resp)
+    if len(server_public) != 32:
+        raise HandshakeError("invalid bootstrap ephemeral from server")
+
+    # Derive session keys from ephemeral DH (secure, not public h)
+    session_keys = tuncore.bootstrap_session_from_dh(
+        client_secret, bytes(server_public), is_initiator=True
     )
+
+    # Also get handshake hash for logging/diagnostics
+    handshake_hash = bytes(initiator.get_handshake_hash())
     log.info("handshake complete (client)")
     return session_keys, handshake_hash
 
@@ -172,11 +189,28 @@ async def server_handshake(
         )
     client_static = responder.read_message_3(msg3)
 
-    # Derive session keys from handshake hash (replaces Snow transport)
-    handshake_hash = bytes(responder.get_handshake_hash())
-    session_keys = tuncore.SessionKeyManager.from_handshake_hash(
-        handshake_hash, is_initiator=False,
+    # Transition to Noise transport and perform ephemeral DH bootstrap
+    # to derive keys from SECRET material (not public handshake hash).
+    noise_transport = responder.into_transport()
+
+    # Receive client ephemeral public
+    bootstrap_init, _ = await _recv(transport)
+    client_public = noise_transport.decrypt(bootstrap_init)
+    if len(client_public) != 32:
+        raise HandshakeError("invalid bootstrap ephemeral from client")
+
+    # Generate server ephemeral and send it back
+    server_secret, server_public = tuncore.generate_ephemeral()
+    bootstrap_resp = noise_transport.encrypt(bytes(server_public))
+    await _send(transport, bootstrap_resp, addr)
+
+    # Derive session keys from ephemeral DH (secure, not public h)
+    session_keys = tuncore.bootstrap_session_from_dh(
+        server_secret, bytes(client_public), is_initiator=False
     )
+
+    # Also get handshake hash for logging/diagnostics
+    handshake_hash = bytes(responder.get_handshake_hash())
     log.info("handshake complete (server)")
     return session_keys, bytes(client_static)
 

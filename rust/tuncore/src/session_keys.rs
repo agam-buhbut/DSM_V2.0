@@ -53,10 +53,39 @@ impl DirectionKeys {
 
 /// Generate a fresh ephemeral X25519 secret from CSPRNG, written directly
 /// into a mlock'd heap buffer.
-fn gen_ephemeral_secret() -> Result<LockedKey32, String> {
+pub fn gen_ephemeral_secret() -> Result<LockedKey32, String> {
     let mut secret = LockedKey32::zeroed()?;
     OsRng.fill_bytes(secret.as_mut());
     Ok(secret)
+}
+
+/// Compute DH shared secret and derive session keys from it.
+/// This is used for post-handshake bootstrap to avoid the vulnerability
+/// of deriving keys from the PUBLIC handshake transcript hash.
+///
+/// This function is called by BOTH sides after exchanging ephemeral public keys.
+/// The `our_secret` must be kept secret; only the public key is sent to the peer.
+pub fn bootstrap_keys_from_dh(
+    our_secret_bytes: &[u8; 32],
+    peer_public_bytes: &[u8; 32],
+    is_initiator: bool,
+) -> Result<(SessionKeyManager, Vec<u8>), String> {
+    let our_secret = StaticSecret::from(*our_secret_bytes);
+    let peer_public = PublicKey::from(*peer_public_bytes);
+    let shared = our_secret.diffie_hellman(&peer_public);
+
+    // Reject low-order points to prevent shared secret = 0
+    if !shared.was_contributory() {
+        return Err("bootstrap: non-contributory shared secret (low-order public key)".into());
+    }
+
+    let shared_secret_bytes = shared.as_bytes();
+    let manager = SessionKeyManager::from_bootstrap_shared_secret(
+        shared_secret_bytes,
+        is_initiator,
+    )?;
+
+    Ok((manager, shared_secret_bytes.to_vec()))
 }
 
 /// Full session key state managing current and previous epoch keys,
@@ -118,6 +147,39 @@ impl SessionKeyManager {
             .map_err(|e| format!("hkdf epoch: {e}"))?;
         // Keep the epoch in a range that still allows many rotations before
         // overflow; clamp to the low 28 bits so u32 rotation has ~16M headroom.
+        let initial_epoch = u32::from_be_bytes(epoch_bytes) & 0x0FFF_FFFF;
+
+        let (send_key, recv_key) = if is_initiator {
+            (key_a, key_b) // initiator sends with key_a, receives with key_b
+        } else {
+            (key_b, key_a) // responder sends with key_b, receives with key_a
+        };
+
+        Self::new(send_key, recv_key, initial_epoch)
+    }
+
+    /// Create a session from a secret shared value (e.g., ephemeral DH or bootstrap).
+    /// Unlike `from_handshake_hash` which uses the PUBLIC transcript hash, this
+    /// derives keys from SECRET material, preventing passive observation.
+    ///
+    /// `is_initiator`: true for client (initiator), false for server (responder).
+    pub fn from_bootstrap_shared_secret(
+        shared_secret: &[u8],
+        is_initiator: bool,
+    ) -> Result<Self, String> {
+        let hk = Hkdf::<Sha256>::new(Some(b"dsm-v2-bootstrap-hkdf"), shared_secret);
+
+        let mut key_a = LockedKey32::zeroed()?;
+        let mut key_b = LockedKey32::zeroed()?;
+        hk.expand(b"dsm-bootstrap-initiator-send", key_a.as_mut())
+            .map_err(|e| format!("hkdf key_a: {e}"))?;
+        hk.expand(b"dsm-bootstrap-responder-send", key_b.as_mut())
+            .map_err(|e| format!("hkdf key_b: {e}"))?;
+
+        // Derive initial epoch from secret material (not public hash).
+        let mut epoch_bytes = [0u8; 4];
+        hk.expand(b"dsm-bootstrap-epoch", &mut epoch_bytes)
+            .map_err(|e| format!("hkdf epoch: {e}"))?;
         let initial_epoch = u32::from_be_bytes(epoch_bytes) & 0x0FFF_FFFF;
 
         let (send_key, recv_key) = if is_initiator {

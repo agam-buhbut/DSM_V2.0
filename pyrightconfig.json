@@ -3,5 +3,5 @@
   "typeCheckingMode": "strict",
   "reportMissingImports": false,
   "reportMissingModuleSource": false,
-  "pythonVersion": "3.12"
+  "pythonVersion": "3.11"
 }

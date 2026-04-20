@@ -1,0 +1,44 @@
+[Unit]
+Description=DSM VPN Tunnel
+Documentation=file:///opt/mtun/README.md
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+User=dsm
+DynamicUser=yes
+AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RemoveIPC=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# Load passphrase from systemd credential
+LoadCredential=passphrase:/etc/dsm/passphrase
+
+# Allow service to access TUN device and routing tables
+ReadWritePaths=/dev/net/tun /proc/sys/net
+
+# Key files
+StateDirectory=mtun
+ConfigurationDirectory=mtun
+LogsDirectory=mtun
+
+# Service execution
+ExecStart=/usr/bin/python3 -m dsm server --mode udp
+Restart=on-failure
+RestartSec=10s
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -83,6 +83,73 @@ def _wipe(buf: bytearray) -> None:
     ctypes.memset(ctypes.addressof(addr), 0, len(buf))
 
 
+def _read_passphrase_from_fd(fd: int) -> bytearray:
+    """Read passphrase from a file descriptor into a bytearray."""
+    buf = bytearray()
+    while True:
+        ch = os.read(fd, 1)
+        if not ch or ch in (b"\n", b"\r"):
+            break
+        buf.extend(ch)
+    return buf
+
+
+def _read_passphrase_from_file(path: str | Path) -> bytearray:
+    """Read passphrase from a file (must be mode 0600 for security)."""
+    path = Path(path)
+    check_user_file_permissions(path)
+    buf = bytearray(path.read_bytes().rstrip(b"\r\n"))
+    return buf
+
+
+def _get_passphrase_noninteractive(
+    passphrase_fd: int | None = None,
+    passphrase_env_file: str | None = None,
+    passphrase_env: str | None = None,
+) -> bytearray | None:
+    """Try non-interactive passphrase sources in order of precedence.
+
+    Precedence:
+    1. passphrase_fd (file descriptor number)
+    2. DSM_PASSPHRASE_FILE env var (path, checked for mode 0600)
+    3. DSM_PASSPHRASE env var (weakest, visible in /proc/*/environ)
+
+    Returns bytearray if found, None if all sources exhausted.
+    """
+    # Explicit FD arg (e.g. from --passphrase-fd)
+    if passphrase_fd is not None:
+        try:
+            return _read_passphrase_from_fd(passphrase_fd)
+        except (OSError, ValueError) as e:
+            log.warning("failed to read from passphrase-fd %d: %s", passphrase_fd, e)
+            return None
+
+    # Env file arg
+    if passphrase_env_file is not None:
+        try:
+            return _read_passphrase_from_file(passphrase_env_file)
+        except (OSError, FileNotFoundError) as e:
+            log.warning("failed to read passphrase from %s: %s", passphrase_env_file, e)
+            return None
+
+    # DSM_PASSPHRASE_FILE env
+    env_file = os.environ.get("DSM_PASSPHRASE_FILE")
+    if env_file:
+        try:
+            return _read_passphrase_from_file(env_file)
+        except (OSError, FileNotFoundError) as e:
+            log.warning("DSM_PASSPHRASE_FILE %s unreadable: %s", env_file, e)
+            # Don't return None; try next source
+
+    # DSM_PASSPHRASE env (weakest; visible in /proc but works for CI)
+    env_pass = os.environ.get("DSM_PASSPHRASE")
+    if env_pass:
+        log.debug("using passphrase from DSM_PASSPHRASE env var")
+        return bytearray(env_pass.encode())
+
+    return None
+
+
 class KeyStore:
     """Manages identity keypair persistence.
 
@@ -157,8 +224,19 @@ class KeyStore:
     def exists(self) -> bool:
         return self._path.is_file()
 
-    def load_or_generate_interactive(self) -> bytes:
-        """Prompt for passphrase and load or generate identity.
+    def load_or_generate(
+        self,
+        passphrase_fd: int | None = None,
+        passphrase_env_file: str | None = None,
+    ) -> bytes:
+        """Load or generate identity, with non-interactive passphrase sources.
+
+        Tries passphrase sources in order:
+        1. passphrase_fd (file descriptor passed by caller)
+        2. passphrase_env_file (path passed by caller)
+        3. DSM_PASSPHRASE_FILE env var (path, must be mode 0600)
+        4. DSM_PASSPHRASE env var (weakest, visible in /proc)
+        5. Interactive tty prompt (fallback)
 
         Reads the passphrase into a mutable ``bytearray`` so it can be wiped
         after use — the usual ``getpass.getpass`` path routes the passphrase
@@ -167,7 +245,16 @@ class KeyStore:
 
         Returns the public key bytes.
         """
-        passphrase = _read_passphrase_into_bytearray("Key passphrase: ")
+        # Try non-interactive sources first
+        passphrase = _get_passphrase_noninteractive(
+            passphrase_fd=passphrase_fd,
+            passphrase_env_file=passphrase_env_file,
+        )
+
+        # Fall back to interactive prompt
+        if passphrase is None:
+            passphrase = _read_passphrase_into_bytearray("Key passphrase: ")
+
         try:
             if self.exists():
                 pub = self.load(passphrase)
@@ -178,4 +265,8 @@ class KeyStore:
             _wipe(passphrase)
         log.info("identity loaded")
         return pub
+
+    def load_or_generate_interactive(self) -> bytes:
+        """Legacy name for load_or_generate (interactive fallback only)."""
+        return self.load_or_generate()
 

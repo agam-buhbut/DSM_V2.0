@@ -324,6 +324,22 @@ impl PySessionKeyManager {
         })
     }
 
+    /// Create a session key manager from a secret shared value (e.g., bootstrap ephemeral DH).
+    /// Unlike from_handshake_hash which uses the PUBLIC transcript hash, this derives
+    /// keys from SECRET material, preventing passive observation.
+    #[staticmethod]
+    fn from_bootstrap_shared_secret(shared_secret: &[u8], is_initiator: bool) -> PyResult<Self> {
+        let inner = session_keys::SessionKeyManager::from_bootstrap_shared_secret(
+            shared_secret,
+            is_initiator,
+        )
+        .map_err(py_err)?;
+        Ok(Self {
+            inner,
+            pending_rotation: None,
+        })
+    }
+
     /// Encrypt a packet. Returns (nonce, ciphertext, epoch).
     fn encrypt(&mut self, plaintext: &[u8], aad: &[u8]) -> PyResult<(Vec<u8>, Vec<u8>, u32)> {
         let (nonce, ciphertext, epoch) = self
@@ -456,6 +472,68 @@ fn harden_process() -> PyResult<()> {
     secure_memory::harden_process().map_err(py_err)
 }
 
+/// Generate a fresh ephemeral X25519 keypair for bootstrap.
+/// Returns (secret_bytes, public_bytes) where secret must be kept secret.
+/// Caller is responsible for securely handling secret_bytes.
+#[pyfunction]
+fn generate_ephemeral() -> PyResult<(Vec<u8>, Vec<u8>)> {
+    use x25519_dalek::{PublicKey, StaticSecret};
+    use rand::RngCore;
+
+    let mut secret_bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut secret_bytes);
+    let secret = StaticSecret::from(secret_bytes);
+    let public = PublicKey::from(&secret);
+
+    Ok((secret_bytes.to_vec(), public.as_bytes().to_vec()))
+}
+
+/// Compute session keys from bootstrap ephemeral DH.
+/// This derives keys from the SECRET shared secret, not the PUBLIC handshake hash.
+///
+/// Args:
+///     our_secret: 32-byte ephemeral secret (must be protected)
+///     peer_public: 32-byte peer ephemeral public key
+///     is_initiator: true for client, false for server
+///
+/// Returns: SessionKeyManager instance
+#[pyfunction]
+fn bootstrap_session_from_dh(
+    our_secret: &[u8],
+    peer_public: &[u8],
+    is_initiator: bool,
+) -> PyResult<PySessionKeyManager> {
+    if our_secret.len() != 32 {
+        return Err(py_err("secret must be 32 bytes"));
+    }
+    if peer_public.len() != 32 {
+        return Err(py_err("peer public must be 32 bytes"));
+    }
+
+    let secret_arr = {
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(our_secret);
+        arr
+    };
+    let public_arr = {
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(peer_public);
+        arr
+    };
+
+    let (inner, _shared_secret) = session_keys::bootstrap_keys_from_dh(
+        &secret_arr,
+        &public_arr,
+        is_initiator,
+    )
+    .map_err(py_err)?;
+
+    Ok(PySessionKeyManager {
+        inner,
+        pending_rotation: None,
+    })
+}
+
 #[pymodule]
 fn tuncore(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyIdentityKeyPair>()?;
@@ -468,5 +546,7 @@ fn tuncore(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyAesKey>()?;
     m.add_function(wrap_pyfunction!(disable_core_dumps, m)?)?;
     m.add_function(wrap_pyfunction!(harden_process, m)?)?;
+    m.add_function(wrap_pyfunction!(generate_ephemeral, m)?)?;
+    m.add_function(wrap_pyfunction!(bootstrap_session_from_dh, m)?)?;
     Ok(())
 }
