@@ -196,8 +196,11 @@ async def server_handshake(
 
     responder = tuncore.NoiseResponder(identity)
 
-    # Message 1: -> e (capture sender address for UDP reply)
-    msg1, recv_addr = await _recv(transport)
+    # Message 1: -> e (capture sender address for UDP reply).
+    # Wait indefinitely — there is no peer state to time out against
+    # before any client has connected. SIGINT/SIGTERM still cancels
+    # this task cleanly via the AsyncExitStack shutdown.
+    msg1, recv_addr = await _recv(transport, indefinite=True)
     responder.read_message_1(msg1)
     addr = recv_addr or client_addr
 
@@ -287,6 +290,8 @@ async def _send(
 async def _recv(
     transport: UDPTransport | TCPTransport,
     retransmit: Callable[[], Awaitable[None]] | None = None,
+    *,
+    indefinite: bool = False,
 ) -> tuple[bytes, tuple[str, int] | None]:
     """Receive a HANDSHAKE_FRAME_SIZE frame and return it verbatim.
 
@@ -296,13 +301,27 @@ async def _recv(
 
     Args:
         transport: UDP or TCP transport
-        retransmit: optional async callback to resend the last outgoing message
-            before each retry, so the peer gets another chance to respond if
-            the original send was lost.
+        retransmit: optional async callback to resend the last outgoing
+            message before each retry, so the peer gets another chance to
+            respond if the original send was lost. Ignored when
+            ``indefinite=True``.
+        indefinite: when True, block until a packet arrives or the task
+            is cancelled — no MAX_RETRIES timeout. Used by the server's
+            initial msg1 wait, where there is no in-flight peer state to
+            time out against (we're literally waiting for any client to
+            connect). Cancellation (SIGINT/SIGTERM via the AsyncExitStack
+            shutdown) still tears the recv down cleanly.
 
     Returns:
         (frame, addr) where addr is the sender address for UDP, None for TCP.
     """
+    if indefinite:
+        if isinstance(transport, UDPTransport):
+            frame, addr = await transport.recv()
+            return bytes(frame), addr
+        frame = await transport.recv()
+        return bytes(frame), None
+
     for attempt in range(MAX_RETRIES):
         try:
             if isinstance(transport, UDPTransport):

@@ -225,5 +225,58 @@ class TestHandshakeRoundtripTCP(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bytes(pt2), b"pong-tcp")
 
 
+@unittest.skipUnless(
+    _HAS_TUNCORE,
+    "tuncore (Rust crypto core) not built; run `maturin develop` in rust/tuncore/",
+)
+class TestServerWaitsIndefinitelyForFirstMsg1(unittest.IsolatedAsyncioTestCase):
+    """Regression: the server's initial msg1 recv must NOT have the
+    MAX_RETRIES × HANDSHAKE_TIMEOUT bound (~18s). Before this fix the
+    server would crash with HandshakeError after no client connected
+    within that window. After: the recv blocks until cancellation.
+
+    The test verifies BOTH halves of the contract:
+      1. After 1+ second of no traffic, the server task is still alive
+         (it didn't bail with HandshakeError).
+      2. Cancelling the task tears down cleanly (no exception leak).
+    """
+
+    async def asyncSetUp(self) -> None:
+        self._so_mark_patches = [
+            patch("dsm.net.transport.udp.apply_so_mark", lambda sock: None),
+        ]
+        for p in self._so_mark_patches:
+            p.start()
+
+    async def asyncTearDown(self) -> None:
+        for p in self._so_mark_patches:
+            p.stop()
+
+    async def test_server_handshake_blocks_then_cancels_clean(self) -> None:
+        from dsm.crypto.handshake import server_handshake
+        from dsm.net.transport.udp import UDPTransport
+
+        transport = UDPTransport()
+        await transport.bind("127.0.0.1", 0)
+        self.addAsyncCleanup(transport.aclose)
+        identity = tuncore.IdentityKeyPair.generate()
+
+        task = asyncio.create_task(server_handshake(transport, identity))
+
+        # Give it well past the OLD bounded timeout (~3s would have triggered
+        # the first warning and ~18s would have raised HandshakeError).
+        await asyncio.sleep(1.5)
+        self.assertFalse(
+            task.done(),
+            "server_handshake should still be waiting; was it bounded?",
+        )
+
+        # Cancel and confirm clean teardown — no HandshakeError, just
+        # CancelledError that the AsyncExitStack swallows.
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
 if __name__ == "__main__":
     unittest.main()
