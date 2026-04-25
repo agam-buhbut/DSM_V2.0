@@ -79,9 +79,26 @@ def _validate(c: Config) -> None:
         raise ValueError(f"invalid server_ip: {c.server_ip!r}") from e
 
     # ports
-    for name, val in [("server_port", c.server_port), ("listen_port", c.listen_port)]:
-        if not (MIN_PORT <= val <= MAX_PORT):
-            raise ValueError(f"{name} must be {MIN_PORT}-{MAX_PORT}, got {val}")
+    # server_port is always a real concrete port — clients need it to connect.
+    if not (MIN_PORT <= c.server_port <= MAX_PORT):
+        raise ValueError(
+            f"server_port must be {MIN_PORT}-{MAX_PORT}, got {c.server_port}"
+        )
+    # listen_port: server-side it's the bound socket; client-side it's the
+    # source port for outgoing UDP, where 0 means "let the kernel pick an
+    # ephemeral port" (the standard idiom). Allow 0 only for the client.
+    if c.mode == "server":
+        if not (MIN_PORT <= c.listen_port <= MAX_PORT):
+            raise ValueError(
+                f"listen_port must be {MIN_PORT}-{MAX_PORT} in server mode, "
+                f"got {c.listen_port}"
+            )
+    else:
+        if not (0 <= c.listen_port <= MAX_PORT):
+            raise ValueError(
+                f"listen_port must be 0-{MAX_PORT} in client mode "
+                f"(0 = ephemeral), got {c.listen_port}"
+            )
 
     # key_file must be a path
     if not c.key_file:

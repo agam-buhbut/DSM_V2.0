@@ -69,9 +69,25 @@ class TestConfigValidation(unittest.TestCase):
         with self.assertRaises(ValueError):
             Config(**_base(server_ip="not-an-ip"))
 
-    def test_port_zero(self) -> None:
+    def test_server_port_zero_rejected(self) -> None:
+        # server_port is the public service port, must be a real port
         with self.assertRaises(ValueError):
             Config(**_base(server_port=0))
+
+    def test_listen_port_zero_rejected_in_server_mode(self) -> None:
+        # In server mode listen_port is the bind, must be a real port
+        with self.assertRaises(ValueError):
+            Config(**_base(
+                mode="server",
+                listen_port=0,
+                dns_providers=["8.8.8.8"],
+                dns_provider_pins={"8.8.8.8": ["a" * 64]},
+            ))
+
+    def test_listen_port_zero_allowed_in_client_mode(self) -> None:
+        # 0 means "kernel picks an ephemeral source port" — standard for clients
+        c = Config(**_base(mode="client", listen_port=0))
+        self.assertEqual(c.listen_port, 0)
 
     def test_port_too_large(self) -> None:
         with self.assertRaises(ValueError):
