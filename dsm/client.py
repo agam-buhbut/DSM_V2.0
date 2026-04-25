@@ -111,21 +111,24 @@ async def run_client(
         # Host-mutating resources: register each with the stack as soon as
         # it succeeds, so any later failure unwinds only what was applied.
         # Unwind order is the REVERSE of registration, which matches the
-        # safe teardown order (scheduler → resolv → tun → nft → tcp_ts →
-        # transport → keystore).
+        # safe teardown order (resolv → nft → tun → tcp_ts → transport →
+        # keystore).
 
         tcp_ts = TcpTimestampsDisabler()
         tcp_ts.apply()
         stack.callback(tcp_ts.remove)
 
-        nft = NFTablesManager(config.server_ip, config.server_port, config.tun_name)
-        nft.apply()
-        stack.callback(nft.remove)
-
+        # TUN must come BEFORE nftables: the kill-switch ruleset references
+        # the TUN interface by name (`oif "mtun0" accept`), and nft refuses
+        # to load rules that mention a nonexistent interface.
         tun = TunDevice(config.tun_name)
         tun.open()
         tun.configure(mtu=config.mtu)
         stack.callback(tun.close)
+
+        nft = NFTablesManager(config.server_ip, config.server_port, config.tun_name)
+        nft.apply()
+        stack.callback(nft.remove)
 
         # Swap /etc/resolv.conf AFTER nft.apply so the kill switch is already
         # up when the new resolver becomes visible — any in-flight DNS to the
