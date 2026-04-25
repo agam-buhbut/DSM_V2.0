@@ -13,6 +13,7 @@ from dsm.crypto.authorized_clients import AuthorizedClients
 from dsm.crypto.keystore import KeyStore
 from dsm.net.dns import DNSResolver
 from dsm.net.dns_proxy import LocalDNSProxy
+from dsm.net.forwarding import IPForwardingManager, MasqueradeManager
 from dsm.net.nftables import ServerRateLimitManager, TcpTimestampsDisabler
 from dsm.net.tunnel import TunDevice
 from dsm.net.transport.udp import UDPTransport
@@ -138,6 +139,19 @@ async def run_server(
         tun.open()
         tun.configure(local_ip=SERVER_TUN_IP, mtu=config.mtu)
         stack.callback(tun.close)
+
+        # Enable IPv4 forwarding + MASQUERADE so decrypted client traffic
+        # actually reaches the internet. Without these, the kernel either
+        # drops the packet (forwarding off) or replies are unroutable
+        # (replies addressed to 10.8.0.0/24, no NAT). Apply AFTER the TUN
+        # exists so the MASQUERADE rule can reference its name.
+        ip_forward = IPForwardingManager()
+        ip_forward.apply()
+        stack.callback(ip_forward.remove)
+
+        masquerade = MasqueradeManager(tun_name=config.tun_name)
+        masquerade.apply()
+        stack.callback(masquerade.remove)
 
         # DNS proxy: listen on the TUN address for DNS queries arriving from
         # clients through the tunnel. Forwards to the pinned DoH/DoT resolver.
