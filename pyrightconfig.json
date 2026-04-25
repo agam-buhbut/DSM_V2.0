@@ -1,7 +1,27 @@
 {
-  "include": ["dsm"],
+  "include": ["dsm", "tests"],
   "typeCheckingMode": "strict",
   "reportMissingImports": false,
   "reportMissingModuleSource": false,
-  "pythonVersion": "3.11"
+  "reportMissingTypeStubs": false,
+  "pythonVersion": "3.11",
+
+  "executionEnvironments": [
+    {
+      "root": "tests",
+      "reportPrivateUsage": "none",
+      "reportUnknownMemberType": "none",
+      "reportUnknownArgumentType": "none",
+      "reportUnknownVariableType": "none",
+      "reportUnknownParameterType": "none",
+      "reportUnknownLambdaType": "none",
+      "reportOptionalMemberAccess": "none",
+      "reportMissingTypeArgument": "none",
+      "reportMissingParameterType": "none",
+      "reportConstantRedefinition": "none",
+      "reportAttributeAccessIssue": "none",
+      "reportArgumentType": "none",
+      "reportInvalidTypeForm": "none"
+    }
+  ]
 }

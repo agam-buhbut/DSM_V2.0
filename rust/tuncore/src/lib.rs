@@ -304,6 +304,10 @@ impl PyNoiseTransport {
 struct PySessionKeyManager {
     inner: session_keys::SessionKeyManager,
     pending_rotation: Option<session_keys::RotationInit>,
+    // For the two-phase responder flow: derived-but-not-yet-applied rotation
+    // held here between prepare_rotation_responder and apply_rotation_responder
+    // so the ACK can be sent with old keys in between.
+    pending_responder_rotation: Option<session_keys::ResponderPending>,
 }
 
 #[pymethods]
@@ -321,6 +325,7 @@ impl PySessionKeyManager {
         Ok(Self {
             inner,
             pending_rotation: None,
+            pending_responder_rotation: None,
         })
     }
 
@@ -337,6 +342,7 @@ impl PySessionKeyManager {
         Ok(Self {
             inner,
             pending_rotation: None,
+            pending_responder_rotation: None,
         })
     }
 
@@ -400,6 +406,10 @@ impl PySessionKeyManager {
     }
 
     /// Complete rotation as the responder. Returns (our_ephemeral_pub, new_epoch).
+    ///
+    /// Single-shot: applies rotation immediately. Network users should prefer
+    /// `prepare_rotation_responder` + `apply_rotation_responder` so the
+    /// REKEY_ACK can be sent with the old keys.
     fn complete_rotation_responder(
         &mut self,
         remote_ephemeral_pub: &[u8],
@@ -411,6 +421,45 @@ impl PySessionKeyManager {
             .complete_rotation_responder(&pub_bytes, new_epoch)
             .map_err(py_err)?;
         Ok((our_pub.to_vec(), complete.new_epoch))
+    }
+
+    /// First phase of two-phase responder rotation. Derives the new keys
+    /// and our ephemeral public key WITHOUT mutating session state; stores
+    /// the derived keys internally. Caller sends REKEY_ACK with the still
+    /// current (old) keys, then calls `apply_rotation_responder`.
+    /// Returns (our_ephemeral_pub, new_epoch).
+    fn prepare_rotation_responder(
+        &mut self,
+        remote_ephemeral_pub: &[u8],
+        new_epoch: u32,
+    ) -> PyResult<(Vec<u8>, u32)> {
+        if self.pending_responder_rotation.is_some() {
+            return Err(py_err("responder rotation already prepared"));
+        }
+        let pub_bytes = pub_key_from_slice(remote_ephemeral_pub)?;
+        let pending = self
+            .inner
+            .prepare_rotation_responder(&pub_bytes, new_epoch)
+            .map_err(py_err)?;
+        let our_pub = pending.our_pub.to_vec();
+        let epoch = pending.new_epoch;
+        self.pending_responder_rotation = Some(pending);
+        Ok((our_pub, epoch))
+    }
+
+    /// Second phase of two-phase responder rotation. Consumes the pending
+    /// state left by `prepare_rotation_responder` and swaps the session keys.
+    /// Returns the new epoch.
+    fn apply_rotation_responder(&mut self) -> PyResult<u32> {
+        let pending = self
+            .pending_responder_rotation
+            .take()
+            .ok_or_else(|| py_err("no prepared responder rotation"))?;
+        let complete = self
+            .inner
+            .apply_rotation_responder(pending)
+            .map_err(py_err)?;
+        Ok(complete.new_epoch)
     }
 
     /// Call periodically to clean up expired grace period keys.
@@ -479,13 +528,16 @@ fn harden_process() -> PyResult<()> {
 fn generate_ephemeral() -> PyResult<(Vec<u8>, Vec<u8>)> {
     use x25519_dalek::{PublicKey, StaticSecret};
     use rand::RngCore;
+    use zeroize::Zeroize;
 
     let mut secret_bytes = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut secret_bytes);
     let secret = StaticSecret::from(secret_bytes);
     let public = PublicKey::from(&secret);
 
-    Ok((secret_bytes.to_vec(), public.as_bytes().to_vec()))
+    let out_secret = secret_bytes.to_vec();
+    secret_bytes.zeroize();
+    Ok((out_secret, public.as_bytes().to_vec()))
 }
 
 /// Compute session keys from bootstrap ephemeral DH.
@@ -503,6 +555,8 @@ fn bootstrap_session_from_dh(
     peer_public: &[u8],
     is_initiator: bool,
 ) -> PyResult<PySessionKeyManager> {
+    use zeroize::Zeroize;
+
     if our_secret.len() != 32 {
         return Err(py_err("secret must be 32 bytes"));
     }
@@ -510,27 +564,26 @@ fn bootstrap_session_from_dh(
         return Err(py_err("peer public must be 32 bytes"));
     }
 
-    let secret_arr = {
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(our_secret);
-        arr
-    };
-    let public_arr = {
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(peer_public);
-        arr
-    };
+    let mut secret_arr = [0u8; 32];
+    secret_arr.copy_from_slice(our_secret);
+    let mut public_arr = [0u8; 32];
+    public_arr.copy_from_slice(peer_public);
 
-    let (inner, _shared_secret) = session_keys::bootstrap_keys_from_dh(
+    let result = session_keys::bootstrap_keys_from_dh(
         &secret_arr,
         &public_arr,
         is_initiator,
-    )
-    .map_err(py_err)?;
+    );
+
+    secret_arr.zeroize();
+    public_arr.zeroize();
+
+    let inner = result.map_err(py_err)?;
 
     Ok(PySessionKeyManager {
         inner,
         pending_rotation: None,
+        pending_responder_rotation: None,
     })
 }
 

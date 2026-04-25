@@ -208,6 +208,62 @@ class Fragment:
         return cls(fragment_id=fid, index=idx, total=total, data=data)
 
 
+# Largest inner payload that fits on the wire inside the MAX size class
+# without spilling past a 1400B outer packet. Used both to decide when a
+# packet MUST be fragmented and as the per-fragment chunk size bound.
+#
+#     max outer (1400) - outer header (20) - GCM tag (16) - inner header (4)
+#   = 1360 bytes of inner payload.
+MAX_INNER_PAYLOAD_ON_WIRE = SIZE_CLASSES[-1] - OUTER_HEADER_SIZE - GCM_TAG_SIZE - INNER_HEADER_SIZE
+
+# Per-fragment data budget: one more header (the Fragment struct) shaves
+# 4 bytes off the inner budget.
+MAX_FRAGMENT_DATA = MAX_INNER_PAYLOAD_ON_WIRE - FRAGMENT_HEADER_SIZE
+
+# Max IP packet the send side can handle: 16 fragments × max fragment data.
+MAX_FRAGMENTABLE_PACKET = MAX_FRAGMENTS * MAX_FRAGMENT_DATA
+
+
+def fragment_ip_packet(
+    packet: bytes,
+    epoch_id: int,
+    fragment_id: int,
+) -> list[InnerPacket]:
+    """Split an IP packet into FRAGMENT inner packets if it doesn't fit
+    on the wire in a single size-class outer. Packets that fit are
+    returned as a single DATA inner — no fragment envelope overhead on
+    the common path.
+
+    The receiver reassembles via ``ReassemblyBuffer``. All fragments
+    carry the same ``fragment_id`` and sequential ``index`` values
+    (0..total-1).
+
+    Raises ``ValueError`` when the packet is larger than the protocol's
+    max fragmentable size (see ``MAX_FRAGMENTABLE_PACKET``).
+    """
+    if len(packet) <= MAX_INNER_PAYLOAD_ON_WIRE:
+        return [InnerPacket(ptype=PacketType.DATA, epoch_id=epoch_id, payload=packet)]
+
+    total = (len(packet) + MAX_FRAGMENT_DATA - 1) // MAX_FRAGMENT_DATA
+    if total > MAX_FRAGMENTS:
+        raise ValueError(
+            f"packet too large to fragment: {len(packet)} bytes "
+            f"({total} fragments > cap {MAX_FRAGMENTS})"
+        )
+
+    fid = fragment_id & 0xFFFF
+    out: list[InnerPacket] = []
+    for i in range(total):
+        chunk = packet[i * MAX_FRAGMENT_DATA : (i + 1) * MAX_FRAGMENT_DATA]
+        frag = Fragment(fragment_id=fid, index=i, total=total, data=chunk)
+        out.append(InnerPacket(
+            ptype=PacketType.FRAGMENT,
+            epoch_id=epoch_id,
+            payload=frag.serialize(),
+        ))
+    return out
+
+
 # ── Fragment reassembly ──
 
 REASSEMBLY_MAX_PENDING = 256

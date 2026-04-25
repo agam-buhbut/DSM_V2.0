@@ -92,75 +92,74 @@ class LocalDNSProxy:
     async def _handle_query(
         self, data: bytes, addr: tuple[str, int], send: Any,
     ) -> None:
-        # Semaphore bounds concurrent query tasks to prevent DoS.
-        # On saturation, drop datagram silently (no SERVFAIL — avoid timing channel).
-        if not self._sem._value:  # Check semaphore state
-            log.warning("DNS query queue saturated, dropping datagram from %s", addr)
+        # Parsing and trivial-response paths run outside the semaphore —
+        # the semaphore exists to bound concurrent *upstream* resolver
+        # calls, not cheap wire parsing.
+        try:
+            query = dns.message.from_wire(data)
+        except dns.exception.DNSException as e:
+            log.debug("dropping malformed DNS query from %s: %s", addr, type(e).__name__)
             return
 
-        async with self._sem:
+        if not query.question:
+            send(_make_error(query, dns.rcode.FORMERR), addr)
+            return
+
+        q = query.question[0]
+        qname = q.name.to_text(omit_final_dot=True).lower()
+        qtype = q.rdtype
+
+        # Only A records are resolved via the upstream client today; other
+        # types return an empty NOERROR so stubs fall through gracefully.
+        if qtype != dns.rdatatype.A:
+            resp = dns.message.make_response(query)
+            resp.flags |= dns.flags.RA
+            send(resp.to_wire(), addr)
+            return
+
+        # In-flight deduplication: coalesce identical concurrent queries.
+        # Only the *first* caller holds a semaphore slot while calling
+        # upstream; later callers await the shared future slot-free, so
+        # the semaphore actually bounds upstream fan-out (not total
+        # duplicates waiting).
+        query_key = (qname, qtype)
+        inflight_future = self._inflight.get(query_key)
+        if inflight_future is None:
+            inflight_future = asyncio.get_running_loop().create_future()
+            self._inflight[query_key] = inflight_future
             try:
-                query = dns.message.from_wire(data)
-            except dns.exception.DNSException as e:
-                log.debug("dropping malformed DNS query from %s: %s", addr, type(e).__name__)
-                return
-
-            if not query.question:
-                send(_make_error(query, dns.rcode.FORMERR), addr)
-                return
-
-            q = query.question[0]
-            qname = q.name.to_text(omit_final_dot=True).lower()
-            qtype = q.rdtype
-
-            # Only A records are resolved via the upstream client today; other
-            # types return an empty NOERROR so stubs fall through gracefully.
-            if qtype != dns.rdatatype.A:
-                resp = dns.message.make_response(query)
-                resp.flags |= dns.flags.RA
-                send(resp.to_wire(), addr)
-                return
-
-            # In-flight deduplication: coalesce identical concurrent queries
-            query_key = (qname, qtype)
-            inflight_future = self._inflight.get(query_key)
-            if inflight_future is None:
-                # First request for this query — create future and resolve
-                inflight_future = asyncio.get_event_loop().create_future()
-                self._inflight[query_key] = inflight_future
-
-                try:
-                    addresses = await self._resolver.resolve(qname)
-                    inflight_future.set_result(addresses)
-                except Exception as e:
-                    log_qname = qname if self._debug_dns else f"qname-sha256={_redact_qname(qname)}"
-                    log.warning("DNS resolve failed for %s: %s", log_qname, type(e).__name__)
-                    inflight_future.set_exception(e)
-                finally:
-                    del self._inflight[query_key]
-            else:
-                # Duplicate in-flight query — await the same future
-                try:
-                    addresses = await inflight_future
-                except Exception:
-                    # Upstream failed; re-raise to handle below
-                    addresses = []
-
-            # Send response
+                async with self._sem:
+                    try:
+                        addresses = await self._resolver.resolve(qname)
+                        inflight_future.set_result(addresses)
+                    except Exception as e:
+                        log_qname = qname if self._debug_dns else f"qname-sha256={_redact_qname(qname)}"
+                        log.warning("DNS resolve failed for %s: %s", log_qname, type(e).__name__)
+                        inflight_future.set_exception(e)
+                        addresses = []
+            finally:
+                del self._inflight[query_key]
+        else:
             try:
-                if not addresses:
-                    send(_make_error(query, dns.rcode.SERVFAIL), addr)
-                    return
+                addresses = await inflight_future
+            except Exception:
+                addresses = []
 
-                resp = dns.message.make_response(query)
-                resp.flags |= dns.flags.RA
-                rrset = dns.rrset.from_text_list(
-                    q.name, DEFAULT_CACHED_TTL, dns.rdataclass.IN, dns.rdatatype.A, addresses,
-                )
-                resp.answer.append(rrset)
-                send(resp.to_wire(), addr)
-            except Exception as e:
-                log.exception("failed to send DNS response to %s: %s", addr, e)
+        # Send response
+        try:
+            if not addresses:
+                send(_make_error(query, dns.rcode.SERVFAIL), addr)
+                return
+
+            resp = dns.message.make_response(query)
+            resp.flags |= dns.flags.RA
+            rrset = dns.rrset.from_text_list(
+                q.name, DEFAULT_CACHED_TTL, dns.rdataclass.IN, dns.rdatatype.A, addresses,
+            )
+            resp.answer.append(rrset)
+            send(resp.to_wire(), addr)
+        except Exception as e:
+            log.exception("failed to send DNS response to %s: %s", addr, e)
 
 
 class _ProxyProtocol(asyncio.DatagramProtocol):

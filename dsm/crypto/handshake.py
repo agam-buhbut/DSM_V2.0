@@ -44,35 +44,40 @@ BACKOFF_BASE = 1.0  # seconds; retry delays: 1s, 2s, 4s
 
 DEFAULT_KNOWN_HOSTS_PATH = Path("/opt/mtun/known_hosts.json")
 
-# Pad every handshake message to this size so the three Noise XX messages are
-# indistinguishable from data packets (which are also 1400B) on the wire.
-# Otherwise a DPI rule can flag the (~32, ~96, ~64) size triple as Noise XX.
+# Every frame on the wire during the handshake is exactly this many bytes,
+# so the three Noise XX messages + two bootstrap messages are indistinguishable
+# from a normal 1400B data packet. The Rust side already pre-pads Noise XX
+# output to this size; bootstrap messages are padded explicitly in Python
+# because NoiseTransport.encrypt returns only the ciphertext+tag.
 HANDSHAKE_FRAME_SIZE = 1400
-_HANDSHAKE_LEN_PREFIX = 2
-_HANDSHAKE_MAX_PAYLOAD = HANDSHAKE_FRAME_SIZE - _HANDSHAKE_LEN_PREFIX
+
+# Bootstrap exchange: the plaintext is a 32-byte X25519 public key.
+# NoiseTransport.encrypt(32) -> 32 + 16 (GCM tag) = 48 bytes.
+BOOTSTRAP_CIPHERTEXT_SIZE = 32 + 16
 
 
-def _pad_handshake(msg: bytes) -> bytes:
-    """Frame a Noise message into a fixed-size padded envelope."""
-    if len(msg) > _HANDSHAKE_MAX_PAYLOAD:
+def _pad_to_frame(data: bytes, expected_size: int) -> bytes:
+    """Pad a handshake ciphertext to HANDSHAKE_FRAME_SIZE with CSPRNG bytes.
+
+    No length prefix on the wire — both sides know the expected ciphertext
+    size from the protocol (pubkey + GCM tag = 48B). This matches the
+    Rust-side `pack_handshake` construction so all 5 handshake frames
+    have the same on-the-wire structure.
+    """
+    if len(data) != expected_size:
         raise HandshakeError(
-            f"handshake message too large: {len(msg)} > {_HANDSHAKE_MAX_PAYLOAD}"
+            f"handshake payload size mismatch: {len(data)} != {expected_size}"
         )
-    prefix = len(msg).to_bytes(_HANDSHAKE_LEN_PREFIX, "big")
-    pad = os.urandom(HANDSHAKE_FRAME_SIZE - _HANDSHAKE_LEN_PREFIX - len(msg))
-    return prefix + msg + pad
+    return bytes(data) + os.urandom(HANDSHAKE_FRAME_SIZE - expected_size)
 
 
-def _unpad_handshake(blob: bytes) -> bytes:
-    """Strip the fixed-size envelope and return the inner Noise message."""
+def _unpad_from_frame(blob: bytes, expected_size: int) -> bytes:
+    """Extract the ciphertext prefix from a fixed-size handshake frame."""
     if len(blob) != HANDSHAKE_FRAME_SIZE:
         raise HandshakeError(
             f"handshake frame wrong size: {len(blob)} != {HANDSHAKE_FRAME_SIZE}"
         )
-    length = int.from_bytes(blob[:_HANDSHAKE_LEN_PREFIX], "big")
-    if length > _HANDSHAKE_MAX_PAYLOAD:
-        raise HandshakeError(f"handshake inner length out of range: {length}")
-    return blob[_HANDSHAKE_LEN_PREFIX : _HANDSHAKE_LEN_PREFIX + length]
+    return bytes(blob[:expected_size])
 
 
 async def client_handshake(
@@ -125,31 +130,54 @@ async def client_handshake(
         )
 
     # Message 3: -> s, se
+    # Single send — loss recovery is handled via the bootstrap-round retransmit
+    # below, which resends msg3 + bootstrap_init together. Multi-sending msg3
+    # alone would be ambiguous: the server processes msg3 then waits for
+    # bootstrap_init, and a duplicate msg3 would be misread as bootstrap_init.
     msg3 = initiator.write_message_3()
     await _send(transport, msg3, server_addr)
+
+    # Snapshot the handshake hash before transitioning to transport state —
+    # into_transport() consumes the initiator.
+    handshake_hash = bytes(initiator.get_handshake_hash())
 
     # Transition to Noise transport and perform ephemeral DH bootstrap
     # to derive keys from SECRET material (not public handshake hash).
     noise_transport = initiator.into_transport()
     client_secret, client_public = tuncore.generate_ephemeral()
+    try:
+        # Send client ephemeral public via Noise transport (encrypted), padded
+        # to HANDSHAKE_FRAME_SIZE to match the 3 Noise XX frame sizes.
+        bootstrap_init_ct = bytes(noise_transport.encrypt(bytes(client_public)))
+        bootstrap_init_frame = _pad_to_frame(bootstrap_init_ct, BOOTSTRAP_CIPHERTEXT_SIZE)
+        await _send(transport, bootstrap_init_frame, server_addr)
 
-    # Send client ephemeral public via Noise transport (encrypted)
-    bootstrap_init = noise_transport.encrypt(bytes(client_public))
-    await _send(transport, bootstrap_init, server_addr)
+        # Receive server ephemeral public. On timeout, resend BOTH msg3 and
+        # the bootstrap frame — we don't know which was lost, and resending
+        # only msg3 would cause the server to wait for bootstrap forever
+        # while resending only bootstrap_init would leave server stuck on
+        # msg3 recv (rejecting the bootstrap frame as an invalid msg3).
+        async def _retransmit_bootstrap() -> None:
+            await _send(transport, msg3, server_addr)
+            await _send(transport, bootstrap_init_frame, server_addr)
 
-    # Receive server ephemeral public
-    bootstrap_resp, _ = await _recv(transport)
-    server_public = noise_transport.decrypt(bootstrap_resp)
-    if len(server_public) != 32:
-        raise HandshakeError("invalid bootstrap ephemeral from server")
+        bootstrap_resp_frame, _ = await _recv(transport, retransmit=_retransmit_bootstrap)
+        bootstrap_resp_ct = _unpad_from_frame(bootstrap_resp_frame, BOOTSTRAP_CIPHERTEXT_SIZE)
+        server_public = noise_transport.decrypt(bootstrap_resp_ct)
+        if len(server_public) != 32:
+            raise HandshakeError("invalid bootstrap ephemeral from server")
 
-    # Derive session keys from ephemeral DH (secure, not public h)
-    session_keys = tuncore.bootstrap_session_from_dh(
-        client_secret, bytes(server_public), is_initiator=True
-    )
+        # Derive session keys from ephemeral DH (secure, not public h).
+        # Rust-side zeroizes the secret after consumption.
+        session_keys = tuncore.bootstrap_session_from_dh(
+            bytes(client_secret), bytes(server_public), is_initiator=True
+        )
+    finally:
+        # Drop the Python reference to the ephemeral secret immediately so the
+        # GC can collect. Python bytes are immutable — real zeroization happens
+        # Rust-side; this just minimizes the lifetime of the copy in the PyObject.
+        del client_secret
 
-    # Also get handshake hash for logging/diagnostics
-    handshake_hash = bytes(initiator.get_handshake_hash())
     log.info("handshake complete (client)")
     return session_keys, handshake_hash
 
@@ -189,29 +217,39 @@ async def server_handshake(
         )
     client_static = responder.read_message_3(msg3)
 
+    # Snapshot the handshake hash before transitioning to transport state —
+    # into_transport() consumes the responder.
+    handshake_hash = bytes(responder.get_handshake_hash())
+
     # Transition to Noise transport and perform ephemeral DH bootstrap
     # to derive keys from SECRET material (not public handshake hash).
     noise_transport = responder.into_transport()
 
     # Receive client ephemeral public
-    bootstrap_init, _ = await _recv(transport)
-    client_public = noise_transport.decrypt(bootstrap_init)
+    bootstrap_init_frame, _ = await _recv(transport)
+    bootstrap_init_ct = _unpad_from_frame(bootstrap_init_frame, BOOTSTRAP_CIPHERTEXT_SIZE)
+    client_public = noise_transport.decrypt(bootstrap_init_ct)
     if len(client_public) != 32:
         raise HandshakeError("invalid bootstrap ephemeral from client")
 
     # Generate server ephemeral and send it back
     server_secret, server_public = tuncore.generate_ephemeral()
-    bootstrap_resp = noise_transport.encrypt(bytes(server_public))
-    await _send(transport, bootstrap_resp, addr)
+    try:
+        bootstrap_resp_ct = bytes(noise_transport.encrypt(bytes(server_public)))
+        bootstrap_resp_frame = _pad_to_frame(bootstrap_resp_ct, BOOTSTRAP_CIPHERTEXT_SIZE)
+        await _send(transport, bootstrap_resp_frame, addr)
 
-    # Derive session keys from ephemeral DH (secure, not public h)
-    session_keys = tuncore.bootstrap_session_from_dh(
-        server_secret, bytes(client_public), is_initiator=False
-    )
+        # Derive session keys from ephemeral DH (secure, not public h).
+        # Rust-side zeroizes the secret after consumption.
+        session_keys = tuncore.bootstrap_session_from_dh(
+            bytes(server_secret), bytes(client_public), is_initiator=False
+        )
+    finally:
+        del server_secret
 
-    # Also get handshake hash for logging/diagnostics
-    handshake_hash = bytes(responder.get_handshake_hash())
     log.info("handshake complete (server)")
+    # handshake_hash is already captured above; returned for diagnostics
+    _ = handshake_hash  # noqa: F841 (kept for symmetry with client)
     return session_keys, bytes(client_static)
 
 
@@ -223,21 +261,38 @@ class KeyMismatchError(HandshakeError):
     pass
 
 
-async def _send(transport: UDPTransport | TCPTransport, data: bytes, addr: tuple[str, int] | None) -> None:
-    """Send a Noise message via UDP or TCP, padded to the fixed handshake size."""
-    framed = _pad_handshake(data)
+async def _send(
+    transport: UDPTransport | TCPTransport,
+    data: bytes,
+    addr: tuple[str, int] | None,
+) -> None:
+    """Send a pre-framed handshake message (exactly HANDSHAKE_FRAME_SIZE bytes).
+
+    Callers pass either a Noise XX message (Rust pads to HANDSHAKE_FRAME_SIZE)
+    or a bootstrap frame produced by ``_pad_to_frame``. No further wrapping
+    happens here; a size check catches misuse.
+    """
+    data = bytes(data)
+    if len(data) != HANDSHAKE_FRAME_SIZE:
+        raise HandshakeError(
+            f"handshake send size mismatch: {len(data)} != {HANDSHAKE_FRAME_SIZE}"
+        )
     if isinstance(transport, UDPTransport):
         assert addr is not None, "UDP transport requires addr"
-        await transport.send(framed, addr)
+        await transport.send(data, addr)
     else:
-        await transport.send(framed)
+        await transport.send(data)
 
 
 async def _recv(
     transport: UDPTransport | TCPTransport,
     retransmit: Callable[[], Awaitable[None]] | None = None,
 ) -> tuple[bytes, tuple[str, int] | None]:
-    """Receive a padded handshake frame, return the inner Noise message.
+    """Receive a HANDSHAKE_FRAME_SIZE frame and return it verbatim.
+
+    Callers are responsible for extracting the inner payload (Rust does
+    this for Noise XX via ``read_message_*``; bootstrap uses
+    ``_unpad_from_frame``).
 
     Args:
         transport: UDP or TCP transport
@@ -246,16 +301,16 @@ async def _recv(
             the original send was lost.
 
     Returns:
-        (data, addr) where addr is the sender address for UDP, None for TCP.
+        (frame, addr) where addr is the sender address for UDP, None for TCP.
     """
     for attempt in range(MAX_RETRIES):
         try:
             if isinstance(transport, UDPTransport):
                 frame, addr = await asyncio.wait_for(transport.recv(), HANDSHAKE_TIMEOUT)
-                return _unpad_handshake(frame), addr
+                return bytes(frame), addr
             else:
                 frame = await asyncio.wait_for(transport.recv(), HANDSHAKE_TIMEOUT)
-                return _unpad_handshake(frame), None
+                return bytes(frame), None
         except asyncio.TimeoutError:
             if attempt == MAX_RETRIES - 1:
                 raise HandshakeError(

@@ -1,4 +1,12 @@
-"""Type stubs for the tuncore native Rust extension (PyO3)."""
+"""Type stubs for the tuncore native Rust extension (PyO3).
+
+PyO3 maps `Vec<u8>` to Python `list[int]` at the FFI boundary; we declare
+those returns as `bytes` here so type-checking is useful, but production
+callers that hand the value to anything strict (struct.unpack_from,
+hmac.compare_digest, os.write) MUST coerce with `bytes(...)`. The cost of
+this small lie in the stub is one explicit wrap per call site; the
+benefit is that everything downstream type-checks correctly.
+"""
 
 class IdentityKeyPair:
     @staticmethod
@@ -52,6 +60,10 @@ class SessionKeyManager:
     def from_handshake_hash(
         hash: bytes, is_initiator: bool
     ) -> SessionKeyManager: ...
+    @staticmethod
+    def from_bootstrap_shared_secret(
+        shared_secret: bytes, is_initiator: bool
+    ) -> SessionKeyManager: ...
     def encrypt(self, plaintext: bytes, aad: bytes) -> tuple[bytes, bytes, int]: ...
     def decrypt(
         self,
@@ -67,6 +79,10 @@ class SessionKeyManager:
     def complete_rotation_responder(
         self, remote_ephemeral_pub: bytes, new_epoch: int
     ) -> tuple[bytes, int]: ...
+    def prepare_rotation_responder(
+        self, remote_ephemeral_pub: bytes, new_epoch: int
+    ) -> tuple[bytes, int]: ...
+    def apply_rotation_responder(self) -> int: ...
     def tick(self) -> None: ...
     @property
     def epoch(self) -> int: ...
@@ -81,3 +97,16 @@ class AesKey:
 
 def disable_core_dumps() -> None: ...
 def harden_process() -> None: ...
+
+# Module-level helpers for the post-handshake bootstrap exchange.
+def generate_ephemeral() -> tuple[bytes, bytes]:
+    """Return ``(secret, public)`` for an X25519 ephemeral keypair."""
+    ...
+
+def bootstrap_session_from_dh(
+    our_secret: bytes,
+    peer_public: bytes,
+    is_initiator: bool,
+) -> SessionKeyManager:
+    """Derive session keys from an ephemeral DH exchange."""
+    ...

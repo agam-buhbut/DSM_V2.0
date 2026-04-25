@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import socket
 
 from dsm.net.transport._fwmark import apply_so_mark
 
@@ -17,6 +18,13 @@ MAX_DATAGRAM = 1472
 # distinguish a drop from loss on the link).
 RECV_QUEUE_SIZE = 256
 
+# Linux IP_MTU_DISCOVER values (from <linux/in.h>). Kept here to avoid a
+# runtime `socket` import-failure on non-Linux platforms where the
+# constants don't exist; actual use is still gated by a hasattr check.
+_IP_MTU_DISCOVER = getattr(socket, "IP_MTU_DISCOVER", 10)
+_IP_PMTUDISC_DO = getattr(socket, "IP_PMTUDISC_DO", 2)  # DF bit set, hard error on oversize
+_IP_MTU = getattr(socket, "IP_MTU", 14)
+
 
 class UDPTransport:
     """Non-blocking UDP send/receive."""
@@ -28,9 +36,23 @@ class UDPTransport:
             maxsize=RECV_QUEUE_SIZE,
         )
         self._closed = False
+        # True if bind() enabled kernel PMTUD (IP_PMTUDISC_DO). Consulted
+        # by `get_path_mtu()`.
+        self._pmtu_enabled = False
 
-    async def bind(self, local_addr: str = "0.0.0.0", local_port: int = 0) -> int:
-        """Bind to a local address. Returns the actual bound port."""
+    async def bind(
+        self,
+        local_addr: str = "0.0.0.0",
+        local_port: int = 0,
+        pmtu_discover: bool = False,
+    ) -> int:
+        """Bind to a local address. Returns the actual bound port.
+
+        ``pmtu_discover``: if True, enable kernel-level Path MTU Discovery
+        on the socket. The kernel will set the DF bit on outbound
+        datagrams and track the discovered path MTU (queryable via
+        ``get_path_mtu()``). Only effective on Linux.
+        """
         loop = asyncio.get_running_loop()
         protocol = _UDPProtocol(self._recv_queue)
         self._protocol = protocol
@@ -38,11 +60,38 @@ class UDPTransport:
             lambda: protocol,
             local_addr=(local_addr, local_port),
         )
-        apply_so_mark(transport.get_extra_info("socket"))
+        sock = transport.get_extra_info("socket")
+        apply_so_mark(sock)
+        if pmtu_discover and sock is not None:
+            try:
+                sock.setsockopt(socket.IPPROTO_IP, _IP_MTU_DISCOVER, _IP_PMTUDISC_DO)
+                self._pmtu_enabled = True
+                log.debug("UDP PMTUD enabled (IP_PMTUDISC_DO)")
+            except OSError as e:
+                log.warning("failed to enable PMTUD on UDP socket: %s", e)
         self._transport = transport
         actual_port = transport.get_extra_info("sockname")[1]
         log.debug("UDP bound to %s:%d", local_addr, actual_port)
         return actual_port
+
+    def get_path_mtu(self) -> int | None:
+        """Query the kernel's current Path MTU for this socket.
+
+        Returns ``None`` if PMTUD was not enabled, the socket isn't open,
+        or the kernel doesn't have a PMTU estimate yet (no packets sent
+        or no ICMP replies received). The returned value is the raw
+        IP_MTU — VPN wire-level overhead (IP+UDP+outer header+GCM tag)
+        must still be subtracted to get the usable inner payload budget.
+        """
+        if self._transport is None or not self._pmtu_enabled:
+            return None
+        sock = self._transport.get_extra_info("socket")
+        if sock is None:
+            return None
+        try:
+            return sock.getsockopt(socket.IPPROTO_IP, _IP_MTU)
+        except OSError:
+            return None
 
     async def send(self, data: bytes, addr: tuple[str, int]) -> None:
         """Send a datagram to the specified address."""

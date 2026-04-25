@@ -16,14 +16,17 @@ from typing import TYPE_CHECKING, Callable
 from dsm.core.fsm import SessionFSM
 from dsm.core.protocol import (
     Fragment, InnerPacket, OuterPacket, PacketType, ReassemblyBuffer,
-    OUTER_HEADER_SIZE, SEQ_STRUCT, SIZE_CLASSES,
+    OUTER_HEADER_SIZE, SEQ_STRUCT, SIZE_CLASSES, fragment_ip_packet,
 )
 from dsm.net.transport.udp import UDPTransport
 from dsm.net.transport.tcp import TCPTransport
 from dsm.net.tunnel import TunDevice
 from dsm.traffic.shaper import TrafficShaper
 from dsm.traffic.scheduler import SendScheduler
-from dsm.rekey import SendFn, initiate_rekey, handle_rekey_init, handle_rekey_ack
+from dsm.rekey import (
+    MAX_REKEY_RETRIES, REKEY_ACK_TIMEOUT, SendFn, initiate_rekey,
+    handle_rekey_ack, handle_rekey_init, resend_rekey_init,
+)
 
 if TYPE_CHECKING:
     import tuncore
@@ -69,6 +72,23 @@ class SequenceCounter:
         self.value += 1
         if self.value >= 2**64:
             raise RuntimeError("sequence number overflow — session must be rekeyed")
+        return self.value
+
+
+@dataclass
+class FragmentIdCounter:
+    """16-bit rolling counter for Fragment.fragment_id.
+
+    Each oversized TUN packet gets a fresh id so the receiver's
+    ReassemblyBuffer can distinguish concurrent bursts. The window is
+    larger than REASSEMBLY_MAX_PENDING (256), so id collisions only
+    happen after thousands of oversized packets — and even then the
+    stale entry has either completed or expired by 5s.
+    """
+    value: int = 0
+
+    def next(self) -> int:
+        self.value = (self.value + 1) & 0xFFFF
         return self.value
 
 
@@ -123,15 +143,17 @@ def _decrypt_with_fallback(
 ) -> tuple[bytes, bool] | None:
     """Try current-epoch decrypt, then previous-epoch if in grace period.
 
-    Returns (plaintext, used_prev_epoch) or None on failure.
+    Returns (plaintext, used_prev_epoch) or None on failure. The PyO3
+    bridge returns ``list[int]`` for ``Vec<u8>``; we coerce to ``bytes``
+    here so downstream ``struct.unpack_from`` calls on the plaintext work.
     """
     try:
-        return session_keys.decrypt(nonce, ciphertext, aad, seq, False), False
+        return bytes(session_keys.decrypt(nonce, ciphertext, aad, seq, False)), False
     except RuntimeError:
         pass
     if session_keys.has_grace_period:
         try:
-            return session_keys.decrypt(nonce, ciphertext, aad, seq, True), True
+            return bytes(session_keys.decrypt(nonce, ciphertext, aad, seq, True)), True
         except RuntimeError:
             pass
     log.debug("decrypt failed, dropping packet")
@@ -189,10 +211,43 @@ def decrypt_packet(
 
 @dataclass
 class RekeyState:
-    """Mutable rekey state shared between recv and send loops."""
+    """Mutable rekey state shared between recv and send loops.
+
+    Tracks:
+      * ``in_progress``: True between INIT send and ACK receive on the
+        initiator side (client). Never set on the responder (server).
+      * ``last_time``: monotonic timestamp of last SUCCESSFULLY completed
+        rekey — used by the rate limiter to enforce MIN_REKEY_INTERVAL.
+      * ``pending_epoch``: the epoch requested in the in-flight INIT;
+        cross-checked against the ACK so a stale/replayed ACK can't
+        complete rotation to the wrong epoch.
+      * ``last_init_payload``: raw payload bytes of the in-flight INIT
+        (``struct + ephemeral_pub``). Stored so the send loop can
+        rebuild + retransmit an identical INIT on ACK timeout without
+        re-deriving the rotation.
+      * ``last_init_sent_at``: monotonic time of the last INIT send
+        (original or retry). Used by the retry scheduler.
+      * ``retries_used``: count of retransmits attempted for the
+        current INIT; capped at ``MAX_REKEY_RETRIES``.
+    """
     in_progress: bool = False
     last_time: float | None = None
     pending_epoch: int | None = None
+    last_init_payload: bytes | None = None
+    last_init_sent_at: float | None = None
+    retries_used: int = 0
+    # Server-side only: the payload of the most recently sent REKEY_ACK,
+    # plus the epoch it applied. Consulted by ``handle_rekey_init`` when a
+    # duplicate REKEY_INIT arrives (client's ACK was lost) so we re-send
+    # the same ACK bytes under the current keys instead of trying to
+    # re-rotate (which would fail the epoch precondition).
+    cached_ack_payload: bytes | None = None
+    cached_ack_epoch: int | None = None
+
+    def reset_retry(self) -> None:
+        self.last_init_payload = None
+        self.last_init_sent_at = None
+        self.retries_used = 0
 
 
 @dataclass
@@ -213,6 +268,7 @@ class DataPathContext:
     liveness: LivenessState
     shutdown: asyncio.Event
     reassembly: ReassemblyBuffer | None = None
+    fragment_ids: FragmentIdCounter = field(default_factory=FragmentIdCounter)
 
 
 async def _handle_data(ctx: DataPathContext, inner: InnerPacket) -> None:
@@ -234,9 +290,15 @@ async def _handle_fragment(ctx: DataPathContext, inner: InnerPacket) -> None:
 
 
 async def _handle_rekey_init(ctx: DataPathContext, inner: InnerPacket) -> None:
-    ctx.rekey.last_time = await handle_rekey_init(
+    (
+        ctx.rekey.last_time,
+        ctx.rekey.cached_ack_epoch,
+        ctx.rekey.cached_ack_payload,
+    ) = await handle_rekey_init(
         inner.payload, ctx.session_keys, ctx.fsm, ctx.shaper, ctx.send_fn,
         ctx.rekey.last_time,
+        cached_ack_epoch=ctx.rekey.cached_ack_epoch,
+        cached_ack_payload=ctx.rekey.cached_ack_payload,
     )
 
 
@@ -247,11 +309,33 @@ async def _handle_rekey_ack(ctx: DataPathContext, inner: InnerPacket) -> None:
     if ts is not None:
         ctx.rekey.last_time = ts
         ctx.rekey.pending_epoch = None
+        # Successful ACK — clear retry scheduler state.
+        ctx.rekey.reset_retry()
     ctx.rekey.in_progress = False
 
 
 async def _handle_session_close(ctx: DataPathContext, inner: InnerPacket) -> None:
     ctx.shutdown.set()
+
+
+async def send_session_close(ctx: DataPathContext) -> None:
+    """Send a single SESSION_CLOSE packet to notify the peer of graceful exit.
+
+    Bypasses the scheduler (direct send_fn call) so the packet leaves
+    immediately; otherwise shutdown could tear down the scheduler before
+    the queued close packet flushed. Best-effort: errors are logged, not
+    raised — shutdown must continue regardless.
+    """
+    inner = InnerPacket(
+        ptype=PacketType.SESSION_CLOSE,
+        epoch_id=ctx.session_keys.epoch & 0x03,
+        payload=b"",
+    )
+    try:
+        padded, target_size = ctx.shaper.pad_packet(inner)
+        await ctx.send_fn(padded, target_size)
+    except Exception as e:
+        log.warning("SESSION_CLOSE send failed (continuing shutdown): %s", e)
 
 
 async def _handle_noop(ctx: DataPathContext, inner: InnerPacket) -> None:
@@ -312,27 +396,79 @@ async def liveness_loop(ctx: DataPathContext) -> None:
 
 
 async def tun_send_loop(ctx: DataPathContext) -> None:
-    """Read from TUN, pad, enqueue for sending. Initiates rekey when needed."""
+    """Read from TUN, fragment if needed, pad, enqueue for sending.
+
+    Initiates rekey when the key manager signals rotation. Packets larger
+    than ``MAX_INNER_PAYLOAD`` are split into FRAGMENT inner packets
+    (receiver reassembles via ``ReassemblyBuffer``); packets beyond the
+    16-fragment cap are dropped with a warning rather than crashing the
+    send loop.
+    """
     while not ctx.shutdown.is_set():
         if ctx.session_keys.needs_rotation() and not ctx.rekey.in_progress:
             ctx.rekey.in_progress = True
-            ctx.rekey.last_time, ctx.rekey.pending_epoch = await initiate_rekey(
+            (
+                ctx.rekey.last_time,
+                ctx.rekey.pending_epoch,
+                init_payload,
+            ) = await initiate_rekey(
                 ctx.session_keys, ctx.fsm, ctx.shaper, ctx.send_fn, ctx.rekey.last_time,
             )
+            # Record the INIT payload + send time so the retry scheduler
+            # below can retransmit on ACK timeout.
+            if init_payload is not None:
+                ctx.rekey.last_init_payload = init_payload
+                ctx.rekey.last_init_sent_at = time.monotonic()
+                ctx.rekey.retries_used = 0
+
+        # Rekey retry scheduler: if we're still waiting on REKEY_ACK after
+        # REKEY_ACK_TIMEOUT, retransmit the same INIT. After MAX_REKEY_RETRIES
+        # exhausted, tear down — the session is dead in a way we can't recover
+        # from (either network partition or peer is gone).
+        if (
+            ctx.rekey.in_progress
+            and ctx.rekey.last_init_payload is not None
+            and ctx.rekey.last_init_sent_at is not None
+        ):
+            since_sent = time.monotonic() - ctx.rekey.last_init_sent_at
+            if since_sent >= REKEY_ACK_TIMEOUT:
+                if ctx.rekey.retries_used >= MAX_REKEY_RETRIES:
+                    log.error(
+                        "rekey giving up after %d retries — tearing down",
+                        ctx.rekey.retries_used,
+                    )
+                    ctx.shutdown.set()
+                    return
+                ctx.rekey.retries_used += 1
+                log.warning(
+                    "rekey ACK timeout — retransmitting INIT (attempt %d/%d)",
+                    ctx.rekey.retries_used, MAX_REKEY_RETRIES,
+                )
+                await resend_rekey_init(
+                    ctx.rekey.last_init_payload, ctx.session_keys,
+                    ctx.shaper, ctx.send_fn,
+                )
+                ctx.rekey.last_init_sent_at = time.monotonic()
 
         try:
             pkt = await asyncio.wait_for(ctx.tun.read(), timeout=0.1)
         except asyncio.TimeoutError:
             continue
 
-        inner = InnerPacket(
-            ptype=PacketType.DATA,
-            epoch_id=ctx.session_keys.epoch & 0x03,
-            payload=pkt,
-        )
+        epoch_id = ctx.session_keys.epoch & 0x03
+        try:
+            inners = fragment_ip_packet(pkt, epoch_id, ctx.fragment_ids.next())
+        except ValueError as e:
+            # Packet exceeds the 16-fragment cap. Drop rather than crash;
+            # the kernel will retransmit if this is TCP, and UDP senders
+            # that exceed path MTU are already non-compliant.
+            log.warning("dropping oversized TUN packet (%d bytes): %s", len(pkt), e)
+            continue
+
         smoothing_delay = ctx.shaper.burst_smoothing_delay()
         if smoothing_delay is not None:
             await asyncio.sleep(smoothing_delay)
-        padded, target_size = ctx.shaper.pad_packet(inner)
-        ctx.shaper.observe_real_packet(target_size)
-        ctx.scheduler.enqueue(padded, target_size)
+        for inner in inners:
+            padded, target_size = ctx.shaper.pad_packet(inner)
+            ctx.shaper.observe_real_packet(target_size)
+            ctx.scheduler.enqueue(padded, target_size)

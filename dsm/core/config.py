@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ipaddress
+import os
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -16,17 +17,24 @@ MAX_PADDING = 1500
 MAX_JITTER_MS = 1000
 MIN_ROTATION_PACKETS = 100
 MIN_ROTATION_SECONDS = 60
+# TUN MTU bounds. 576 is the IPv4 minimum path MTU (RFC 791). 1500 is
+# standard Ethernet; DSM's wire overhead (IP+UDP+outer header+GCM tag +
+# inner header ≈ 68 B) requires TUN MTU ≤ outer_link_MTU − 68 to avoid
+# path fragmentation. The default 1400 leaves slack for typical VPN-in-
+# VPN or PPPoE paths.
+MIN_TUN_MTU = 576
+MAX_TUN_MTU = 1500
+DEFAULT_TUN_MTU = 1400
 
 
 @dataclass(frozen=True, slots=True)
 class Config:
-    mode: Literal["client", "server", "relay"]
+    mode: Literal["client", "server"]
     server_ip: str
     server_port: int
     listen_port: int
     key_file: str
     transport: Literal["udp", "tcp"] = "udp"
-    relay_addresses: list[str] = field(default_factory=list[str])
     dns_providers: list[str] = field(default_factory=list[str])
     dns_provider_pins: dict[str, list[str]] = field(default_factory=dict[str, list[str]])
     known_hosts_path: str | None = None
@@ -39,6 +47,21 @@ class Config:
     rotation_packets: int = 5000
     rotation_seconds: int = 600
     debug_dns: bool = False
+    # When True (default), the server rejects any client whose static pubkey
+    # is not in authorized_clients.json. When False AND the allowlist is empty,
+    # the server accepts the first client's pubkey (TOFU) — convenience knob
+    # for single-operator bootstrap. Set back to True after first connection.
+    strict_client_auth: bool = True
+    # TUN device MTU in bytes. Must satisfy MIN_TUN_MTU <= mtu <= MAX_TUN_MTU.
+    # The wire-level path MTU budget is checked against this at startup.
+    mtu: int = DEFAULT_TUN_MTU
+    # Enable kernel Path-MTU Discovery on the UDP socket (IP_MTU_DISCOVER).
+    # When True the kernel sets the DF (Don't Fragment) bit on outgoing
+    # datagrams and records ICMP "frag needed" replies. `get_path_mtu()`
+    # in dsm.net.transport.udp queries the current PMTU. When False the
+    # kernel runs its default policy (IP_PMTUDISC_WANT).
+    pmtu_discover: bool = False
+    config_dir: Path = field(default_factory=lambda: Path("/opt/mtun/"))
 
     def __post_init__(self) -> None:
         _validate(self)
@@ -46,7 +69,7 @@ class Config:
 
 def _validate(c: Config) -> None:
     # mode
-    if c.mode not in ("client", "server", "relay"):
+    if c.mode not in ("client", "server"):
         raise ValueError(f"invalid mode: {c.mode!r}")
 
     # server_ip
@@ -67,12 +90,6 @@ def _validate(c: Config) -> None:
     # transport
     if c.transport not in ("udp", "tcp"):
         raise ValueError(f"invalid transport: {c.transport!r}")
-
-    # relay addresses
-    if c.mode == "relay" and not c.relay_addresses:
-        raise ValueError("relay mode requires at least one relay_addresses entry")
-    for addr in c.relay_addresses:
-        _validate_host_port(addr, "relay_addresses")
 
     # dns providers
     if c.mode == "server" and not c.dns_providers:
@@ -132,28 +149,28 @@ def _validate(c: Config) -> None:
     if c.log_level not in ("debug", "info", "warning", "error"):
         raise ValueError(f"invalid log_level: {c.log_level!r}")
 
-
-def _validate_host_port(addr: str, field_name: str) -> None:
-    """Validate 'host:port' string."""
-    if ":" not in addr:
-        raise ValueError(f"{field_name} entry missing port: {addr!r}")
-    host, port_str = addr.rsplit(":", 1)
-    try:
-        port = int(port_str)
-    except ValueError as e:
-        raise ValueError(f"{field_name} invalid port: {addr!r}") from e
-    if not (MIN_PORT <= port <= MAX_PORT):
-        raise ValueError(f"{field_name} port out of range: {addr!r}")
-    # Validate host is an IP
-    try:
-        ipaddress.ip_address(host)
-    except ValueError as e:
-        raise ValueError(f"{field_name} invalid IP: {addr!r}") from e
+    # TUN MTU bounds — below 576 breaks IPv4 connectivity in common
+    # assumptions, above 1500 overflows Ethernet without jumbo frames.
+    if not (MIN_TUN_MTU <= c.mtu <= MAX_TUN_MTU):
+        raise ValueError(
+            f"mtu must be {MIN_TUN_MTU}-{MAX_TUN_MTU}, got {c.mtu}"
+        )
 
 
 def load(path: Path | None = None) -> Config:
-    """Load and validate config from TOML file."""
+    """Load and validate config from TOML file.
+
+    Config directory resolution (highest precedence first):
+        1. DSM_CONFIG_DIR environment variable
+        2. Parent directory of the config file path
+        3. Built-in default (/opt/mtun/)
+    """
     p = path or CONFIG_PATH
+    if dsm_config_dir := os.getenv("DSM_CONFIG_DIR"):
+        config_dir = Path(dsm_config_dir)
+    else:
+        config_dir = Path(p).parent
     with open(p, "rb") as f:
         raw = tomllib.load(f)
+    raw.setdefault("config_dir", config_dir)
     return Config(**raw)

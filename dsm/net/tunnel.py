@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import asyncio
 import fcntl
+import json
 import logging
 import os
 import struct
 import subprocess
+from pathlib import Path
 
 log = logging.getLogger(__name__)
 
@@ -50,11 +52,18 @@ def _run_commands(cmds: list[list[str]], *, strict: bool = True) -> None:
 class TunDevice:
     """Linux TUN device for VPN packet routing."""
 
+    # Path to store IPv6 per-interface state for restoration on cleanup.
+    _IPV6_STATE_PATH = Path("/run/dsm/ipv6_state.json")
+
     def __init__(self, name: str = "mtun0") -> None:
         if len(name.encode()) > 15:
             raise ValueError(f"TUN device name too long (max 15 chars): {name!r}")
         self._name = name
         self._fd: int | None = None
+        # Only set to True once configure() has fully succeeded.
+        # Guards deconfigure() from restoring IPv6 state that belongs to
+        # a prior crashed run rather than this process.
+        self._configured = False
 
     @property
     def name(self) -> str:
@@ -65,6 +74,63 @@ class TunDevice:
         if self._fd is None:
             raise RuntimeError("TUN device not open")
         return self._fd
+
+    def _capture_ipv6_state(self) -> dict[str, bool]:
+        """Capture current IPv6 disable state for all non-TUN interfaces.
+
+        Interface names are read from /sys/class/net (no text parsing),
+        then the sysctl `net.ipv6.conf.<iface>.disable_ipv6` is read via
+        the procfs path (avoids shelling out to `sysctl` per iface).
+        """
+        state: dict[str, bool] = {}
+        try:
+            net_dir = Path("/sys/class/net")
+            if not net_dir.exists():
+                return state
+            for iface_dir in net_dir.iterdir():
+                iface = iface_dir.name
+                if iface == self._name:
+                    continue
+                sysctl_path = Path(f"/proc/sys/net/ipv6/conf/{iface}/disable_ipv6")
+                try:
+                    state[iface] = sysctl_path.read_text().strip() == "1"
+                except OSError:
+                    # Some virtual interfaces (e.g., removed between iterdir
+                    # and read) or IPv6-less kernels won't have this knob.
+                    continue
+        except OSError as e:
+            log.warning("failed to capture IPv6 state: %s", e)
+        return state
+
+    def _save_ipv6_state(self, state: dict[str, bool]) -> None:
+        """Save IPv6 disable state to persistent JSON file."""
+        try:
+            self._IPV6_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with open(self._IPV6_STATE_PATH, "w") as f:
+                json.dump(state, f)
+            os.chmod(self._IPV6_STATE_PATH, 0o600)
+            log.debug("saved IPv6 state to %s", self._IPV6_STATE_PATH)
+        except Exception as e:
+            log.warning("failed to save IPv6 state: %s", e)
+
+    def _restore_ipv6_state(self) -> None:
+        """Restore IPv6 disable state from persistent JSON file."""
+        if not self._IPV6_STATE_PATH.exists():
+            log.debug("no IPv6 state file found, skipping restore")
+            return
+        try:
+            with open(self._IPV6_STATE_PATH, "r") as f:
+                state: dict[str, bool] = json.load(f)
+            cmds: list[list[str]] = []
+            for iface, was_disabled in state.items():
+                value = "1" if was_disabled else "0"
+                cmds.append(["sysctl", "-w", f"net.ipv6.conf.{iface}.disable_ipv6={value}"])
+            if cmds:
+                _run_commands(cmds, strict=False)
+            self._IPV6_STATE_PATH.unlink(missing_ok=True)
+            log.debug("restored IPv6 state from %s", self._IPV6_STATE_PATH)
+        except Exception as e:
+            log.warning("failed to restore IPv6 state: %s", e)
 
     def open(self) -> None:
         """Create and open the TUN device."""
@@ -91,6 +157,10 @@ class TunDevice:
         mtu: int = 1400,
     ) -> None:
         """Configure IP address, bring up the interface, and set routing."""
+        # Capture IPv6 state before disabling globally
+        ipv6_state = self._capture_ipv6_state()
+        self._save_ipv6_state(ipv6_state)
+
         cmds = [
             ["ip", "addr", "replace", f"{local_ip}/{netmask}", "dev", self._name],
             ["ip", "link", "set", self._name, "mtu", str(mtu)],
@@ -115,6 +185,7 @@ class TunDevice:
         cmds.append(["ip", "rule", "add", *rule_args])
 
         _run_commands(cmds)
+        self._configured = True
 
         log.info("TUN %s configured: %s/%d mtu=%d", self._name, local_ip, netmask, mtu)
 
@@ -125,11 +196,15 @@ class TunDevice:
                 ["ip", "rule", "del", "not", "fwmark", str(FWMARK), "table", "100"],
                 ["ip", "route", "del", "default", "dev", self._name, "table", "100"],
                 ["ip", "link", "set", self._name, "down"],
-                # Re-enable IPv6 on teardown
-                ["sysctl", "-w", "net.ipv6.conf.all.disable_ipv6=0"],
             ],
             strict=False,
         )
+        # Only restore IPv6 state if we successfully configured in this process.
+        # Without this guard we might restore a state file left behind by a
+        # crashed earlier run that doesn't reflect the current host state.
+        if self._configured:
+            self._restore_ipv6_state()
+            self._configured = False
 
     async def read(self, bufsize: int = 2048) -> bytes:
         """Read a packet from the TUN device (async)."""
@@ -174,8 +249,13 @@ class TunDevice:
 
     def close(self) -> None:
         """Close the TUN device."""
-        if self._fd is not None:
+        if self._fd is None:
+            return
+        try:
             self.deconfigure()
+        finally:
+            # Always close the fd, even if deconfigure raises — otherwise the
+            # file descriptor leaks and the TUN device stays held by the kernel.
             os.close(self._fd)
             self._fd = None
             log.info("TUN device %s closed", self._name)

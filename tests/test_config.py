@@ -85,10 +85,6 @@ class TestConfigValidation(unittest.TestCase):
         with self.assertRaises(ValueError):
             Config(**_base(transport="websocket"))
 
-    def test_relay_requires_addresses(self) -> None:
-        with self.assertRaises(ValueError):
-            Config(**_base(mode="relay"))
-
     def test_server_requires_dns(self) -> None:
         with self.assertRaises(ValueError):
             Config(**_base(mode="server"))
@@ -122,18 +118,24 @@ class TestConfigValidation(unittest.TestCase):
         self.assertEqual(c.padding_max, 1400)
         self.assertEqual(c.jitter_ms_min, 1)
         self.assertEqual(c.jitter_ms_max, 50)
+        self.assertEqual(c.mtu, 1400)
+        self.assertFalse(c.pmtu_discover)
 
-    def test_relay_valid(self) -> None:
-        c = Config(**_base(mode="relay", relay_addresses=["10.0.0.2:51820"]))
-        self.assertEqual(c.mode, "relay")
-
-    def test_relay_bad_address(self) -> None:
+    def test_mtu_too_small(self) -> None:
         with self.assertRaises(ValueError):
-            Config(**_base(mode="relay", relay_addresses=["no-port"]))
+            Config(**_base(mtu=100))
 
-    def test_relay_bad_port(self) -> None:
+    def test_mtu_too_large(self) -> None:
         with self.assertRaises(ValueError):
-            Config(**_base(mode="relay", relay_addresses=["10.0.0.2:99999"]))
+            Config(**_base(mtu=9000))
+
+    def test_mtu_custom_valid(self) -> None:
+        c = Config(**_base(mtu=1280))
+        self.assertEqual(c.mtu, 1280)
+
+    def test_pmtu_discover_flag(self) -> None:
+        c = Config(**_base(pmtu_discover=True))
+        self.assertTrue(c.pmtu_discover)
 
 
 if __name__ == "__main__":

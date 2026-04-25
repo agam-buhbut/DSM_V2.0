@@ -1,40 +1,49 @@
-"""Tests for dsm.crypto.handshake framing helpers."""
+"""Tests for dsm.crypto.handshake framing helpers.
+
+Noise XX messages are pre-padded by the Rust side; the Python helpers
+tested here only frame the *bootstrap* messages (post-handshake ephemeral
+DH exchange), which are ciphertexts of a fixed, protocol-known size.
+"""
 
 import unittest
 
 from dsm.crypto.handshake import (
+    BOOTSTRAP_CIPHERTEXT_SIZE,
     HANDSHAKE_FRAME_SIZE,
     HandshakeError,
-    _pad_handshake,
-    _unpad_handshake,
+    _pad_to_frame,
+    _unpad_from_frame,
 )
 
 
-class TestHandshakePadding(unittest.TestCase):
+class TestHandshakeFraming(unittest.TestCase):
     def test_pad_produces_fixed_size(self) -> None:
-        for n in (0, 1, 32, 96, 1398):
-            framed = _pad_handshake(b"x" * n)
-            self.assertEqual(len(framed), HANDSHAKE_FRAME_SIZE)
+        ct = b"x" * BOOTSTRAP_CIPHERTEXT_SIZE
+        framed = _pad_to_frame(ct, BOOTSTRAP_CIPHERTEXT_SIZE)
+        self.assertEqual(len(framed), HANDSHAKE_FRAME_SIZE)
+
+    def test_pad_preserves_prefix(self) -> None:
+        ct = b"y" * BOOTSTRAP_CIPHERTEXT_SIZE
+        framed = _pad_to_frame(ct, BOOTSTRAP_CIPHERTEXT_SIZE)
+        self.assertEqual(framed[:BOOTSTRAP_CIPHERTEXT_SIZE], ct)
 
     def test_round_trip(self) -> None:
-        for payload in (b"", b"abc", b"\x00" * 64, b"y" * 1398):
-            self.assertEqual(_unpad_handshake(_pad_handshake(payload)), payload)
+        ct = bytes(range(BOOTSTRAP_CIPHERTEXT_SIZE))
+        framed = _pad_to_frame(ct, BOOTSTRAP_CIPHERTEXT_SIZE)
+        self.assertEqual(_unpad_from_frame(framed, BOOTSTRAP_CIPHERTEXT_SIZE), ct)
 
-    def test_oversize_payload_rejected(self) -> None:
-        too_big = b"z" * (HANDSHAKE_FRAME_SIZE - 1)
+    def test_wrong_payload_size_rejected(self) -> None:
+        # Caller passed a ct that's a different size than the protocol expects.
         with self.assertRaises(HandshakeError):
-            _pad_handshake(too_big)
+            _pad_to_frame(b"x" * (BOOTSTRAP_CIPHERTEXT_SIZE - 1), BOOTSTRAP_CIPHERTEXT_SIZE)
+        with self.assertRaises(HandshakeError):
+            _pad_to_frame(b"x" * (BOOTSTRAP_CIPHERTEXT_SIZE + 1), BOOTSTRAP_CIPHERTEXT_SIZE)
 
     def test_wrong_frame_size_rejected(self) -> None:
         with self.assertRaises(HandshakeError):
-            _unpad_handshake(b"x" * (HANDSHAKE_FRAME_SIZE - 1))
+            _unpad_from_frame(b"x" * (HANDSHAKE_FRAME_SIZE - 1), BOOTSTRAP_CIPHERTEXT_SIZE)
         with self.assertRaises(HandshakeError):
-            _unpad_handshake(b"x" * (HANDSHAKE_FRAME_SIZE + 1))
-
-    def test_length_prefix_out_of_range_rejected(self) -> None:
-        bad = (HANDSHAKE_FRAME_SIZE).to_bytes(2, "big") + b"\x00" * (HANDSHAKE_FRAME_SIZE - 2)
-        with self.assertRaises(HandshakeError):
-            _unpad_handshake(bad)
+            _unpad_from_frame(b"x" * (HANDSHAKE_FRAME_SIZE + 1), BOOTSTRAP_CIPHERTEXT_SIZE)
 
 
 if __name__ == "__main__":

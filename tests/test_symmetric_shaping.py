@@ -59,7 +59,7 @@ class TestSymmetricShaping(unittest.TestCase):
             server = TrafficShaper(PADDING_MIN, PADDING_MAX)
             client_targets: set[int] = set()
             server_targets: set[int] = set()
-            for _ in range(200):
+            for _ in range(500):
                 _, ct = await make_chaff_packet(client, epoch_id=0)
                 _, st = await make_chaff_packet(server, epoch_id=0)
                 client_targets.add(ct)

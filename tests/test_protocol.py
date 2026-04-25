@@ -5,9 +5,6 @@ import struct
 import unittest
 
 from dsm.core.protocol import (
-    FRAGMENT_HEADER_SIZE,
-    GCM_TAG_SIZE,
-    INNER_HEADER_SIZE,
     OUTER_HEADER_SIZE,
     SIZE_CLASSES,
     Fragment,

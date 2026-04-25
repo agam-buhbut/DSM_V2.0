@@ -186,7 +186,9 @@ class KeyStore:
         import tuncore
 
         kp = tuncore.IdentityKeyPair.generate()
-        blob = kp.encrypt_to_store(bytes(passphrase))
+        # PyO3 returns Vec<u8> as Python list[int]; coerce to bytes before
+        # handing to os.write via atomic_write.
+        blob = bytes(kp.encrypt_to_store(bytes(passphrase)))
         atomic_write(self._path, blob)
         self._identity = kp
         return bytes(kp.public_key)

@@ -69,7 +69,7 @@ pub fn bootstrap_keys_from_dh(
     our_secret_bytes: &[u8; 32],
     peer_public_bytes: &[u8; 32],
     is_initiator: bool,
-) -> Result<(SessionKeyManager, Vec<u8>), String> {
+) -> Result<SessionKeyManager, String> {
     let our_secret = StaticSecret::from(*our_secret_bytes);
     let peer_public = PublicKey::from(*peer_public_bytes);
     let shared = our_secret.diffie_hellman(&peer_public);
@@ -79,13 +79,10 @@ pub fn bootstrap_keys_from_dh(
         return Err("bootstrap: non-contributory shared secret (low-order public key)".into());
     }
 
-    let shared_secret_bytes = shared.as_bytes();
-    let manager = SessionKeyManager::from_bootstrap_shared_secret(
-        shared_secret_bytes,
-        is_initiator,
-    )?;
-
-    Ok((manager, shared_secret_bytes.to_vec()))
+    // `shared.as_bytes()` borrows from the zeroizing `SharedSecret`; consumed
+    // inline so no copy escapes this function. The `SharedSecret` is dropped
+    // at end-of-scope (x25519-dalek zeroizes on drop).
+    SessionKeyManager::from_bootstrap_shared_secret(shared.as_bytes(), is_initiator)
 }
 
 /// Full session key state managing current and previous epoch keys,
@@ -119,6 +116,16 @@ pub struct RotationInit {
 /// Result of processing a rotation acknowledgment.
 pub struct RotationComplete {
     pub new_epoch: u32,
+}
+
+/// Opaque handle for a responder's derived-but-not-yet-applied rotation.
+/// Keeps the new keys in mlock'd memory until `apply_rotation_responder`
+/// consumes it.
+pub struct ResponderPending {
+    pub our_pub: [u8; 32],
+    pub new_epoch: u32,
+    new_send: LockedKey32,
+    new_recv: LockedKey32,
 }
 
 impl SessionKeyManager {
@@ -306,11 +313,31 @@ impl SessionKeyManager {
 
     /// Complete rotation as the responder after receiving the initiator's INIT.
     /// Returns (ephemeral_pub, RotationComplete) — send ephemeral_pub in ACK.
+    ///
+    /// This is the single-shot variant. Network users should prefer
+    /// `prepare_rotation_responder` + `apply_rotation_responder` so that the
+    /// REKEY_ACK can be sent with the OLD keys (needed for the initiator to
+    /// decrypt it before it has applied its own rotation).
     pub fn complete_rotation_responder(
         &mut self,
         remote_ephemeral_pub: &[u8; 32],
         new_epoch: u32,
     ) -> Result<([u8; 32], RotationComplete), String> {
+        let pending = self.prepare_rotation_responder(remote_ephemeral_pub, new_epoch)?;
+        let our_pub = pending.our_pub;
+        let complete = self.apply_rotation_responder(pending)?;
+        Ok((our_pub, complete))
+    }
+
+    /// First phase of the network-responder rotation flow: derive the new
+    /// keys and our ephemeral public key, but do NOT mutate `self`. Caller
+    /// sends the ACK with the still-current (old) keys and then invokes
+    /// `apply_rotation_responder` to actually rotate.
+    pub fn prepare_rotation_responder(
+        &self,
+        remote_ephemeral_pub: &[u8; 32],
+        new_epoch: u32,
+    ) -> Result<ResponderPending, String> {
         let expected = self.epoch.checked_add(1).ok_or("epoch overflow")?;
         if new_epoch != expected {
             return Err(format!(
@@ -327,8 +354,16 @@ impl SessionKeyManager {
         let (new_recv, new_send) =
             derive_rotation_keys(secret.as_array(), remote_ephemeral_pub, new_epoch)?;
 
-        let complete = self.apply_rotation(new_send, new_recv, new_epoch)?;
-        Ok((our_pub, complete))
+        Ok(ResponderPending { our_pub, new_epoch, new_send, new_recv })
+    }
+
+    /// Second phase: consume the `ResponderPending` produced by
+    /// `prepare_rotation_responder` and swap the session keys in.
+    pub fn apply_rotation_responder(
+        &mut self,
+        pending: ResponderPending,
+    ) -> Result<RotationComplete, String> {
+        self.apply_rotation(pending.new_send, pending.new_recv, pending.new_epoch)
     }
 
     /// Apply new keys, keeping old recv key for grace period.

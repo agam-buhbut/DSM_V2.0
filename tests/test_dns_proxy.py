@@ -1,14 +1,9 @@
 """Tests for dsm.net.dns_proxy — qname redaction and debug_dns gating."""
 
-import asyncio
 import hashlib
-import logging
 import unittest
-from unittest.mock import MagicMock
 
-import dns.flags
 import dns.message
-import dns.rdataclass
 import dns.rdatatype
 
 from dsm.net.dns_proxy import LocalDNSProxy, _redact_qname

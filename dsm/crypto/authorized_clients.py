@@ -66,11 +66,12 @@ class AuthorizedClients:
                 stored_hmac = bytes.fromhex(entry["hmac"])
                 pubkey = bytes.fromhex(pubkey_hex)
 
-                # Verify HMAC
-                expected_hmac = self._identity.compute_hmac(
+                # Verify HMAC. compute_hmac returns a Python list[int] over
+                # the FFI boundary; wrap in bytes() for constant-time compare.
+                expected_hmac = bytes(self._identity.compute_hmac(
                     b"dsm-authorized-clients-v1-",
                     pubkey,
-                )
+                ))
                 if not hmac.compare_digest(stored_hmac, expected_hmac):
                     raise ValueError("HMAC verification failed")
 
@@ -82,18 +83,18 @@ class AuthorizedClients:
 
     def save(self) -> None:
         """Save authorized clients to disk with HMAC integrity."""
-        entries = []
+        entries: list[dict[str, str]] = []
         for pubkey in sorted(self._clients):
-            hmac_tag = self._identity.compute_hmac(
+            hmac_tag = bytes(self._identity.compute_hmac(
                 b"dsm-authorized-clients-v1-",
                 pubkey,
-            )
+            ))
             entries.append({
                 "pubkey_hex": pubkey.hex(),
                 "hmac": hmac_tag.hex(),
             })
 
-        blob = {
+        blob: dict[str, object] = {
             "version": 1,
             "entries": entries,
         }
