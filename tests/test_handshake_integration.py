@@ -229,6 +229,70 @@ class TestHandshakeRoundtripTCP(unittest.IsolatedAsyncioTestCase):
     _HAS_TUNCORE,
     "tuncore (Rust crypto core) not built; run `maturin develop` in rust/tuncore/",
 )
+class TestHandshakeWithTOFUSave(unittest.IsolatedAsyncioTestCase):
+    """Regression: client_handshake with a real (non-None) known_hosts_path.
+
+    This is the path that exercises ``_check_known_host`` →
+    ``_save_known_host`` → ``static_key.hex()``. A list/bytes leak in
+    ``read_message_2``'s return value used to crash here with
+    ``'list' object has no attribute 'hex'``. Now ``server_static`` is
+    coerced to ``bytes`` at the FFI boundary; this test pins that.
+    """
+
+    async def asyncSetUp(self) -> None:
+        self._so_mark_patches = [
+            patch("dsm.net.transport.udp.apply_so_mark", lambda sock: None),
+        ]
+        for p in self._so_mark_patches:
+            p.start()
+
+    async def asyncTearDown(self) -> None:
+        for p in self._so_mark_patches:
+            p.stop()
+
+    async def test_first_connection_writes_tofu_known_hosts(self) -> None:
+        import tempfile
+        from pathlib import Path
+        from dsm.crypto.handshake import client_handshake, server_handshake
+        from dsm.net.transport.udp import UDPTransport
+
+        with tempfile.TemporaryDirectory() as tmp:
+            known_hosts = Path(tmp) / "known_hosts.json"
+
+            server_t = UDPTransport()
+            server_port = await server_t.bind("127.0.0.1", 0)
+            self.addAsyncCleanup(server_t.aclose)
+
+            client_t = UDPTransport()
+            await client_t.bind("127.0.0.1", 0)
+            self.addAsyncCleanup(client_t.aclose)
+
+            server_id = tuncore.IdentityKeyPair.generate()
+            client_id = tuncore.IdentityKeyPair.generate()
+
+            (client_keys, _h), (_server_keys, _client_static) = await asyncio.wait_for(
+                asyncio.gather(
+                    client_handshake(
+                        client_t, client_id, ("127.0.0.1", server_port),
+                        known_hosts_path=known_hosts,
+                    ),
+                    server_handshake(server_t, server_id),
+                ),
+                timeout=30.0,
+            )
+            del client_keys
+
+            # The handshake must have written the TOFU file.
+            self.assertTrue(
+                known_hosts.exists(),
+                "TOFU first-connection save did not write known_hosts.json",
+            )
+
+
+@unittest.skipUnless(
+    _HAS_TUNCORE,
+    "tuncore (Rust crypto core) not built; run `maturin develop` in rust/tuncore/",
+)
 class TestServerWaitsIndefinitelyForFirstMsg1(unittest.IsolatedAsyncioTestCase):
     """Regression: the server's initial msg1 recv must NOT have the
     MAX_RETRIES × HANDSHAKE_TIMEOUT bound (~18s). Before this fix the

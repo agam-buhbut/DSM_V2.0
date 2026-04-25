@@ -120,7 +120,10 @@ async def client_handshake(
         raise HandshakeError(
             f"msg2 from unexpected source {recv_addr}, expected {server_addr}"
         )
-    server_static = initiator.read_message_2(msg2)
+    # PyO3 hands us Vec<u8> as Python list[int]; coerce to bytes once at
+    # the FFI boundary so every downstream consumer (TOFU known_hosts
+    # serialization, HMAC compare, log .hex()) works on a real bytes object.
+    server_static = bytes(initiator.read_message_2(msg2))
 
     # Validate server static key against cache (HMAC-protected)
     if known_hosts_path:
@@ -218,7 +221,8 @@ async def server_handshake(
         raise HandshakeError(
             f"msg3 from unexpected source {msg3_addr}, expected {addr}"
         )
-    client_static = responder.read_message_3(msg3)
+    # Coerce list[int] -> bytes at the FFI boundary (see server_handshake).
+    client_static = bytes(responder.read_message_3(msg3))
 
     # Snapshot the handshake hash before transitioning to transport state —
     # into_transport() consumes the responder.
@@ -253,7 +257,7 @@ async def server_handshake(
     log.info("handshake complete (server)")
     # handshake_hash is already captured above; returned for diagnostics
     _ = handshake_hash  # noqa: F841 (kept for symmetry with client)
-    return session_keys, bytes(client_static)
+    return session_keys, client_static
 
 
 class HandshakeError(Exception):
