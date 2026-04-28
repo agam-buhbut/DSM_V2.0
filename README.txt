@@ -187,7 +187,10 @@ Path: /opt/mtun/config.toml
 
 Parameters:
 - mode: client | server
-- server_ip, server_port, listen_port
+- server_ip: literal IPv4/IPv6 address ONLY (hostnames are rejected;
+  the kill-switch nftables rules cannot resolve names. Run
+  `dig +short <host> | head -1` and put the resulting IP here)
+- server_port, listen_port
 - key_file: path to encrypted identity key
 - transport: udp | tcp (default: udp)
 - dns_providers: DoH/DoT URLs (server mode)
@@ -196,7 +199,10 @@ Parameters:
 - tun_name: TUN device name (default: mtun0)
 - mtu: TUN interface MTU in bytes (default: 1400, bounds 576-1500)
 - pmtu_discover: enable kernel PMTUD on UDP socket (default: false)
-- log_level: debug | info | warning | error (default: warning)
+- log_level: debug | info | warning | error (default: info — operational
+  lines like "ip_forward enabled", "MASQUERADE applied", "tunnel
+  established", "client connected" only appear at info or below.
+  Use "debug" for protocol-level packet tracing.)
 - padding_min, padding_max: padding range (default: 128-1400)
 - jitter_ms_min, jitter_ms_max: jitter range in ms (default: 1-50)
 - rotation_packets, rotation_seconds: key rotation thresholds (default: 5000/600)
@@ -325,7 +331,12 @@ OPERATOR GUIDE
    $ sudo /usr/bin/python3 -m pip install --break-system-packages \
          pytest pytest-asyncio
    $ python3 -m pytest tests/ -q              # ~150 tests should pass
-   $ cd rust/tuncore && cargo test --release  # 55 tests should pass
+   $ cd rust/tuncore && PYO3_PYTHON=/usr/bin/python3 cargo test --release
+                                              # 55 tests should pass.
+                                              # PYO3_PYTHON is required on
+                                              # Debian/Ubuntu where only
+                                              # /usr/bin/python3 exists (pyo3
+                                              # otherwise looks for /usr/bin/python).
    $ cd ../..
 
    The tests don't need root, so plain `python3` here is fine.
@@ -783,11 +794,18 @@ CLI REFERENCE
 
 LOGGING
 
-Development:
-- log_level = "debug" for full verbose logging
+Default: log_level = "info". This shows operational lifecycle lines
+(listening, connected, authorized, configured, MASQUERADE applied,
+sysctl changes, shutting down) without per-packet noise. Recommended
+for both initial deployment and steady-state operation.
 
-Production:
-- log_level = "warning" (default) for errors and warnings only
+- log_level = "debug" for protocol-level tracing (every packet class,
+  every retry, every key derivation step). Verbose; use during
+  bring-up or to diagnose specific protocol bugs.
+- log_level = "warning" or "error" if you only want exceptional
+  events. NOTE: at warning, you will not see "tunnel established",
+  "MASQUERADE applied", or other normal-operation lines, which makes
+  diagnosing "is the new code running?" much harder.
 
 TESTING
 

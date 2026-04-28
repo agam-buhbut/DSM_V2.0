@@ -56,9 +56,23 @@ class UDPTransport:
         loop = asyncio.get_running_loop()
         protocol = _UDPProtocol(self._recv_queue)
         self._protocol = protocol
+        # Pre-create the socket so we can set SO_REUSEADDR before bind.
+        # Without this a fast restart on a fixed listen_port races the
+        # kernel's TIME_WAIT cleanup and bind fails with EADDRINUSE —
+        # painful enough during dev iteration that it's the default.
+        # SO_REUSEPORT is intentionally NOT set: it would let two
+        # instances bind the same port silently.
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.setblocking(False)
+        try:
+            sock.bind((local_addr, local_port))
+        except OSError:
+            sock.close()
+            raise
         transport, _ = await loop.create_datagram_endpoint(
             lambda: protocol,
-            local_addr=(local_addr, local_port),
+            sock=sock,
         )
         sock = transport.get_extra_info("socket")
         apply_so_mark(sock)

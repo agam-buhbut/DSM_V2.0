@@ -16,11 +16,13 @@ Server (responder):
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import fcntl
 import hmac
 import json
 import logging
 import os
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Generator
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -444,12 +446,34 @@ def _save_known_hosts_dict(
     atomic_write(path, mac + payload)
 
 
+@contextlib.contextmanager
+def _known_hosts_lock(path: Path) -> Generator[None, None, None]:
+    """Hold an exclusive flock on a sidecar file across read-modify-write.
+
+    Without this, two clients TOFU-saving to the same path simultaneously
+    can race: both read the same baseline, both add their entry, the
+    second atomic_write rename wins, and the first entry is lost.
+    """
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
 def _save_known_host(
     path: Path,
     host_key: str,
     static_key: bytes,
     identity: tuncore.IdentityKeyPair,
 ) -> None:
-    hosts = _load_known_hosts(path, identity)
-    hosts[host_key] = static_key.hex()
-    _save_known_hosts_dict(path, hosts, identity)
+    with _known_hosts_lock(path):
+        hosts = _load_known_hosts(path, identity)
+        hosts[host_key] = static_key.hex()
+        _save_known_hosts_dict(path, hosts, identity)

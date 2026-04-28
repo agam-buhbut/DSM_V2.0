@@ -5,6 +5,7 @@ from __future__ import annotations
 import hmac
 import json
 import logging
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -53,11 +54,20 @@ class AuthorizedClients:
 
         try:
             blob = json.loads(self._path.read_text())
-        except (json.JSONDecodeError, OSError) as e:
-            raise RuntimeError(f"failed to load authorized_clients: {e}")
+        except OSError as e:
+            raise RuntimeError(f"failed to read authorized_clients: {e}")
+        except json.JSONDecodeError as e:
+            # Corrupted file (interrupted save, manual edit, etc.) would
+            # otherwise permanently DoS the server. Quarantine instead and
+            # continue with an empty allowlist — the operator sees the
+            # warning, can re-authorize via `dsm authorize`, and the bad
+            # file is preserved for inspection.
+            self._quarantine(f"malformed JSON: {e}")
+            return
 
         if blob.get("version") != 1:
-            raise RuntimeError("unsupported authorized_clients version")
+            self._quarantine(f"unsupported version: {blob.get('version')!r}")
+            return
 
         entries = blob.get("entries", [])
         for entry in entries:
@@ -116,3 +126,21 @@ class AuthorizedClients:
 
     def __len__(self) -> int:
         return len(self._clients)
+
+    def _quarantine(self, reason: str) -> None:
+        """Move a corrupted file aside so the server can keep starting."""
+        ts = int(time.time())
+        broken = self._path.with_suffix(f".broken-{ts}")
+        try:
+            self._path.rename(broken)
+            log.error(
+                "authorized_clients.json is corrupted (%s); moved to %s. "
+                "Re-authorize clients with `dsm authorize <pubkey>`.",
+                reason, broken,
+            )
+        except OSError as e:
+            log.error(
+                "authorized_clients.json is corrupted (%s) and could not be "
+                "renamed (%s). Allowlist starting empty.",
+                reason, e,
+            )

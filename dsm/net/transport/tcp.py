@@ -76,20 +76,32 @@ class TCPTransport:
         await self._writer.drain()
 
     async def recv(self, timeout: float | None = None) -> bytes:
-        """Receive a length-prefixed frame."""
+        """Receive a length-prefixed frame.
+
+        Raises ``ConnectionError`` on clean peer disconnect (EOF mid-frame).
+        Callers' recv loops should treat this the same as shutdown — propagating
+        IncompleteReadError directly would tear down the asyncio.gather without
+        a clean log line.
+        """
         if self._reader is None:
             raise RuntimeError("not connected")
 
         async def _read() -> bytes:
             reader = self._reader
             assert reader is not None
-            len_buf = await reader.readexactly(LEN_PREFIX_SIZE)
-            (length,) = struct.unpack("!I", len_buf)
-            if length > MAX_FRAME_SIZE:
-                raise ValueError(f"frame length {length} exceeds max {MAX_FRAME_SIZE}")
-            if length == 0:
-                return b""
-            return await reader.readexactly(length)
+            try:
+                len_buf = await reader.readexactly(LEN_PREFIX_SIZE)
+                (length,) = struct.unpack("!I", len_buf)
+                if length > MAX_FRAME_SIZE:
+                    raise ValueError(f"frame length {length} exceeds max {MAX_FRAME_SIZE}")
+                if length == 0:
+                    return b""
+                return await reader.readexactly(length)
+            except asyncio.IncompleteReadError as e:
+                raise ConnectionError(
+                    f"TCP peer closed mid-frame ({len(e.partial)} of "
+                    f"{e.expected} bytes received)"
+                ) from None
 
         if timeout is not None:
             return await asyncio.wait_for(_read(), timeout)

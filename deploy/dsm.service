@@ -1,42 +1,42 @@
 [Unit]
 Description=DSM VPN Tunnel
-Documentation=file:///opt/mtun/README.md
-After=network.target
+Documentation=file:///opt/mtun/README.txt
+After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=notify
-User=dsm
-DynamicUser=yes
-AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN
-NoNewPrivileges=yes
-ProtectSystem=strict
-ProtectHome=yes
-PrivateTmp=yes
-ProtectKernelTunables=yes
-ProtectKernelModules=yes
-RestrictNamespaces=yes
-RestrictRealtime=yes
-RestrictSUIDSGID=yes
-RemoveIPC=yes
-SystemCallFilter=@system-service
-SystemCallErrorNumber=EPERM
+# Type=simple (NOT notify): the dsm process does not call sd_notify(),
+# so notify would block systemd until TimeoutStartSec then assume failure.
+Type=simple
 
-# Load passphrase from systemd credential
+# Run as root. The service needs CAP_NET_ADMIN+CAP_SYS_ADMIN+CAP_NET_BIND_SERVICE
+# (TUN, nftables, sysctl, /etc/resolv.conf write, bind 10.8.0.1:53), AND
+# write access to /opt/mtun/ for keystore + known_hosts. Hardening with
+# DynamicUser=yes / ProtectSystem=strict requires substantial path remapping
+# that is left to the operator. The dsm process itself runs harden_process()
+# (no_new_privs, dumpable=0, core dumps disabled) once started.
+User=root
+
+# Pass passphrase via systemd credential. The source file /etc/dsm/passphrase
+# must be mode 0600, owned by root. systemd materializes a per-process copy
+# at $CREDENTIALS_DIRECTORY/passphrase (mode 0400, root-owned, in tmpfs).
 LoadCredential=passphrase:/etc/dsm/passphrase
 
-# Allow service to access TUN device and routing tables
-ReadWritePaths=/dev/net/tun /proc/sys/net
+# --mode server is the correct CLI form. The previous `dsm server --mode udp`
+# was wrong: `server` is not a subcommand and `--mode` only accepts
+# {client,server}. Transport (udp/tcp) lives in config.toml.
+ExecStart=/usr/bin/python3 -m dsm --mode server \
+          --passphrase-env-file=${CREDENTIALS_DIRECTORY}/passphrase
 
-# Key files
-StateDirectory=mtun
-ConfigurationDirectory=mtun
-LogsDirectory=mtun
+# Graceful shutdown: dsm.session.setup_signal_handlers wires SIGINT, SIGTERM,
+# SIGHUP, SIGQUIT to the AsyncExitStack unwind. 15s is comfortable for the
+# stack to send SESSION_CLOSE and tear down nftables/TUN/resolv.conf.
+KillSignal=SIGTERM
+TimeoutStopSec=15
 
-# Service execution
-ExecStart=/usr/bin/python3 -m dsm server --mode udp
 Restart=on-failure
 RestartSec=10s
+
 StandardOutput=journal
 StandardError=journal
 

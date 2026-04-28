@@ -39,7 +39,7 @@ class Config:
     dns_provider_pins: dict[str, list[str]] = field(default_factory=dict[str, list[str]])
     known_hosts_path: str | None = None
     tun_name: str = "mtun0"
-    log_level: Literal["debug", "info", "warning", "error"] = "warning"
+    log_level: Literal["debug", "info", "warning", "error"] = "info"
     padding_min: int = 128
     padding_max: int = 1400
     jitter_ms_min: int = 1
@@ -72,11 +72,18 @@ def _validate(c: Config) -> None:
     if c.mode not in ("client", "server"):
         raise ValueError(f"invalid mode: {c.mode!r}")
 
-    # server_ip
+    # server_ip must be a literal IP — the kill-switch nftables rules
+    # reference it with `ip daddr <addr>` which does not accept hostnames.
+    # Auto-resolution would change behavior depending on which resolver is
+    # up at config-load time (and would happen before the kill switch is
+    # installed, leaking the lookup), so we require an explicit IP.
     try:
         ipaddress.ip_address(c.server_ip)
     except ValueError as e:
-        raise ValueError(f"invalid server_ip: {c.server_ip!r}") from e
+        raise ValueError(
+            f"server_ip must be a literal IP, got {c.server_ip!r}. "
+            f"Resolve your hostname first: `dig +short <host> | head -1`"
+        ) from e
 
     # ports
     # server_port is always a real concrete port — clients need it to connect.
@@ -171,6 +178,20 @@ def _validate(c: Config) -> None:
     if not (MIN_TUN_MTU <= c.mtu <= MAX_TUN_MTU):
         raise ValueError(
             f"mtu must be {MIN_TUN_MTU}-{MAX_TUN_MTU}, got {c.mtu}"
+        )
+
+    # Wire-overhead sanity warning. DSM adds ~68 bytes of outer
+    # IP+UDP+header+GCM tag+inner header. With Ethernet's 1500-byte MTU,
+    # values above ~1400 risk silent kernel fragmentation or PMTU drops
+    # on PPPoE / VPN-in-VPN paths where the link MTU is below 1500.
+    if c.mtu > 1400:
+        import logging
+        logging.getLogger(__name__).warning(
+            "configured tun mtu=%d is above the safe default 1400; "
+            "wire packets will be ~%d B which may exceed link MTU on "
+            "PPPoE/tunnel-in-tunnel paths. Lower to 1380 if ping works "
+            "but throughput stalls.",
+            c.mtu, c.mtu + 68,
         )
 
 

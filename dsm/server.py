@@ -64,6 +64,11 @@ async def run_server(
         # stack.push_async_callback. Mixing them is the most common
         # AsyncExitStack footgun — see typing on contextlib.AsyncExitStack.
 
+        # Register keystore unload first so it unwinds last — the
+        # encrypted identity must stay in memory for the lifetime of
+        # the session. Mirrors client.py.
+        stack.callback(keystore.unload)
+
         rate_limiter = ServerRateLimitManager(config.listen_port)
         rate_limiter.apply()
         stack.callback(rate_limiter.remove)
@@ -145,7 +150,7 @@ async def run_server(
         # drops the packet (forwarding off) or replies are unroutable
         # (replies addressed to 10.8.0.0/24, no NAT). Apply AFTER the TUN
         # exists so the MASQUERADE rule can reference its name.
-        ip_forward = IPForwardingManager()
+        ip_forward = IPForwardingManager(tun_name=config.tun_name)
         ip_forward.apply()
         stack.callback(ip_forward.remove)
 
@@ -184,6 +189,11 @@ async def run_server(
 
         # Guard chaff generation until client_addr is known — the scheduler
         # starts immediately but chaff requires a destination for UDP.
+        # Assumes client_addr is monotonic-set-once: it's populated on the
+        # first authenticated packet and never cleared. If a future change
+        # ever resets it to None, _should_chaff and chaff_fn race across
+        # the scheduler tick's await and chaff_fn() will hit the
+        # "UDP send requires destination" branch in send_packet.
         def _should_chaff() -> bool:
             return client_addr[0] is not None and shaper.should_send_chaff()
 
@@ -224,6 +234,10 @@ async def run_server(
                 except asyncio.TimeoutError:
                     session_keys.tick()
                     continue
+                except ConnectionError as e:
+                    log.info("transport closed by peer: %s", e)
+                    shutdown.set()
+                    return
 
                 result = decrypt_packet(data, session_keys, replay)
                 if result is None:
@@ -251,7 +265,7 @@ async def run_server(
             # Notify peer first (before scheduler + transport tear down),
             # so it sees a fast graceful close rather than DEAD_PEER_TIMEOUT.
             await send_session_close(ctx)
-            keystore.unload()
             fsm.transition(State.TEARDOWN)
             fsm.transition(State.IDLE)
             # AsyncExitStack cleanup happens automatically here
+            # (including keystore.unload — see top of stack).

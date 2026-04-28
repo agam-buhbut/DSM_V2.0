@@ -107,21 +107,30 @@ class TestAuthorizedClients(unittest.TestCase):
             ac2.load()
         self.assertEqual(len(ac2), 0)
 
-    # --- Corrupted JSON raises ---
-    def test_corrupted_json_raises(self) -> None:
+    # --- Corrupted JSON quarantines and continues empty ---
+    # Crashing on corruption made the server permanently undeployable on
+    # any half-written or operator-edited file. Quarantine + continue
+    # logs the event loudly and lets the operator re-authorize.
+    def test_corrupted_json_quarantines(self) -> None:
         self.path.write_bytes(b"not a json at all {{{")
         _harden(self.path)
         ac = AuthorizedClients(self.path, self.identity)
-        with self.assertRaises(RuntimeError):
+        with self.assertLogs("dsm.crypto.authorized_clients", level="ERROR"):
             ac.load()
+        self.assertEqual(len(ac), 0)
+        self.assertFalse(self.path.exists())
+        # The broken file should have been moved aside.
+        broken = list(self.path.parent.glob(f"{self.path.stem}.broken-*"))
+        self.assertEqual(len(broken), 1)
 
-    # --- Bad version raises ---
-    def test_bad_version_raises(self) -> None:
+    # --- Bad version quarantines and continues empty ---
+    def test_bad_version_quarantines(self) -> None:
         self.path.write_text(json.dumps({"version": 2, "entries": []}))
         _harden(self.path)
         ac = AuthorizedClients(self.path, self.identity)
-        with self.assertRaises(RuntimeError):
+        with self.assertLogs("dsm.crypto.authorized_clients", level="ERROR"):
             ac.load()
+        self.assertEqual(len(ac), 0)
 
     # --- add() enforces 32 bytes ---
     def test_add_enforces_pubkey_length(self) -> None:

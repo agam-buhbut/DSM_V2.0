@@ -129,7 +129,7 @@ class TestConfigValidation(unittest.TestCase):
         c = Config(**_base())
         self.assertEqual(c.transport, "udp")
         self.assertEqual(c.tun_name, "mtun0")
-        self.assertEqual(c.log_level, "warning")
+        self.assertEqual(c.log_level, "info")
         self.assertEqual(c.padding_min, 128)
         self.assertEqual(c.padding_max, 1400)
         self.assertEqual(c.jitter_ms_min, 1)

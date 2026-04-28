@@ -212,6 +212,10 @@ async def run_client(
                 except asyncio.TimeoutError:
                     session_keys.tick()
                     continue
+                except ConnectionError as e:
+                    log.info("transport closed by peer: %s", e)
+                    shutdown.set()
+                    return
 
                 result = decrypt_packet(data, session_keys, replay)
                 if result is None:

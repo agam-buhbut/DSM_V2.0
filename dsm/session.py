@@ -51,11 +51,18 @@ class LivenessState:
 
 
 def setup_signal_handlers(shutdown: asyncio.Event) -> None:
-    """Register SIGINT/SIGTERM to set the shutdown event."""
+    """Register termination signals to set the shutdown event.
+
+    SIGHUP and SIGQUIT are included so that ``systemctl reload`` (sends
+    SIGHUP) and Ctrl-\\ (SIGQUIT) trigger graceful AsyncExitStack
+    unwind rather than killing the process and leaving nftables, TUN,
+    resolv.conf, and sysctl state on the host. We do not support config
+    reload — SIGHUP is treated as shutdown.
+    """
     import signal
 
     loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT):
         loop.add_signal_handler(sig, shutdown.set)
 
 
@@ -335,7 +342,10 @@ async def send_session_close(ctx: DataPathContext) -> None:
         padded, target_size = ctx.shaper.pad_packet(inner)
         await ctx.send_fn(padded, target_size)
     except Exception as e:
-        log.warning("SESSION_CLOSE send failed (continuing shutdown): %s", e)
+        # Debug-level: the peer being gone at shutdown is the common case
+        # (we may be shutting down BECAUSE the peer disappeared). Warning
+        # would be noise on every disconnect.
+        log.debug("SESSION_CLOSE send failed (continuing shutdown): %s", e)
 
 
 async def _handle_noop(ctx: DataPathContext, inner: InnerPacket) -> None:
