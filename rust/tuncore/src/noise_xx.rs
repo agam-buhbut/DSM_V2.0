@@ -464,9 +464,9 @@ mod tests {
         assert_eq!(client_hash, server_hash);
 
         let mut client_keys =
-            SessionKeyManager::from_handshake_hash(&client_hash, true).unwrap();
+            SessionKeyManager::from_handshake_hash(&client_hash, true, None, None).unwrap();
         let mut server_keys =
-            SessionKeyManager::from_handshake_hash(&server_hash, false).unwrap();
+            SessionKeyManager::from_handshake_hash(&server_hash, false, None, None).unwrap();
 
         let aad = b"e2e";
         let initial_epoch = client_keys.epoch();

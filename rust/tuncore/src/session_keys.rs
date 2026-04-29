@@ -12,27 +12,40 @@ use x25519_dalek::{PublicKey, StaticSecret};
 /// Rotation threshold baselines. Each session independently jitters these
 /// (±20% packets, ±10% time) so the rotation moment is not predictable to a
 /// passive observer watching packet flow or wall-clock timing.
-const ROTATION_PACKET_BASE: u64 = 5000;
-const ROTATION_PACKET_JITTER: u64 = 1000; // ±20%
-const ROTATION_TIME_BASE_SECS: u64 = 600; // 10 minutes
-const ROTATION_TIME_JITTER_SECS: u64 = 60; // ±10%
+/// Default rotation thresholds. Operators can override at session
+/// construction; jitter is always applied to keep rotation timing
+/// unpredictable to passive observers (anonymity property).
+pub const ROTATION_PACKET_BASE: u64 = 5000;
+pub const ROTATION_TIME_BASE_SECS: u64 = 600; // 10 minutes
+/// Proportional jitter: ±20% of the operator-supplied base. Absolute
+/// jitter (the previous design) produced [1, base+1000] when operators
+/// set small bases — making them rotate every packet. Proportional
+/// jitter keeps the operator's intent intact across the full range.
+const ROTATION_JITTER_PCT: u64 = 20;
 const GRACE_PERIOD_SECS: u64 = 5;
 
-fn randomized_packet_threshold() -> u64 {
-    let mut rng_bytes = [0u8; 8];
-    OsRng.fill_bytes(&mut rng_bytes);
-    let r = u64::from_be_bytes(rng_bytes);
-    let jitter = (r % (2 * ROTATION_PACKET_JITTER + 1)) as i64 - ROTATION_PACKET_JITTER as i64;
-    ((ROTATION_PACKET_BASE as i64) + jitter).max(1) as u64
+fn jitter_amount(base: u64) -> u64 {
+    // Always at least 1 so the threshold is non-deterministic even at
+    // base=1 (degenerate but allowed).
+    (base * ROTATION_JITTER_PCT / 100).max(1)
 }
 
-fn randomized_time_threshold() -> Duration {
+fn randomized_packet_threshold(base: u64) -> u64 {
+    let j = jitter_amount(base);
     let mut rng_bytes = [0u8; 8];
     OsRng.fill_bytes(&mut rng_bytes);
     let r = u64::from_be_bytes(rng_bytes);
-    let jitter =
-        (r % (2 * ROTATION_TIME_JITTER_SECS + 1)) as i64 - ROTATION_TIME_JITTER_SECS as i64;
-    let secs = ((ROTATION_TIME_BASE_SECS as i64) + jitter).max(1) as u64;
+    let jitter = (r % (2 * j + 1)) as i64 - j as i64;
+    ((base as i64) + jitter).max(1) as u64
+}
+
+fn randomized_time_threshold(base_secs: u64) -> Duration {
+    let j = jitter_amount(base_secs);
+    let mut rng_bytes = [0u8; 8];
+    OsRng.fill_bytes(&mut rng_bytes);
+    let r = u64::from_be_bytes(rng_bytes);
+    let jitter = (r % (2 * j + 1)) as i64 - j as i64;
+    let secs = ((base_secs as i64) + jitter).max(1) as u64;
     Duration::from_secs(secs)
 }
 
@@ -69,6 +82,8 @@ pub fn bootstrap_keys_from_dh(
     our_secret_bytes: &[u8; 32],
     peer_public_bytes: &[u8; 32],
     is_initiator: bool,
+    rotation_packets: Option<u64>,
+    rotation_seconds: Option<u64>,
 ) -> Result<SessionKeyManager, String> {
     let our_secret = StaticSecret::from(*our_secret_bytes);
     let peer_public = PublicKey::from(*peer_public_bytes);
@@ -82,7 +97,9 @@ pub fn bootstrap_keys_from_dh(
     // `shared.as_bytes()` borrows from the zeroizing `SharedSecret`; consumed
     // inline so no copy escapes this function. The `SharedSecret` is dropped
     // at end-of-scope (x25519-dalek zeroizes on drop).
-    SessionKeyManager::from_bootstrap_shared_secret(shared.as_bytes(), is_initiator)
+    SessionKeyManager::from_bootstrap_shared_secret(
+        shared.as_bytes(), is_initiator, rotation_packets, rotation_seconds,
+    )
 }
 
 /// Full session key state managing current and previous epoch keys,
@@ -104,6 +121,10 @@ pub struct SessionKeyManager {
     /// Per-session randomized rotation thresholds (see audit M1/M2).
     packet_threshold: u64,
     time_threshold: Duration,
+    /// Bases used to re-randomize after rotation. Operator-supplied at
+    /// session construction; persist so each new epoch uses the same base.
+    packet_threshold_base: u64,
+    time_threshold_base_secs: u64,
 }
 
 /// Result of a key rotation initiation.
@@ -136,6 +157,8 @@ impl SessionKeyManager {
     pub fn from_handshake_hash(
         hash: &[u8],
         is_initiator: bool,
+        rotation_packets: Option<u64>,
+        rotation_seconds: Option<u64>,
     ) -> Result<Self, String> {
         let hk = Hkdf::<Sha256>::new(Some(b"dsm-v2-session-init"), hash);
 
@@ -162,7 +185,7 @@ impl SessionKeyManager {
             (key_b, key_a) // responder sends with key_b, receives with key_a
         };
 
-        Self::new(send_key, recv_key, initial_epoch)
+        Self::new(send_key, recv_key, initial_epoch, rotation_packets, rotation_seconds)
     }
 
     /// Create a session from a secret shared value (e.g., ephemeral DH or bootstrap).
@@ -173,6 +196,8 @@ impl SessionKeyManager {
     pub fn from_bootstrap_shared_secret(
         shared_secret: &[u8],
         is_initiator: bool,
+        rotation_packets: Option<u64>,
+        rotation_seconds: Option<u64>,
     ) -> Result<Self, String> {
         let hk = Hkdf::<Sha256>::new(Some(b"dsm-v2-bootstrap-hkdf"), shared_secret);
 
@@ -195,15 +220,21 @@ impl SessionKeyManager {
             (key_b, key_a) // responder sends with key_b, receives with key_a
         };
 
-        Self::new(send_key, recv_key, initial_epoch)
+        Self::new(send_key, recv_key, initial_epoch, rotation_packets, rotation_seconds)
     }
 
     /// Create a new session from initial handshake-derived keys.
+    /// `rotation_packets` / `rotation_seconds` override the default thresholds;
+    /// `None` means use the built-in defaults. Jitter is always applied.
     pub fn new(
         send_key: LockedKey32,
         recv_key: LockedKey32,
         initial_epoch: u32,
+        rotation_packets: Option<u64>,
+        rotation_seconds: Option<u64>,
     ) -> Result<Self, String> {
+        let packet_base = rotation_packets.unwrap_or(ROTATION_PACKET_BASE);
+        let time_base = rotation_seconds.unwrap_or(ROTATION_TIME_BASE_SECS);
         Ok(Self {
             epoch: initial_epoch,
             send: DirectionKeys::new(send_key, initial_epoch)?,
@@ -214,8 +245,10 @@ impl SessionKeyManager {
             grace_start: None,
             packets_sent: 0,
             epoch_start: Instant::now(),
-            packet_threshold: randomized_packet_threshold(),
-            time_threshold: randomized_time_threshold(),
+            packet_threshold: randomized_packet_threshold(packet_base),
+            time_threshold: randomized_time_threshold(time_base),
+            packet_threshold_base: packet_base,
+            time_threshold_base_secs: time_base,
         })
     }
 
@@ -392,8 +425,8 @@ impl SessionKeyManager {
         self.epoch_start = Instant::now();
         // Re-roll thresholds for the new epoch so the next rotation is also
         // unpredictable to a passive observer.
-        self.packet_threshold = randomized_packet_threshold();
-        self.time_threshold = randomized_time_threshold();
+        self.packet_threshold = randomized_packet_threshold(self.packet_threshold_base);
+        self.time_threshold = randomized_time_threshold(self.time_threshold_base_secs);
 
         Ok(RotationComplete { new_epoch })
     }
@@ -479,12 +512,16 @@ mod tests {
             LockedKey32::from_array(send_bytes).unwrap(),
             LockedKey32::from_array(recv_bytes).unwrap(),
             1,
+            None,
+            None,
         )
         .unwrap();
         let server = SessionKeyManager::new(
             LockedKey32::from_array(recv_bytes).unwrap(),
             LockedKey32::from_array(send_bytes).unwrap(),
             1,
+            None,
+            None,
         )
         .unwrap();
         (client, server)
@@ -519,8 +556,9 @@ mod tests {
         let (mut client, _) = make_paired_managers();
         let aad = b"";
 
-        // Upper bound of the randomized threshold is base + jitter.
-        for _ in 0..(ROTATION_PACKET_BASE + ROTATION_PACKET_JITTER) {
+        // Upper bound of the randomized threshold is base + 20%.
+        let upper = ROTATION_PACKET_BASE + jitter_amount(ROTATION_PACKET_BASE);
+        for _ in 0..upper {
             client.encrypt(b"x", aad).unwrap();
         }
         assert!(client.needs_rotation());
@@ -600,8 +638,8 @@ mod tests {
         let mut hash = [0u8; 32];
         OsRng.fill_bytes(&mut hash);
 
-        let mut client = SessionKeyManager::from_handshake_hash(&hash, true).unwrap();
-        let mut server = SessionKeyManager::from_handshake_hash(&hash, false).unwrap();
+        let mut client = SessionKeyManager::from_handshake_hash(&hash, true, None, None).unwrap();
+        let mut server = SessionKeyManager::from_handshake_hash(&hash, false, None, None).unwrap();
         let aad = b"test-aad";
 
         // Both peers derive the same initial epoch from the handshake hash
@@ -626,8 +664,8 @@ mod tests {
         let mut hash = [0u8; 32];
         OsRng.fill_bytes(&mut hash);
 
-        let mut client = SessionKeyManager::from_handshake_hash(&hash, true).unwrap();
-        let mut server = SessionKeyManager::from_handshake_hash(&hash, false).unwrap();
+        let mut client = SessionKeyManager::from_handshake_hash(&hash, true, None, None).unwrap();
+        let mut server = SessionKeyManager::from_handshake_hash(&hash, false, None, None).unwrap();
         let aad = b"rot";
         let start_epoch = client.epoch();
 

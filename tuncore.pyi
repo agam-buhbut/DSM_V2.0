@@ -58,11 +58,17 @@ class NoiseTransport:
 class SessionKeyManager:
     @staticmethod
     def from_handshake_hash(
-        hash: bytes, is_initiator: bool
+        hash: bytes,
+        is_initiator: bool,
+        rotation_packets: int | None = None,
+        rotation_seconds: int | None = None,
     ) -> SessionKeyManager: ...
     @staticmethod
     def from_bootstrap_shared_secret(
-        shared_secret: bytes, is_initiator: bool
+        shared_secret: bytes,
+        is_initiator: bool,
+        rotation_packets: int | None = None,
+        rotation_seconds: int | None = None,
     ) -> SessionKeyManager: ...
     def encrypt(self, plaintext: bytes, aad: bytes) -> tuple[bytes, bytes, int]: ...
     def decrypt(
@@ -107,6 +113,12 @@ def bootstrap_session_from_dh(
     our_secret: bytes,
     peer_public: bytes,
     is_initiator: bool,
+    rotation_packets: int | None = None,
+    rotation_seconds: int | None = None,
 ) -> SessionKeyManager:
-    """Derive session keys from an ephemeral DH exchange."""
+    """Derive session keys from an ephemeral DH exchange.
+
+    ``rotation_packets`` / ``rotation_seconds`` override the default
+    rotation thresholds (5000 / 600); jitter is always applied.
+    """
     ...

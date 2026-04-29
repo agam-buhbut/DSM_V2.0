@@ -88,6 +88,8 @@ async def client_handshake(
     server_addr: tuple[str, int],
     known_hosts_path: Path | None = None,
     strict_keys: bool = True,
+    rotation_packets: int | None = None,
+    rotation_seconds: int | None = None,
 ) -> tuple[tuncore.SessionKeyManager, bytes]:
     """Perform Noise XX handshake as initiator (client).
 
@@ -175,7 +177,9 @@ async def client_handshake(
         # Derive session keys from ephemeral DH (secure, not public h).
         # Rust-side zeroizes the secret after consumption.
         session_keys = tuncore.bootstrap_session_from_dh(
-            bytes(client_secret), bytes(server_public), is_initiator=True
+            bytes(client_secret), bytes(server_public), is_initiator=True,
+            rotation_packets=rotation_packets,
+            rotation_seconds=rotation_seconds,
         )
     finally:
         # Drop the Python reference to the ephemeral secret immediately so the
@@ -191,6 +195,8 @@ async def server_handshake(
     transport: UDPTransport | TCPTransport,
     identity: tuncore.IdentityKeyPair,
     client_addr: tuple[str, int] | None = None,
+    rotation_packets: int | None = None,
+    rotation_seconds: int | None = None,
 ) -> tuple[tuncore.SessionKeyManager, bytes]:
     """Perform Noise XX handshake as responder (server).
 
@@ -251,7 +257,9 @@ async def server_handshake(
         # Derive session keys from ephemeral DH (secure, not public h).
         # Rust-side zeroizes the secret after consumption.
         session_keys = tuncore.bootstrap_session_from_dh(
-            bytes(server_secret), bytes(client_public), is_initiator=False
+            bytes(server_secret), bytes(client_public), is_initiator=False,
+            rotation_packets=rotation_packets,
+            rotation_seconds=rotation_seconds,
         )
     finally:
         del server_secret

@@ -315,11 +315,21 @@ impl PySessionKeyManager {
     /// Create a session key manager from the Noise handshake hash.
     /// The initial epoch is derived from the handshake hash (same on both
     /// peers) to avoid the deterministic "start at 1" linkability.
+    /// `rotation_packets` / `rotation_seconds` override the default base
+    /// thresholds (5000 packets / 600 s); jitter is always applied.
     #[staticmethod]
-    fn from_handshake_hash(hash: &[u8], is_initiator: bool) -> PyResult<Self> {
+    #[pyo3(signature = (hash, is_initiator, rotation_packets=None, rotation_seconds=None))]
+    fn from_handshake_hash(
+        hash: &[u8],
+        is_initiator: bool,
+        rotation_packets: Option<u64>,
+        rotation_seconds: Option<u64>,
+    ) -> PyResult<Self> {
         let inner = session_keys::SessionKeyManager::from_handshake_hash(
             hash,
             is_initiator,
+            rotation_packets,
+            rotation_seconds,
         )
         .map_err(py_err)?;
         Ok(Self {
@@ -332,11 +342,21 @@ impl PySessionKeyManager {
     /// Create a session key manager from a secret shared value (e.g., bootstrap ephemeral DH).
     /// Unlike from_handshake_hash which uses the PUBLIC transcript hash, this derives
     /// keys from SECRET material, preventing passive observation.
+    /// `rotation_packets` / `rotation_seconds` override the default base
+    /// thresholds (5000 packets / 600 s); jitter is always applied.
     #[staticmethod]
-    fn from_bootstrap_shared_secret(shared_secret: &[u8], is_initiator: bool) -> PyResult<Self> {
+    #[pyo3(signature = (shared_secret, is_initiator, rotation_packets=None, rotation_seconds=None))]
+    fn from_bootstrap_shared_secret(
+        shared_secret: &[u8],
+        is_initiator: bool,
+        rotation_packets: Option<u64>,
+        rotation_seconds: Option<u64>,
+    ) -> PyResult<Self> {
         let inner = session_keys::SessionKeyManager::from_bootstrap_shared_secret(
             shared_secret,
             is_initiator,
+            rotation_packets,
+            rotation_seconds,
         )
         .map_err(py_err)?;
         Ok(Self {
@@ -547,13 +567,20 @@ fn generate_ephemeral() -> PyResult<(Vec<u8>, Vec<u8>)> {
 ///     our_secret: 32-byte ephemeral secret (must be protected)
 ///     peer_public: 32-byte peer ephemeral public key
 ///     is_initiator: true for client, false for server
+///     rotation_packets: optional override for the per-epoch packet
+///         rotation base (default 5000). Jitter is always applied.
+///     rotation_seconds: optional override for the per-epoch time
+///         rotation base (default 600s).
 ///
 /// Returns: SessionKeyManager instance
 #[pyfunction]
+#[pyo3(signature = (our_secret, peer_public, is_initiator, rotation_packets=None, rotation_seconds=None))]
 fn bootstrap_session_from_dh(
     our_secret: &[u8],
     peer_public: &[u8],
     is_initiator: bool,
+    rotation_packets: Option<u64>,
+    rotation_seconds: Option<u64>,
 ) -> PyResult<PySessionKeyManager> {
     use zeroize::Zeroize;
 
@@ -573,6 +600,8 @@ fn bootstrap_session_from_dh(
         &secret_arr,
         &public_arr,
         is_initiator,
+        rotation_packets,
+        rotation_seconds,
     );
 
     secret_arr.zeroize();

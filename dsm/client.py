@@ -100,6 +100,8 @@ async def run_client(
                 keystore.identity,
                 server_addr,
                 known_hosts_path=known_hosts_path,
+                rotation_packets=config.rotation_packets,
+                rotation_seconds=config.rotation_seconds,
             )
         except Exception as e:
             log.error("handshake failed: %s", e)

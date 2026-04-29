@@ -573,5 +573,54 @@ class TestDataPathRoundtrip(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class TestRotationThresholdOverride(unittest.TestCase):
+    """Regression: ``config.rotation_packets`` and ``rotation_seconds``
+    were dead config fields for one milestone — validated but never
+    plumbed to the Rust SessionKeyManager. This pins down that the
+    operator override actually changes the threshold.
+    """
+
+    def test_packet_threshold_override_takes_effect(self) -> None:
+        import tuncore
+
+        OVERRIDE = 200
+        # Sample 20 sessions; with proportional ±20% jitter, every threshold
+        # should land in [160, 240]. Default base of 5000 lands in [4000, 6000].
+        for _ in range(20):
+            secret, public = tuncore.generate_ephemeral()
+            sk = tuncore.bootstrap_session_from_dh(
+                bytes(secret), bytes(public), is_initiator=True,
+                rotation_packets=OVERRIDE, rotation_seconds=30,
+            )
+            n = 0
+            while not sk.needs_rotation() and n < OVERRIDE * 2:
+                sk.encrypt(b"x", b"")
+                n += 1
+            self.assertGreaterEqual(
+                n, int(OVERRIDE * 0.8),
+                f"override threshold rotated too early: {n} < 160",
+            )
+            self.assertLessEqual(
+                n, int(OVERRIDE * 1.2),
+                f"override threshold rotated too late: {n} > 240",
+            )
+
+    def test_default_threshold_when_no_override(self) -> None:
+        import tuncore
+
+        for _ in range(5):
+            secret, public = tuncore.generate_ephemeral()
+            sk = tuncore.bootstrap_session_from_dh(
+                bytes(secret), bytes(public), is_initiator=True,
+            )
+            n = 0
+            while not sk.needs_rotation() and n < 7000:
+                sk.encrypt(b"x", b"")
+                n += 1
+            # Default base 5000 ± 20% → [4000, 6000]
+            self.assertGreaterEqual(n, 4000)
+            self.assertLessEqual(n, 6000)
+
+
 if __name__ == "__main__":
     unittest.main()

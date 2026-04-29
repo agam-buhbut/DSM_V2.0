@@ -99,7 +99,11 @@ async def run_server(
         fsm.transition(State.HANDSHAKING)
 
         try:
-            session_keys, client_pub = await server_handshake(transport, keystore.identity)
+            session_keys, client_pub = await server_handshake(
+                transport, keystore.identity,
+                rotation_packets=config.rotation_packets,
+                rotation_seconds=config.rotation_seconds,
+            )
         except Exception as e:
             log.error("handshake failed: %s", e)
             raise
