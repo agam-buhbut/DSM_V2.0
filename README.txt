@@ -26,7 +26,8 @@ State Model:
 
 Concurrency:
 - Python asyncio (single-threaded async I/O)
-- Concurrent recv_loop + tun_send_loop via asyncio.gather
+- Concurrent recv_loop + tun_send_loop + liveness_loop via asyncio.gather
+  (client also runs auto_mtu_loop alongside the others)
 
 NETWORKING
 
@@ -66,6 +67,12 @@ Path MTU:
   (IP_PMTUDISC_DO) — sets DF bit, records ICMP "frag needed"
 - Client logs the kernel-discovered path MTU on session start and warns
   if the configured tun MTU exceeds the usable inner budget
+- Optional `auto_mtu` adapter (client only): a background loop polls
+  the kernel-discovered path MTU every `pmtu_check_interval_s` (default
+  30 s) and adjusts the TUN MTU. Lower-on-drop is immediate; raise back
+  toward `mtu` requires 3 stable observations (hysteresis-gated) so a
+  transient PMTU bump can't cause flap. Recommended for cellular /
+  roaming clients.
 
 CRYPTOGRAPHY
 
@@ -108,12 +115,16 @@ Replay Protection:
 - Check-before-decrypt, update-after-authentication
 
 Key Storage:
-- Identity keys encrypted at rest with Argon2id + XChaCha20-Poly1305
+- Identity (X25519 Noise static) AND attest key (ECDSA P-256, soft
+  backend) both encrypted at rest with Argon2id + XChaCha20-Poly1305
 - Argon2id parameters: 512 MiB memory, 4 iterations, 2 parallelism
 - Memory locked (mlock) during use
 - Single-pass zeroization via Rust zeroize crate on drop
 - Core dumps disabled at startup (setrlimit RLIMIT_CORE)
 - Atomic file writes with 0600 permissions (tmpfile -> fchmod -> fsync -> rename)
+- TPM 2.0 backend for the attest key is on the punch list (Phase 1
+  step 8); when shipped, the on-disk attest blob is replaced by a TPM
+  persistent handle.
 
 ANONYMITY AND TRAFFIC RESISTANCE
 
@@ -175,17 +186,21 @@ Languages:
 Rust crate (tuncore):
 - AES-256-GCM encrypt/decrypt
 - X25519 key exchange
-- Noise XX handshake (via snow crate)
+- Noise XX handshake (via snow crate, with fixed-size attest payload)
 - HKDF-SHA256 key derivation
 - Argon2id password hashing
 - Nonce generation with structured uniqueness and exhaustion poisoning
 - Replay window (128-bit bitmap)
 - Secure memory (mlock, zeroize, core dump disable)
-- Identity key storage (XChaCha20-Poly1305)
+- Identity + attest key storage (XChaCha20-Poly1305)
+- ECDSA P-256 device-attestation soft backend (dev/CI only)
 
 Dependencies:
-- Python: httpx (DNS-over-HTTPS)
-- Rust: snow, aes-gcm, hkdf, sha2, x25519-dalek, zeroize, argon2, chacha20poly1305, pyo3
+- Python: httpx (DoH client), cryptography (X.509 cert + CRL), dnspython
+  (server DNS proxy)
+- Rust: snow, aes-gcm, hkdf, sha2, x25519-dalek, zeroize, argon2,
+  chacha20poly1305, pyo3, plus p256 (optional, gated on `dev-soft-attest`
+  Cargo feature — the default).
 
 CONFIGURATION
 
@@ -211,7 +226,14 @@ Parameters:
 - dns_provider_pins: SPKI SHA-256 pins per provider (server mode, required)
 - tun_name: TUN device name (default: mtun0)
 - mtu: TUN interface MTU in bytes (default: 1400, bounds 576-1500)
-- pmtu_discover: enable kernel PMTUD on UDP socket (default: false)
+- pmtu_discover: enable kernel PMTUD on UDP socket (default: false).
+  Required for `auto_mtu` to do anything — the kernel only tracks per-
+  path MTU when this is on.
+- auto_mtu: client-side adaptive TUN-MTU loop (default: false). Lower
+  on PMTU drop; raise back toward `mtu` after 3 stable observations.
+  Recommended for cellular / roaming clients.
+- pmtu_check_interval_s: how often the auto_mtu loop polls the kernel
+  PMTU, seconds (default: 30, bounds (0, 3600]).
 - log_level: debug | info | warning | error (default: info — operational
   lines like "ip_forward enabled", "MASQUERADE applied", "tunnel
   established", "client connected" only appear at info or below.
@@ -220,13 +242,29 @@ Parameters:
 - jitter_ms_min, jitter_ms_max: jitter range in ms (default: 1-50)
 - rotation_packets, rotation_seconds: key rotation thresholds (default: 5000/600)
 - debug_dns: log plaintext DNS queries (default: false, logs are redacted)
+- debug_net: emit structured JSON events on the `dsm.netaudit` logger
+  (handshake start/end, nft apply/remove, TUN configure/deconfigure,
+  rekey, liveness, shutdown, auto_mtu_change). Default: false. May
+  also be enabled per-run via the `--debug-net` CLI flag.
 
 OPERATOR GUIDE
 
   This section is a complete, copy-paste-friendly walkthrough: from a
-  blank Linux box to a working tunnel, plus a debugging section keyed
-  to the failure modes you will actually hit. See deploy/SMOKE_TEST.md
-  for a shorter quick-reference version.
+  blank Linux box to a working single-host loopback tunnel, plus a
+  debugging section keyed to the failure modes you will actually hit.
+
+  Companion docs:
+  - deploy/SMOKE_TEST.md     — single-host loopback sanity check (what
+                               this section covers in shorter form).
+  - deploy/CA_RUNBOOK.md     — offline CA bootstrap + per-device
+                               enrollment workflow on the air-gapped
+                               laptop. You walk through this once
+                               before any host can run dsm.
+  - deploy/two_box_runbook.md — Phase 2 demo procedure across two real
+                               ISPs (server on home Wi-Fi + client on
+                               cellular hotspot). Includes the strace
+                               audit that gates the deferred systemd
+                               hardening flags.
 
 0. PREREQUISITES (both hosts)
 
@@ -235,11 +273,19 @@ OPERATOR GUIDE
    - Ethernet or WiFi connectivity; the server must have a public IP or
      at least a port the client can reach (by default UDP 51820)
 
-   Privileges: the process needs CAP_NET_ADMIN + CAP_SYS_ADMIN to create
-   the TUN device, install nftables rules, set SO_MARK, and read
-   /proc/sys/net for IPv6 state. Running as root is the simplest route;
-   the shipped systemd unit (deploy/dsm.service) uses AmbientCapabilities
-   instead.
+   Privileges: the process needs CAP_NET_ADMIN + CAP_SYS_ADMIN +
+   CAP_NET_BIND_SERVICE to create the TUN device, install nftables rules,
+   set SO_MARK, write sysctls, and bind UDP/53 on the TUN address.
+   Running as root is the simplest route. The shipped systemd unit
+   (deploy/dsm.service) runs as `User=root` with a tightened
+   `CapabilityBoundingSet` plus a conservative hardening subset
+   (MemoryDenyWriteExecute, LockPersonality, ProtectKernelModules,
+   ProtectControlGroups, RestrictAddressFamilies, RestrictRealtime,
+   PrivateTmp, ProcSubset=pid, etc.). Two flags — `RestrictNamespaces`
+   and `SystemCallFilter` — are intentionally left as TODOs in the unit
+   pending an empirical strace audit (see deploy/two_box_runbook.md §7);
+   running `sudo systemd-analyze security dsm` after install reports a
+   ~5.5 MEDIUM score, target < 3.0 once the audit closes.
 
 0a. Install system packages
 
@@ -341,13 +387,17 @@ OPERATOR GUIDE
 
    $ sudo /usr/bin/python3 -m pip install --break-system-packages \
          pytest pytest-asyncio
-   $ python3 -m pytest tests/ -q              # ~150 tests should pass
-   $ cd rust/tuncore && PYO3_PYTHON=/usr/bin/python3 cargo test --release
-                                              # 55 tests should pass.
+   $ python3 -m pytest tests/ -q              # ~250 tests should pass
+   $ cd rust/tuncore && PYO3_PYTHON=/usr/bin/python3 cargo test --release \
+         --features dev-soft-attest
+                                              # ~70 tests should pass.
                                               # PYO3_PYTHON is required on
                                               # Debian/Ubuntu where only
                                               # /usr/bin/python3 exists (pyo3
                                               # otherwise looks for /usr/bin/python).
+                                              # `dev-soft-attest` is the
+                                              # default feature; explicit
+                                              # here so the intent is clear.
    $ cd ../..
 
    The tests don't need root, so plain `python3` here is fine.
@@ -554,6 +604,11 @@ OPERATOR GUIDE
    transport          = "udp"
    mtu                = 1400
    pmtu_discover      = true            # client benefits more from PMTUD
+   # Cellular path MTU drifts on handover (Wi-Fi <-> LTE/5G). The
+   # auto_mtu loop tracks the kernel-discovered PMTU and adjusts the
+   # TUN MTU on the fly. Safe default for cellular; harmless on stable
+   # wired links (no PMTU drift -> no adaptation).
+   auto_mtu           = true
    log_level          = "info"
    EOF
 
@@ -610,12 +665,17 @@ OPERATOR GUIDE
 
    Expected client log (log_level = info):
      ... handshake complete (client) — server_cn=dsm-XXXXXXXX-server
+     ... TUN mtun0 configured: 10.8.0.2/24 mtu=1400
      ... tunnel established
      ... kernel path MTU = 1500 (usable inner 1432)
+     ... auto_mtu: lowered tun mtu 1400 -> 1232 (kernel pmtu=1300)
+                                                   ↑ only when auto_mtu=true
+                                                     AND the path needs it
+                                                     (typical on cellular)
 
    Expected server log:
-     ... server listening on port 51820 (udp)
      ... CN allowlist loaded (N entries)
+     ... server listening on port 51820 (udp)
      ... handshake complete (server) — client_cn=dsm-XXXXXXXX-client
      ... client connected (noise_static=<first16hex>)
 
@@ -703,13 +763,17 @@ OPERATOR GUIDE
    The log_level = "debug" setting turns on per-packet-class log lines;
    turn it on while reproducing a bug, then off.
 
-   PROBLEM: "handshake failed: msg3 send timeout (server may be unreachable)"
+   PROBLEM: "handshake recv timed out after 3 attempts" / "handshake failed: ..."
      - Server actually down, or port blocked. Test plain UDP reachability:
          $ nc -u -v <server-ip> 51820     # then type and press enter
      - Server is up but bound to the wrong interface. On the server:
          $ sudo ss -ulnp | grep 51820
      - Firewall between you and the server dropping DF packets (less
        likely with default pmtu_discover=false).
+     - On cellular: the link was down when the handshake started. Each
+       retry adds 5 s of timeout + (1, 2, 4) s of backoff — total budget
+       ~22 s. A longer outage exceeds the budget; restart the client
+       once the link is back up.
 
    PROBLEM: "client CN not in allowlist"
      - Expected on first connect; see step 4. The client's CN must be
@@ -732,8 +796,12 @@ OPERATOR GUIDE
 
    PROBLEM: "process hardening partially failed"
      - Informational, not fatal. The service started, but core-dump
-       disabling or prctl(PR_SET_DUMPABLE) didn't stick. Usually means
-       SELinux/AppArmor + missing CAP_SYS_RESOURCE.
+       disabling or prctl(PR_SET_DUMPABLE) didn't stick. Usually one of:
+       (a) SELinux/AppArmor blocking; (b) systemd unit's
+       `CapabilityBoundingSet` is too tight (we ship NET_ADMIN +
+       SYS_ADMIN + NET_BIND_SERVICE only — if a future change needs
+       another cap, add it to deploy/dsm.service and restart);
+       (c) running outside systemd without the right caps.
 
    PROBLEM: Tunnel is up but `curl` through it is very slow or hangs
      - Path MTU issue. Check the startup log for:
@@ -840,10 +908,14 @@ FILE PLACEMENT REFERENCE
 CLI REFERENCE
 
    python -m dsm --mode {client,server}          Run the VPN
+   python -m dsm --config PATH                   Override config file path
    python -m dsm --passphrase-fd N               Read passphrase from FD N
    python -m dsm --passphrase-env-file PATH      Read passphrase from file
+   python -m dsm --debug-net                     Emit JSON audit events
+                                                 on the dsm.netaudit logger
    python -m dsm enroll --csr-out PATH           Provision keys + emit CSR
    python -m dsm enroll --import CERT_PATH       Verify + persist signed cert
+   python -m dsm enroll --cn CN [--role …]       Override CN / role suffix
    python -m dsm show-pubkey                     Print local identity pubkey
 
 
@@ -864,24 +936,53 @@ for both initial deployment and steady-state operation.
 
 TESTING
 
-- 150 Python tests (unittest, discovered by pytest)
-- 55 Rust tests (cargo test --release)
-- Covers: protocol serialization, FSM transitions, config validation,
-  replay window, nonce generation (including exhaustion), key rotation,
-  AES-GCM, identity storage, Noise XX handshake, post-handshake DH
-  bootstrap, full end-to-end handshake over UDP and TCP, full data path
+- 253 Python tests (unittest, discovered by pytest)
+- 70 Rust tests (cargo test --features dev-soft-attest)
+- Covers: protocol serialization, FSM transitions, config validation
+  (including auto_mtu/pmtu_check_interval bounds), replay window, nonce
+  generation (including exhaustion), key rotation, AES-GCM, identity +
+  attest-key storage (Argon2id + XChaCha20), Noise XX handshake (with
+  fixed-size attest payload), X.509 cert parse + chain validation,
+  noiseStaticBinding extension validation, attest-payload build/verify,
+  CN allowlist + CRL, device enrollment (CSR build + signed-cert import
+  with binding/SPKI/chain checks), post-handshake DH bootstrap, full
+  end-to-end handshake over UDP and TCP with cert policy, full data path
   (TUN -> fragment -> encrypt -> wire -> decrypt -> reassemble -> TUN)
   round-trip, rekey with duplicate-INIT idempotency and retry-on-timeout
-  scheduler, DNS proxy coalescing and semaphore bounds, authorized
-  clients HMAC, IPv6 state save/restore, CLI subcommands, PMTU sockopt
-  plumbing
+  scheduler, handshake retry under simulated cellular outage,
+  auto_mtu adapter (lower/raise/floor/ceiling/oscillation/shutdown),
+  netaudit JSON event stream + schema lock, DNS proxy coalescing and
+  semaphore bounds, IPv6 state save/restore, CLI subcommands, PMTU
+  sockopt plumbing.
 
 Run:
    $ python3 -m pytest tests/ -q
-   $ cd rust/tuncore && cargo test --release
+   $ cd rust/tuncore && cargo test --features dev-soft-attest
 
 
-TODO:
-add relay software to connect to client via wpa3-sae wifi network for additional security
-add multi-client system and dont only allow one client so o one can authenticate before you or add more authentication (cert or hadrware verification)
-add android support
+ROADMAP
+
+The current build (Phase 1 + Phase 2A) ships single-client, single-server,
+Linux-only with cert-based auth (CA-signed device certs binding the
+hardware ECDSA attest key to the X25519 Noise static via a custom
+critical X.509 extension). Live items on the punch list:
+
+- Phase 1 step 8 — TPM 2.0 attest backend (`tpm-attest` Cargo feature
+  via tss-esapi). Parked until TPM hardware is available for empirical
+  testing; the soft attest backend is the default and works end-to-end.
+- Phase 2B — real-network demo on two physical Linux boxes across two
+  ISPs (home Wi-Fi server + cellular client). Procedure in
+  deploy/two_box_runbook.md; once the strace-audit step there closes,
+  RestrictNamespaces and SystemCallFilter land in deploy/dsm.service.
+- Phase 3 — Android client (Kotlin VpnService + JNI to the Rust crate,
+  with hardware-bound signing via Android Keystore/StrongBox). The
+  protocol state machine is lifted into Rust as part of this phase so
+  there is one implementation across Linux + Android.
+- Phase 4 — third-party pentest: threat model authoring, hardening
+  checklist execution, telemetry build toggle, engagement coordination.
+
+Explicit non-goals (reaffirmed):
+- Multiple clients per server / multi-tenant infrastructure — out of
+  scope by design (NON-GOALS at top of file).
+- Server hopping / relay chains / geographic load balancing — out of
+  scope; the threat model assumes a single client-owned server.
