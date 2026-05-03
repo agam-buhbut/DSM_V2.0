@@ -189,6 +189,16 @@ class TunDevice:
 
         log.info("TUN %s configured: %s/%d mtu=%d", self._name, local_ip, netmask, mtu)
 
+    def set_mtu(self, mtu: int) -> None:
+        """Change the MTU of an already-configured TUN device.
+
+        Used by the auto-MTU adapter to track kernel-discovered path MTU
+        drift across the lifetime of a session. Caller is responsible for
+        clamping ``mtu`` to a sensible range — this method just wraps
+        ``ip link set <iface> mtu <n>``.
+        """
+        _run_commands([["ip", "link", "set", self._name, "mtu", str(mtu)]])
+
     def deconfigure(self) -> None:
         """Remove routing rules and bring down the interface."""
         _run_commands(

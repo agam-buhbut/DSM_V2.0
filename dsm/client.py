@@ -24,9 +24,9 @@ from dsm.net.transport.tcp import TCPTransport
 VPN_DNS_SERVER = "10.8.0.1"  # server's TUN address; DNS proxy listens there
 from dsm.core.protocol import ReassemblyBuffer
 from dsm.session import (
-    DataPathContext, LivenessState, RekeyState, SequenceCounter, decrypt_packet,
-    dispatch_inner, liveness_loop, make_send_fn, send_session_close,
-    setup_signal_handlers, tun_send_loop,
+    DataPathContext, LivenessState, RekeyState, SequenceCounter, auto_mtu_loop,
+    decrypt_packet, dispatch_inner, liveness_loop, make_send_fn,
+    send_session_close, setup_signal_handlers, tun_send_loop,
 )
 from dsm.traffic.shaper import TrafficShaper, make_chaff_packet
 from dsm.traffic.scheduler import SendScheduler
@@ -193,19 +193,22 @@ async def run_client(
         # After the handshake has exchanged several full-size datagrams,
         # the kernel may have learned the path MTU via ICMP. Log it once
         # so the operator can tell whether the configured tun MTU is a
-        # good fit. Warn if the path MTU can't carry the wire overhead.
+        # good fit. When `auto_mtu` is on, the adapter loop below will
+        # also act on this information; we still log the warning when
+        # `auto_mtu` is off so a misconfigured static MTU is visible at
+        # startup.
         if isinstance(transport, UDPTransport):
             path_mtu = transport.get_path_mtu()
             if path_mtu is not None:
-                # IP(20) + UDP(8) + outer(20) + GCM tag(16) + inner(4) = 68
-                # plus any extra encapsulation (PPPoE, GRE, etc.) below us.
-                WIRE_OVERHEAD = 68
+                # See dsm.session.WIRE_OVERHEAD for the breakdown.
+                from dsm.session import WIRE_OVERHEAD
                 usable = path_mtu - WIRE_OVERHEAD
                 log.info("kernel path MTU = %d (usable inner %d)", path_mtu, usable)
-                if usable < config.mtu:
+                if usable < config.mtu and not config.auto_mtu:
                     log.warning(
                         "configured tun mtu=%d exceeds usable inner %d "
-                        "(path MTU %d); lower `mtu` in config to avoid fragmentation",
+                        "(path MTU %d); enable `auto_mtu` or lower `mtu` "
+                        "in config to avoid fragmentation",
                         config.mtu, usable, path_mtu,
                     )
 
@@ -282,6 +285,7 @@ async def run_client(
                 recv_loop(),
                 tun_send_loop(ctx),
                 liveness_loop(ctx),
+                auto_mtu_loop(ctx, transport, config),
             )
         except asyncio.CancelledError:
             pass

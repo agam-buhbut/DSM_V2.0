@@ -13,6 +13,7 @@ from collections.abc import Awaitable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable
 
+from dsm.core.config import Config, MIN_TUN_MTU
 from dsm.core.fsm import SessionFSM
 from dsm.core.protocol import (
     Fragment, InnerPacket, OuterPacket, PacketType, ReassemblyBuffer,
@@ -37,6 +38,16 @@ log = logging.getLogger(__name__)
 KEEPALIVE_SEND_INTERVAL = 15.0   # emit KEEPALIVE if send-idle for this long
 DEAD_PEER_TIMEOUT = 60.0         # tear down if recv-idle for this long
 LIVENESS_CHECK_INTERVAL = 5.0    # cadence at which liveness_loop wakes
+
+# Wire overhead per outer packet — IP(20) + UDP(8) + outer header(20) +
+# GCM tag(16) + inner header(4) = 68 bytes. Subtracted from the kernel-
+# discovered path MTU to size the inner TUN MTU.
+WIRE_OVERHEAD = 68
+
+# auto-MTU adapter: how many consecutive same-or-higher path-MTU
+# observations are required before raising the TUN MTU back toward
+# config.mtu. Guards against transient PMTU bumps causing flap.
+AUTO_MTU_HYSTERESIS_RISES = 3
 
 
 @dataclass
@@ -403,6 +414,77 @@ async def liveness_loop(ctx: DataPathContext) -> None:
             )
             padded, target_size = ctx.shaper.pad_packet(inner)
             ctx.scheduler.enqueue(padded, target_size)
+
+
+async def auto_mtu_loop(
+    ctx: DataPathContext,
+    transport: UDPTransport | TCPTransport,
+    config: Config,
+) -> None:
+    """Track kernel-discovered path MTU; adjust the TUN MTU to match.
+
+    Lower-on-drop is immediate; raise-toward ``config.mtu`` is gated on
+    ``AUTO_MTU_HYSTERESIS_RISES`` consecutive observations of a stable
+    larger usable MTU to avoid flap on transient PMTU bumps. Bounded
+    below by ``MIN_TUN_MTU`` and above by ``config.mtu``.
+
+    No-ops when:
+      * ``config.auto_mtu`` is False
+      * transport is non-UDP — kernel ``IP_MTU`` is meaningful only on
+        UDP sockets with PMTU discovery enabled
+    """
+    if not config.auto_mtu:
+        return
+    if not isinstance(transport, UDPTransport):
+        return
+
+    current = config.mtu
+    rises_observed = 0
+
+    while not ctx.shutdown.is_set():
+        try:
+            await asyncio.wait_for(
+                ctx.shutdown.wait(), timeout=config.pmtu_check_interval_s,
+            )
+            return  # shutdown
+        except asyncio.TimeoutError:
+            pass
+
+        path_mtu = transport.get_path_mtu()
+        if path_mtu is None:
+            continue
+
+        usable = max(MIN_TUN_MTU, min(config.mtu, path_mtu - WIRE_OVERHEAD))
+
+        if usable < current:
+            try:
+                ctx.tun.set_mtu(usable)
+            except Exception as e:
+                log.warning("auto_mtu: set_mtu(%d) failed: %s", usable, e)
+                continue
+            log.info(
+                "auto_mtu: lowered tun mtu %d -> %d (kernel pmtu=%d)",
+                current, usable, path_mtu,
+            )
+            current = usable
+            rises_observed = 0
+        elif usable > current:
+            rises_observed += 1
+            if rises_observed >= AUTO_MTU_HYSTERESIS_RISES:
+                try:
+                    ctx.tun.set_mtu(usable)
+                except Exception as e:
+                    log.warning("auto_mtu: set_mtu(%d) failed: %s", usable, e)
+                    rises_observed = 0
+                    continue
+                log.info(
+                    "auto_mtu: raised tun mtu %d -> %d after %d stable observations (kernel pmtu=%d)",
+                    current, usable, rises_observed, path_mtu,
+                )
+                current = usable
+                rises_observed = 0
+        else:
+            rises_observed = 0
 
 
 async def tun_send_loop(ctx: DataPathContext) -> None:

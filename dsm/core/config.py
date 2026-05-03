@@ -70,6 +70,15 @@ class Config:
     # in dsm.net.transport.udp queries the current PMTU. When False the
     # kernel runs its default policy (IP_PMTUDISC_WANT).
     pmtu_discover: bool = False
+    # Adaptive TUN-MTU loop. When True, a background task polls the
+    # kernel-discovered path MTU every `pmtu_check_interval_s` seconds and
+    # adjusts the TUN device's MTU to track it: lower-on-drop is immediate,
+    # raise-toward-`mtu` is hysteresis-gated (3 consecutive stable rises)
+    # to avoid flap on transient PMTU bumps. Recommended for cellular /
+    # roaming clients; safe to leave False on stable wired links where
+    # `mtu` is already correct.
+    auto_mtu: bool = False
+    pmtu_check_interval_s: float = 30.0
     config_dir: Path = field(default_factory=lambda: Path("/opt/mtun/"))
 
     def __post_init__(self) -> None:
@@ -216,6 +225,14 @@ def _validate(c: Config) -> None:
     if not (MIN_TUN_MTU <= c.mtu <= MAX_TUN_MTU):
         raise ValueError(
             f"mtu must be {MIN_TUN_MTU}-{MAX_TUN_MTU}, got {c.mtu}"
+        )
+
+    # auto_mtu polling interval. Must be strictly positive (zero would
+    # tight-loop in asyncio.wait_for) and within an hour. The lower bound
+    # is intentionally permissive so unit tests can drive the loop fast.
+    if not (0.0 < c.pmtu_check_interval_s <= 3600.0):
+        raise ValueError(
+            f"pmtu_check_interval_s must be in (0, 3600] s, got {c.pmtu_check_interval_s}"
         )
 
     # Wire-overhead sanity warning. DSM adds ~68 bytes of outer

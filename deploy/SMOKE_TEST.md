@@ -1,8 +1,15 @@
-# DSM VPN — Operational Smoke Test
+# DSM VPN — Single-Host Loopback Smoke Test
 
-A manual runbook for bringing a DSM client ↔ server pair up on real hosts
-and verifying it works end-to-end. Assumes two Linux boxes (or VMs): one
-**server** (public IP) and one **client** (anywhere that can reach it).
+A manual runbook for bringing a DSM client ↔ server pair up on a **single
+Linux host** as a sanity check before crossing real ISPs. Two `dsm`
+processes (one per network namespace, or one host + one VM on the same
+LAN) run client and server against each other.
+
+> **Doing the real two-box demo over different ISPs?** See
+> [two_box_runbook.md](two_box_runbook.md) — that's the Phase 2 procedure.
+> This file is the prerequisite sanity check you run first to confirm the
+> code builds, certs validate, and the data path works under ideal
+> conditions, before introducing real-network failure modes.
 
 ## 0. Prerequisites (both hosts)
 
