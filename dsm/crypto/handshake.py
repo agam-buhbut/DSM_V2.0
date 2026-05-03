@@ -1,36 +1,55 @@
 """Noise XX handshake orchestration over transport.
 
+Both peers carry a CA-signed device cert + a per-handshake binding
+signature inside the Noise XX msg2 (server->client) and msg3
+(client->server) payloads. The cert binds:
+  * device subject CN
+  * the hardware-bound ECDSA P-256 signing pubkey
+  * the device's X25519 Noise static (via custom critical extension)
+
+The binding signature is over the Noise handshake hash captured at
+the point the message is sent — post-msg1 for msg2, post-msg2 for
+msg3 — and is freshness/role-bound, so a captured payload cannot
+replay against a different handshake or role.
+
 Client (initiator):
-    msg1 = write_message_1()  -> send
-    recv -> read_message_2()  -> server_static_key
-    msg3 = write_message_3()  -> send
-    -> NoiseTransport
+    msg1 = write_message_1()                       -> send
+    recv -> read_message_2() -> (server_static, attest_payload)
+    verify_attest_payload(server_attest, role=RESPONDER) -> server_cert
+    enforce: server_cert.subject_cn == expected_server_cn
+    msg3 = write_message_3(our_attest_payload)     -> send
+    -> NoiseTransport (then bootstrap DH)
 
 Server (responder):
     recv -> read_message_1()
-    msg2 = write_message_2()  -> send
-    recv -> read_message_3()  -> client_static_key
-    -> NoiseTransport
+    msg2 = write_message_2(our_attest_payload)     -> send
+    recv -> read_message_3() -> (client_static, attest_payload)
+    verify_attest_payload(client_attest, role=INITIATOR) -> client_cert
+    enforce: cn_allowlist.is_allowed(client_cert.subject_cn)
+    enforce: not crl.is_revoked(client_cert.serial_number) (if CRL)
+    -> NoiseTransport (then bootstrap DH)
 """
 
 from __future__ import annotations
 
 import asyncio
-import contextlib
-import fcntl
-import hmac
-import json
 import logging
 import os
-from collections.abc import Awaitable, Callable, Generator
-from pathlib import Path
+from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING
 
-from dsm.core.atomic_io import atomic_write
-from dsm.core.path_security import (
-    InsecureFilePermissionsError,
-    check_user_file_permissions,
+from cryptography.x509 import Certificate as X509Certificate
+from cryptography.x509 import ObjectIdentifier
+
+from dsm.crypto.attest import (
+    AttestError,
+    PeerRole,
+    build_attest_payload,
+    verify_attest_payload,
 )
+from dsm.crypto.cert import CertError
+from dsm.crypto.cert_allowlist import CNAllowlist
+from dsm.crypto.crl import CRL, CRLError
 from dsm.net.transport.tcp import TCPTransport
 from dsm.net.transport.udp import UDPTransport
 
@@ -39,33 +58,43 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-# Handshake timeout per message (seconds)
 HANDSHAKE_TIMEOUT = 5.0
 MAX_RETRIES = 3
-BACKOFF_BASE = 1.0  # seconds; retry delays: 1s, 2s, 4s
+BACKOFF_BASE = 1.0  # retry delays: 1s, 2s, 4s
 
-DEFAULT_KNOWN_HOSTS_PATH = Path("/opt/mtun/known_hosts.json")
-
-# Every frame on the wire during the handshake is exactly this many bytes,
-# so the three Noise XX messages + two bootstrap messages are indistinguishable
-# from a normal 1400B data packet. The Rust side already pre-pads Noise XX
-# output to this size; bootstrap messages are padded explicitly in Python
-# because NoiseTransport.encrypt returns only the ciphertext+tag.
+# Every frame on the wire during the handshake is exactly this many bytes.
+# The Rust side already pre-pads Noise XX output to this size; bootstrap
+# messages are padded explicitly in Python because NoiseTransport.encrypt
+# returns only the ciphertext+tag.
 HANDSHAKE_FRAME_SIZE = 1400
 
-# Bootstrap exchange: the plaintext is a 32-byte X25519 public key.
+# Bootstrap exchange: plaintext is a 32-byte X25519 public key.
 # NoiseTransport.encrypt(32) -> 32 + 16 (GCM tag) = 48 bytes.
 BOOTSTRAP_CIPHERTEXT_SIZE = 32 + 16
 
 
-def _pad_to_frame(data: bytes, expected_size: int) -> bytes:
-    """Pad a handshake ciphertext to HANDSHAKE_FRAME_SIZE with CSPRNG bytes.
+class HandshakeError(Exception):
+    pass
 
-    No length prefix on the wire — both sides know the expected ciphertext
-    size from the protocol (pubkey + GCM tag = 48B). This matches the
-    Rust-side `pack_handshake` construction so all 5 handshake frames
-    have the same on-the-wire structure.
-    """
+
+class CertAuthError(HandshakeError):
+    """Cert / binding-attestation verification failed."""
+
+
+class CNNotAllowedError(CertAuthError):
+    """Server saw a client cert whose CN is not in the allowlist."""
+
+
+class CNMismatchError(CertAuthError):
+    """Client saw a server cert whose CN does not match expected_server_cn."""
+
+
+class CertRevokedError(CertAuthError):
+    """Peer's cert serial appears in the CRL."""
+
+
+def _pad_to_frame(data: bytes, expected_size: int) -> bytes:
+    """Pad a handshake ciphertext to HANDSHAKE_FRAME_SIZE with CSPRNG bytes."""
     if len(data) != expected_size:
         raise HandshakeError(
             f"handshake payload size mismatch: {len(data)} != {expected_size}"
@@ -86,36 +115,52 @@ async def client_handshake(
     transport: UDPTransport | TCPTransport,
     identity: tuncore.IdentityKeyPair,
     server_addr: tuple[str, int],
-    known_hosts_path: Path | None = None,
-    strict_keys: bool = True,
+    *,
+    attest_key: tuncore.AttestKey,
+    cert_der: bytes,
+    ca_root: X509Certificate,
+    expected_server_cn: str,
+    crl: CRL | None = None,
+    required_server_eku: ObjectIdentifier | None = None,
     rotation_packets: int | None = None,
     rotation_seconds: int | None = None,
 ) -> tuple[tuncore.SessionKeyManager, bytes]:
     """Perform Noise XX handshake as initiator (client).
 
     Args:
-        transport: UDPTransport or TCPTransport instance
-        identity: tuncore.IdentityKeyPair
-        server_addr: (host, port) of the server
-        known_hosts_path: path to encrypted known_hosts file
-        strict_keys: abort on any key mismatch (vs warn)
+        transport: UDPTransport or TCPTransport.
+        identity: long-term Noise X25519 keypair (this device's).
+        server_addr: (host, port) of the server.
+        attest_key: hardware-bound ECDSA P-256 signing key (this
+            device's). Must match the public key embedded in
+            ``cert_der`` (caller verifies at startup).
+        cert_der: DER-encoded device cert for this client (issued by
+            the CA, with the noiseStaticBinding extension carrying the
+            current device's Noise static pub).
+        ca_root: pinned CA root cert.
+        expected_server_cn: server cert subject CN we will accept.
+        crl: optional revocation list (will be consulted for the
+            received server cert's serial number).
+        required_server_eku: optional EKU OID required on the server
+            cert (typically id-kp-serverAuth).
 
     Returns:
-        (SessionKeyManager, handshake_hash) on success
+        (SessionKeyManager, handshake_hash) on success.
 
     Raises:
-        HandshakeError on failure
+        HandshakeError on transport/protocol failure.
+        CertAuthError on cert validation / CN policy / CRL failure.
     """
     import tuncore
 
     initiator = tuncore.NoiseInitiator(identity)
+    our_static_pub = bytes(identity.public_key)
 
     # Message 1: -> e
     msg1 = initiator.write_message_1()
     await _send(transport, msg1, server_addr)
 
-    # Message 2: <- e, ee, s, es
-    # Retransmit msg1 on timeout so the server gets another chance to respond
+    # Message 2: <- e, ee, s, es [+ server attest payload]
     async def _retransmit_msg1() -> None:
         await _send(transport, msg1, server_addr)
 
@@ -124,76 +169,116 @@ async def client_handshake(
         raise HandshakeError(
             f"msg2 from unexpected source {recv_addr}, expected {server_addr}"
         )
-    # PyO3 hands us Vec<u8> as Python list[int]; coerce to bytes once at
-    # the FFI boundary so every downstream consumer (TOFU known_hosts
-    # serialization, HMAC compare, log .hex()) works on a real bytes object.
-    server_static = bytes(initiator.read_message_2(msg2))
 
-    # Validate server static key against cache (HMAC-protected)
-    if known_hosts_path:
-        _check_known_host(
-            known_hosts_path, server_addr[0], server_static, strict_keys,
-            identity=identity, server_port=server_addr[1],
+    # Snapshot the handshake hash that signs msg2's binding *before*
+    # read_message_2 advances the Noise state past it.
+    binding_hash_for_msg2 = bytes(initiator.get_handshake_hash())
+    server_static_raw, server_attest_payload = initiator.read_message_2(msg2)
+    server_static = bytes(server_static_raw)
+
+    # Verify server attestation: cert chain → CA, binding → server_static,
+    # signature over (binding_hash_for_msg2, server_static, RESPONDER).
+    try:
+        server_cert = verify_attest_payload(
+            payload=bytes(server_attest_payload),
+            ca_root=ca_root,
+            handshake_hash=binding_hash_for_msg2,
+            expected_remote_static=server_static,
+            expected_peer_role=PeerRole.RESPONDER,
+            required_eku=required_server_eku,
         )
+    except (AttestError, CertError) as e:
+        raise CertAuthError(f"server attestation verify failed: {e}") from e
 
-    # Message 3: -> s, se
-    # Single send — loss recovery is handled via the bootstrap-round retransmit
-    # below, which resends msg3 + bootstrap_init together. Multi-sending msg3
-    # alone would be ambiguous: the server processes msg3 then waits for
-    # bootstrap_init, and a duplicate msg3 would be misread as bootstrap_init.
-    msg3 = initiator.write_message_3()
+    if server_cert.subject_cn != expected_server_cn:
+        raise CNMismatchError(
+            f"server CN {server_cert.subject_cn!r} does not match "
+            f"expected {expected_server_cn!r}"
+        )
+    if crl is not None:
+        try:
+            if crl.is_revoked(server_cert.serial_number):
+                raise CertRevokedError(
+                    f"server cert serial {server_cert.serial_number} "
+                    "is revoked"
+                )
+        except CRLError as e:
+            raise CertAuthError(f"CRL check failed: {e}") from e
+
+    # Message 3: -> s, se [+ client attest payload]
+    # Snapshot binding hash *before* write_message_3 advances Noise state.
+    binding_hash_for_msg3 = bytes(initiator.get_handshake_hash())
+    our_attest_payload = build_attest_payload(
+        attest_key=attest_key,
+        cert_der=cert_der,
+        handshake_hash=binding_hash_for_msg3,
+        our_static_pub=our_static_pub,
+        our_role=PeerRole.INITIATOR,
+    )
+    msg3 = initiator.write_message_3(our_attest_payload)
     await _send(transport, msg3, server_addr)
 
-    # Snapshot the handshake hash before transitioning to transport state —
-    # into_transport() consumes the initiator.
+    # Final handshake hash (post-msg3) — used by bootstrap DH key
+    # derivation (downstream callers).
     handshake_hash = bytes(initiator.get_handshake_hash())
 
-    # Transition to Noise transport and perform ephemeral DH bootstrap
-    # to derive keys from SECRET material (not public handshake hash).
     noise_transport = initiator.into_transport()
     client_secret, client_public = tuncore.generate_ephemeral()
     try:
-        # Send client ephemeral public via Noise transport (encrypted), padded
-        # to HANDSHAKE_FRAME_SIZE to match the 3 Noise XX frame sizes.
-        bootstrap_init_ct = bytes(noise_transport.encrypt(bytes(client_public)))
-        bootstrap_init_frame = _pad_to_frame(bootstrap_init_ct, BOOTSTRAP_CIPHERTEXT_SIZE)
+        bootstrap_init_ct = bytes(
+            noise_transport.encrypt(bytes(client_public))
+        )
+        bootstrap_init_frame = _pad_to_frame(
+            bootstrap_init_ct, BOOTSTRAP_CIPHERTEXT_SIZE
+        )
         await _send(transport, bootstrap_init_frame, server_addr)
 
         # Receive server ephemeral public. On timeout, resend BOTH msg3 and
-        # the bootstrap frame — we don't know which was lost, and resending
-        # only msg3 would cause the server to wait for bootstrap forever
-        # while resending only bootstrap_init would leave server stuck on
-        # msg3 recv (rejecting the bootstrap frame as an invalid msg3).
+        # the bootstrap frame — we don't know which was lost, and
+        # resending only one would deadlock the protocol step.
         async def _retransmit_bootstrap() -> None:
             await _send(transport, msg3, server_addr)
             await _send(transport, bootstrap_init_frame, server_addr)
 
-        bootstrap_resp_frame, _ = await _recv(transport, retransmit=_retransmit_bootstrap)
-        bootstrap_resp_ct = _unpad_from_frame(bootstrap_resp_frame, BOOTSTRAP_CIPHERTEXT_SIZE)
+        bootstrap_resp_frame, _ = await _recv(
+            transport, retransmit=_retransmit_bootstrap
+        )
+        bootstrap_resp_ct = _unpad_from_frame(
+            bootstrap_resp_frame, BOOTSTRAP_CIPHERTEXT_SIZE
+        )
         server_public = noise_transport.decrypt(bootstrap_resp_ct)
         if len(server_public) != 32:
-            raise HandshakeError("invalid bootstrap ephemeral from server")
+            raise HandshakeError(
+                "invalid bootstrap ephemeral from server"
+            )
 
-        # Derive session keys from ephemeral DH (secure, not public h).
-        # Rust-side zeroizes the secret after consumption.
         session_keys = tuncore.bootstrap_session_from_dh(
-            bytes(client_secret), bytes(server_public), is_initiator=True,
+            bytes(client_secret),
+            bytes(server_public),
+            is_initiator=True,
             rotation_packets=rotation_packets,
             rotation_seconds=rotation_seconds,
         )
     finally:
-        # Drop the Python reference to the ephemeral secret immediately so the
-        # GC can collect. Python bytes are immutable — real zeroization happens
-        # Rust-side; this just minimizes the lifetime of the copy in the PyObject.
         del client_secret
 
-    log.info("handshake complete (client)")
+    log.info(
+        "handshake complete (client) — server_cn=%s",
+        server_cert.subject_cn,
+    )
     return session_keys, handshake_hash
 
 
 async def server_handshake(
     transport: UDPTransport | TCPTransport,
     identity: tuncore.IdentityKeyPair,
+    *,
+    attest_key: tuncore.AttestKey,
+    cert_der: bytes,
+    ca_root: X509Certificate,
+    cn_allowlist: CNAllowlist,
+    crl: CRL | None = None,
+    required_client_eku: ObjectIdentifier | None = None,
     client_addr: tuple[str, int] | None = None,
     rotation_packets: int | None = None,
     rotation_seconds: int | None = None,
@@ -202,80 +287,121 @@ async def server_handshake(
 
     Returns:
         (SessionKeyManager, client_static_pubkey)
+
+    Raises:
+        HandshakeError on transport/protocol failure.
+        CertAuthError / CNNotAllowedError / CertRevokedError on cert
+            policy failure.
     """
     import tuncore
 
     responder = tuncore.NoiseResponder(identity)
+    our_static_pub = bytes(identity.public_key)
 
     # Message 1: -> e (capture sender address for UDP reply).
     # Wait indefinitely — there is no peer state to time out against
-    # before any client has connected. SIGINT/SIGTERM still cancels
-    # this task cleanly via the AsyncExitStack shutdown.
+    # before any client has connected.
     msg1, recv_addr = await _recv(transport, indefinite=True)
     responder.read_message_1(msg1)
     addr = recv_addr or client_addr
 
-    # Message 2: <- e, ee, s, es
-    msg2 = responder.write_message_2()
+    # Message 2: <- e, ee, s, es [+ server attest payload]
+    binding_hash_for_msg2 = bytes(responder.get_handshake_hash())
+    our_attest_payload = build_attest_payload(
+        attest_key=attest_key,
+        cert_der=cert_der,
+        handshake_hash=binding_hash_for_msg2,
+        our_static_pub=our_static_pub,
+        our_role=PeerRole.RESPONDER,
+    )
+    msg2 = responder.write_message_2(our_attest_payload)
     await _send(transport, msg2, addr)
 
-    # Message 3: -> s, se (validate source matches msg1 sender for UDP)
-    # Retransmit msg2 on timeout so the client gets another chance to respond
+    # Message 3: -> s, se [+ client attest payload]
     async def _retransmit_msg2() -> None:
         await _send(transport, msg2, addr)
 
     msg3, msg3_addr = await _recv(transport, retransmit=_retransmit_msg2)
-    if isinstance(transport, UDPTransport) and addr is not None and msg3_addr != addr:
+    if (
+        isinstance(transport, UDPTransport)
+        and addr is not None
+        and msg3_addr != addr
+    ):
         raise HandshakeError(
             f"msg3 from unexpected source {msg3_addr}, expected {addr}"
         )
-    # Coerce list[int] -> bytes at the FFI boundary (see server_handshake).
-    client_static = bytes(responder.read_message_3(msg3))
 
-    # Snapshot the handshake hash before transitioning to transport state —
-    # into_transport() consumes the responder.
+    binding_hash_for_msg3 = bytes(responder.get_handshake_hash())
+    client_static_raw, client_attest_payload = responder.read_message_3(
+        msg3
+    )
+    client_static = bytes(client_static_raw)
+
+    try:
+        client_cert = verify_attest_payload(
+            payload=bytes(client_attest_payload),
+            ca_root=ca_root,
+            handshake_hash=binding_hash_for_msg3,
+            expected_remote_static=client_static,
+            expected_peer_role=PeerRole.INITIATOR,
+            required_eku=required_client_eku,
+        )
+    except (AttestError, CertError) as e:
+        raise CertAuthError(f"client attestation verify failed: {e}") from e
+
+    if not cn_allowlist.is_allowed(client_cert.subject_cn):
+        raise CNNotAllowedError(
+            f"client CN {client_cert.subject_cn!r} not in allowlist"
+        )
+    if crl is not None:
+        try:
+            if crl.is_revoked(client_cert.serial_number):
+                raise CertRevokedError(
+                    f"client cert serial {client_cert.serial_number} "
+                    "is revoked"
+                )
+        except CRLError as e:
+            raise CertAuthError(f"CRL check failed: {e}") from e
+
+    # Final handshake hash (post-msg3).
     handshake_hash = bytes(responder.get_handshake_hash())
-
-    # Transition to Noise transport and perform ephemeral DH bootstrap
-    # to derive keys from SECRET material (not public handshake hash).
     noise_transport = responder.into_transport()
 
-    # Receive client ephemeral public
+    # Bootstrap: receive client ephemeral, send server ephemeral.
     bootstrap_init_frame, _ = await _recv(transport)
-    bootstrap_init_ct = _unpad_from_frame(bootstrap_init_frame, BOOTSTRAP_CIPHERTEXT_SIZE)
+    bootstrap_init_ct = _unpad_from_frame(
+        bootstrap_init_frame, BOOTSTRAP_CIPHERTEXT_SIZE
+    )
     client_public = noise_transport.decrypt(bootstrap_init_ct)
     if len(client_public) != 32:
         raise HandshakeError("invalid bootstrap ephemeral from client")
 
-    # Generate server ephemeral and send it back
     server_secret, server_public = tuncore.generate_ephemeral()
     try:
-        bootstrap_resp_ct = bytes(noise_transport.encrypt(bytes(server_public)))
-        bootstrap_resp_frame = _pad_to_frame(bootstrap_resp_ct, BOOTSTRAP_CIPHERTEXT_SIZE)
+        bootstrap_resp_ct = bytes(
+            noise_transport.encrypt(bytes(server_public))
+        )
+        bootstrap_resp_frame = _pad_to_frame(
+            bootstrap_resp_ct, BOOTSTRAP_CIPHERTEXT_SIZE
+        )
         await _send(transport, bootstrap_resp_frame, addr)
 
-        # Derive session keys from ephemeral DH (secure, not public h).
-        # Rust-side zeroizes the secret after consumption.
         session_keys = tuncore.bootstrap_session_from_dh(
-            bytes(server_secret), bytes(client_public), is_initiator=False,
+            bytes(server_secret),
+            bytes(client_public),
+            is_initiator=False,
             rotation_packets=rotation_packets,
             rotation_seconds=rotation_seconds,
         )
     finally:
         del server_secret
 
-    log.info("handshake complete (server)")
-    # handshake_hash is already captured above; returned for diagnostics
-    _ = handshake_hash  # noqa: F841 (kept for symmetry with client)
+    log.info(
+        "handshake complete (server) — client_cn=%s",
+        client_cert.subject_cn,
+    )
+    _ = handshake_hash  # captured for diagnostic symmetry with client
     return session_keys, client_static
-
-
-class HandshakeError(Exception):
-    pass
-
-
-class KeyMismatchError(HandshakeError):
-    pass
 
 
 async def _send(
@@ -283,12 +409,6 @@ async def _send(
     data: bytes,
     addr: tuple[str, int] | None,
 ) -> None:
-    """Send a pre-framed handshake message (exactly HANDSHAKE_FRAME_SIZE bytes).
-
-    Callers pass either a Noise XX message (Rust pads to HANDSHAKE_FRAME_SIZE)
-    or a bootstrap frame produced by ``_pad_to_frame``. No further wrapping
-    happens here; a size check catches misuse.
-    """
     data = bytes(data)
     if len(data) != HANDSHAKE_FRAME_SIZE:
         raise HandshakeError(
@@ -307,27 +427,15 @@ async def _recv(
     *,
     indefinite: bool = False,
 ) -> tuple[bytes, tuple[str, int] | None]:
-    """Receive a HANDSHAKE_FRAME_SIZE frame and return it verbatim.
-
-    Callers are responsible for extracting the inner payload (Rust does
-    this for Noise XX via ``read_message_*``; bootstrap uses
-    ``_unpad_from_frame``).
+    """Receive a HANDSHAKE_FRAME_SIZE frame.
 
     Args:
-        transport: UDP or TCP transport
-        retransmit: optional async callback to resend the last outgoing
-            message before each retry, so the peer gets another chance to
-            respond if the original send was lost. Ignored when
-            ``indefinite=True``.
+        retransmit: optional async callback resending the last outgoing
+            message before each retry, so peer gets another chance to
+            respond if our send was lost. Ignored when ``indefinite=True``.
         indefinite: when True, block until a packet arrives or the task
             is cancelled — no MAX_RETRIES timeout. Used by the server's
-            initial msg1 wait, where there is no in-flight peer state to
-            time out against (we're literally waiting for any client to
-            connect). Cancellation (SIGINT/SIGTERM via the AsyncExitStack
-            shutdown) still tears the recv down cleanly.
-
-    Returns:
-        (frame, addr) where addr is the sender address for UDP, None for TCP.
+            initial msg1 wait.
     """
     if indefinite:
         if isinstance(transport, UDPTransport):
@@ -339,149 +447,33 @@ async def _recv(
     for attempt in range(MAX_RETRIES):
         try:
             if isinstance(transport, UDPTransport):
-                frame, addr = await asyncio.wait_for(transport.recv(), HANDSHAKE_TIMEOUT)
+                frame, addr = await asyncio.wait_for(
+                    transport.recv(), HANDSHAKE_TIMEOUT
+                )
                 return bytes(frame), addr
             else:
-                frame = await asyncio.wait_for(transport.recv(), HANDSHAKE_TIMEOUT)
+                frame = await asyncio.wait_for(
+                    transport.recv(), HANDSHAKE_TIMEOUT
+                )
                 return bytes(frame), None
         except asyncio.TimeoutError:
             if attempt == MAX_RETRIES - 1:
                 raise HandshakeError(
                     f"handshake recv timed out after {MAX_RETRIES} attempts"
                 )
-            delay = BACKOFF_BASE * (2 ** attempt)
-            log.warning("handshake recv timeout, retry %d/%d in %.1fs",
-                        attempt + 1, MAX_RETRIES, delay)
+            delay = BACKOFF_BASE * (2**attempt)
+            log.warning(
+                "handshake recv timeout, retry %d/%d in %.1fs",
+                attempt + 1,
+                MAX_RETRIES,
+                delay,
+            )
             await asyncio.sleep(delay)
             if retransmit is not None:
-                log.debug("retransmitting last handshake message (attempt %d)", attempt + 1)
+                log.debug(
+                    "retransmitting last handshake message (attempt %d)",
+                    attempt + 1,
+                )
                 await retransmit()
 
     raise HandshakeError("handshake recv failed")
-
-
-def _check_known_host(
-    path: Path,
-    server_ip: str,
-    server_static: bytes,
-    strict: bool,
-    identity: tuncore.IdentityKeyPair,
-    server_port: int = 0,
-) -> None:
-    """TOFU check: verify server static key against HMAC-protected known_hosts."""
-    host_key = f"{server_ip}:{server_port}" if server_port else server_ip
-
-    if not path.exists():
-        _save_known_host(path, host_key, server_static, identity)
-        log.info("TOFU: saved server static key for %s", host_key)
-        return
-
-    hosts = _load_known_hosts(path, identity)
-    cached = hosts.get(host_key)
-
-    if cached is None:
-        # No entry under the canonical host:port key. Do fresh TOFU, even if
-        # a stale entry exists under an older key format (e.g. bare IP). We
-        # do NOT migrate the trust relationship from an older format, since
-        # the old entry's provenance can't be re-verified here.
-        _save_known_host(path, host_key, server_static, identity)
-        log.info("TOFU: saved server static key for %s", host_key)
-        return
-
-    if not hmac.compare_digest(bytes.fromhex(cached), server_static):
-        msg = f"SECURITY WARNING: server static key changed for {host_key}"
-        log.critical(msg)
-        if strict:
-            raise KeyMismatchError(msg)
-        log.warning("continuing despite key mismatch (strict_keys=False)")
-
-
-def _known_hosts_hmac(identity: tuncore.IdentityKeyPair, payload: bytes) -> bytes:
-    """Compute HMAC-SHA256 over payload using a key derived from the identity's
-    secret. The derived key never crosses the FFI boundary (audit H2)."""
-    return bytes(identity.compute_hmac(b"known-hosts", payload))
-
-
-def _load_known_hosts(
-    path: Path, identity: tuncore.IdentityKeyPair,
-) -> dict[str, str]:
-    if not path.exists():
-        return {}
-
-    try:
-        check_user_file_permissions(path)
-    except InsecureFilePermissionsError as e:
-        raise HandshakeError(str(e)) from e
-
-    try:
-        raw = path.read_bytes()
-    except OSError:
-        return {}
-
-    # Format: HMAC(32 bytes) || JSON payload
-    if len(raw) < 32:
-        raise HandshakeError(
-            f"known_hosts file too short ({len(raw)} bytes), possibly corrupted. "
-            f"Delete {path} manually to reset trust."
-        )
-
-    stored_mac = raw[:32]
-    payload = raw[32:]
-
-    # Try current (secret-key-based) HMAC first
-    expected_mac = _known_hosts_hmac(identity, payload)
-
-    if not hmac.compare_digest(stored_mac, expected_mac):
-        raise HandshakeError(
-            f"known_hosts HMAC verification failed for {path}. "
-            "File may have been tampered with. Delete the file manually to reset trust."
-        )
-
-    try:
-        return json.loads(payload)
-    except json.JSONDecodeError as e:
-        raise HandshakeError(f"known_hosts corrupted (invalid JSON): {e}") from e
-
-
-def _save_known_hosts_dict(
-    path: Path,
-    hosts: dict[str, str],
-    identity: tuncore.IdentityKeyPair,
-) -> None:
-    """Write a known_hosts dict to disk with HMAC integrity."""
-    payload = json.dumps(hosts).encode()
-    mac = _known_hosts_hmac(identity, payload)
-    atomic_write(path, mac + payload)
-
-
-@contextlib.contextmanager
-def _known_hosts_lock(path: Path) -> Generator[None, None, None]:
-    """Hold an exclusive flock on a sidecar file across read-modify-write.
-
-    Without this, two clients TOFU-saving to the same path simultaneously
-    can race: both read the same baseline, both add their entry, the
-    second atomic_write rename wins, and the first entry is lost.
-    """
-    lock_path = path.with_suffix(path.suffix + ".lock")
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        yield
-    finally:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        finally:
-            os.close(fd)
-
-
-def _save_known_host(
-    path: Path,
-    host_key: str,
-    static_key: bytes,
-    identity: tuncore.IdentityKeyPair,
-) -> None:
-    with _known_hosts_lock(path):
-        hosts = _load_known_hosts(path, identity)
-        hosts[host_key] = static_key.hex()
-        _save_known_hosts_dict(path, hosts, identity)

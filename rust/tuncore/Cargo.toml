@@ -5,7 +5,15 @@ edition = "2021"
 
 [lib]
 name = "tuncore"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["dev-soft-attest"]
+# Software ECDSA P-256 attestation backend. Dev/CI/test only — keys are
+# extractable from process memory. Replaced by `tpm-attest` (Linux) and the
+# Android Keystore JNI backend (Android) for production builds.
+dev-soft-attest = ["dep:p256"]
+# tpm-attest = ["dep:tss-esapi"]   # Phase 1 step 5
 
 [dependencies]
 pyo3 = { version = "0.22", features = ["extension-module"] }
@@ -23,6 +31,7 @@ serde = { version = "1", features = ["derive"] }
 libc = "0.2"
 subtle = "2"
 hmac = "0.12"
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8"], optional = true }
 
 [profile.release]
 opt-level = 3

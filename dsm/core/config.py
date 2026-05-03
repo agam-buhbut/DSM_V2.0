@@ -34,10 +34,24 @@ class Config:
     server_port: int
     listen_port: int
     key_file: str
+    # Device cert (PEM or DER) — issued by the internal CA, binds the
+    # device's hardware-bound signing key + Noise static via the
+    # noiseStaticBinding extension. Required.
+    cert_file: str
+    # Pinned CA root cert (PEM). Required.
+    ca_root_file: str
+    # Persisted attest key blob (soft-attest backend only). For TPM /
+    # Keystore backends this points to a key handle, not a file.
+    attest_key_file: str
     transport: Literal["udp", "tcp"] = "udp"
     dns_providers: list[str] = field(default_factory=list[str])
     dns_provider_pins: dict[str, list[str]] = field(default_factory=dict[str, list[str]])
-    known_hosts_path: str | None = None
+    # Optional CRL file (DER or PEM).
+    crl_file: str | None = None
+    # Client-only: subject CN we will accept on the server cert.
+    expected_server_cn: str | None = None
+    # Server-only: file with one allowed client subject CN per line.
+    allowed_cns_file: str | None = None
     tun_name: str = "mtun0"
     log_level: Literal["debug", "info", "warning", "error"] = "info"
     padding_min: int = 128
@@ -47,11 +61,6 @@ class Config:
     rotation_packets: int = 5000
     rotation_seconds: int = 600
     debug_dns: bool = False
-    # When True (default), the server rejects any client whose static pubkey
-    # is not in authorized_clients.json. When False AND the allowlist is empty,
-    # the server accepts the first client's pubkey (TOFU) — convenience knob
-    # for single-operator bootstrap. Set back to True after first connection.
-    strict_client_auth: bool = True
     # TUN device MTU in bytes. Must satisfy MIN_TUN_MTU <= mtu <= MAX_TUN_MTU.
     # The wire-level path MTU budget is checked against this at startup.
     mtu: int = DEFAULT_TUN_MTU
@@ -140,13 +149,42 @@ def _validate(c: Config) -> None:
                     f"dns_provider_pins[{provider!r}] entry {pin!r} is not valid hex"
                 ) from e
 
-    # known_hosts_path (client only; optional — falls back to built-in default)
-    if c.known_hosts_path is not None:
-        if not c.known_hosts_path:
-            raise ValueError("known_hosts_path must not be empty")
-        if not Path(c.known_hosts_path).is_absolute():
+    # cert_file / ca_root_file / attest_key_file: required, absolute paths.
+    for name, value in (
+        ("cert_file", c.cert_file),
+        ("ca_root_file", c.ca_root_file),
+        ("attest_key_file", c.attest_key_file),
+    ):
+        if not value:
+            raise ValueError(f"{name} must not be empty")
+        if not Path(value).is_absolute():
             raise ValueError(
-                f"known_hosts_path must be absolute, got {c.known_hosts_path!r}"
+                f"{name} must be absolute, got {value!r}"
+            )
+
+    # crl_file: optional but absolute when present.
+    if c.crl_file is not None:
+        if not c.crl_file:
+            raise ValueError("crl_file must not be empty")
+        if not Path(c.crl_file).is_absolute():
+            raise ValueError(
+                f"crl_file must be absolute, got {c.crl_file!r}"
+            )
+
+    # Role-specific cert policy fields.
+    if c.mode == "client":
+        if not c.expected_server_cn:
+            raise ValueError(
+                "client mode requires expected_server_cn"
+            )
+    else:  # server
+        if not c.allowed_cns_file:
+            raise ValueError(
+                "server mode requires allowed_cns_file"
+            )
+        if not Path(c.allowed_cns_file).is_absolute():
+            raise ValueError(
+                f"allowed_cns_file must be absolute, got {c.allowed_cns_file!r}"
             )
 
     # padding

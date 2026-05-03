@@ -92,6 +92,7 @@ class TestDataPathRoundtrip(unittest.IsolatedAsyncioTestCase):
         DataPathContexts on both sides using MockTuns. Returns (client, server)
         dicts with the resources we need in the test.
         """
+        from dsm.crypto.cert_allowlist import CNAllowlist
         from dsm.crypto.handshake import client_handshake, server_handshake
         from dsm.net.transport.udp import UDPTransport
         from dsm.core.protocol import ReassemblyBuffer
@@ -102,6 +103,12 @@ class TestDataPathRoundtrip(unittest.IsolatedAsyncioTestCase):
         )
         from dsm.traffic.shaper import TrafficShaper, make_chaff_packet
         from dsm.traffic.scheduler import SendScheduler
+        from tests.cert_helpers import (
+            CLIENT_AUTH_OID,
+            SERVER_AUTH_OID,
+            make_enrolled_device,
+            make_test_ca,
+        )
 
         server_transport = UDPTransport()
         server_port = await server_transport.bind("127.0.0.1", 0)
@@ -111,17 +118,33 @@ class TestDataPathRoundtrip(unittest.IsolatedAsyncioTestCase):
         await client_transport.bind("127.0.0.1", 0)
         self.addAsyncCleanup(client_transport.aclose)
 
-        server_identity = tuncore.IdentityKeyPair.generate()
-        client_identity = tuncore.IdentityKeyPair.generate()
+        ca = make_test_ca()
+        client = make_enrolled_device(
+            ca, subject_cn="dsm-data-client", eku=CLIENT_AUTH_OID
+        )
+        server = make_enrolled_device(
+            ca, subject_cn="dsm-data-server", eku=SERVER_AUTH_OID
+        )
         server_addr = ("127.0.0.1", server_port)
 
         (c_keys, _c_hash), (s_keys, _c_pub) = await asyncio.wait_for(
             asyncio.gather(
                 client_handshake(
-                    client_transport, client_identity, server_addr,
-                    known_hosts_path=None,
+                    client_transport, client.identity, server_addr,
+                    attest_key=client.attest_key,
+                    cert_der=client.cert_der,
+                    ca_root=ca.certificate,
+                    expected_server_cn="dsm-data-server",
                 ),
-                server_handshake(server_transport, server_identity),
+                server_handshake(
+                    server_transport, server.identity,
+                    attest_key=server.attest_key,
+                    cert_der=server.cert_der,
+                    ca_root=ca.certificate,
+                    cn_allowlist=CNAllowlist(
+                        cns=frozenset({"dsm-data-client"})
+                    ),
+                ),
             ),
             timeout=30.0,
         )

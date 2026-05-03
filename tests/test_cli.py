@@ -1,25 +1,12 @@
-"""Tests for dsm CLI entry point and config directory resolution.
-
-Covers:
-    1. DSM_CONFIG_DIR env var precedence in dsm.core.config.load
-    2. `reset-trust --yes` deletes the known_hosts file
-    3. `reset-trust` on missing file is a no-op
-    4. `reset-trust` without --yes and without a tty exits with code 2
-"""
+"""Tests for dsm CLI entry point and config directory resolution."""
 
 from __future__ import annotations
 
-import io
 import os
-import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout, redirect_stderr
 from pathlib import Path
-from unittest import mock
 
-import dsm.__main__ as dsm_main
-import dsm.crypto.handshake as handshake_mod
 from dsm.core.config import load as config_load
 
 
@@ -29,6 +16,10 @@ server_ip = "10.0.0.1"
 server_port = 51820
 listen_port = 51821
 key_file = "/tmp/test.key"
+cert_file = "/tmp/test.crt"
+ca_root_file = "/tmp/test-ca.pem"
+attest_key_file = "/tmp/test-attest.key"
+expected_server_cn = "dsm-test-server"
 transport = "udp"
 """
 
@@ -38,7 +29,6 @@ class TestConfigDirPrecedence(unittest.TestCase):
         self._tmpdir = tempfile.mkdtemp()
         self.config_path = Path(self._tmpdir) / "config.toml"
         self.config_path.write_bytes(_VALID_TOML)
-        # Preserve and clear DSM_CONFIG_DIR for predictable starting state.
         self._prev_env = os.environ.get("DSM_CONFIG_DIR")
         if "DSM_CONFIG_DIR" in os.environ:
             del os.environ["DSM_CONFIG_DIR"]
@@ -65,7 +55,6 @@ class TestConfigDirPrecedence(unittest.TestCase):
         try:
             os.environ["DSM_CONFIG_DIR"] = other
             cfg = config_load(self.config_path)
-            # Env-var wins even though config parent is self._tmpdir.
             self.assertEqual(Path(cfg.config_dir), Path(other))
             self.assertNotEqual(Path(cfg.config_dir), Path(self._tmpdir))
         finally:
@@ -85,60 +74,6 @@ class TestConfigDirPrecedence(unittest.TestCase):
                 del os.environ["DSM_CONFIG_DIR"]
             else:
                 os.environ["DSM_CONFIG_DIR"] = prev
-
-
-class TestResetTrust(unittest.TestCase):
-    def setUp(self) -> None:
-        self._tmpdir = tempfile.mkdtemp()
-        self.known_hosts = Path(self._tmpdir) / "known_hosts.json"
-        # Monkeypatch DEFAULT_KNOWN_HOSTS_PATH so _run_reset_trust imports
-        # our temp path. The CLI re-imports it inside the function, so
-        # patching at module scope on dsm.crypto.handshake works.
-        self._orig_path = handshake_mod.DEFAULT_KNOWN_HOSTS_PATH
-        handshake_mod.DEFAULT_KNOWN_HOSTS_PATH = self.known_hosts
-
-    def tearDown(self) -> None:
-        handshake_mod.DEFAULT_KNOWN_HOSTS_PATH = self._orig_path
-        if self.known_hosts.exists():
-            try:
-                self.known_hosts.unlink()
-            except OSError:
-                pass
-        try:
-            os.rmdir(self._tmpdir)
-        except OSError:
-            pass
-
-    def test_reset_trust_yes_deletes_file(self) -> None:
-        self.known_hosts.write_text("{}")
-        self.assertTrue(self.known_hosts.exists())
-        buf = io.StringIO()
-        with redirect_stdout(buf):
-            dsm_main._run_reset_trust(assume_yes=True)
-        self.assertFalse(self.known_hosts.exists())
-        self.assertIn("Deleted", buf.getvalue())
-
-    def test_reset_trust_missing_file_no_op(self) -> None:
-        self.assertFalse(self.known_hosts.exists())
-        buf = io.StringIO()
-        with redirect_stdout(buf):
-            # Should just return without error.
-            result = dsm_main._run_reset_trust(assume_yes=True)
-        self.assertIsNone(result)
-        self.assertIn("does not exist", buf.getvalue())
-
-    def test_reset_trust_without_yes_non_tty_exits_2(self) -> None:
-        self.known_hosts.write_text("{}")
-        err_buf = io.StringIO()
-        fake_stdin = mock.MagicMock()
-        fake_stdin.isatty.return_value = False
-        with mock.patch.object(sys, "stdin", fake_stdin):
-            with redirect_stderr(err_buf):
-                with self.assertRaises(SystemExit) as ctx:
-                    dsm_main._run_reset_trust(assume_yes=False)
-        self.assertEqual(ctx.exception.code, 2)
-        # File must still exist — we refused to delete it.
-        self.assertTrue(self.known_hosts.exists())
 
 
 if __name__ == "__main__":

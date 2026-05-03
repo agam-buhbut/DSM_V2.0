@@ -14,6 +14,10 @@ def _base(**overrides: Any) -> dict[str, Any]:
         "server_port": 51820,
         "listen_port": 51821,
         "key_file": "/tmp/test.key",
+        "cert_file": "/tmp/test.crt",
+        "ca_root_file": "/tmp/test-ca.pem",
+        "attest_key_file": "/tmp/test-attest.key",
+        "expected_server_cn": "dsm-test-server",
         "transport": "udp",
     }
     defaults.update(overrides)
@@ -30,6 +34,8 @@ class TestConfigValidation(unittest.TestCase):
             mode="server",
             dns_providers=["8.8.8.8"],
             dns_provider_pins={"8.8.8.8": ["a" * 64]},
+            allowed_cns_file="/tmp/test-allowed-cns.txt",
+            expected_server_cn=None,
         ))
         self.assertEqual(c.mode, "server")
 
@@ -53,13 +59,49 @@ class TestConfigValidation(unittest.TestCase):
                 dns_provider_pins={"8.8.8.8": ["deadbeef"]},
             ))
 
-    def test_known_hosts_path_must_be_absolute(self) -> None:
+    def test_cert_file_must_be_absolute(self) -> None:
         with self.assertRaises(ValueError):
-            Config(**_base(known_hosts_path="relative/path"))
+            Config(**_base(cert_file="relative/path.crt"))
 
-    def test_known_hosts_path_optional(self) -> None:
-        c = Config(**_base(known_hosts_path="/opt/mtun/kh.json"))
-        self.assertEqual(c.known_hosts_path, "/opt/mtun/kh.json")
+    def test_ca_root_file_must_be_absolute(self) -> None:
+        with self.assertRaises(ValueError):
+            Config(**_base(ca_root_file="not/absolute.pem"))
+
+    def test_attest_key_file_must_be_absolute(self) -> None:
+        with self.assertRaises(ValueError):
+            Config(**_base(attest_key_file="rel.key"))
+
+    def test_crl_file_optional_when_absent(self) -> None:
+        c = Config(**_base())
+        self.assertIsNone(c.crl_file)
+
+    def test_crl_file_must_be_absolute(self) -> None:
+        with self.assertRaises(ValueError):
+            Config(**_base(crl_file="rel.crl"))
+
+    def test_client_requires_expected_server_cn(self) -> None:
+        with self.assertRaises(ValueError):
+            Config(**_base(expected_server_cn=None))
+
+    def test_server_requires_allowed_cns_file(self) -> None:
+        with self.assertRaises(ValueError):
+            Config(**_base(
+                mode="server",
+                dns_providers=["8.8.8.8"],
+                dns_provider_pins={"8.8.8.8": ["a" * 64]},
+                expected_server_cn=None,
+                allowed_cns_file=None,
+            ))
+
+    def test_server_allowed_cns_file_must_be_absolute(self) -> None:
+        with self.assertRaises(ValueError):
+            Config(**_base(
+                mode="server",
+                dns_providers=["8.8.8.8"],
+                dns_provider_pins={"8.8.8.8": ["a" * 64]},
+                expected_server_cn=None,
+                allowed_cns_file="rel.txt",
+            ))
 
     def test_invalid_mode(self) -> None:
         with self.assertRaises(ValueError):
@@ -82,6 +124,8 @@ class TestConfigValidation(unittest.TestCase):
                 listen_port=0,
                 dns_providers=["8.8.8.8"],
                 dns_provider_pins={"8.8.8.8": ["a" * 64]},
+                allowed_cns_file="/tmp/allowed.txt",
+                expected_server_cn=None,
             ))
 
     def test_listen_port_zero_allowed_in_client_mode(self) -> None:

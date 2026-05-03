@@ -1,4 +1,7 @@
 pub mod aes_gcm;
+pub mod device_attest;
+#[cfg(feature = "dev-soft-attest")]
+pub mod device_attest_soft;
 pub mod identity;
 pub mod nonce;
 pub mod noise_xx;
@@ -185,15 +188,20 @@ impl PyNoiseInitiator {
             .map_err(py_err)
     }
 
-    fn read_message_2(&mut self, msg: &[u8]) -> PyResult<Vec<u8>> {
+    /// Decrypt msg2. Returns `(remote_static_pub, attest_payload)`. The
+    /// attest_payload is exactly HANDSHAKE_ATTEST_PAYLOAD_SIZE bytes —
+    /// the caller parses cert + signature + pad framing.
+    fn read_message_2(&mut self, msg: &[u8]) -> PyResult<(Vec<u8>, Vec<u8>)> {
         require_inner!(self, "already consumed")
             .read_message_2(msg)
             .map_err(py_err)
     }
 
-    fn write_message_3(&mut self) -> PyResult<Vec<u8>> {
+    /// Send msg3 carrying the initiator's attestation payload. The payload
+    /// must be exactly HANDSHAKE_ATTEST_PAYLOAD_SIZE bytes.
+    fn write_message_3(&mut self, attest_payload: &[u8]) -> PyResult<Vec<u8>> {
         require_inner!(self, "already consumed")
-            .write_message_3()
+            .write_message_3(attest_payload)
             .map_err(py_err)
     }
 
@@ -242,13 +250,17 @@ impl PyNoiseResponder {
             .map_err(py_err)
     }
 
-    fn write_message_2(&mut self) -> PyResult<Vec<u8>> {
+    /// Send msg2 carrying the responder's attestation payload. The payload
+    /// must be exactly HANDSHAKE_ATTEST_PAYLOAD_SIZE bytes.
+    fn write_message_2(&mut self, attest_payload: &[u8]) -> PyResult<Vec<u8>> {
         require_inner!(self, "already consumed")
-            .write_message_2()
+            .write_message_2(attest_payload)
             .map_err(py_err)
     }
 
-    fn read_message_3(&mut self, msg: &[u8]) -> PyResult<Vec<u8>> {
+    /// Decrypt msg3. Returns `(remote_static_pub, attest_payload)`. The
+    /// attest_payload is exactly HANDSHAKE_ATTEST_PAYLOAD_SIZE bytes.
+    fn read_message_3(&mut self, msg: &[u8]) -> PyResult<(Vec<u8>, Vec<u8>)> {
         require_inner!(self, "already consumed")
             .read_message_3(msg)
             .map_err(py_err)
@@ -529,6 +541,34 @@ impl PyAesKey {
     }
 }
 
+/// Python-visible device-attestation key. Backend selected at compile time
+/// (see `device_attest.rs`). Holds an opaque handle; raw private-key bytes
+/// never cross the FFI boundary.
+#[pyclass(name = "AttestKey")]
+struct PyAttestKey {
+    inner: device_attest::AttestKey,
+}
+
+#[pymethods]
+impl PyAttestKey {
+    /// Generate a fresh attestation keypair using the active backend.
+    #[staticmethod]
+    fn generate() -> PyResult<Self> {
+        let inner = device_attest::AttestKey::generate().map_err(py_err)?;
+        Ok(Self { inner })
+    }
+
+    /// Return the verifying key as SubjectPublicKeyInfo DER.
+    fn public_spki_der(&self) -> Vec<u8> {
+        self.inner.public_spki_der().to_vec()
+    }
+
+    /// Sign `msg` with the attestation key. Returns ASN.1 DER ECDSA signature.
+    fn sign(&self, msg: &[u8]) -> PyResult<Vec<u8>> {
+        self.inner.sign(msg).map_err(py_err)
+    }
+}
+
 /// Disable core dumps (call once at startup).
 #[pyfunction]
 fn disable_core_dumps() -> PyResult<()> {
@@ -626,9 +666,11 @@ fn tuncore(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyNoiseTransport>()?;
     m.add_class::<PySessionKeyManager>()?;
     m.add_class::<PyAesKey>()?;
+    m.add_class::<PyAttestKey>()?;
     m.add_function(wrap_pyfunction!(disable_core_dumps, m)?)?;
     m.add_function(wrap_pyfunction!(harden_process, m)?)?;
     m.add_function(wrap_pyfunction!(generate_ephemeral, m)?)?;
     m.add_function(wrap_pyfunction!(bootstrap_session_from_dh, m)?)?;
+    m.add("HANDSHAKE_ATTEST_PAYLOAD_SIZE", noise_xx::HANDSHAKE_ATTEST_PAYLOAD_SIZE)?;
     Ok(())
 }

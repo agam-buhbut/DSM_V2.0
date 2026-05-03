@@ -15,15 +15,29 @@ const NOISE_PATTERN: &str = "Noise_XX_25519_AESGCM_SHA256";
 /// Maximum handshake message size (padded to hide message lengths).
 pub const HANDSHAKE_PAD_SIZE: usize = 1400;
 
-/// Exact Snow payload sizes for Noise_XX_25519_AESGCM_SHA256 with empty payloads.
+/// Fixed attestation-payload size carried in Noise XX msg2 (server cert + sig)
+/// and msg3 (client cert + sig). The payload is always exactly this many
+/// bytes, padded internally by the producer (cert/sig + length framing +
+/// random pad). A fixed size keeps the snow message length protocol-constant
+/// and avoids reintroducing the length prefix that audit finding H1 removed.
+///
+/// Sizing: a P-256 cert with custom binding extension is ~600 bytes; an
+/// ASN.1-DER ECDSA signature is ~70-72 bytes; framing is 4 bytes (two u16
+/// length tags). 1024 leaves ~340 bytes of random pad for forward-compat.
+pub const HANDSHAKE_ATTEST_PAYLOAD_SIZE: usize = 1024;
+
+/// Exact Snow message sizes for Noise_XX_25519_AESGCM_SHA256.
 /// These are protocol-constant — binding them out of band eliminates the
 /// previously-unauthenticated length prefix (audit finding H1).
-///   msg1 = e(32)
-///   msg2 = e(32) + ENC(s)(48) + ENC(empty)(16) = 96
-///   msg3 = ENC(s)(48) + ENC(empty)(16) = 64
+///   msg1 = e(32)                                                      → 32
+///   msg2 = e(32) + ENC(s)(48) + ENC(payload)(payload_size + 16 tag)   → 1120
+///   msg3 = ENC(s)(48) + ENC(payload)(payload_size + 16 tag)           → 1088
 const MSG1_SNOW_LEN: usize = 32;
-const MSG2_SNOW_LEN: usize = 96;
-const MSG3_SNOW_LEN: usize = 64;
+const MSG2_SNOW_LEN: usize = 32 + 48 + HANDSHAKE_ATTEST_PAYLOAD_SIZE + 16;
+const MSG3_SNOW_LEN: usize = 48 + HANDSHAKE_ATTEST_PAYLOAD_SIZE + 16;
+
+const _: () = assert!(MSG2_SNOW_LEN <= HANDSHAKE_PAD_SIZE);
+const _: () = assert!(MSG3_SNOW_LEN <= HANDSHAKE_PAD_SIZE);
 
 /// Size of the X25519 ephemeral public key in Noise XX msg1.
 const EPHEMERAL_SIZE: usize = 32;
@@ -137,9 +151,17 @@ impl NoiseInitiator {
         pack_handshake(&buf, MSG1_SNOW_LEN)
     }
 
-    /// Message 2: <- e, ee, s, es
-    /// Returns the server's static public key.
-    pub fn read_message_2(&mut self, msg: &[u8]) -> Result<Vec<u8>, String> {
+    /// Message 2: <- e, ee, s, es [+ attest_payload]
+    ///
+    /// Decrypts the responder's attestation payload and returns
+    /// `(remote_static, attest_payload)` where `attest_payload` is exactly
+    /// `HANDSHAKE_ATTEST_PAYLOAD_SIZE` bytes — the caller parses the
+    /// internal cert/sig framing and ignores trailing pad.
+    ///
+    /// The binding signature inside `attest_payload` is over the handshake
+    /// hash captured BEFORE this call (i.e. post-msg1). The caller must
+    /// snapshot `get_handshake_hash()` before invoking `read_message_2`.
+    pub fn read_message_2(&mut self, msg: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
         let snow_data = unpack_handshake(msg, MSG2_SNOW_LEN)?;
 
         // Noise XX msg2 starts with the responder's ephemeral public key (32
@@ -147,11 +169,16 @@ impl NoiseInitiator {
         // handshake state.
         validate_ephemeral_not_low_order(&snow_data[..EPHEMERAL_SIZE])?;
 
-        let mut payload = vec![0u8; HANDSHAKE_PAD_SIZE];
-        let _len = self
+        let mut payload = vec![0u8; HANDSHAKE_ATTEST_PAYLOAD_SIZE];
+        let len = self
             .state
             .read_message(snow_data, &mut payload)
             .map_err(|e| format!("read msg2: {e}"))?;
+        if len != HANDSHAKE_ATTEST_PAYLOAD_SIZE {
+            return Err(format!(
+                "msg2 attest payload length mismatch: got {len}, expected {HANDSHAKE_ATTEST_PAYLOAD_SIZE}"
+            ));
+        }
 
         let remote_static = self
             .state
@@ -159,15 +186,27 @@ impl NoiseInitiator {
             .ok_or("no remote static key after msg2")?
             .to_vec();
 
-        Ok(remote_static)
+        Ok((remote_static, payload))
     }
 
-    /// Message 3: -> s, se
-    pub fn write_message_3(&mut self) -> Result<Vec<u8>, String> {
+    /// Message 3: -> s, se [+ attest_payload]
+    ///
+    /// `attest_payload` must be exactly `HANDSHAKE_ATTEST_PAYLOAD_SIZE`
+    /// bytes. The caller produces it by serializing
+    /// `cert_len(2) || cert || sig_len(2) || sig` then padding with random
+    /// bytes; the binding signature is over the handshake hash captured
+    /// before this call (i.e. post-msg2).
+    pub fn write_message_3(&mut self, attest_payload: &[u8]) -> Result<Vec<u8>, String> {
+        if attest_payload.len() != HANDSHAKE_ATTEST_PAYLOAD_SIZE {
+            return Err(format!(
+                "msg3 attest payload must be {HANDSHAKE_ATTEST_PAYLOAD_SIZE} bytes, got {}",
+                attest_payload.len()
+            ));
+        }
         let mut buf = Zeroizing::new(vec![0u8; HANDSHAKE_PAD_SIZE]);
         let len = self
             .state
-            .write_message(&[], &mut buf)
+            .write_message(attest_payload, &mut buf)
             .map_err(|e| format!("write msg3: {e}"))?;
         if len != MSG3_SNOW_LEN {
             return Err(format!("msg3 length mismatch: got {len}, expected {MSG3_SNOW_LEN}"));
@@ -223,12 +262,23 @@ impl NoiseResponder {
         Ok(())
     }
 
-    /// Message 2: <- e, ee, s, es
-    pub fn write_message_2(&mut self) -> Result<Vec<u8>, String> {
+    /// Message 2: <- e, ee, s, es [+ attest_payload]
+    ///
+    /// `attest_payload` must be exactly `HANDSHAKE_ATTEST_PAYLOAD_SIZE`
+    /// bytes (server's cert + binding signature, padded). The binding
+    /// signature is over the handshake hash captured before this call
+    /// (i.e. post-msg1).
+    pub fn write_message_2(&mut self, attest_payload: &[u8]) -> Result<Vec<u8>, String> {
+        if attest_payload.len() != HANDSHAKE_ATTEST_PAYLOAD_SIZE {
+            return Err(format!(
+                "msg2 attest payload must be {HANDSHAKE_ATTEST_PAYLOAD_SIZE} bytes, got {}",
+                attest_payload.len()
+            ));
+        }
         let mut buf = Zeroizing::new(vec![0u8; HANDSHAKE_PAD_SIZE]);
         let len = self
             .state
-            .write_message(&[], &mut buf)
+            .write_message(attest_payload, &mut buf)
             .map_err(|e| format!("write msg2: {e}"))?;
         if len != MSG2_SNOW_LEN {
             return Err(format!("msg2 length mismatch: got {len}, expected {MSG2_SNOW_LEN}"));
@@ -236,15 +286,25 @@ impl NoiseResponder {
         pack_handshake(&buf, MSG2_SNOW_LEN)
     }
 
-    /// Message 3: -> s, se
-    /// Returns the initiator's static public key.
-    pub fn read_message_3(&mut self, msg: &[u8]) -> Result<Vec<u8>, String> {
+    /// Message 3: -> s, se [+ attest_payload]
+    ///
+    /// Decrypts the initiator's attestation payload and returns
+    /// `(remote_static, attest_payload)`. The binding signature inside
+    /// `attest_payload` is over the handshake hash captured before this
+    /// call (i.e. post-msg2). The caller must snapshot
+    /// `get_handshake_hash()` before invoking `read_message_3`.
+    pub fn read_message_3(&mut self, msg: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
         let snow_data = unpack_handshake(msg, MSG3_SNOW_LEN)?;
-        let mut payload = vec![0u8; HANDSHAKE_PAD_SIZE];
-        let _len = self
+        let mut payload = vec![0u8; HANDSHAKE_ATTEST_PAYLOAD_SIZE];
+        let len = self
             .state
             .read_message(snow_data, &mut payload)
             .map_err(|e| format!("read msg3: {e}"))?;
+        if len != HANDSHAKE_ATTEST_PAYLOAD_SIZE {
+            return Err(format!(
+                "msg3 attest payload length mismatch: got {len}, expected {HANDSHAKE_ATTEST_PAYLOAD_SIZE}"
+            ));
+        }
 
         let remote_static = self
             .state
@@ -252,7 +312,7 @@ impl NoiseResponder {
             .ok_or("no remote static key after msg3")?
             .to_vec();
 
-        Ok(remote_static)
+        Ok((remote_static, payload))
     }
 
     /// Transition to transport mode after handshake completion.
@@ -306,6 +366,12 @@ mod tests {
         key
     }
 
+    fn random_attest_payload() -> Vec<u8> {
+        let mut buf = vec![0u8; HANDSHAKE_ATTEST_PAYLOAD_SIZE];
+        OsRng.fill_bytes(&mut buf);
+        buf
+    }
+
     fn do_handshake(
         client_secret: &[u8; 32],
         server_secret: &[u8; 32],
@@ -316,10 +382,12 @@ mod tests {
         let msg1 = initiator.write_message_1().unwrap();
         responder.read_message_1(&msg1).unwrap();
 
-        let msg2 = responder.write_message_2().unwrap();
+        let server_payload = random_attest_payload();
+        let msg2 = responder.write_message_2(&server_payload).unwrap();
         initiator.read_message_2(&msg2).unwrap();
 
-        let msg3 = initiator.write_message_3().unwrap();
+        let client_payload = random_attest_payload();
+        let msg3 = initiator.write_message_3(&client_payload).unwrap();
         responder.read_message_3(&msg3).unwrap();
 
         (initiator, responder)
@@ -337,16 +405,20 @@ mod tests {
         assert_eq!(msg1.len(), HANDSHAKE_PAD_SIZE);
         responder.read_message_1(&msg1).unwrap();
 
-        let msg2 = responder.write_message_2().unwrap();
+        let server_payload = random_attest_payload();
+        let msg2 = responder.write_message_2(&server_payload).unwrap();
         assert_eq!(msg2.len(), HANDSHAKE_PAD_SIZE);
-        let server_static = initiator.read_message_2(&msg2).unwrap();
+        let (server_static, recovered_server_payload) = initiator.read_message_2(&msg2).unwrap();
+        assert_eq!(recovered_server_payload, server_payload);
 
         let expected_server_pub = PublicKey::from(&StaticSecret::from(server_secret));
         assert_eq!(server_static, expected_server_pub.as_bytes());
 
-        let msg3 = initiator.write_message_3().unwrap();
+        let client_payload = random_attest_payload();
+        let msg3 = initiator.write_message_3(&client_payload).unwrap();
         assert_eq!(msg3.len(), HANDSHAKE_PAD_SIZE);
-        let client_static = responder.read_message_3(&msg3).unwrap();
+        let (client_static, recovered_client_payload) = responder.read_message_3(&msg3).unwrap();
+        assert_eq!(recovered_client_payload, client_payload);
 
         let expected_client_pub = PublicKey::from(&StaticSecret::from(client_secret));
         assert_eq!(client_static, expected_client_pub.as_bytes());
@@ -377,12 +449,62 @@ mod tests {
         assert_eq!(msg1.len(), HANDSHAKE_PAD_SIZE);
         responder.read_message_1(&msg1).unwrap();
 
-        let msg2 = responder.write_message_2().unwrap();
+        let msg2 = responder.write_message_2(&random_attest_payload()).unwrap();
         assert_eq!(msg2.len(), HANDSHAKE_PAD_SIZE);
 
         initiator.read_message_2(&msg2).unwrap();
-        let msg3 = initiator.write_message_3().unwrap();
+        let msg3 = initiator.write_message_3(&random_attest_payload()).unwrap();
         assert_eq!(msg3.len(), HANDSHAKE_PAD_SIZE);
+    }
+
+    #[test]
+    fn test_attest_payload_wrong_size_rejected() {
+        let k1 = gen_keypair();
+        let k2 = gen_keypair();
+        let mut initiator = NoiseInitiator::new(&k1).unwrap();
+        let mut responder = NoiseResponder::new(&k2).unwrap();
+
+        let msg1 = initiator.write_message_1().unwrap();
+        responder.read_message_1(&msg1).unwrap();
+
+        // Too small.
+        let too_small = vec![0u8; HANDSHAKE_ATTEST_PAYLOAD_SIZE - 1];
+        let err = responder.write_message_2(&too_small).unwrap_err();
+        assert!(err.contains("attest payload"), "got: {err}");
+
+        // Too large.
+        let too_large = vec![0u8; HANDSHAKE_ATTEST_PAYLOAD_SIZE + 1];
+        let err = responder.write_message_2(&too_large).unwrap_err();
+        assert!(err.contains("attest payload"), "got: {err}");
+    }
+
+    #[test]
+    fn test_attest_payload_roundtrips_byte_for_byte() {
+        let k1 = gen_keypair();
+        let k2 = gen_keypair();
+        let mut initiator = NoiseInitiator::new(&k1).unwrap();
+        let mut responder = NoiseResponder::new(&k2).unwrap();
+
+        let msg1 = initiator.write_message_1().unwrap();
+        responder.read_message_1(&msg1).unwrap();
+
+        // Use a recognisable pattern, not random — so we can pinpoint the
+        // bytes that come back.
+        let mut server_payload = vec![0u8; HANDSHAKE_ATTEST_PAYLOAD_SIZE];
+        for (i, b) in server_payload.iter_mut().enumerate() {
+            *b = (i & 0xFF) as u8;
+        }
+        let msg2 = responder.write_message_2(&server_payload).unwrap();
+        let (_remote_static, got) = initiator.read_message_2(&msg2).unwrap();
+        assert_eq!(got, server_payload);
+
+        let mut client_payload = vec![0u8; HANDSHAKE_ATTEST_PAYLOAD_SIZE];
+        for (i, b) in client_payload.iter_mut().enumerate() {
+            *b = ((i.wrapping_mul(7)) & 0xFF) as u8;
+        }
+        let msg3 = initiator.write_message_3(&client_payload).unwrap();
+        let (_remote_static, got) = responder.read_message_3(&msg3).unwrap();
+        assert_eq!(got, client_payload);
     }
 
     #[test]
@@ -444,7 +566,7 @@ mod tests {
 
         let msg1 = initiator.write_message_1().unwrap();
         responder.read_message_1(&msg1).unwrap();
-        let mut msg2 = responder.write_message_2().unwrap();
+        let mut msg2 = responder.write_message_2(&random_attest_payload()).unwrap();
         // Flip a byte inside the encrypted static block (past the ephemeral)
         msg2[40] ^= 0xFF;
         assert!(initiator.read_message_2(&msg2).is_err());
