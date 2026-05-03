@@ -1,0 +1,108 @@
+# OpenSSL config for the DSM offline CA.
+#
+# Used on the air-gapped CA laptop to:
+#   * bootstrap the root CA (one-time)
+#   * sign device CSRs produced by `dsm enroll --csr-out`
+#   * emit the periodic CRL
+#
+# Walk this file to the offline laptop alongside the CA private key (which
+# never leaves the laptop's encrypted USB). See deploy/CA_RUNBOOK.md.
+#
+# Custom OID:
+#   id-dsm-noiseStaticBinding 1.3.6.1.4.1.99999.1.1
+#       OCTET STRING (32) carrying the device's X25519 Noise static pubkey.
+#       MUST be marked critical on every issued leaf cert. The DSM runtime
+#       refuses non-critical entries.
+
+# ─── OID registration (required so openssl prints the friendly name) ─────
+[ new_oids ]
+noiseStaticBinding = 1.3.6.1.4.1.99999.1.1
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# CA database (offline, on encrypted USB)
+# ═════════════════════════════════════════════════════════════════════════
+[ ca ]
+default_ca = dsm_ca
+
+[ dsm_ca ]
+dir              = .
+certs            = $dir/certs
+crl_dir          = $dir/crl
+new_certs_dir    = $dir/newcerts
+database         = $dir/index.txt
+serial           = $dir/serial
+crlnumber        = $dir/crlnumber
+
+certificate      = $dir/dsm_ca_root.pem
+private_key      = $dir/private/dsm_ca.key
+RANDFILE         = $dir/private/.rand
+
+default_md       = sha384
+default_days     = 365
+default_crl_days = 31
+
+policy           = policy_strict
+unique_subject   = no
+copy_extensions  = copy
+preserve         = no
+email_in_dn      = no
+name_opt         = ca_default
+cert_opt         = ca_default
+
+# Sign requests that match: same O attribute (none here), exact CN type.
+[ policy_strict ]
+commonName       = supplied
+# All other DN attributes are forbidden — DSM cert subjects are CN-only.
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# Root CA bootstrap (one-time)
+# ═════════════════════════════════════════════════════════════════════════
+# Only used by the initial `openssl req -new -x509 ...` invocation.
+[ req ]
+default_bits        = 384
+default_md          = sha384
+prompt              = no
+distinguished_name  = ca_dn
+x509_extensions     = ca_root_ext
+string_mask         = utf8only
+
+[ ca_dn ]
+CN = DSM Root CA
+
+[ ca_root_ext ]
+basicConstraints       = critical, CA:TRUE, pathlen:0
+keyUsage               = critical, keyCertSign, cRLSign
+subjectKeyIdentifier   = hash
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# Leaf cert profiles (selected per-issuance via -extensions)
+# ═════════════════════════════════════════════════════════════════════════
+# Both profiles enforce the same critical extensions; only EKU differs.
+# `copy_extensions = copy` carries the binding extension from the CSR
+# unmodified — operator MUST verify it is critical and 34 bytes
+# (0x04 0x20 || <32 bytes>) before signing. See CA_RUNBOOK §4.
+
+[ dsm_client_leaf ]
+basicConstraints       = critical, CA:FALSE
+keyUsage               = critical, digitalSignature
+extendedKeyUsage       = critical, clientAuth
+subjectKeyIdentifier   = hash
+authorityKeyIdentifier = keyid:always
+# CRL distribution intentionally omitted — DSM ships CRLs via walked-USB.
+
+[ dsm_server_leaf ]
+basicConstraints       = critical, CA:FALSE
+keyUsage               = critical, digitalSignature
+extendedKeyUsage       = critical, serverAuth
+subjectKeyIdentifier   = hash
+authorityKeyIdentifier = keyid:always
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# CRL extensions
+# ═════════════════════════════════════════════════════════════════════════
+[ crl_ext ]
+authorityKeyIdentifier = keyid:always

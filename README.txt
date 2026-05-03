@@ -74,9 +74,16 @@ Key Exchange:
 - Noise XX pattern (X25519 + AES-256-GCM + SHA-256)
 - Prologue-tagged: "DSM\x00\x01\x00\x01"
 - Handshake messages padded to 1400 bytes (constant size)
-- Trust-on-first-use (TOFU) server key pinning, keyed by "host:port",
-  stored in a file whose contents are authenticated with HMAC-SHA256
-  using a key derived from the client identity
+- Each peer carries a CA-signed device cert (X.509, ECDSA P-256 leaf
+  signed by an internal P-384 CA) inside the Noise XX msg2/msg3 payload
+- The cert binds the device's hardware-bound ECDSA signing pubkey AND
+  the device's X25519 Noise static (via custom critical extension
+  id-dsm-noiseStaticBinding 1.3.6.1.4.1.99999.1.1)
+- Per-handshake binding signature over the Noise handshake hash +
+  remote_static + role, signed by the attest key — replay-resistant
+- Server enforces a CN allowlist (one CN per line in allowed_cns_file);
+  client checks the server cert's CN against expected_server_cn
+- Optional CRL distributed via walked-USB on the offline-CA cadence
 
 Key Rotation:
 - Every 5000 packets or 600 seconds (configurable)
@@ -191,11 +198,17 @@ Parameters:
   the kill-switch nftables rules cannot resolve names. Run
   `dig +short <host> | head -1` and put the resulting IP here)
 - server_port, listen_port
-- key_file: path to encrypted identity key
+- key_file: path to Argon2id-wrapped X25519 Noise static key
+- cert_file: path to the device's CA-signed leaf cert (PEM or DER)
+- ca_root_file: path to the pinned CA root cert (PEM)
+- attest_key_file: path to Argon2id-wrapped ECDSA P-256 attest key
+- crl_file: optional path to the CA's CRL (PEM or DER)
+- expected_server_cn: client only; subject CN we accept on the server cert
+- allowed_cns_file: server only; one allowed client subject CN per line,
+  mode 0o600 / 0o640
 - transport: udp | tcp (default: udp)
 - dns_providers: DoH/DoT URLs (server mode)
 - dns_provider_pins: SPKI SHA-256 pins per provider (server mode, required)
-- known_hosts_path: path to client's TOFU cache (client only, optional)
 - tun_name: TUN device name (default: mtun0)
 - mtu: TUN interface MTU in bytes (default: 1400, bounds 576-1500)
 - pmtu_discover: enable kernel PMTUD on UDP socket (default: false)
@@ -207,8 +220,6 @@ Parameters:
 - jitter_ms_min, jitter_ms_max: jitter range in ms (default: 1-50)
 - rotation_packets, rotation_seconds: key rotation thresholds (default: 5000/600)
 - debug_dns: log plaintext DNS queries (default: false, logs are redacted)
-- strict_client_auth: server-only; when false and allowlist is empty the
-  server TOFU-authorizes the first client (default: true)
 
 OPERATOR GUIDE
 
@@ -381,23 +392,31 @@ OPERATOR GUIDE
 2b. Write the server config file
 
    Pick your server's public IP and a UDP port (default 51820). Drop
-   the pin from 2a into the config below.
+   the pin from 2a into the config below. The cert/CA/attest paths
+   below assume the offline-CA runbook (deploy/CA_RUNBOOK.md) has
+   already been walked at least once to produce dsm_ca_root.pem; the
+   device.crt + attest.key + identity.key files are produced in step
+   2c via `dsm enroll`.
 
    $ sudo mkdir -p /opt/mtun
    $ sudo tee /opt/mtun/config.toml >/dev/null <<'EOF'
-   mode            = "server"
-   server_ip       = "10.0.0.5"         # this host's public IP
-   server_port     = 51820
-   listen_port     = 51820
-   key_file        = "/opt/mtun/identity.enc"
-   transport       = "udp"              # "tcp" also supported
-   mtu             = 1400
-   pmtu_discover   = false              # set true for WAN deployment
-   log_level       = "info"
+   mode               = "server"
+   server_ip          = "10.0.0.5"         # this host's public IP
+   server_port        = 51820
+   listen_port        = 51820
+   key_file           = "/opt/mtun/identity.key"
+   cert_file          = "/opt/mtun/device.crt"
+   ca_root_file       = "/opt/mtun/dsm_ca_root.pem"
+   attest_key_file    = "/opt/mtun/attest.key"
+   # crl_file         = "/opt/mtun/dsm_ca.crl"   # optional, recommended
 
-   # Require explicit client authorization. Flip to false ONCE for TOFU
-   # bootstrap (see step 4), then set back to true.
-   strict_client_auth = true
+   # Server-only: one allowed client subject CN per line.
+   allowed_cns_file   = "/opt/mtun/allowed_cns.txt"
+
+   transport          = "udp"              # "tcp" also supported
+   mtu                = 1400
+   pmtu_discover      = false              # set true for WAN deployment
+   log_level          = "info"
 
    # DoH upstream for client DNS queries tunneled through the server.
    dns_providers = ["https://1.1.1.1/dns-query"]
@@ -431,13 +450,15 @@ OPERATOR GUIDE
        Must be "double-quoted":
          mode, transport, log_level         e.g. "server" "udp" "info"
          server_ip, key_file                e.g. "10.0.0.5" "/opt/..."
-         known_hosts_path                   e.g. "/opt/mtun/known_hosts.json"
+         cert_file, ca_root_file,
+         attest_key_file, crl_file,
+         expected_server_cn,
+         allowed_cns_file                   e.g. "/opt/mtun/..."
 
        Bare (no quotes):
          server_port, listen_port, mtu      bare integers
          padding_*, jitter_*, rotation_*    bare integers
-         pmtu_discover, debug_dns,
-         strict_client_auth                 bare true / false
+         pmtu_discover, debug_dns           bare true / false
 
        Concrete example: writing `server_ip = 10.0.0.5` (no quotes)
        trips at column 17 because tomllib parses `10.0` as a float
@@ -463,12 +484,29 @@ OPERATOR GUIDE
    Re-run the `python3 -c "import tomllib..."` check after every edit;
    only proceed once it prints `ok`.
 
-2c. First-run: generate the server identity (interactive, one time)
+2c. First-run: enroll the server (interactive, one time)
 
-   $ sudo python3 -m dsm --mode server
-   # You will be prompted for a passphrase (twice, on first run).
-   # After "server listening on port 51820" appears, Ctrl-C to stop.
-   # /opt/mtun/identity.enc now exists (Argon2id + XChaCha20-Poly1305).
+   The CA root file (dsm_ca_root.pem) must already be in place per
+   deploy/CA_RUNBOOK.md §2. Then run enroll on the server:
+
+   $ sudo python3 -m dsm --config /opt/mtun/config.toml \
+         enroll --csr-out /tmp/dsm-csr-server.der --role server
+   # Prompted for the new passphrase (twice). Identity + attest keys
+   # are written to /opt/mtun/identity.key and /opt/mtun/attest.key
+   # (mode 0o600), and a CSR is dropped at /tmp/dsm-csr-server.der.
+
+   Walk the CSR to the offline CA laptop (CA_RUNBOOK.md §3b), have
+   the operator sign it with the dsm_server_leaf profile, walk the
+   resulting cert back, then:
+
+   $ sudo python3 -m dsm --config /opt/mtun/config.toml \
+         enroll --import /tmp/dsm-cert-server.pem
+   # Verifies chain + binding + attest pubkey, then writes
+   # /opt/mtun/device.crt (mode 0o600).
+
+   Populate /opt/mtun/allowed_cns.txt with the CNs of every client
+   you intend to authorize (mode 0o600, root-owned). One CN per line;
+   `# comments` allowed.
 
 2d. Store the passphrase for non-interactive restarts
 
@@ -500,15 +538,23 @@ OPERATOR GUIDE
 
    $ sudo mkdir -p /opt/mtun
    $ sudo tee /opt/mtun/config.toml >/dev/null <<'EOF'
-   mode            = "client"
-   server_ip       = "10.0.0.5"         # the server's public IP (step 2)
-   server_port     = 51820
-   listen_port     = 0                  # ephemeral client port
-   key_file        = "/opt/mtun/identity.enc"
-   transport       = "udp"
-   mtu             = 1400
-   pmtu_discover   = true               # client benefits more from PMTUD
-   log_level       = "info"
+   mode               = "client"
+   server_ip          = "10.0.0.5"      # the server's public IP (step 2)
+   server_port        = 51820
+   listen_port        = 0               # ephemeral client port
+   key_file           = "/opt/mtun/identity.key"
+   cert_file          = "/opt/mtun/device.crt"
+   ca_root_file       = "/opt/mtun/dsm_ca_root.pem"
+   attest_key_file    = "/opt/mtun/attest.key"
+   # crl_file         = "/opt/mtun/dsm_ca.crl"   # optional
+
+   # Subject CN we will accept on the server cert (from CA_RUNBOOK).
+   expected_server_cn = "dsm-XXXXXXXX-server"
+
+   transport          = "udp"
+   mtu                = 1400
+   pmtu_discover      = true            # client benefits more from PMTUD
+   log_level          = "info"
    EOF
 
    Sanity check — same TOML-parse verification as on the server:
@@ -519,39 +565,37 @@ OPERATOR GUIDE
    numbered fix recipes under "Sanity check" in step 2b — they apply
    identically to the client config.
 
-   Generate the client identity (interactive, one time):
-   $ sudo python3 -m dsm --mode client
-   # The first handshake will FAIL with "client not authorized" — that
-   # is expected. Note the 64-hex pubkey printed in the error message,
-   # or print it explicitly:
-   $ sudo python3 -m dsm show-pubkey \
-         --passphrase-env-file /etc/dsm/passphrase
-   <64-character hex pubkey>
+   Enroll the client (CA_RUNBOOK.md §3 again, mirror of step 2c):
+
+   $ sudo python3 -m dsm --config /opt/mtun/config.toml \
+         enroll --csr-out /tmp/dsm-csr-client.der --role client
+   # Prompted for a passphrase. Note the printed CN — record it; the
+   # operator adds it to the server's allowed_cns_file.
+
+   Walk the CSR to the CA, have it signed with the dsm_client_leaf
+   profile, walk the cert back, then:
+
+   $ sudo python3 -m dsm --config /opt/mtun/config.toml \
+         enroll --import /tmp/dsm-cert-client.pem
 
 
-4. AUTHORIZATION BOOTSTRAP
+4. AUTHORIZATION
 
-   Choose EXACTLY ONE of these two paths to teach the server which
-   clients are allowed. Both paths populate authorized_clients.json
-   (HMAC-protected under the server identity).
+   On the server, append the client's CN (printed by `dsm enroll
+   --csr-out`) to the allowlist:
 
-   (A) Explicit authorize (recommended, auditable)
+   $ echo 'dsm-XXXXXXXX-client' \
+         | sudo install -m 0600 -o root -g root /dev/stdin /tmp/cn \
+         && sudo cat /tmp/cn >> /opt/mtun/allowed_cns.txt \
+         && sudo chmod 0600 /opt/mtun/allowed_cns.txt \
+         && sudo rm /tmp/cn
 
-       On the SERVER:
-       $ sudo python3 -m dsm authorize <paste-client-pubkey-hex> \
-             --passphrase-env-file /etc/dsm/passphrase
-       Authorized client <first16hex>... (1 total)
+   Restart the server. Future restarts re-read the file at startup;
+   live SIGHUP reload is on the Phase 2 punch list.
 
-       Restart the client (step 5) — handshake should now succeed.
-
-   (B) TOFU bootstrap (single-step, less auditable)
-
-       Set strict_client_auth = false in /opt/mtun/config.toml on the
-       server, restart the server, connect the client once. The server
-       will log:
-         WARNING TOFU bootstrap: first client authorized (pubkey ...)
-       Then set strict_client_auth = true and restart the server —
-       further unknown clients will be rejected.
+   To revoke a client: remove its CN from allowed_cns_file (and
+   issue a CRL update via CA_RUNBOOK.md §5 if the cert may surface
+   elsewhere).
 
 
 5. RUN BOTH SIDES
@@ -565,16 +609,15 @@ OPERATOR GUIDE
    $ sudo python3 -m dsm --mode client --passphrase-env-file /etc/dsm/passphrase
 
    Expected client log (log_level = info):
-     ... handshake complete (client)
+     ... handshake complete (client) — server_cn=dsm-XXXXXXXX-server
      ... tunnel established
      ... kernel path MTU = 1500 (usable inner 1432)
-     ... client authorized: <first16hex>
 
    Expected server log:
      ... server listening on port 51820 (udp)
-     ... handshake complete (server)
-     ... client authorized: <first16hex>
-     ... client connected
+     ... CN allowlist loaded (N entries)
+     ... handshake complete (server) — client_cn=dsm-XXXXXXXX-client
+     ... client connected (noise_static=<first16hex>)
 
 
 6. VERIFICATION
@@ -616,27 +659,33 @@ OPERATOR GUIDE
 
 7. COMMON OPERATOR TASKS
 
-7a. Reset client trust after rotating the server identity
+7a. Re-pin a new server cert on the client
 
-    On the client:
-    $ sudo python3 -m dsm reset-trust --yes
-    Next connection re-TOFUs the server key into /opt/mtun/known_hosts.json.
+    No client-side action when the server rotates within the same CA:
+    the client trusts any cert that chains to dsm_ca_root.pem and
+    matches expected_server_cn. If you change expected_server_cn,
+    update /opt/mtun/config.toml and restart the client.
 
 7b. Revoke a client
 
-    On the server, edit /opt/mtun/authorized_clients.json by hand to
-    remove the entry, then restart. (A dedicated `dsm revoke` CLI is
-    not shipped; the JSON is small and human-readable.)
+    On the server: remove the client's CN from /opt/mtun/allowed_cns.txt
+    and restart. Optionally issue a CRL update via deploy/CA_RUNBOOK.md
+    §5 so any other server in the fleet refuses the cert too.
 
 7c. Rotate the server identity
 
     On the server:
     $ sudo systemctl stop dsm
-    $ sudo rm /opt/mtun/identity.enc
-    $ sudo python3 -m dsm --mode server         # prompts for new passphrase
-    # Tell every client to reset-trust (step 7a) — old known_hosts is stale.
-    # authorized_clients.json was HMAC'd with the old identity; regenerate
-    # it by authorizing each client pubkey again (step 4).
+    $ sudo rm /opt/mtun/identity.key /opt/mtun/attest.key /opt/mtun/device.crt
+    $ sudo python3 -m dsm --config /opt/mtun/config.toml \
+          enroll --csr-out /tmp/dsm-csr-server.der --role server
+    # Walk CSR to CA, sign, walk back:
+    $ sudo python3 -m dsm --config /opt/mtun/config.toml \
+          enroll --import /tmp/dsm-cert-server.pem
+    $ sudo systemctl start dsm
+    # Clients keep working as long as expected_server_cn still matches
+    # (deterministic CN derivation produces a new CN per Noise pubkey;
+    # if the CN changed, push the new value to every client).
 
 7d. Change MTU live
 
@@ -645,10 +694,8 @@ OPERATOR GUIDE
 
 7e. Change transport (UDP <-> TCP)
 
-    Same as MTU: change config on both sides, restart. Note clients
-    cannot reuse the server's UDP known_hosts entry for a TCP session;
-    the key changes by "host:port" and transport isn't part of the key
-    but the server's listening socket does differ.
+    Same as MTU: change config on both sides, restart. Cert auth is
+    transport-independent — the same enrollment works for either.
 
 
 8. DEBUGGING
@@ -664,19 +711,24 @@ OPERATOR GUIDE
      - Firewall between you and the server dropping DF packets (less
        likely with default pmtu_discover=false).
 
-   PROBLEM: "client not authorized"
-     - Expected on first connect; see step 4.
-     - Wrong pubkey in authorized_clients.json. Reprint the client's
-       pubkey and compare:
-         $ sudo python3 -m dsm show-pubkey --passphrase-env-file /etc/dsm/passphrase
-     - File HMAC mismatch after a server identity rotation. Regenerate
-       authorized_clients.json under the new identity (step 7c).
+   PROBLEM: "client CN not in allowlist"
+     - Expected on first connect; see step 4. The client's CN must be
+       on a line of /opt/mtun/allowed_cns.txt on the server (mode 0o600).
+     - The CN you added to the file does not match the cert the client
+       actually presents. Ask the client operator for the CN that
+       `dsm enroll --csr-out` printed, and compare exactly.
 
-   PROBLEM: "SECURITY WARNING: server static key changed for <host:port>"
-     - The server's identity genuinely changed (rotation) — run
-       `dsm reset-trust --yes` on the client.
-     - Or: active MitM. The default strict_keys=true aborts the
-       connection rather than trusting a new key.
+   PROBLEM: "server CN check failed: server CN ... does not match expected ..."
+     - The client's expected_server_cn does not match the cert the
+       server presents. Either correct the client's config, or roll
+       the server back if the CN changed unexpectedly (which would
+       imply an unauthorized re-enrollment).
+
+   PROBLEM: "server cert auth failed: cert chain ..."
+     - The pinned ca_root_file does not match the CA that issued
+       the server's cert. Cross-check
+       `sha256sum /opt/mtun/dsm_ca_root.pem` against the value the
+       CA operator recorded in the safe (CA_RUNBOOK.md §1).
 
    PROBLEM: "process hardening partially failed"
      - Informational, not fatal. The service started, but core-dump
@@ -775,9 +827,12 @@ OPERATOR GUIDE
 FILE PLACEMENT REFERENCE
 
    /opt/mtun/config.toml                 # main config (both modes)
-   /opt/mtun/identity.enc                # encrypted Argon2id+XChaCha20
-   /opt/mtun/known_hosts.json            # client only: TOFU server key cache
-   /opt/mtun/authorized_clients.json     # server only: HMAC'd client allowlist
+   /opt/mtun/identity.key                # X25519 Noise static (Argon2id)
+   /opt/mtun/attest.key                  # ECDSA P-256 attest key (Argon2id)
+   /opt/mtun/device.crt                  # CA-signed leaf cert (mode 0o600)
+   /opt/mtun/dsm_ca_root.pem             # pinned CA root cert
+   /opt/mtun/dsm_ca.crl                  # optional CRL (walked-USB cadence)
+   /opt/mtun/allowed_cns.txt             # server only: one CN per line
    /etc/dsm/passphrase                   # non-interactive passphrase (0600)
    /run/dsm/ipv6_state.json              # per-iface IPv6 state snapshot
    /etc/systemd/system/dsm.service       # (optional) systemd unit
@@ -787,9 +842,9 @@ CLI REFERENCE
    python -m dsm --mode {client,server}          Run the VPN
    python -m dsm --passphrase-fd N               Read passphrase from FD N
    python -m dsm --passphrase-env-file PATH      Read passphrase from file
-   python -m dsm authorize <pubkey-hex>          Add client to allowlist (server)
+   python -m dsm enroll --csr-out PATH           Provision keys + emit CSR
+   python -m dsm enroll --import CERT_PATH       Verify + persist signed cert
    python -m dsm show-pubkey                     Print local identity pubkey
-   python -m dsm reset-trust [--yes]             Delete known_hosts.json (client)
 
 
 LOGGING

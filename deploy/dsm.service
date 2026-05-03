@@ -11,7 +11,7 @@ Type=simple
 
 # Run as root. The service needs CAP_NET_ADMIN+CAP_SYS_ADMIN+CAP_NET_BIND_SERVICE
 # (TUN, nftables, sysctl, /etc/resolv.conf write, bind 10.8.0.1:53), AND
-# write access to /opt/mtun/ for keystore + known_hosts. Hardening with
+# write access to /opt/mtun/ for keystore + cert + CRL refreshes. Hardening with
 # DynamicUser=yes / ProtectSystem=strict requires substantial path remapping
 # that is left to the operator. The dsm process itself runs harden_process()
 # (no_new_privs, dumpable=0, core dumps disabled) once started.

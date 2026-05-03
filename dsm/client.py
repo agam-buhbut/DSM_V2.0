@@ -6,10 +6,14 @@ import asyncio
 import logging
 import time
 from contextlib import AsyncExitStack
-from pathlib import Path
+
+from cryptography.x509.oid import ExtendedKeyUsageOID
 
 from dsm.core.config import Config
 from dsm.core.fsm import SessionFSM, State
+from dsm.core.passphrase import read_passphrase, wipe_passphrase
+from dsm.crypto.attest_store import AttestStore
+from dsm.crypto.auth_loader import AuthMaterialsError, load_cert_materials
 from dsm.crypto.keystore import KeyStore
 from dsm.net.nftables import NFTablesManager, TcpTimestampsDisabler
 from dsm.net.resolv_conf import ResolvConfManager
@@ -55,11 +59,34 @@ async def run_client(
 
     fsm = SessionFSM()
 
+    # Cert auth materials must load BEFORE we touch any host state, so a
+    # missing cert file aborts cleanly with no rules / no TUN created.
+    try:
+        materials = load_cert_materials(config)
+    except AuthMaterialsError as e:
+        log.error("cert auth materials missing or invalid: %s", e)
+        return
+
+    # Read the passphrase once and unlock both stores. Identity (X25519
+    # Noise static) and attest key (ECDSA P-256) live behind the same
+    # passphrase by design — they're both provisioned together by
+    # `dsm enroll`.
     keystore = KeyStore(config.key_file)
-    keystore.load_or_generate(
+    attest_store = AttestStore(config.attest_key_file)
+    passphrase = read_passphrase(
         passphrase_fd=passphrase_fd,
         passphrase_env_file=passphrase_env_file,
     )
+    try:
+        keystore.load_or_generate_with_passphrase(passphrase)
+        try:
+            attest_store.load_with_passphrase(passphrase)
+        except RuntimeError as e:
+            log.error("attest store: %s", e)
+            keystore.unload()
+            return
+    finally:
+        wipe_passphrase(passphrase)
 
     shaper = TrafficShaper(config.padding_min, config.padding_max)
 
@@ -68,6 +95,7 @@ async def run_client(
         # the encrypted identity material is kept in memory for the lifetime
         # of the session.
         stack.callback(keystore.unload)
+        stack.callback(attest_store.unload)
 
         # Transport
         if config.transport == "udp":
@@ -86,12 +114,16 @@ async def run_client(
         fsm.transition(State.CONNECTING)
         fsm.transition(State.HANDSHAKING)
 
-        from dsm.crypto.handshake import DEFAULT_KNOWN_HOSTS_PATH, client_handshake
+        from dsm.crypto.handshake import (
+            CertAuthError,
+            CertRevokedError,
+            CNMismatchError,
+            HandshakeError,
+            client_handshake,
+        )
 
-        known_hosts_path = (
-            Path(config.known_hosts_path)
-            if config.known_hosts_path
-            else DEFAULT_KNOWN_HOSTS_PATH
+        assert config.expected_server_cn is not None, (
+            "client mode requires expected_server_cn (validated in Config)"
         )
 
         try:
@@ -99,11 +131,28 @@ async def run_client(
                 transport,
                 keystore.identity,
                 server_addr,
-                known_hosts_path=known_hosts_path,
+                attest_key=attest_store.attest_key,
+                cert_der=materials.cert_der,
+                ca_root=materials.ca_root,
+                expected_server_cn=config.expected_server_cn,
+                crl=materials.crl,
+                required_server_eku=ExtendedKeyUsageOID.SERVER_AUTH,
                 rotation_packets=config.rotation_packets,
                 rotation_seconds=config.rotation_seconds,
             )
-        except Exception as e:
+        except CNMismatchError as e:
+            log.error("server CN check failed: %s", e)
+            fsm.transition(State.TEARDOWN)
+            return
+        except CertRevokedError as e:
+            log.error("server cert revoked: %s", e)
+            fsm.transition(State.TEARDOWN)
+            return
+        except CertAuthError as e:
+            log.error("server cert auth failed: %s", e)
+            fsm.transition(State.TEARDOWN)
+            return
+        except HandshakeError as e:
             log.error("handshake failed: %s", e)
             fsm.transition(State.TEARDOWN)
             return  # AsyncExitStack unwinds transport + keystore

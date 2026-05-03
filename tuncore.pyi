@@ -130,6 +130,28 @@ class AttestKey:
         """Sign ``msg``. Returns ASN.1 DER ECDSA signature."""
         ...
 
+    def encrypt_to_store(self, passphrase: bytes) -> bytes:
+        """Encrypt the attest key (Argon2id + XChaCha20-Poly1305).
+
+        Soft backend only — TPM / Keystore backends seal natively and
+        will reject this call when implemented.
+        """
+        ...
+
+    @staticmethod
+    def decrypt_from_store(blob: bytes, passphrase: bytes) -> AttestKey:
+        """Restore an attest key from a stored blob (soft backend only)."""
+        ...
+
+    def private_pkcs8_der(self) -> bytes:
+        """PKCS#8 DER export of the private key (soft backend only).
+
+        Used by the ``dsm enroll`` flow so the standard ``cryptography``
+        CSR builder can sign with it. TPM / Keystore backends sign CSRs
+        internally and will not expose this method.
+        """
+        ...
+
 def disable_core_dumps() -> None: ...
 def harden_process() -> None: ...
 

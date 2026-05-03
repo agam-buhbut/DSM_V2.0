@@ -34,11 +34,13 @@ mode = "server"
 server_ip = "10.0.0.5"          # this host's public address
 server_port = 51820              # port clients will connect to
 listen_port = 51820
-key_file = "/opt/mtun/identity.enc"
+key_file = "/opt/mtun/identity.key"
+cert_file = "/opt/mtun/device.crt"
+ca_root_file = "/opt/mtun/dsm_ca_root.pem"
+attest_key_file = "/opt/mtun/attest.key"
+# crl_file = "/opt/mtun/dsm_ca.crl"   # optional
+allowed_cns_file = "/opt/mtun/allowed_cns.txt"
 transport = "udp"
-
-# Strict by default. Flip to false for TOFU bootstrap on first connect.
-strict_client_auth = true
 
 # DoH provider + pinned SPKI SHA-256 (example — replace with your pin).
 dns_providers = ["https://1.1.1.1/dns-query"]
@@ -47,55 +49,57 @@ dns_providers = ["https://1.1.1.1/dns-query"]
 EOF
 ```
 
-## 3. First-run: generate server identity + passphrase
+Place the pinned CA root cert (per `deploy/CA_RUNBOOK.md`) at
+`/opt/mtun/dsm_ca_root.pem`. Cross-check its SHA-256 against the value
+recorded in your physical safe.
+
+## 3. First-run: enroll the server
 
 ```sh
-# Interactive prompt (one-time identity generation).
-sudo python3 -m dsm --mode server
-# Enter a strong passphrase twice. The server will START and wait for
-# connections. Ctrl-C once the log line "server listening on port 51820"
-# appears.
+# Generate identity + attest key, emit a CSR.
+sudo python3 -m dsm --config /opt/mtun/config.toml \
+    enroll --csr-out /tmp/dsm-csr-server.der --role server
+# Enter a strong passphrase twice. /opt/mtun/identity.key and
+# /opt/mtun/attest.key are written (mode 0o600).
+
+# Walk /tmp/dsm-csr-server.der to the offline CA on a wiped USB,
+# sign with profile `dsm_server_leaf` (CA_RUNBOOK.md §3b), walk
+# the resulting cert back, then import:
+sudo python3 -m dsm --config /opt/mtun/config.toml \
+    enroll --import /tmp/dsm-cert-server.pem
+# Verifies chain + binding + attest pubkey, writes /opt/mtun/device.crt.
 
 # Stash the passphrase for non-interactive restarts:
 sudo install -m 0600 /dev/stdin /etc/dsm/passphrase <<<"<your-passphrase>"
+
+# Create an empty allowlist; populated in step 5.
+sudo install -m 0600 -o root -g root /dev/null /opt/mtun/allowed_cns.txt
 ```
 
-The identity is now encrypted at `/opt/mtun/identity.enc`.
+## 4. Configure + enroll the client
 
-## 4. Configure + generate client identity
-
-On the client host, mirror step 2 with `mode = "client"` and the server's
-public IP. Then:
+On the client host, mirror step 2 with `mode = "client"`, the server's
+public IP, and `expected_server_cn = "<server CN from step 3>"`. Then:
 
 ```sh
-sudo python3 -m dsm --mode client
-# Passphrase prompt (client has its own identity). Ctrl-C after
-# "handshake failed: client not authorized" in the log — that's expected
-# on the first run; proceed to step 5.
+sudo python3 -m dsm --config /opt/mtun/config.toml \
+    enroll --csr-out /tmp/dsm-csr-client.der --role client
+# Note the printed CN — record it.
+
+# Walk CSR to CA, sign with `dsm_client_leaf` profile, walk back:
+sudo python3 -m dsm --config /opt/mtun/config.toml \
+    enroll --import /tmp/dsm-cert-client.pem
 ```
 
-## 5. Authorize the client on the server
+## 5. Add the client CN to the server allowlist
 
-On the **client**, print its public key:
+On the **server**:
 
 ```sh
-sudo python3 -m dsm show-pubkey \
-    --passphrase-env-file /etc/dsm/passphrase
-# Copy the 64-char hex output.
+echo 'dsm-XXXXXXXX-client' | sudo tee -a /opt/mtun/allowed_cns.txt
+sudo chmod 0600 /opt/mtun/allowed_cns.txt
+sudo systemctl restart dsm
 ```
-
-On the **server**, add it to the allowlist:
-
-```sh
-sudo python3 -m dsm authorize <client-hex-pubkey> \
-    --passphrase-env-file /etc/dsm/passphrase
-# Expected: "Authorized client <prefix>... (1 total)"
-```
-
-**Alternative: TOFU bootstrap.** Set `strict_client_auth = false` in the
-server config before the first client connects. The first client to complete
-the handshake is added automatically. Flip back to `true` immediately
-after — otherwise any future client pubkey replaces the trust anchor.
 
 ## 6. Start both sides in production mode
 
@@ -209,15 +213,11 @@ sudo python3 -m dsm --mode client ...  # the next normal start restores IPv6
 
 ### 9c. Identity rotation
 
-If the server's identity is rotated, clients' known_hosts caches are
-invalidated. On each client:
-
-```sh
-sudo python3 -m dsm reset-trust --yes
-```
-
-Next connection re-TOFUs the server key. If `strict_keys=true` (default),
-the client MUST have a fresh known_hosts file before reconnecting.
+The cert-based model removes the client-side TOFU cache. Within the
+same CA + same expected_server_cn, the server can rotate its identity
+freely (re-enroll, re-import) and clients keep working. If the server
+CN changes, push the new value to every client's
+`expected_server_cn` and restart them. See README.txt §7c.
 
 ## 10. Verdict criteria
 

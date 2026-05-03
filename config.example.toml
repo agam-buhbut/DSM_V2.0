@@ -1,28 +1,50 @@
 # DSM VPN Configuration
-# Copy to /opt/mtun/config.toml and edit
+# Copy to /opt/mtun/config.toml and edit. All file paths must be absolute.
+#
+# Trust model: every device runs `dsm enroll --csr-out` once, walks the CSR to
+# the offline CA laptop, gets a cert back, and runs `dsm enroll --import`.
+# At runtime the daemon authenticates peers against the pinned CA root +
+# (server) CN allowlist or (client) expected_server_cn. See deploy/CA_RUNBOOK.md.
 
-mode = "client"                  # "client" | "server" | "relay"
-server_ip = "203.0.113.1"       # Server public IP
-server_port = 51820             # Server listen port
-listen_port = 51820             # Local listen port
-key_file = "/opt/mtun/identity.enc"  # Encrypted identity key store
-transport = "udp"               # "udp" | "tcp"
+mode = "client"                              # "client" | "server"
+server_ip = "203.0.113.1"                    # Server public IP (literal IP, not hostname)
+server_port = 51820                          # Server's UDP service port
+listen_port = 0                              # client: 0 = ephemeral; server: real bind port
 
-# Optional relay chain (empty = direct connection)
-relay_addresses = []
+# ─── Identity & device cert ────────────────────────────────────────────────
+key_file = "/opt/mtun/identity.key"          # Argon2id-wrapped X25519 Noise static
+cert_file = "/opt/mtun/device.crt"           # X.509 leaf cert (DER or PEM), signed by internal CA
+ca_root_file = "/opt/mtun/dsm_ca_root.pem"   # Pinned CA root cert (PEM); SHA-256 verified at install
+attest_key_file = "/opt/mtun/attest.key"     # Argon2id-wrapped ECDSA P-256 attestation key
+# crl_file = "/opt/mtun/dsm_ca.crl"          # Optional but recommended; refresh monthly via walked-USB
 
-# Server-only: DNS providers (required for server mode)
-# dns_providers = ["https://1.1.1.1/dns-query", "tls://9.9.9.9:853"]
+# ─── Role-specific cert policy ─────────────────────────────────────────────
+# Client only: subject CN we accept on the server cert.
+expected_server_cn = "dsm-1234abcd-server"
 
+# Server only: file with one allowed client subject CN per line, mode 0o600 or 0o640.
+# allowed_cns_file = "/opt/mtun/allowed_cns.txt"
+
+# Server only: DNS providers + pinned SPKI SHA-256 (server resolves on behalf of clients).
+# dns_providers = ["https://1.1.1.1/dns-query"]
+# [dns_provider_pins]
+# "https://1.1.1.1/dns-query" = ["<64-char hex SPKI SHA-256>"]
+
+# ─── Network ───────────────────────────────────────────────────────────────
+transport = "udp"                            # "udp" | "tcp"
 tun_name = "mtun0"
-log_level = "warning"           # "debug" | "info" | "warning" | "error"
+log_level = "warning"                        # "debug" | "info" | "warning" | "error"
 
-# Traffic shaping
+# TUN MTU. Default 1400 leaves slack for VPN-in-VPN / PPPoE paths.
+mtu = 1400
+# pmtu_discover = false                      # Enable IP_MTU_DISCOVER (sets DF bit)
+
+# ─── Traffic shaping ───────────────────────────────────────────────────────
 padding_min = 128
 padding_max = 1400
 jitter_ms_min = 1
 jitter_ms_max = 50
 
-# Key rotation
-rotation_packets = 5000         # Rotate after N packets
-rotation_seconds = 600          # Rotate after N seconds (10 min)
+# ─── Key rotation ──────────────────────────────────────────────────────────
+rotation_packets = 5000                      # Rotate after N packets
+rotation_seconds = 600                       # Rotate after N seconds (10 min)

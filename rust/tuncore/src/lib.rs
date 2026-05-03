@@ -567,6 +567,29 @@ impl PyAttestKey {
     fn sign(&self, msg: &[u8]) -> PyResult<Vec<u8>> {
         self.inner.sign(msg).map_err(py_err)
     }
+
+    /// Encrypt the attest key to a passphrase-protected blob (Argon2id +
+    /// XChaCha20-Poly1305). Soft backend only — TPM/Keystore backends use
+    /// platform-native sealing and reject this call.
+    fn encrypt_to_store(&self, passphrase: &[u8]) -> PyResult<Vec<u8>> {
+        self.inner.encrypt_to_store(passphrase).map_err(py_err)
+    }
+
+    /// Restore an attest key from a stored blob. Soft backend only.
+    #[staticmethod]
+    fn decrypt_from_store(blob: &[u8], passphrase: &[u8]) -> PyResult<Self> {
+        let inner = device_attest::AttestKey::decrypt_from_store(blob, passphrase)
+            .map_err(py_err)?;
+        Ok(Self { inner })
+    }
+
+    /// PKCS#8 DER export of the private key. Soft backend only — used by
+    /// the `dsm enroll --csr-out` flow to hand the key to the
+    /// ``cryptography`` library's CSR builder. TPM / Keystore backends
+    /// will not expose this method; they sign the CSR via platform APIs.
+    fn private_pkcs8_der(&self) -> PyResult<Vec<u8>> {
+        self.inner.private_pkcs8_der().map_err(py_err)
+    }
 }
 
 /// Disable core dumps (call once at startup).

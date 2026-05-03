@@ -6,10 +6,16 @@ import asyncio
 import logging
 import time
 from contextlib import AsyncExitStack
+from pathlib import Path
+
+from cryptography.x509.oid import ExtendedKeyUsageOID
 
 from dsm.core.config import Config
 from dsm.core.fsm import SessionFSM, State
-from dsm.crypto.authorized_clients import AuthorizedClients
+from dsm.core.passphrase import read_passphrase, wipe_passphrase
+from dsm.crypto.attest_store import AttestStore
+from dsm.crypto.auth_loader import AuthMaterialsError, load_cert_materials
+from dsm.crypto.cert_allowlist import CNAllowlist, CNAllowlistError
 from dsm.crypto.keystore import KeyStore
 from dsm.net.dns import DNSResolver
 from dsm.net.dns_proxy import LocalDNSProxy
@@ -51,13 +57,50 @@ async def run_server(
 
     fsm = SessionFSM()
 
-    # Load identity — uses non-interactive sources when provided, falls back
-    # to interactive TTY prompt only if none are set.
+    # Cert auth materials must load BEFORE we touch any host state, so a
+    # missing cert file aborts cleanly with no rules / no TUN created.
+    try:
+        materials = load_cert_materials(config)
+    except AuthMaterialsError as e:
+        log.error("cert auth materials missing or invalid: %s", e)
+        return
+
+    if not config.allowed_cns_file:
+        log.error(
+            "server mode requires allowed_cns_file in config "
+            "(validated by Config; should not reach this branch)"
+        )
+        return
+    try:
+        cn_allowlist = CNAllowlist.from_file(Path(config.allowed_cns_file))
+    except CNAllowlistError as e:
+        log.error("CN allowlist load failed: %s", e)
+        return
+    if len(cn_allowlist) == 0:
+        log.error(
+            "CN allowlist at %s is empty; refusing to start (would accept no clients)",
+            config.allowed_cns_file,
+        )
+        return
+    log.info("CN allowlist loaded (%d entries)", len(cn_allowlist))
+
+    # Read the passphrase once and unlock both stores.
     keystore = KeyStore(config.key_file)
-    keystore.load_or_generate(
+    attest_store = AttestStore(config.attest_key_file)
+    passphrase = read_passphrase(
         passphrase_fd=passphrase_fd,
         passphrase_env_file=passphrase_env_file,
     )
+    try:
+        keystore.load_or_generate_with_passphrase(passphrase)
+        try:
+            attest_store.load_with_passphrase(passphrase)
+        except RuntimeError as e:
+            log.error("attest store: %s", e)
+            keystore.unload()
+            return
+    finally:
+        wipe_passphrase(passphrase)
 
     async with AsyncExitStack() as stack:
         # Sync cleanup callbacks use stack.callback; async ones use
@@ -68,6 +111,7 @@ async def run_server(
         # encrypted identity must stay in memory for the lifetime of
         # the session. Mirrors client.py.
         stack.callback(keystore.unload)
+        stack.callback(attest_store.unload)
 
         rate_limiter = ServerRateLimitManager(config.listen_port)
         rate_limiter.apply()
@@ -92,56 +136,53 @@ async def run_server(
 
         log.info("server listening on port %d (%s)", config.listen_port, config.transport)
 
-        # Wait for handshake
-        from dsm.crypto.handshake import server_handshake
+        # Wait for handshake — cert chain + binding-extension match +
+        # CN allowlist + (optional) CRL all run inside server_handshake.
+        from dsm.crypto.handshake import (
+            CertAuthError,
+            CertRevokedError,
+            CNNotAllowedError,
+            HandshakeError,
+            server_handshake,
+        )
 
         fsm.transition(State.CONNECTING)
         fsm.transition(State.HANDSHAKING)
 
         try:
             session_keys, client_pub = await server_handshake(
-                transport, keystore.identity,
+                transport,
+                keystore.identity,
+                attest_key=attest_store.attest_key,
+                cert_der=materials.cert_der,
+                ca_root=materials.ca_root,
+                cn_allowlist=cn_allowlist,
+                crl=materials.crl,
+                required_client_eku=ExtendedKeyUsageOID.CLIENT_AUTH,
                 rotation_packets=config.rotation_packets,
                 rotation_seconds=config.rotation_seconds,
             )
-        except Exception as e:
+        except CNNotAllowedError as e:
+            log.warning("client CN not in allowlist: %s", e)
+            fsm.transition(State.TEARDOWN)
+            return
+        except CertRevokedError as e:
+            log.warning("client cert revoked: %s", e)
+            fsm.transition(State.TEARDOWN)
+            return
+        except CertAuthError as e:
+            log.warning("client cert auth failed: %s", e)
+            fsm.transition(State.TEARDOWN)
+            return
+        except HandshakeError as e:
             log.error("handshake failed: %s", e)
-            raise
+            fsm.transition(State.TEARDOWN)
+            return
 
-        # Check client authorization. Authorization happens AFTER the expensive
-        # handshake because the handshake must complete to learn the client's
-        # static pubkey (Noise XX pattern). A malicious client pays the same
-        # handshake cost regardless.
         client_pub_bytes = bytes(client_pub)
-        authorized_clients = AuthorizedClients(
-            config.config_dir / "authorized_clients.json", keystore.identity
-        )
-        authorized_clients.load()
-
-        if authorized_clients.is_authorized(client_pub_bytes):
-            log.info("client authorized: %s", client_pub_bytes.hex()[:16])
-        elif not config.strict_client_auth and len(authorized_clients) == 0:
-            # TOFU bootstrap: accept the first client on a fresh allowlist.
-            # Future connections from other clients will still be rejected
-            # (allowlist no longer empty). Log loudly — this is a security
-            # event the operator should notice.
-            authorized_clients.add(client_pub_bytes)
-            authorized_clients.save()
-            log.warning(
-                "TOFU bootstrap: first client authorized (pubkey %s). "
-                "Flip strict_client_auth=True in config; future different "
-                "clients will now be rejected.",
-                client_pub_bytes.hex(),
-            )
-        else:
-            log.warning("unauthorized client: %s", client_pub_bytes.hex())
-            raise RuntimeError(
-                f"client not authorized: {client_pub_bytes.hex()}. "
-                f"Add with: dsm authorize {client_pub_bytes.hex()}"
-            )
+        log.info("client connected (noise_static=%s)", client_pub_bytes.hex()[:16])
 
         fsm.transition(State.ESTABLISHED)
-        log.info("client connected")
 
         # TUN device
         tun = TunDevice(config.tun_name)

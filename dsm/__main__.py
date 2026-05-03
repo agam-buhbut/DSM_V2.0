@@ -3,7 +3,9 @@
 Usage:
     python -m dsm --mode client
     python -m dsm --mode server
-    python -m dsm reset-trust [--yes]
+    python -m dsm enroll --csr-out PATH [--cn CN] [--role client|server]
+    python -m dsm enroll --import CERT_PATH
+    python -m dsm show-pubkey
 """
 
 from __future__ import annotations
@@ -47,36 +49,45 @@ def main() -> None:
 
     subparsers = parser.add_subparsers(dest="command", help="Subcommand (optional)")
 
-    reset_parser = subparsers.add_parser(
-        "reset-trust", help="Delete known_hosts.json after identity rotation"
+    enroll_parser = subparsers.add_parser(
+        "enroll",
+        help="Provision device keys + emit CSR / import signed cert",
     )
-    reset_parser.add_argument(
-        "--yes", "-y", action="store_true",
-        help="Skip interactive confirmation",
+    mode = enroll_parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument(
+        "--csr-out", type=Path, default=None,
+        help="Generate identity + attest key and write a CSR to PATH",
     )
-
-    authorize_parser = subparsers.add_parser(
-        "authorize",
-        help="Add a client public key (hex) to authorized_clients.json",
+    mode.add_argument(
+        "--import", dest="import_cert", type=Path, default=None,
+        help="Import a CA-signed cert from PATH",
     )
-    authorize_parser.add_argument("pubkey_hex", help="32-byte client public key as hex")
-    _add_passphrase_args(authorize_parser)
+    enroll_parser.add_argument(
+        "--cn", type=str, default=None,
+        help="Override the device CN (default derived from Noise static pub)",
+    )
+    enroll_parser.add_argument(
+        "--role",
+        choices=["client", "server"],
+        default=None,
+        help="Role suffix used when --cn is not given (default: from config.mode)",
+    )
+    _add_passphrase_args(enroll_parser)
 
     show_parser = subparsers.add_parser(
-        "show-pubkey", help="Print the local identity's public key (hex)"
+        "show-pubkey", help="Print the local identity's Noise static pubkey (hex)"
     )
     _add_passphrase_args(show_parser)
 
     args = parser.parse_args()
 
-    if args.command == "reset-trust":
-        _run_reset_trust(assume_yes=args.yes)
-        return
-
-    if args.command == "authorize":
-        _run_authorize(
-            args.pubkey_hex,
+    if args.command == "enroll":
+        _run_enroll(
             args.config,
+            csr_out=args.csr_out,
+            import_cert=args.import_cert,
+            cn=args.cn,
+            role=args.role,
             passphrase_fd=args.passphrase_fd,
             passphrase_env_file=args.passphrase_env_file,
         )
@@ -115,43 +126,119 @@ def main() -> None:
         sys.exit(1)
 
 
-def _run_reset_trust(assume_yes: bool) -> None:
-    from dsm.crypto.handshake import DEFAULT_KNOWN_HOSTS_PATH
+def _run_enroll(
+    config_path: Path | None,
+    *,
+    csr_out: Path | None,
+    import_cert: Path | None,
+    cn: str | None,
+    role: str | None,
+    passphrase_fd: int | None,
+    passphrase_env_file: str | None,
+) -> None:
+    from dsm.core.passphrase import read_passphrase, wipe_passphrase
+    from dsm.crypto.attest_store import AttestStore
+    from dsm.crypto.enroll import EnrollError, generate_enrollment, import_signed_cert
+    from dsm.crypto.keystore import KeyStore
 
-    path = DEFAULT_KNOWN_HOSTS_PATH
-    if not path.exists():
-        print(f"{path} does not exist")
-        return
+    config = load(config_path)
+    keystore = KeyStore(config.key_file)
+    attest_store = AttestStore(config.attest_key_file)
 
-    if not assume_yes:
-        if not sys.stdin.isatty():
+    if csr_out is not None:
+        effective_role = role or config.mode
+        if effective_role not in ("client", "server"):
             print(
-                f"refusing to delete {path} non-interactively; pass --yes",
+                f"--role must be client or server (got {effective_role!r})",
                 file=sys.stderr,
             )
             sys.exit(2)
-        response = input(f"Delete {path}? [y/N] ").strip().lower()
-        if response != "y":
-            print("Aborted")
-            return
 
-    try:
-        path.unlink()
-        print(f"Deleted {path}")
-    except OSError as e:
-        print(f"Error deleting {path}: {e}", file=sys.stderr)
-        sys.exit(1)
+        passphrase = read_passphrase(
+            passphrase_fd=passphrase_fd,
+            passphrase_env_file=passphrase_env_file,
+            prompt="New passphrase (will protect identity + attest key): ",
+        )
+        try:
+            try:
+                result = generate_enrollment(
+                    keystore=keystore,
+                    attest_store=attest_store,
+                    passphrase=passphrase,
+                    role=effective_role,
+                    cn=cn,
+                )
+            except EnrollError as e:
+                print(f"enroll: {e}", file=sys.stderr)
+                sys.exit(2)
+        finally:
+            wipe_passphrase(passphrase)
+
+        csr_out.write_bytes(result.csr_der)
+        print(f"Wrote CSR to {csr_out}")
+        print(f"  cn = {result.cn}")
+        print(f"  noise_static_pub = {result.noise_static_pub.hex()}")
+        print(
+            "Walk the CSR via USB to the offline CA per "
+            "deploy/CA_RUNBOOK.md, then run "
+            "`dsm enroll --import <signed.crt>`."
+        )
+        return
+
+    if import_cert is not None:
+        passphrase = read_passphrase(
+            passphrase_fd=passphrase_fd,
+            passphrase_env_file=passphrase_env_file,
+        )
+        try:
+            try:
+                keystore.load_or_generate_with_passphrase(passphrase)
+            except Exception as e:
+                print(
+                    f"failed to unlock identity at {config.key_file}: {e}",
+                    file=sys.stderr,
+                )
+                sys.exit(2)
+            try:
+                attest_store.load_with_passphrase(passphrase)
+            except Exception as e:
+                print(
+                    f"failed to unlock attest key at {config.attest_key_file}: {e}",
+                    file=sys.stderr,
+                )
+                keystore.unload()
+                sys.exit(2)
+        finally:
+            wipe_passphrase(passphrase)
+
+        try:
+            try:
+                leaf = import_signed_cert(
+                    cert_input_path=import_cert,
+                    cert_output_path=Path(config.cert_file),
+                    ca_root_path=Path(config.ca_root_file),
+                    keystore=keystore,
+                    attest_store=attest_store,
+                )
+            except EnrollError as e:
+                print(f"enroll: {e}", file=sys.stderr)
+                sys.exit(2)
+        finally:
+            attest_store.unload()
+            keystore.unload()
+
+        print(f"Imported cert into {config.cert_file}")
+        print(f"  cn = {leaf.subject_cn}")
+        print(f"  serial = {leaf.serial_number}")
+        print(f"  not_after = {leaf.not_after.isoformat()}")
+        return
 
 
-def _load_identity(
+def _run_show_pubkey(
     config_path: Path | None,
     passphrase_fd: int | None,
     passphrase_env_file: str | None,
-):
-    """Shared helper for authorize/show-pubkey subcommands.
-
-    Returns (config, keystore) — caller must keystore.unload() when done.
-    """
+) -> None:
     from dsm.crypto.keystore import KeyStore
 
     config = load(config_path)
@@ -160,45 +247,6 @@ def _load_identity(
         passphrase_fd=passphrase_fd,
         passphrase_env_file=passphrase_env_file,
     )
-    return config, keystore
-
-
-def _run_authorize(
-    pubkey_hex: str,
-    config_path: Path | None,
-    passphrase_fd: int | None,
-    passphrase_env_file: str | None,
-) -> None:
-    from dsm.crypto.authorized_clients import AuthorizedClients
-
-    try:
-        pubkey = bytes.fromhex(pubkey_hex)
-    except ValueError as e:
-        print(f"invalid hex pubkey: {e}", file=sys.stderr)
-        sys.exit(2)
-    if len(pubkey) != 32:
-        print(f"pubkey must be 32 bytes, got {len(pubkey)}", file=sys.stderr)
-        sys.exit(2)
-
-    config, keystore = _load_identity(config_path, passphrase_fd, passphrase_env_file)
-    try:
-        ac = AuthorizedClients(
-            config.config_dir / "authorized_clients.json", keystore.identity,
-        )
-        ac.load()
-        ac.add(pubkey)
-        ac.save()
-        print(f"Authorized client {pubkey.hex()[:16]}… ({len(ac)} total)")
-    finally:
-        keystore.unload()
-
-
-def _run_show_pubkey(
-    config_path: Path | None,
-    passphrase_fd: int | None,
-    passphrase_env_file: str | None,
-) -> None:
-    _config, keystore = _load_identity(config_path, passphrase_fd, passphrase_env_file)
     try:
         pub = bytes(keystore.identity.public_key)
         print(pub.hex())
