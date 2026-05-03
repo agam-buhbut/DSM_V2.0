@@ -102,11 +102,24 @@ class NFTablesManager:
         self._tun_name = tun_name
 
     def apply(self) -> None:
+        from dsm.core import netaudit
         _apply_ruleset(self._render(), fatal=True, log_label="nftables kill switch")
+        netaudit.emit(
+            "nft_apply",
+            tables=["dsm_killswitch", "dsm_dns_leak"],
+            tun_name=self._tun_name,
+            server_ip=self._server_ip,
+            server_port=self._server_port,
+        )
 
     def remove(self) -> None:
+        from dsm.core import netaudit
         _delete_tables("dsm_killswitch", "dsm_dns_leak")
         log.info("nftables rules removed")
+        netaudit.emit(
+            "nft_remove",
+            tables=["dsm_killswitch", "dsm_dns_leak"],
+        )
 
     def _render(self) -> str:
         ipaddress.ip_address(self._server_ip)
@@ -135,16 +148,25 @@ class ServerRateLimitManager:
         self._applied = False
 
     def apply(self) -> None:
+        from dsm.core import netaudit
         self._applied = _apply_ruleset(
             self._render(), fatal=False,
             log_label=f"server rate-limit (port {self._listen_port})",
         )
+        if self._applied:
+            netaudit.emit(
+                "nft_apply",
+                tables=["dsm_server_ratelimit"],
+                listen_port=self._listen_port,
+            )
 
     def remove(self) -> None:
         if not self._applied:
             return
+        from dsm.core import netaudit
         _delete_tables("dsm_server_ratelimit")
         self._applied = False
+        netaudit.emit("nft_remove", tables=["dsm_server_ratelimit"])
 
     def _render(self) -> str:
         return SERVER_TEMPLATE_PATH.read_text().replace(

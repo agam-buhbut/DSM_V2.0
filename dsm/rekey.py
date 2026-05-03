@@ -190,6 +190,8 @@ async def handle_rekey_init(
 
     fsm.transition(State.ESTABLISHED)
     log.info("rekey completed as responder, epoch=%d", completed_epoch)
+    from dsm.core import netaudit
+    netaudit.emit("rekey_epoch", role="responder", new_epoch=completed_epoch)
     # Cache the ACK we just sent under the NEW keys (after apply) so a
     # duplicate INIT retransmitted by the client (with its stale pending
     # rotation) lands here, matches cached_ack_epoch, and we re-send the
@@ -235,4 +237,6 @@ def handle_rekey_ack(
 
     fsm.transition(State.ESTABLISHED)
     log.info("rekey completed as initiator, epoch=%d", completed_epoch)
+    from dsm.core import netaudit
+    netaudit.emit("rekey_epoch", role="initiator", new_epoch=completed_epoch)
     return time.monotonic()

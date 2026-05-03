@@ -72,9 +72,15 @@ def setup_signal_handlers(shutdown: asyncio.Event) -> None:
     """
     import signal
 
+    from dsm.core import netaudit
+
+    def _on_signal(sig_name: str) -> None:
+        netaudit.emit("shutdown_signal", source=sig_name)
+        shutdown.set()
+
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT):
-        loop.add_signal_handler(sig, shutdown.set)
+        loop.add_signal_handler(sig, _on_signal, sig.name)
 
 
 @dataclass
@@ -403,6 +409,13 @@ async def liveness_loop(ctx: DataPathContext) -> None:
                 "dead peer: no packets received for %.1fs, tearing down session",
                 recv_idle,
             )
+            from dsm.core import netaudit
+            netaudit.emit(
+                "liveness_fire",
+                reason="dead_peer_timeout",
+                recv_idle_s=round(recv_idle, 2),
+                threshold_s=DEAD_PEER_TIMEOUT,
+            )
             ctx.shutdown.set()
             return
 
@@ -466,6 +479,14 @@ async def auto_mtu_loop(
                 "auto_mtu: lowered tun mtu %d -> %d (kernel pmtu=%d)",
                 current, usable, path_mtu,
             )
+            from dsm.core import netaudit
+            netaudit.emit(
+                "auto_mtu_change",
+                direction="lower",
+                old_mtu=current,
+                new_mtu=usable,
+                kernel_pmtu=path_mtu,
+            )
             current = usable
             rises_observed = 0
         elif usable > current:
@@ -480,6 +501,15 @@ async def auto_mtu_loop(
                 log.info(
                     "auto_mtu: raised tun mtu %d -> %d after %d stable observations (kernel pmtu=%d)",
                     current, usable, rises_observed, path_mtu,
+                )
+                from dsm.core import netaudit
+                netaudit.emit(
+                    "auto_mtu_change",
+                    direction="raise",
+                    old_mtu=current,
+                    new_mtu=usable,
+                    kernel_pmtu=path_mtu,
+                    stable_observations=rises_observed,
                 )
                 current = usable
                 rises_observed = 0

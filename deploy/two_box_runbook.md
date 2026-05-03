@@ -330,8 +330,11 @@ On the **server** (or any host running dsm under systemd):
 sudo systemd-analyze security dsm
 ```
 
-PASS: top-line score < 4.0 (with the conservative subset shipped in
-this Ship). After the strace audit step (§7), targeting < 3.0.
+PASS: top-line score ≤ 5.5 (`MEDIUM`) with the conservative subset
+shipped in Ship 2. After the strace audit step (§7) unblocks
+`SystemCallFilter` and `RestrictNamespaces`, target < 3.0 (`OK`).
+Run `systemd-analyze security --offline=true /path/to/dsm.service`
+to score the unit file directly without installing.
 
 ### §5.7 — Auto-MTU adaptation
 

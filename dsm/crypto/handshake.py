@@ -41,6 +41,7 @@ from typing import TYPE_CHECKING
 from cryptography.x509 import Certificate as X509Certificate
 from cryptography.x509 import ObjectIdentifier
 
+from dsm.core import netaudit
 from dsm.crypto.attest import (
     AttestError,
     PeerRole,
@@ -156,6 +157,14 @@ async def client_handshake(
     initiator = tuncore.NoiseInitiator(identity)
     our_static_pub = bytes(identity.public_key)
 
+    started_at = asyncio.get_event_loop().time()
+    netaudit.emit(
+        "handshake_start",
+        role="client",
+        server_addr=f"{server_addr[0]}:{server_addr[1]}",
+        expected_server_cn=expected_server_cn,
+    )
+
     # Message 1: -> e
     msg1 = initiator.write_message_1()
     await _send(transport, msg1, server_addr)
@@ -262,9 +271,18 @@ async def client_handshake(
     finally:
         del client_secret
 
+    duration_s = asyncio.get_event_loop().time() - started_at
     log.info(
         "handshake complete (client) — server_cn=%s",
         server_cert.subject_cn,
+    )
+    netaudit.emit(
+        "handshake_end",
+        role="client",
+        outcome="ok",
+        peer_cn=server_cert.subject_cn,
+        peer_serial=server_cert.serial_number,
+        duration_s=round(duration_s, 4),
     )
     return session_keys, handshake_hash
 
@@ -298,10 +316,20 @@ async def server_handshake(
     responder = tuncore.NoiseResponder(identity)
     our_static_pub = bytes(identity.public_key)
 
+    netaudit.emit(
+        "handshake_start",
+        role="server",
+        client_addr=(
+            f"{client_addr[0]}:{client_addr[1]}" if client_addr else None
+        ),
+    )
+    started_at: float | None = None  # set after msg1 arrives
+
     # Message 1: -> e (capture sender address for UDP reply).
     # Wait indefinitely — there is no peer state to time out against
     # before any client has connected.
     msg1, recv_addr = await _recv(transport, indefinite=True)
+    started_at = asyncio.get_event_loop().time()
     responder.read_message_1(msg1)
     addr = recv_addr or client_addr
 
@@ -396,9 +424,22 @@ async def server_handshake(
     finally:
         del server_secret
 
+    duration_s = (
+        asyncio.get_event_loop().time() - started_at
+        if started_at is not None
+        else 0.0
+    )
     log.info(
         "handshake complete (server) — client_cn=%s",
         client_cert.subject_cn,
+    )
+    netaudit.emit(
+        "handshake_end",
+        role="server",
+        outcome="ok",
+        peer_cn=client_cert.subject_cn,
+        peer_serial=client_cert.serial_number,
+        duration_s=round(duration_s, 4),
     )
     _ = handshake_hash  # captured for diagnostic symmetry with client
     return session_keys, client_static

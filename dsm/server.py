@@ -10,6 +10,7 @@ from pathlib import Path
 
 from cryptography.x509.oid import ExtendedKeyUsageOID
 
+from dsm.core import netaudit
 from dsm.core.config import Config
 from dsm.core.fsm import SessionFSM, State
 from dsm.core.passphrase import read_passphrase, wipe_passphrase
@@ -164,18 +165,34 @@ async def run_server(
             )
         except CNNotAllowedError as e:
             log.warning("client CN not in allowlist: %s", e)
+            netaudit.emit(
+                "handshake_end", role="server", outcome="failed",
+                error="CNNotAllowedError", message=str(e),
+            )
             fsm.transition(State.TEARDOWN)
             return
         except CertRevokedError as e:
             log.warning("client cert revoked: %s", e)
+            netaudit.emit(
+                "handshake_end", role="server", outcome="failed",
+                error="CertRevokedError", message=str(e),
+            )
             fsm.transition(State.TEARDOWN)
             return
         except CertAuthError as e:
             log.warning("client cert auth failed: %s", e)
+            netaudit.emit(
+                "handshake_end", role="server", outcome="failed",
+                error="CertAuthError", message=str(e),
+            )
             fsm.transition(State.TEARDOWN)
             return
         except HandshakeError as e:
             log.error("handshake failed: %s", e)
+            netaudit.emit(
+                "handshake_end", role="server", outcome="failed",
+                error="HandshakeError", message=str(e),
+            )
             fsm.transition(State.TEARDOWN)
             return
 

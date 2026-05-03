@@ -9,6 +9,7 @@ from contextlib import AsyncExitStack
 
 from cryptography.x509.oid import ExtendedKeyUsageOID
 
+from dsm.core import netaudit
 from dsm.core.config import Config
 from dsm.core.fsm import SessionFSM, State
 from dsm.core.passphrase import read_passphrase, wipe_passphrase
@@ -142,18 +143,34 @@ async def run_client(
             )
         except CNMismatchError as e:
             log.error("server CN check failed: %s", e)
+            netaudit.emit(
+                "handshake_end", role="client", outcome="failed",
+                error="CNMismatchError", message=str(e),
+            )
             fsm.transition(State.TEARDOWN)
             return
         except CertRevokedError as e:
             log.error("server cert revoked: %s", e)
+            netaudit.emit(
+                "handshake_end", role="client", outcome="failed",
+                error="CertRevokedError", message=str(e),
+            )
             fsm.transition(State.TEARDOWN)
             return
         except CertAuthError as e:
             log.error("server cert auth failed: %s", e)
+            netaudit.emit(
+                "handshake_end", role="client", outcome="failed",
+                error="CertAuthError", message=str(e),
+            )
             fsm.transition(State.TEARDOWN)
             return
         except HandshakeError as e:
             log.error("handshake failed: %s", e)
+            netaudit.emit(
+                "handshake_end", role="client", outcome="failed",
+                error="HandshakeError", message=str(e),
+            )
             fsm.transition(State.TEARDOWN)
             return  # AsyncExitStack unwinds transport + keystore
 

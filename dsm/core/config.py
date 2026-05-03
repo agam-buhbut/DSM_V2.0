@@ -61,6 +61,13 @@ class Config:
     rotation_packets: int = 5000
     rotation_seconds: int = 600
     debug_dns: bool = False
+    # Structured-JSON audit stream on the `dsm.netaudit` logger.
+    # When True, dsm emits one JSON event per state transition
+    # (handshake start/end, nft apply/remove, TUN configure/deconfigure,
+    # rekey, liveness, shutdown). Used by the two-box demo runbook for
+    # capturing ground truth, and by Phase 4 pentest replays. May also
+    # be enabled via the `--debug-net` CLI flag.
+    debug_net: bool = False
     # TUN device MTU in bytes. Must satisfy MIN_TUN_MTU <= mtu <= MAX_TUN_MTU.
     # The wire-level path MTU budget is checked against this at startup.
     mtu: int = DEFAULT_TUN_MTU

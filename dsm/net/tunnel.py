@@ -188,6 +188,14 @@ class TunDevice:
         self._configured = True
 
         log.info("TUN %s configured: %s/%d mtu=%d", self._name, local_ip, netmask, mtu)
+        from dsm.core import netaudit
+        netaudit.emit(
+            "tun_configure",
+            iface=self._name,
+            local_ip=local_ip,
+            netmask=netmask,
+            mtu=mtu,
+        )
 
     def set_mtu(self, mtu: int) -> None:
         """Change the MTU of an already-configured TUN device.
@@ -215,6 +223,8 @@ class TunDevice:
         if self._configured:
             self._restore_ipv6_state()
             self._configured = False
+            from dsm.core import netaudit
+            netaudit.emit("tun_deconfigure", iface=self._name)
 
     async def read(self, bufsize: int = 2048) -> bytes:
         """Read a packet from the TUN device (async)."""

@@ -45,6 +45,13 @@ def main() -> None:
         default=None,
         help="Config file path (default: /opt/mtun/config.toml)",
     )
+    parser.add_argument(
+        "--debug-net",
+        action="store_true",
+        help="Emit structured JSON events on the dsm.netaudit logger "
+             "(handshake/nft/tun/rekey/liveness/shutdown). Overrides "
+             "config.debug_net. Used by the two-box runbook for capture.",
+    )
     _add_passphrase_args(parser)
 
     subparsers = parser.add_subparsers(dest="command", help="Subcommand (optional)")
@@ -106,6 +113,11 @@ def main() -> None:
         config = replace(config, mode=args.mode)
 
     dsm_log.configure(config.log_level)
+
+    # Audit stream: --debug-net CLI flag wins over config.debug_net so
+    # an operator can flip it on for one run without editing the file.
+    from dsm.core import netaudit
+    netaudit.configure(args.debug_net or config.debug_net)
 
     if config.mode == "client":
         from dsm.client import run_client

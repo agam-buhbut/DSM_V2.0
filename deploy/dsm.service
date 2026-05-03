@@ -40,5 +40,111 @@ RestartSec=10s
 StandardOutput=journal
 StandardError=journal
 
+# ─── Sandboxing (Phase 2 conservative subset) ─────────────────────────────
+# Each flag below was selected because it is known-safe given dsm's syscall
+# surface (Python interpreter + Rust extension + ip / nft subprocess calls).
+# Run `systemd-analyze security dsm` after a fresh deploy to track score;
+# target < 4.0 with this subset alone, < 3.0 once the audit-gated flags
+# below are unblocked.
+
+# Python is ahead-of-time bytecode + Rust .so is mapped at import time;
+# no JIT, no plugins that mmap RWX. Safe to forbid W^X.
+MemoryDenyWriteExecute=true
+
+# Refuses personality(2) — guards against ASLR-evasion exploits that flip
+# personality to defeat KASLR. dsm never calls personality().
+LockPersonality=true
+
+# Refuses module load/unload via init_module(2) and finit_module(2).
+# dsm uses pre-loaded `tun` module; never modprobes at runtime.
+ProtectKernelModules=true
+
+# Mounts /sys/fs/cgroup read-only for the unit. dsm doesn't manage cgroups.
+ProtectControlGroups=true
+
+# Forbid alt-arch syscalls (i386 ABI when running on amd64). Removes an
+# attack surface used by some sandbox-escape exploits.
+SystemCallArchitectures=native
+
+# Once-and-done hardening: deny privilege escalation via SUID/SGID exec.
+# dsm.session's harden_process() sets prctl(PR_SET_NO_NEW_PRIVS) anyway,
+# but stating it on the unit means it kicks in BEFORE Python starts, so
+# even an exec hijack between systemd start and Python init can't escalate.
+NoNewPrivileges=true
+
+# dsm doesn't create SUID/SGID files. Setting these flags blocks any
+# accidental future write that would.
+RestrictSUIDSGID=true
+
+# dsm doesn't change hostname / read /proc/kmsg / set hardware clock.
+ProtectHostname=true
+ProtectClock=true
+ProtectKernelLogs=true
+
+# dsm doesn't use realtime scheduling — block sched_setscheduler(SCHED_RR/FIFO)
+# so a compromised dsm can't pin a CPU and starve the rest of the system.
+RestrictRealtime=true
+
+# Service-private kernel keyring; we don't share key material with other units.
+KeyringMode=private
+
+# Cap the bounding set to what's actually needed:
+#   CAP_NET_ADMIN         — TUN ifconfig + nftables + sysctl
+#   CAP_SYS_ADMIN         — nft set/table operations + mount-related ioctls
+#   CAP_NET_BIND_SERVICE  — bind UDP/53 on the TUN address (DNS proxy)
+# Everything else is dropped. Strace audit (§7) will confirm; if a missing
+# cap surfaces an EPERM in the cellular demo, add it here with a comment.
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_NET_BIND_SERVICE
+
+# Tighten the file-creation default so any file dsm creates is mode 0600
+# regardless of where it's written. Already what we do for cert + key
+# files explicitly; this catches any future code path that forgets.
+UMask=0077
+
+# Per-unit /tmp + /var/tmp namespaces. dsm.service never reads other
+# services' temp files; PrivateTmp gives us a fresh tmpfs that's torn
+# down on stop. (Note: this only applies to the daemon — `dsm enroll`
+# is run by the operator directly and writes its CSR to the host /tmp.)
+PrivateTmp=true
+
+# Only see our own PIDs in /proc; hide other processes. dsm doesn't
+# scan /proc for siblings. /proc/sys (kernel tunables) is unaffected.
+ProcSubset=pid
+ProtectProc=invisible
+
+# Skipped because dsm legitimately writes to /proc/sys/net:
+#   ProtectKernelTunables=true
+# dsm writes net.ipv4.ip_forward (server side) and
+# net.ipv6.conf.*.disable_ipv6 (both sides) at startup and restores
+# them on shutdown. Enabling this flag would break the data path.
+
+# Enumerate the address families we actually use:
+#   AF_UNIX     — Python's internal IPC, journalctl
+#   AF_INET     — UDP/TCP IPv4
+#   AF_INET6    — UDP/TCP IPv6 (config-dependent; dsm doesn't open v6 sockets
+#                 today but listing this keeps the surface stable if it does)
+#   AF_NETLINK  — TUN ioctl + ip(8) calls go through netlink
+#   AF_PACKET   — nft(8) raw socket fallbacks on some kernels
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET
+
+# ─── Sandboxing TODOs (gated on the strace audit step) ────────────────────
+# The two flags below are likely safe but can break TUN ioctl / netlink in
+# subtle ways depending on kernel build. Enable empirically after walking
+# deploy/two_box_runbook.md §7 (strace audit on the cellular client).
+#
+# RestrictNamespaces=true
+#     Should not break dsm in the common case — we don't enter any namespaces
+#     at runtime — but `ip(8)` may attempt unshare()/setns() calls on some
+#     distros. Verify: `journalctl -u dsm | grep -i 'permission denied'` after
+#     enabling, and test the kill-switch nftables apply path specifically.
+#
+# SystemCallFilter=@system-service ~@privileged ~@resources @network-io ...
+#     The exact allowlist is captured by the strace audit step. Without the
+#     audit, a too-tight filter will SIGSYS the daemon mid-handshake.
+#
+# Permanently skipped (would break /opt/mtun + /etc/resolv.conf writes):
+#   DynamicUser=yes
+#   ProtectSystem=strict
+
 [Install]
 WantedBy=multi-user.target
