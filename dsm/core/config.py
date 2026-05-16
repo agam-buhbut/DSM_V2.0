@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import ipaddress
 import os
+import re
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
+
+_TUN_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9_-]{1,15}$")
 
 CONFIG_PATH = Path("/opt/mtun/config.toml")
 
@@ -48,6 +51,12 @@ class Config:
     dns_provider_pins: dict[str, list[str]] = field(default_factory=dict[str, list[str]])
     # Optional CRL file (DER or PEM).
     crl_file: str | None = None
+    # When True, refuse to start if the configured CRL is past its
+    # ``next_update`` timestamp. Default False preserves the previous
+    # behavior of logging a warning and continuing — a stale CRL is
+    # operationally better than a crashloop, but security-paranoid
+    # deployments can flip this to fail closed.
+    crl_strict: bool = False
     # Client-only: subject CN we will accept on the server cert.
     expected_server_cn: str | None = None
     # Server-only: file with one allowed client subject CN per line.
@@ -144,8 +153,22 @@ def _validate(c: Config) -> None:
     if c.mode == "server" and not c.dns_providers:
         raise ValueError("server mode requires at least one dns_providers entry")
 
-    # dns provider pins: any user-supplied provider must have SPKI pins configured
+    # dns provider pins: any user-supplied provider must have SPKI pins configured.
+    # The scheme is checked at config load and a typo (`http://`, `dns://`, or
+    # a bare hostname) surfaces as a startup WARNING. Without this, an
+    # unrecognized scheme is silently skipped at query time, leaving the
+    # server with no working resolver and clients with unexplained SERVFAILs.
+    # Warning rather than raising keeps backward compatibility with existing
+    # test fixtures and operator configs that pass non-URL placeholders.
     for provider in c.dns_providers:
+        if not (provider.startswith("https://") or provider.startswith("tls://")):
+            import logging
+            logging.getLogger(__name__).warning(
+                "dns_provider %r has no 'https://' (DoH) or 'tls://' (DoT) "
+                "scheme; it will be silently skipped at query time. Fix the "
+                "config to include the scheme so this provider is actually used.",
+                provider,
+            )
         pins = c.dns_provider_pins.get(provider)
         if not pins:
             raise ValueError(
@@ -226,6 +249,15 @@ def _validate(c: Config) -> None:
     # log_level
     if c.log_level not in ("debug", "info", "warning", "error"):
         raise ValueError(f"invalid log_level: {c.log_level!r}")
+
+    # tun_name: Linux IFNAMSIZ is 16 (including NUL), so 15 usable chars.
+    # The kill-switch ruleset and MASQUERADE rule both interpolate this into
+    # nftables config; restricting to alphanumeric + dash/underscore keeps the
+    # interpolation site safe even if a future code path forgets to validate.
+    if not _TUN_NAME_PATTERN.match(c.tun_name):
+        raise ValueError(
+            f"tun_name {c.tun_name!r} must be 1-15 alphanumeric/dash/underscore chars"
+        )
 
     # TUN MTU bounds — below 576 breaks IPv4 connectivity in common
     # assumptions, above 1500 overflows Ethernet without jumbo frames.

@@ -4,7 +4,7 @@
 # Trust model: every device runs `dsm enroll --csr-out` once, walks the CSR to
 # the offline CA laptop, gets a cert back, and runs `dsm enroll --import`.
 # At runtime the daemon authenticates peers against the pinned CA root +
-# (server) CN allowlist or (client) expected_server_cn. See deploy/CA_RUNBOOK.md.
+# (server) CN allowlist or (client) expected_server_cn. See deploy/GUIDE.txt.
 
 mode = "client"                              # "client" | "server"
 server_ip = "203.0.113.1"                    # Server public IP (literal IP, not hostname)

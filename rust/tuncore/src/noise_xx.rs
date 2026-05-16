@@ -3,7 +3,9 @@ use rand::RngCore;
 use snow::{Builder, HandshakeState, TransportState};
 use subtle::ConstantTimeEq;
 use x25519_dalek::{PublicKey, StaticSecret};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
+
+use crate::secure_noise::SecureResolver;
 
 /// Protocol prologue authenticated by both sides.
 /// Format: "DSM" || version(2 bytes) || initiator_role || responder_role
@@ -68,6 +70,12 @@ fn validate_ephemeral_not_low_order(pub_bytes: &[u8]) -> Result<(), String> {
     let mut probe = [0u8; 32];
     OsRng.fill_bytes(&mut probe);
     let probe_secret = StaticSecret::from(probe);
+    // `probe` was copied into `probe_secret`; scrub the stack original now
+    // that the dalek copy (which clamps & zeroizes on its own drop) holds
+    // the live scalar. Defense in depth — the probe is a per-call random
+    // value, not a long-lived key, but leaving it on the stack would let
+    // a subsequent read of reused frame slots observe it.
+    probe.zeroize();
     let public = PublicKey::from(pk_arr);
     let shared = probe_secret.diffie_hellman(&public);
 
@@ -98,9 +106,30 @@ fn pack_handshake(snow_data: &[u8], expected_len: usize) -> Result<Vec<u8>, Stri
 }
 
 /// Unpack a handshake message: extract the protocol-constant prefix.
+///
+/// Enforces the outer frame length: every handshake frame on the wire is
+/// exactly `HANDSHAKE_PAD_SIZE` bytes. Rejecting any other length defends
+/// the fixed-size invariant the padding exists for — a peer (or attacker
+/// reaching this Rust API directly, e.g. bypassing the Python wrapper's
+/// frame-size check) cannot truncate or extend the frame to fingerprint
+/// the handshake or smuggle extra bytes after the snow prefix.
+///
+/// The `expected_len > HANDSHAKE_PAD_SIZE` branch is unreachable for the
+/// in-tree callers (`MSG1_SNOW_LEN` / `MSG2_SNOW_LEN` / `MSG3_SNOW_LEN`
+/// are all `<= HANDSHAKE_PAD_SIZE`, statically asserted above). The
+/// explicit check makes the slice-bounds panic impossible to reach even
+/// from a future misuse, replacing it with a typed error.
 fn unpack_handshake<'a>(buf: &'a [u8], expected_len: usize) -> Result<&'a [u8], String> {
-    if buf.len() < expected_len {
-        return Err("invalid handshake message".into());
+    if buf.len() != HANDSHAKE_PAD_SIZE {
+        return Err(format!(
+            "handshake frame wrong size: {} != {HANDSHAKE_PAD_SIZE}",
+            buf.len()
+        ));
+    }
+    if expected_len > HANDSHAKE_PAD_SIZE {
+        return Err(format!(
+            "expected_len {expected_len} exceeds HANDSHAKE_PAD_SIZE {HANDSHAKE_PAD_SIZE}"
+        ));
     }
     Ok(&buf[..expected_len])
 }
@@ -122,12 +151,20 @@ pub struct NoiseTransport {
 
 impl NoiseInitiator {
     /// Create a new initiator with the given static secret key.
+    ///
+    /// Uses [`SecureResolver`] so the static / ephemeral X25519 scalars
+    /// live in mlock'd, zeroize-on-drop heap buffers inside snow — closing
+    /// the upstream leak where `Dh25519`'s `[u8; 32]` field is returned
+    /// to the allocator with the scalar still in place.
     pub fn new(static_secret: &[u8; 32]) -> Result<Self, String> {
-        let state = Builder::new(NOISE_PATTERN.parse().map_err(|e| format!("pattern: {e}"))?)
-            .local_private_key(static_secret)
-            .prologue(PROLOGUE)
-            .build_initiator()
-            .map_err(|e| format!("build initiator: {e}"))?;
+        let state = Builder::with_resolver(
+            NOISE_PATTERN.parse().map_err(|e| format!("pattern: {e}"))?,
+            Box::new(SecureResolver::new()),
+        )
+        .local_private_key(static_secret)
+        .prologue(PROLOGUE)
+        .build_initiator()
+        .map_err(|e| format!("build initiator: {e}"))?;
 
         Ok(Self { state })
     }
@@ -230,12 +267,19 @@ impl NoiseInitiator {
 
 impl NoiseResponder {
     /// Create a new responder with the given static secret key.
+    ///
+    /// Uses [`SecureResolver`] so snow's internal X25519 scalars are
+    /// mlock'd and zeroize-on-drop — see [`NoiseInitiator::new`] for the
+    /// full rationale.
     pub fn new(static_secret: &[u8; 32]) -> Result<Self, String> {
-        let state = Builder::new(NOISE_PATTERN.parse().map_err(|e| format!("pattern: {e}"))?)
-            .local_private_key(static_secret)
-            .prologue(PROLOGUE)
-            .build_responder()
-            .map_err(|e| format!("build responder: {e}"))?;
+        let state = Builder::with_resolver(
+            NOISE_PATTERN.parse().map_err(|e| format!("pattern: {e}"))?,
+            Box::new(SecureResolver::new()),
+        )
+        .local_private_key(static_secret)
+        .prologue(PROLOGUE)
+        .build_responder()
+        .map_err(|e| format!("build responder: {e}"))?;
 
         Ok(Self { state })
     }
@@ -555,6 +599,40 @@ mod tests {
     }
 
     #[test]
+    fn test_handshake_rejects_short_frame() {
+        // unpack_handshake must require the full HANDSHAKE_PAD_SIZE outer
+        // frame on receive. A peer (or attacker reaching this API directly)
+        // sending a truncated frame breaks the anonymity invariant that
+        // every handshake message is the same length on the wire.
+        let server_secret = gen_keypair();
+        let mut responder = NoiseResponder::new(&server_secret).unwrap();
+
+        let msg = vec![0u8; MSG1_SNOW_LEN]; // snow prefix only, no pad
+        assert!(msg.len() < HANDSHAKE_PAD_SIZE);
+        let err = responder.read_message_1(&msg).unwrap_err();
+        assert!(
+            err.contains("wrong size"),
+            "expected wrong-size rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_handshake_rejects_long_frame() {
+        // The other failure mode: a frame larger than HANDSHAKE_PAD_SIZE.
+        // Accepting a longer frame would let a peer smuggle bytes past the
+        // snow prefix that the receiver silently ignores — covert channel.
+        let server_secret = gen_keypair();
+        let mut responder = NoiseResponder::new(&server_secret).unwrap();
+
+        let msg = vec![0u8; HANDSHAKE_PAD_SIZE + 1];
+        let err = responder.read_message_1(&msg).unwrap_err();
+        assert!(
+            err.contains("wrong size"),
+            "expected wrong-size rejection, got: {err}"
+        );
+    }
+
+    #[test]
     fn test_handshake_tampered_msg2_fails() {
         // msg2 is AEAD-authenticated (ee, s, es) — tampering any byte in
         // the fixed snow-payload prefix must cause the initiator to fail.
@@ -570,6 +648,163 @@ mod tests {
         // Flip a byte inside the encrypted static block (past the ephemeral)
         msg2[40] ^= 0xFF;
         assert!(initiator.read_message_2(&msg2).is_err());
+    }
+
+    #[test]
+    fn fuzz_handshake_state_machine_no_panic_on_random_bytes() {
+        // Deep-fuzz: feed random byte blobs of the right size into each
+        // handshake-state reader. The property is "never panic" — every
+        // bit pattern must either authenticate (impossible without the
+        // peer's key) or return a typed Err. The static_secret on each
+        // side is unrelated to the bytes we're feeding, so AEAD failure
+        // is the expected outcome.
+        for _ in 0..32 {
+            let server_secret = gen_keypair();
+            let client_secret = gen_keypair();
+
+            // Random msg1 — responder must reject (low-order or AEAD).
+            {
+                let mut responder = NoiseResponder::new(&server_secret).unwrap();
+                let mut msg = vec![0u8; HANDSHAKE_PAD_SIZE];
+                OsRng.fill_bytes(&mut msg);
+                // Most random msg1 ephemerals will be high-order so
+                // low-order check passes; snow will then try to decrypt
+                // an unauthenticated payload, which is always
+                // expected to succeed for msg1 (no AEAD on `-> e`).
+                // The state will still be valid for read_message_1.
+                let _ = responder.read_message_1(&msg);
+            }
+
+            // Random msg2 — initiator must reject (AEAD over msg2's
+            // payload is real). We get to msg2 by doing a legitimate
+            // msg1 first.
+            {
+                let mut initiator = NoiseInitiator::new(&client_secret).unwrap();
+                let mut responder = NoiseResponder::new(&server_secret).unwrap();
+                let msg1 = initiator.write_message_1().unwrap();
+                responder.read_message_1(&msg1).unwrap();
+
+                let mut msg2 = vec![0u8; HANDSHAKE_PAD_SIZE];
+                OsRng.fill_bytes(&mut msg2);
+                let result = initiator.read_message_2(&msg2);
+                assert!(
+                    result.is_err(),
+                    "initiator must reject a random msg2 (AEAD-protected)"
+                );
+            }
+
+            // Random msg3 — responder rejects.
+            {
+                let mut initiator = NoiseInitiator::new(&client_secret).unwrap();
+                let mut responder = NoiseResponder::new(&server_secret).unwrap();
+                let msg1 = initiator.write_message_1().unwrap();
+                responder.read_message_1(&msg1).unwrap();
+                let msg2 = responder.write_message_2(&random_attest_payload()).unwrap();
+                initiator.read_message_2(&msg2).unwrap();
+
+                let mut msg3 = vec![0u8; HANDSHAKE_PAD_SIZE];
+                OsRng.fill_bytes(&mut msg3);
+                let result = responder.read_message_3(&msg3);
+                assert!(
+                    result.is_err(),
+                    "responder must reject a random msg3 (AEAD-protected)"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fuzz_handshake_wrong_order_no_panic() {
+        // Property: calling state-machine methods in the WRONG order
+        // must produce Err, not panic. snow's HandshakeState tracks
+        // which message is expected next; calling read_message_2 before
+        // read_message_1 should fail at the snow layer.
+        let client_secret = gen_keypair();
+        let server_secret = gen_keypair();
+        let mut initiator = NoiseInitiator::new(&client_secret).unwrap();
+        let mut responder = NoiseResponder::new(&server_secret).unwrap();
+
+        // Initiator tries to read a fake msg2 BEFORE writing msg1.
+        let fake = vec![0u8; HANDSHAKE_PAD_SIZE];
+        assert!(initiator.read_message_2(&fake).is_err());
+
+        // Responder tries to write msg2 BEFORE reading msg1.
+        assert!(responder.write_message_2(&random_attest_payload()).is_err());
+
+        // Initiator tries to write msg3 BEFORE reading msg2.
+        assert!(initiator.write_message_3(&random_attest_payload()).is_err());
+    }
+
+    #[test]
+    fn fuzz_replay_handshake_message_no_panic() {
+        // Property: replaying the same handshake message must produce
+        // Err on the second attempt (snow's state machine has advanced
+        // past it), never panic.
+        let client_secret = gen_keypair();
+        let server_secret = gen_keypair();
+        let mut initiator = NoiseInitiator::new(&client_secret).unwrap();
+        let mut responder = NoiseResponder::new(&server_secret).unwrap();
+
+        let msg1 = initiator.write_message_1().unwrap();
+        responder.read_message_1(&msg1).unwrap();
+        // Replay of msg1 — second read must fail.
+        let res = responder.read_message_1(&msg1);
+        assert!(res.is_err(), "replay of msg1 must fail");
+
+        let msg2 = responder.write_message_2(&random_attest_payload()).unwrap();
+        initiator.read_message_2(&msg2).unwrap();
+        // Replay of msg2 — second read must fail.
+        let res = initiator.read_message_2(&msg2);
+        assert!(res.is_err(), "replay of msg2 must fail");
+    }
+
+    #[test]
+    fn unpack_handshake_random_lengths_never_panic() {
+        // Property: unpack_handshake must return Result for ANY input
+        // buffer length and ANY expected_len, never panic on slice bounds.
+        // Covers the defensive `expected_len > HANDSHAKE_PAD_SIZE` branch
+        // that protects against a future caller passing a value larger
+        // than the protocol-constant prefix.
+        for buf_len in [0usize, 1, MSG1_SNOW_LEN, MSG2_SNOW_LEN, MSG3_SNOW_LEN,
+                        HANDSHAKE_PAD_SIZE - 1, HANDSHAKE_PAD_SIZE,
+                        HANDSHAKE_PAD_SIZE + 1, HANDSHAKE_PAD_SIZE * 2] {
+            for expected_len in [0usize, 1, MSG1_SNOW_LEN, MSG2_SNOW_LEN,
+                                 MSG3_SNOW_LEN, HANDSHAKE_PAD_SIZE,
+                                 HANDSHAKE_PAD_SIZE + 1, usize::MAX / 2] {
+                let buf = vec![0u8; buf_len];
+                let result = unpack_handshake(&buf, expected_len);
+                match result {
+                    Ok(slice) => {
+                        assert_eq!(slice.len(), expected_len);
+                        assert!(buf_len == HANDSHAKE_PAD_SIZE);
+                        assert!(expected_len <= HANDSHAKE_PAD_SIZE);
+                    }
+                    Err(_) => {
+                        assert!(
+                            buf_len != HANDSHAKE_PAD_SIZE
+                                || expected_len > HANDSHAKE_PAD_SIZE,
+                            "valid (buf_len, expected_len) was rejected: \
+                             buf_len={buf_len}, expected_len={expected_len}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unpack_handshake_random_byte_content_never_panic() {
+        // Stronger fuzz-style property: random byte content at the
+        // correct frame size still produces Ok with the expected slice.
+        let mut buf = vec![0u8; HANDSHAKE_PAD_SIZE];
+        for _ in 0..256 {
+            OsRng.fill_bytes(&mut buf);
+            for &expected in &[MSG1_SNOW_LEN, MSG2_SNOW_LEN, MSG3_SNOW_LEN] {
+                let slice = unpack_handshake(&buf, expected).expect("ok");
+                assert_eq!(slice.len(), expected);
+                assert_eq!(slice, &buf[..expected]);
+            }
+        }
     }
 
     #[test]

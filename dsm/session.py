@@ -122,15 +122,30 @@ def make_send_fn(
     dest_addr: Callable[[], tuple[str, int] | None],
     seq: SequenceCounter,
     liveness: LivenessState | None = None,
+    shutdown: asyncio.Event | None = None,
 ) -> SendFn:
-    """Create a send_packet closure."""
+    """Create a send_packet closure.
+
+    ``shutdown`` (when supplied) is set if the send path hits an unrecoverable
+    encryption-side condition — sequence-number overflow or nonce-counter
+    exhaustion. Both indicate the session has produced 2^64 packets or has
+    fallen too far behind on rekey; either way, propagating the RuntimeError
+    out would kill the asyncio.gather without cleanup. Setting shutdown lets
+    the existing teardown path unwind nftables/TUN/resolv.conf cleanly.
+    """
 
     # For TCP, always use max size class so the length-prefix is constant,
     # preventing passive traffic analysis via frame sizes.
     tcp_fixed_size = SIZE_CLASSES[-1] if isinstance(transport, TCPTransport) else 0
 
     async def send_packet(data: bytes, target_size: int) -> None:
-        n = seq.next()
+        try:
+            n = seq.next()
+        except RuntimeError as e:
+            log.error("sequence counter exhausted: %s — triggering shutdown", e)
+            if shutdown is not None:
+                shutdown.set()
+            return
         if tcp_fixed_size and tcp_fixed_size > target_size:
             # Fixed-size TCP framing: extend in place to avoid the
             # intermediate concat buffer on the send hot path. Entropy
@@ -142,7 +157,13 @@ def make_send_fn(
             data = bytes(buf)
             target_size = tcp_fixed_size
         aad = SEQ_STRUCT.pack(n)
-        nonce, ct, _epoch = session_keys.encrypt(data, aad)
+        try:
+            nonce, ct, _epoch = session_keys.encrypt(data, aad)
+        except RuntimeError as e:
+            log.error("AEAD nonce exhausted: %s — triggering shutdown", e)
+            if shutdown is not None:
+                shutdown.set()
+            return
         outer = OuterPacket(seq=n, nonce=nonce, ciphertext=ct)
         wire = outer.serialize(target_size)
         if isinstance(transport, UDPTransport):
@@ -332,9 +353,13 @@ async def _handle_rekey_ack(ctx: DataPathContext, inner: InnerPacket) -> None:
     )
     if ts is not None:
         ctx.rekey.last_time = ts
-        ctx.rekey.pending_epoch = None
-        # Successful ACK — clear retry scheduler state.
-        ctx.rekey.reset_retry()
+    # Clear pending rotation state on BOTH success and failure. On failure
+    # (malformed ACK, low-order peer ephemeral, etc.) the Rust-side
+    # pending_rotation has already been consumed by complete_rotation_initiator,
+    # so leaving stale Python-side payload/epoch/retry counters would block the
+    # next needs_rotation() trigger from starting a clean cycle.
+    ctx.rekey.pending_epoch = None
+    ctx.rekey.reset_retry()
     ctx.rekey.in_progress = False
 
 

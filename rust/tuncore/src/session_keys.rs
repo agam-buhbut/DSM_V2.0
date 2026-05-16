@@ -24,29 +24,41 @@ pub const ROTATION_TIME_BASE_SECS: u64 = 600; // 10 minutes
 const ROTATION_JITTER_PCT: u64 = 20;
 const GRACE_PERIOD_SECS: u64 = 5;
 
-fn jitter_amount(base: u64) -> u64 {
-    // Always at least 1 so the threshold is non-deterministic even at
-    // base=1 (degenerate but allowed).
-    (base * ROTATION_JITTER_PCT / 100).max(1)
+/// Cap on operator-supplied rotation bases. The defaults are 5_000 packets
+/// and 600 s; the cap leaves several orders of magnitude of headroom while
+/// keeping `base * 20 / 100` and the modulus-based jitter calc clear of
+/// u64 / i64 boundary cases (`r % (2*j+1)`, `(base as i64) + jitter`).
+const ROTATION_BASE_MAX: u64 = 1 << 48;
+
+fn clamp_base(base: u64) -> u64 {
+    base.min(ROTATION_BASE_MAX).max(1)
 }
 
-fn randomized_packet_threshold(base: u64) -> u64 {
+fn jitter_amount(base: u64) -> u64 {
+    // `base` is pre-clamped to [1, 2^48] by `clamp_base`, so `base * 20`
+    // fits comfortably in u64. Saturating mul is still used as belt-and-
+    // suspenders in case future callers bypass the clamp.
+    (base.saturating_mul(ROTATION_JITTER_PCT) / 100).max(1)
+}
+
+/// Apply ±[`ROTATION_JITTER_PCT`]% jitter to `base` using one CSPRNG
+/// draw. Result is clamped at `1` so the returned threshold is never
+/// zero. `base` is pre-clamped to `[1, ROTATION_BASE_MAX]` so the
+/// internal `2 * j + 1` cannot overflow u64.
+fn randomized_threshold(base: u64) -> u64 {
+    let base = clamp_base(base);
     let j = jitter_amount(base);
     let mut rng_bytes = [0u8; 8];
     OsRng.fill_bytes(&mut rng_bytes);
     let r = u64::from_be_bytes(rng_bytes);
+    // 2*j+1 fits in u64 because j ≤ 2^48 * 20 / 100 < 2^52.
     let jitter = (r % (2 * j + 1)) as i64 - j as i64;
     ((base as i64) + jitter).max(1) as u64
 }
 
+#[inline]
 fn randomized_time_threshold(base_secs: u64) -> Duration {
-    let j = jitter_amount(base_secs);
-    let mut rng_bytes = [0u8; 8];
-    OsRng.fill_bytes(&mut rng_bytes);
-    let r = u64::from_be_bytes(rng_bytes);
-    let jitter = (r % (2 * j + 1)) as i64 - j as i64;
-    let secs = ((base_secs as i64) + jitter).max(1) as u64;
-    Duration::from_secs(secs)
+    Duration::from_secs(randomized_threshold(base_secs))
 }
 
 /// Session key state for one direction of traffic.
@@ -151,10 +163,18 @@ pub struct ResponderPending {
 
 impl SessionKeyManager {
     /// Create a session key manager from the Noise handshake hash.
-    /// Derives initial send/recv keys via HKDF, written directly into
-    /// mlock'd heap buffers (no transient stack copies of key material).
-    /// `is_initiator`: true for client (initiator), false for server (responder).
-    pub fn from_handshake_hash(
+    ///
+    /// **Insecure for production.** The Noise handshake hash is part of the
+    /// public transcript — a passive on-path observer can recompute it and
+    /// derive the same session keys. Production code uses
+    /// `from_bootstrap_shared_secret` (the SECRET ephemeral-DH path).
+    ///
+    /// `#[cfg(test)]`-gated so this insecure path cannot be exposed to
+    /// Python, called from other crates, or accidentally re-introduced
+    /// into a non-test build. Kept for internal tests that exercise the
+    /// HKDF/AEAD plumbing without needing to set up a DH peer.
+    #[cfg(test)]
+    pub(crate) fn from_handshake_hash(
         hash: &[u8],
         is_initiator: bool,
         rotation_packets: Option<u64>,
@@ -192,13 +212,31 @@ impl SessionKeyManager {
     /// Unlike `from_handshake_hash` which uses the PUBLIC transcript hash, this
     /// derives keys from SECRET material, preventing passive observation.
     ///
+    /// `shared_secret` must be the full 32-byte X25519 DH output. Shorter inputs
+    /// would yield deterministic / low-entropy session keys (HKDF tolerates any
+    /// IKM length but cannot manufacture entropy that isn't there). Rejecting
+    /// anything other than 32 bytes is defense-in-depth: today the only caller
+    /// is `bootstrap_keys_from_dh`, which produces exactly 32 bytes from the
+    /// X25519 DH; the length check guards against a future Rust caller (or a
+    /// re-introduced Python binding) handing us a wrong-sized buffer.
+    ///
+    /// Crate-private since audit M4: the Python wrapper that exposed this
+    /// directly was removed in favor of `complete_bootstrap`, which performs
+    /// the DH inside Rust so no shared secret ever crosses the FFI.
+    ///
     /// `is_initiator`: true for client (initiator), false for server (responder).
-    pub fn from_bootstrap_shared_secret(
+    pub(crate) fn from_bootstrap_shared_secret(
         shared_secret: &[u8],
         is_initiator: bool,
         rotation_packets: Option<u64>,
         rotation_seconds: Option<u64>,
     ) -> Result<Self, String> {
+        if shared_secret.len() != 32 {
+            return Err(format!(
+                "bootstrap shared_secret must be 32 bytes (X25519 DH output), got {}",
+                shared_secret.len()
+            ));
+        }
         let hk = Hkdf::<Sha256>::new(Some(b"dsm-v2-bootstrap-hkdf"), shared_secret);
 
         let mut key_a = LockedKey32::zeroed()?;
@@ -245,7 +283,7 @@ impl SessionKeyManager {
             grace_start: None,
             packets_sent: 0,
             epoch_start: Instant::now(),
-            packet_threshold: randomized_packet_threshold(packet_base),
+            packet_threshold: randomized_threshold(packet_base),
             time_threshold: randomized_time_threshold(time_base),
             packet_threshold_base: packet_base,
             time_threshold_base_secs: time_base,
@@ -425,7 +463,7 @@ impl SessionKeyManager {
         self.epoch_start = Instant::now();
         // Re-roll thresholds for the new epoch so the next rotation is also
         // unpredictable to a passive observer.
-        self.packet_threshold = randomized_packet_threshold(self.packet_threshold_base);
+        self.packet_threshold = randomized_threshold(self.packet_threshold_base);
         self.time_threshold = randomized_time_threshold(self.time_threshold_base_secs);
 
         Ok(RotationComplete { new_epoch })
@@ -690,6 +728,27 @@ mod tests {
         let (nonce, ct, _) = server.encrypt(b"server after rotation", aad).unwrap();
         let pt = client.decrypt(&nonce, &ct, aad, 1, false).unwrap();
         assert_eq!(pt, b"server after rotation");
+    }
+
+    #[test]
+    fn test_from_bootstrap_shared_secret_requires_32_bytes() {
+        // The PyO3 binding for this constructor was retired in audit M4,
+        // but the length check stays as defense-in-depth for any future
+        // Rust caller. HKDF tolerates any IKM length; rejecting non-32
+        // inputs prevents low-entropy keys from a short or empty buffer.
+        for bad_len in [0usize, 1, 16, 31, 33, 64, 128] {
+            let bad = vec![0u8; bad_len];
+            match SessionKeyManager::from_bootstrap_shared_secret(&bad, true, None, None) {
+                Ok(_) => panic!("len={bad_len} must be rejected"),
+                Err(err) => assert!(
+                    err.contains("32 bytes"),
+                    "len={bad_len}: expected 32-byte rejection, got: {err}"
+                ),
+            }
+        }
+        // Exact 32 bytes must succeed.
+        let good = vec![0xAAu8; 32];
+        assert!(SessionKeyManager::from_bootstrap_shared_secret(&good, true, None, None).is_ok());
     }
 
     #[test]

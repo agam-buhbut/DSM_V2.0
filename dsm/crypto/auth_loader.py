@@ -10,13 +10,19 @@ stays in the role's own runtime module.
 
 from __future__ import annotations
 
+import datetime
 import logging
 from dataclasses import dataclass
 from pathlib import Path
 
 from cryptography import x509
 
+from dsm.core import netaudit
 from dsm.core.config import Config
+from dsm.core.path_security import (
+    InsecureFilePermissionsError,
+    check_user_file_permissions,
+)
 from dsm.crypto.cert import CertError, DeviceCert, load_ca_root
 from dsm.crypto.crl import CRL, CRLError
 
@@ -36,8 +42,22 @@ class CertAuthMaterials:
     crl: CRL | None
 
 
+def _check_perms_or_raise(path: Path, label: str) -> None:
+    """Reject paths that are symlinks, owned by another uid, or
+    group/world readable. Defence-in-depth: cert/CA/CRL files are
+    integrity-critical (substitution = wrong trust anchor / unrevoked
+    cert), even though their content is signed."""
+    try:
+        check_user_file_permissions(path)
+    except InsecureFilePermissionsError as e:
+        raise AuthMaterialsError(
+            f"refusing to load {label} with insecure permissions: {e}"
+        ) from e
+
+
 def _load_cert_der(cert_file: Path) -> bytes:
     """Read a leaf cert from disk in either PEM or DER form, return DER."""
+    _check_perms_or_raise(cert_file, "cert_file")
     raw = cert_file.read_bytes()
     if not raw:
         raise AuthMaterialsError(f"cert file {cert_file} is empty")
@@ -75,11 +95,12 @@ def load_cert_materials(config: Config) -> CertAuthMaterials:
     if not ca_root_file.is_file():
         raise AuthMaterialsError(
             f"ca_root_file missing at {ca_root_file}; copy the pinned "
-            "CA root cert into place per deploy/CA_RUNBOOK.md"
+            "CA root cert into place per deploy/GUIDE.txt §2e"
         )
 
     cert_der = _load_cert_der(cert_file)
 
+    _check_perms_or_raise(ca_root_file, "ca_root_file")
     try:
         ca_root = load_ca_root(ca_root_file)
     except CertError as e:
@@ -88,22 +109,66 @@ def load_cert_materials(config: Config) -> CertAuthMaterials:
         ) from e
 
     crl: CRL | None = None
+    if not config.crl_file:
+        # CRL is optional in config but its absence means revoked certs are
+        # silently accepted. Surface it as a WARNING so misconfigured
+        # deployments don't get a silent revocation-check bypass. A separate
+        # event from "crl_stale" so monitoring can distinguish "no CRL at
+        # all" from "CRL is past its next_update".
+        log.warning(
+            "no crl_file configured; revoked client/server certs will be "
+            "accepted until the operator wires a CRL through per "
+            "deploy/GUIDE.txt §7e"
+        )
+        netaudit.emit("crl_missing")
     if config.crl_file:
         crl_path = Path(config.crl_file)
         if not crl_path.is_file():
             raise AuthMaterialsError(
                 f"crl_file configured but missing at {crl_path}"
             )
+        _check_perms_or_raise(crl_path, "crl_file")
         try:
             # Pass now=None so a stale CRL surfaces via is_stale() rather
-            # than refusing startup outright. The daemon logs the stale
-            # state and continues — operationally a stale CRL is better
-            # than a crashloop.
+            # than refusing startup outright; we apply the freshness
+            # policy below based on config.crl_strict.
             crl = CRL.load(crl_path, ca_root, now=None)
         except CRLError as e:
             raise AuthMaterialsError(
                 f"CRL at {crl_path} failed validation: {e}"
             ) from e
         log.info("loaded CRL crl_number=%s", crl.crl_number)
+        _now = datetime.datetime.now(datetime.timezone.utc)
+        if crl.is_stale(_now):
+            if config.crl_strict:
+                # Fail closed: refuse to start under a stale CRL. The
+                # daemon's revocation surface is incomplete and a
+                # security-paranoid operator opted into hard-fail.
+                netaudit.emit(
+                    "crl_stale",
+                    path=str(crl_path),
+                    next_update=crl.next_update.isoformat(),
+                    action="refused_start",
+                )
+                raise AuthMaterialsError(
+                    f"CRL at {crl_path} is stale (next_update="
+                    f"{crl.next_update.isoformat()}) and crl_strict=true; "
+                    "refusing to start. Refresh the CRL via the CA workflow "
+                    "or set crl_strict=false in config to fall back to a "
+                    "warning."
+                )
+            log.warning(
+                "CRL at %s is stale (next_update=%s); revocation checks "
+                "will miss certs revoked since that date. Set crl_strict=true "
+                "in config to refuse to start under a stale CRL.",
+                crl_path,
+                crl.next_update.isoformat(),
+            )
+            netaudit.emit(
+                "crl_stale",
+                path=str(crl_path),
+                next_update=crl.next_update.isoformat(),
+                action="warned",
+            )
 
     return CertAuthMaterials(cert_der=cert_der, ca_root=ca_root, crl=crl)

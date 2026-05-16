@@ -122,7 +122,14 @@ class NFTablesManager:
         )
 
     def _render(self) -> str:
-        ipaddress.ip_address(self._server_ip)
+        # Determine the nftables IP-family matcher: "ip" for IPv4, "ip6" for
+        # IPv6. The default-drop policy on the chain handles the complementary
+        # AF: if the server is IPv6, the killswitch's `ip6 daddr SERVER`
+        # accept rule fires for legitimate VPN traffic, while IPv4 packets to
+        # the same port hit the chain's `policy drop`. Same logic mirrored for
+        # IPv4 servers.
+        addr = ipaddress.ip_address(self._server_ip)
+        ip_proto = "ip6" if addr.version == 6 else "ip"
         if not re.match(r'^[a-zA-Z0-9_-]{1,15}$', self._tun_name):
             raise ValueError(f"invalid tun_name: {self._tun_name!r}")
         template = TEMPLATE_PATH.read_text()
@@ -131,6 +138,7 @@ class NFTablesManager:
             .replace("{SERVER_IP}", self._server_ip)
             .replace("{SERVER_PORT}", str(int(self._server_port)))
             .replace("{TUN_NAME}", self._tun_name)
+            .replace("{IP_PROTO}", ip_proto)
         )
 
 

@@ -11,11 +11,18 @@ import fcntl
 import json
 import logging
 import os
+import re
 import struct
 import subprocess
 from pathlib import Path
 
 log = logging.getLogger(__name__)
+
+# Linux IFNAMSIZ minus the trailing NUL gives 15 usable characters; the
+# kernel accepts only this character set in interface names. Used to
+# validate keys loaded from the persisted IPv6 state file before they are
+# interpolated into a sysctl path on restore.
+_IFACE_NAME_RE = re.compile(r"^[a-zA-Z0-9_.\-]{1,15}$")
 
 # ioctl constants for TUN/TAP (Linux)
 TUNSETIFF = 0x400454CA
@@ -103,27 +110,76 @@ class TunDevice:
         return state
 
     def _save_ipv6_state(self, state: dict[str, bool]) -> None:
-        """Save IPv6 disable state to persistent JSON file."""
+        """Save IPv6 disable state to persistent JSON file.
+
+        Directory is created at mode 0o700 and the file is written via
+        ``atomic_write`` (tmpfile → fchmod 0o600 → rename) so the JSON
+        never briefly exists at an umask-default mode. ``exist_ok=True``
+        does not chmod an already-existing dir, so we follow up with an
+        explicit ``os.chmod`` to harden against a permissive pre-existing
+        parent.
+        """
+        from dsm.core.atomic_io import atomic_write
         try:
-            self._IPV6_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-            with open(self._IPV6_STATE_PATH, "w") as f:
-                json.dump(state, f)
-            os.chmod(self._IPV6_STATE_PATH, 0o600)
+            parent = self._IPV6_STATE_PATH.parent
+            parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            try:
+                os.chmod(parent, 0o700)
+            except OSError:
+                pass
+            atomic_write(
+                self._IPV6_STATE_PATH,
+                json.dumps(state).encode(),
+                mode=0o600,
+            )
             log.debug("saved IPv6 state to %s", self._IPV6_STATE_PATH)
         except Exception as e:
             log.warning("failed to save IPv6 state: %s", e)
 
     def _restore_ipv6_state(self) -> None:
-        """Restore IPv6 disable state from persistent JSON file."""
+        """Restore IPv6 disable state from persistent JSON file.
+
+        The state file lives in ``/run/dsm/`` (mode 0700, root-owned), so
+        attacker-controlled content is filesystem-gated. Even so, the
+        loaded keys feed directly into a ``sysctl`` path interpolation;
+        we validate each key against the kernel's interface-name charset
+        and each value as a bool before issuing the command. Anything
+        else is dropped with a warning. Defence-in-depth: a corrupt or
+        attacker-substituted state file cannot reach ``sysctl -w`` with
+        an arbitrary key/value string.
+        """
         if not self._IPV6_STATE_PATH.exists():
             log.debug("no IPv6 state file found, skipping restore")
             return
         try:
             with open(self._IPV6_STATE_PATH, "r") as f:
-                state: dict[str, bool] = json.load(f)
+                raw_state: object = json.load(f)
+            if not isinstance(raw_state, dict):
+                log.warning(
+                    "IPv6 state file %s is not a JSON object, skipping",
+                    self._IPV6_STATE_PATH,
+                )
+                self._IPV6_STATE_PATH.unlink(missing_ok=True)
+                return
             cmds: list[list[str]] = []
-            for iface, was_disabled in state.items():
-                value = "1" if was_disabled else "0"
+            for raw_iface, raw_value in raw_state.items():  # type: ignore[reportUnknownVariableType]
+                if not isinstance(raw_iface, str):
+                    log.warning(
+                        "IPv6 state: skipping non-string key %r", raw_iface  # type: ignore[reportUnknownArgumentType]
+                    )
+                    continue
+                iface: str = raw_iface
+                if not _IFACE_NAME_RE.match(iface):
+                    log.warning(
+                        "IPv6 state: skipping invalid iface name %r", iface
+                    )
+                    continue
+                if not isinstance(raw_value, bool):
+                    log.warning(
+                        "IPv6 state: skipping non-bool value for iface %s", iface
+                    )
+                    continue
+                value = "1" if raw_value else "0"
                 cmds.append(["sysctl", "-w", f"net.ipv6.conf.{iface}.disable_ipv6={value}"])
             if cmds:
                 _run_commands(cmds, strict=False)
@@ -201,19 +257,33 @@ class TunDevice:
         """Change the MTU of an already-configured TUN device.
 
         Used by the auto-MTU adapter to track kernel-discovered path MTU
-        drift across the lifetime of a session. Caller is responsible for
-        clamping ``mtu`` to a sensible range — this method just wraps
-        ``ip link set <iface> mtu <n>``.
+        drift across the lifetime of a session. Clamps to
+        ``[MIN_TUN_MTU, MAX_TUN_MTU]`` so a kernel-reported PMTU of 0 (or
+        any other out-of-range value) cannot corrupt the device.
         """
-        _run_commands([["ip", "link", "set", self._name, "mtu", str(mtu)]])
+        from dsm.core.config import MAX_TUN_MTU, MIN_TUN_MTU
+        clamped = max(MIN_TUN_MTU, min(MAX_TUN_MTU, int(mtu)))
+        _run_commands([["ip", "link", "set", self._name, "mtu", str(clamped)]])
 
     def deconfigure(self) -> None:
-        """Remove routing rules and bring down the interface."""
+        """Remove routing rules and bring down the interface.
+
+        Order is leak-safe: bring the link down FIRST so any packet that
+        the kernel still routes to this device gets dropped at the link
+        layer. Then remove the default route in table 100 (so unmarked
+        traffic that still hits the ip rule lookup gets ENETUNREACH from
+        the empty table instead of falling through to eth0). Finally
+        remove the ip rule itself so unmarked traffic uses the main
+        routing table again. Removing the ip rule LAST keeps the brief
+        window between "table 100 empty" and "rule gone" closed — there
+        is no moment where unmarked traffic can leak out via the WAN
+        without the kill switch covering it.
+        """
         _run_commands(
             [
-                ["ip", "rule", "del", "not", "fwmark", str(FWMARK), "table", "100"],
-                ["ip", "route", "del", "default", "dev", self._name, "table", "100"],
                 ["ip", "link", "set", self._name, "down"],
+                ["ip", "route", "del", "default", "dev", self._name, "table", "100"],
+                ["ip", "rule", "del", "not", "fwmark", str(FWMARK), "table", "100"],
             ],
             strict=False,
         )

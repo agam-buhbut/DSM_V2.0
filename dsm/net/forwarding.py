@@ -19,10 +19,13 @@ session, and reverting on teardown.
 from __future__ import annotations
 
 import logging
+import re
 import subprocess
 from pathlib import Path
 
 log = logging.getLogger(__name__)
+
+_TUN_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9_-]{1,15}$")
 
 IP_FORWARD_PATH = Path("/proc/sys/net/ipv4/ip_forward")
 
@@ -96,6 +99,8 @@ class MasqueradeManager:
     TABLE = "dsm_server_nat"
 
     def __init__(self, tun_name: str) -> None:
+        if not _TUN_NAME_PATTERN.match(tun_name):
+            raise ValueError(f"invalid tun_name: {tun_name!r}")
         self._tun_name = tun_name
         self._applied = False
 

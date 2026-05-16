@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from collections.abc import Iterable
-from typing import Any, cast
+from typing import cast
 from urllib.parse import urlparse
 
 import dns.exception
@@ -24,6 +24,8 @@ import dns.rcode
 import dns.rdata
 import dns.rdatatype
 import dns.rdtypes.IN.A
+
+from dsm.net.transport._fwmark import apply_so_mark
 
 log = logging.getLogger(__name__)
 
@@ -80,14 +82,52 @@ class DNSResolver:
         # Min-heap of (expires, hostname) for O(log n) eviction.
         self._cache_heap: list[tuple[float, str]] = []
         self._static_hosts: dict[str, str] = {}
-        self._http_client: Any = None  # lazy httpx.AsyncClient
         self._load_hosts_file()
 
+    # Cap the hosts file read so a 100 MiB symlink-to-some-other-file cannot
+    # blow process memory at startup. 1 MiB fits ~30k entries which is well
+    # beyond any realistic static-hosts use case.
+    _HOSTS_FILE_MAX_BYTES = 1 << 20
+
     def _load_hosts_file(self) -> None:
-        """Load static host mappings from hosts file."""
+        """Load static host mappings from hosts file.
+
+        Refuses to follow symlinks so an attacker who plants a symlink at
+        the hosts-file path cannot redirect reads to (e.g.) /etc/shadow or
+        another sensitive file. Caps the read size to bound memory cost on
+        startup. Parse errors are logged without echoing the offending line
+        — the file might point to attacker content and we don't want
+        unparseable bytes from it landing in the operator's journald.
+        """
         if not self._hosts_file.exists():
             return
-        for line in self._hosts_file.read_text().splitlines():
+        if self._hosts_file.is_symlink():
+            log.warning(
+                "hosts file %s is a symlink; refusing to follow",
+                self._hosts_file,
+            )
+            return
+        try:
+            raw = self._hosts_file.read_bytes()
+        except OSError as e:
+            log.warning("failed to read hosts file %s: %s", self._hosts_file, e)
+            return
+        if len(raw) > self._HOSTS_FILE_MAX_BYTES:
+            log.warning(
+                "hosts file %s exceeds %d bytes; refusing to load",
+                self._hosts_file,
+                self._HOSTS_FILE_MAX_BYTES,
+            )
+            return
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            log.warning(
+                "hosts file %s is not valid UTF-8; refusing to load",
+                self._hosts_file,
+            )
+            return
+        for lineno, line in enumerate(text.splitlines(), start=1):
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
@@ -97,7 +137,11 @@ class DNSResolver:
                 try:
                     ipaddress.ip_address(ip)
                 except ValueError:
-                    log.warning("invalid IP in hosts file, skipping: %s", ip)
+                    log.warning(
+                        "hosts file %s line %d: invalid IP, skipping",
+                        self._hosts_file,
+                        lineno,
+                    )
                     continue
                 self._static_hosts[hostname.lower()] = ip
 
@@ -131,52 +175,101 @@ class DNSResolver:
 
                 if result:
                     return result
-            except Exception:
-                log.debug("DNS provider %s failed for %s", provider, hostname)
+            except Exception as e:
+                # SPKI pin failures surface as PinMismatchError and indicate
+                # a possible MITM (cert chains to a trusted CA but is not
+                # the pinned key). Promote those to WARNING so an operator
+                # tailing journald can see them; lower-severity transient
+                # network errors stay at DEBUG. Import locally to avoid a
+                # top-level dependency cycle with dns_pinning.
+                from dsm.net.dns_pinning import PinMismatchError
+                if isinstance(e, PinMismatchError):
+                    log.warning(
+                        "DNS provider %s SPKI pin MISMATCH for %s — possible MITM; "
+                        "refusing and falling through",
+                        provider, hostname,
+                    )
+                else:
+                    log.debug(
+                        "DNS provider %s failed for %s: %s",
+                        provider, hostname, type(e).__name__,
+                    )
                 continue
 
         log.error("all DNS providers failed for %s", hostname)
         return []
 
-    def _get_http_client(self) -> Any:
-        """Return a reusable httpx.AsyncClient (created on first use)."""
-        if self._http_client is None:
-            import httpx  # type: ignore[import-untyped]
-            from dsm.net.dns_pinning import build_pinned_ssl_context
-            self._http_client = httpx.AsyncClient(  # pyright: ignore[reportUnknownMemberType]
-                verify=build_pinned_ssl_context(),
-                timeout=DOH_TIMEOUT,
-            )
-        return self._http_client  # pyright: ignore[reportUnknownMemberType,reportUnknownVariableType]
-
     async def _resolve_doh(self, url: str, hostname: str) -> list[str]:
-        """DNS-over-HTTPS query (wire format POST) with SPKI pin check."""
+        """DNS-over-HTTPS query with SPKI pin checked BEFORE the qname
+        is sent.
+
+        Uses a manual asyncio TLS + HTTP/1.1 path instead of httpx so the
+        pin is verified on the live SSL object before any application
+        bytes (the DNS query containing the qname) cross the wire. The
+        underlying socket is marked with SO_MARK so the connection
+        bypasses the VPN's ip-rule routing — otherwise the server's own
+        DoH lookup would be routed back through its own TUN device and
+        loop forever (the server's routing table sends all unmarked
+        traffic via mtun0).
+        """
         from dsm.net.dns_pinning import verify_pin_on_ssl_object
 
+        parsed = urlparse(url)
+        if parsed.scheme != "https":
+            raise ValueError(f"invalid DoH provider scheme: {url!r}")
+        host = parsed.hostname
+        port = parsed.port or 443
+        path = parsed.path or "/dns-query"
+        if not host:
+            raise ValueError(f"invalid DoH provider format: {url!r}")
+        if parsed.query:
+            path = f"{path}?{parsed.query}"
+
         query = _build_dns_query(hostname, A_RECORD)
-        client = self._get_http_client()
-        req = client.build_request(
-            "POST",
+
+        reader, writer = await _open_pinned_tls_connection(
+            host,
+            port,
+            self._pins[url],
             url,
-            content=query,
-            headers={
-                "Content-Type": "application/dns-message",
-                "Accept": "application/dns-message",
-            },
+            timeout=DOH_TIMEOUT,
         )
-        # Stream so we can inspect the live TLS object before the stream
-        # is released back to the connection pool.
-        resp = await client.send(req, stream=True)
         try:
-            resp.raise_for_status()
-            network_stream = resp.extensions.get("network_stream")
-            ssl_obj = network_stream.get_extra_info("ssl_object") if network_stream else None
+            # Belt-and-braces: re-verify pin from this end of the
+            # connection after _open_pinned_tls_connection has already
+            # checked it. A second verify here would catch any future
+            # regression where the helper is refactored to defer.
+            ssl_obj = writer.get_extra_info("ssl_object")
             if ssl_obj is None:
                 raise RuntimeError(f"DoH connection to {url} did not negotiate TLS")
             verify_pin_on_ssl_object(ssl_obj, self._pins[url], url)
-            body = await resp.aread()
+
+            # Minimal HTTP/1.1 request. Connection: close so we don't
+            # keep a pool — DNS resolutions are infrequent enough that
+            # pool benefit is small, and each new query gets a fresh
+            # connection with a fresh pin check.
+            request = (
+                f"POST {path} HTTP/1.1\r\n"
+                f"Host: {host}\r\n"
+                f"User-Agent: dsm/1.0\r\n"
+                f"Content-Type: application/dns-message\r\n"
+                f"Accept: application/dns-message\r\n"
+                f"Content-Length: {len(query)}\r\n"
+                f"Connection: close\r\n"
+                f"\r\n"
+            ).encode("ascii") + query
+            writer.write(request)
+            await writer.drain()
+
+            body = await asyncio.wait_for(
+                _read_http_response(reader), timeout=DOH_TIMEOUT,
+            )
         finally:
-            await resp.aclose()
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except (ConnectionError, OSError):
+                pass
 
         addresses, ttl = _parse_dns_response(body)
         if addresses:
@@ -184,9 +277,11 @@ class DNSResolver:
         return addresses
 
     async def _resolve_dot(self, provider: str, hostname: str) -> list[str]:
-        """DNS-over-TLS query with SPKI pin check."""
-        from dsm.net.dns_pinning import build_pinned_ssl_context, verify_pin
-
+        """DNS-over-TLS query with SPKI pin checked before the qname is
+        sent. Underlying socket is SO_MARK'd so the connection bypasses
+        the VPN's ip-rule routing (otherwise the lookup would loop
+        through our own TUN device — see _resolve_doh for the explanation).
+        """
         # Parse "tls://host:port" or "tls://[ipv6]:port"
         parsed = urlparse(provider)
         if parsed.scheme != "tls":
@@ -200,18 +295,14 @@ class DNSResolver:
         # DoT uses TCP with 2-byte length prefix
         framed = struct.pack("!H", len(query)) + query
 
-        ctx = build_pinned_ssl_context()
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(host, port, ssl=ctx),
+        reader, writer = await _open_pinned_tls_connection(
+            host,
+            port,
+            self._pins[provider],
+            provider,
             timeout=DOT_TIMEOUT,
         )
         try:
-            ssl_obj = writer.get_extra_info("ssl_object")
-            der = ssl_obj.getpeercert(binary_form=True) if ssl_obj else None
-            if not der:
-                raise RuntimeError(f"DoT connection to {provider} did not negotiate TLS")
-            verify_pin(der, self._pins[provider], provider)
-
             writer.write(framed)
             await writer.drain()
 
@@ -226,7 +317,10 @@ class DNSResolver:
             return addresses
         finally:
             writer.close()
-            await writer.wait_closed()
+            try:
+                await writer.wait_closed()
+            except (ConnectionError, OSError):
+                pass
 
     def _cache_result(self, hostname: str, addresses: list[str], ttl: int = 300) -> None:
         """Cache DNS results with TTL enforcement."""
@@ -254,10 +348,11 @@ class DNSResolver:
         self._cache_heap.clear()
 
     async def close(self) -> None:
-        """Close the shared HTTP client (if any)."""
-        if self._http_client is not None:
-            await self._http_client.aclose()
-            self._http_client = None
+        """No-op kept for API compatibility. The manual TLS+HTTP/1.1
+        path opens a fresh connection per query (Connection: close), so
+        there is no pool to drain. Server cleanup callers still invoke
+        this for symmetry with the prior httpx-based shape."""
+        return
 
 
 def _build_dns_query(hostname: str, qtype: int) -> bytes:
@@ -300,3 +395,193 @@ def _parse_dns_response(data: bytes) -> tuple[list[str], int]:
                 addresses.append(rdata.address)
 
     return addresses, min_ttl
+
+
+# Hard caps on the manual HTTP/1.1 parser. DoH responses are tiny —
+# headers fit in well under 8 KiB and body is bounded by the DNS reply
+# size (~4 KiB EDNS). Caps prevent a malicious or buggy upstream from
+# forcing unbounded reads.
+_HTTP_HEADER_MAX_BYTES = 8 * 1024
+_HTTP_BODY_MAX_BYTES = 64 * 1024
+
+
+async def _open_pinned_tls_connection(
+    host: str,
+    port: int,
+    expected_pins: list[bytes],
+    provider_label: str,
+    *,
+    timeout: float,
+) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    """Open a TLS connection, verify the SPKI pin, return (reader, writer).
+
+    The underlying TCP socket is marked with SO_MARK so the connection
+    bypasses the VPN's ip-rule routing (otherwise the server's own DNS
+    upstream traffic would loop through its own TUN device). Pin
+    verification happens AFTER the TLS handshake completes but BEFORE
+    any application bytes are written by the caller — if the pin fails,
+    the connection is closed without leaking the application payload
+    (in DoH's case, the qname) to the peer.
+
+    Raises:
+        TimeoutError on connection / handshake timeout.
+        PinMismatchError if the peer cert SPKI does not match any
+            entry in expected_pins (connection is closed before raise).
+        RuntimeError if TLS does not negotiate.
+    """
+    from dsm.net.dns_pinning import build_pinned_ssl_context, verify_pin_on_ssl_object
+
+    # Create the raw TCP socket first so we can set SO_MARK BEFORE
+    # connect. asyncio.open_connection does not expose a pre-connect
+    # socket-config hook, so we drive the connect + start_tls dance
+    # manually using loop.sock_connect on a configured socket and then
+    # asyncio.StreamReader/Writer over a transport.
+    import socket as socket_mod
+
+    loop = asyncio.get_running_loop()
+
+    # Resolve the host (may be IP literal or hostname). getaddrinfo is
+    # blocking, so dispatch via the loop's resolver.
+    infos = await loop.getaddrinfo(
+        host, port, type=socket_mod.SOCK_STREAM,
+    )
+    if not infos:
+        raise OSError(f"no addrinfo for {host}:{port}")
+    family, sock_type, proto, _canon, sockaddr = infos[0]
+
+    sock = socket_mod.socket(family, sock_type, proto)
+    try:
+        sock.setblocking(False)
+        # Mark the socket BEFORE connect so the very first SYN bypasses
+        # the VPN ip-rule routing. Without this the SYN itself could be
+        # routed through mtun0 and cause the loop we're trying to avoid.
+        apply_so_mark(sock)
+        await asyncio.wait_for(
+            loop.sock_connect(sock, sockaddr), timeout=timeout,
+        )
+    except BaseException:
+        sock.close()
+        raise
+
+    ctx = build_pinned_ssl_context()
+    try:
+        # create_connection wraps the existing socket and then we
+        # start_tls. We use open_connection + sock parameter to get
+        # reader/writer.
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(
+                sock=sock,
+                ssl=ctx,
+                server_hostname=host,
+            ),
+            timeout=timeout,
+        )
+    except BaseException:
+        try:
+            sock.close()
+        except OSError:
+            pass
+        raise
+
+    # Pin check happens here, before the caller is handed the writer.
+    # If the pin fails the helper closes the connection and re-raises
+    # the PinMismatchError so the caller never gets a writer they could
+    # accidentally write the qname to.
+    try:
+        ssl_obj = writer.get_extra_info("ssl_object")
+        if ssl_obj is None:
+            raise RuntimeError(
+                f"TLS connection to {provider_label} did not negotiate TLS"
+            )
+        verify_pin_on_ssl_object(ssl_obj, expected_pins, provider_label)
+    except BaseException:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except (ConnectionError, OSError):
+            pass
+        raise
+
+    return reader, writer
+
+
+async def _read_http_response(reader: asyncio.StreamReader) -> bytes:
+    """Read an HTTP/1.1 response and return the body bytes.
+
+    Supports Content-Length-framed and Connection: close-framed
+    responses. Chunked transfer encoding is rejected — DoH servers do
+    not use chunked for /dns-query responses, and supporting it would
+    add a lot of attack surface for no benefit.
+
+    Raises:
+        RuntimeError on malformed status, missing required headers, or
+            size cap violation.
+    """
+    # Status line + headers terminated by \r\n\r\n.
+    header_blob = await reader.readuntil(b"\r\n\r\n")
+    if len(header_blob) > _HTTP_HEADER_MAX_BYTES:
+        raise RuntimeError(
+            f"HTTP response headers exceed cap ({_HTTP_HEADER_MAX_BYTES} B)"
+        )
+
+    # Parse just enough: status line + headers we care about. Case-
+    # insensitive header lookup.
+    head_text = header_blob.decode("ascii", errors="replace")
+    lines = head_text.split("\r\n")
+    if not lines:
+        raise RuntimeError("HTTP response empty")
+    status_line = lines[0]
+    parts = status_line.split(" ", 2)
+    if len(parts) < 2 or not parts[0].startswith("HTTP/1."):
+        raise RuntimeError(f"HTTP malformed status: {status_line!r}")
+    try:
+        status = int(parts[1])
+    except ValueError as e:
+        raise RuntimeError(f"HTTP malformed status code: {parts[1]!r}") from e
+    if status != 200:
+        raise RuntimeError(f"HTTP status {status} for DoH request")
+
+    headers: dict[str, str] = {}
+    for line in lines[1:]:
+        if not line:
+            continue
+        if ":" not in line:
+            continue
+        name, _, value = line.partition(":")
+        headers[name.strip().lower()] = value.strip()
+
+    transfer = headers.get("transfer-encoding", "").lower()
+    if transfer and transfer != "identity":
+        raise RuntimeError(
+            f"HTTP transfer-encoding {transfer!r} not supported"
+        )
+
+    cl = headers.get("content-length")
+    if cl is not None:
+        try:
+            length = int(cl)
+        except ValueError as e:
+            raise RuntimeError(f"HTTP malformed content-length {cl!r}") from e
+        if length < 0 or length > _HTTP_BODY_MAX_BYTES:
+            raise RuntimeError(
+                f"HTTP content-length {length} out of bounds (max {_HTTP_BODY_MAX_BYTES})"
+            )
+        body = await reader.readexactly(length)
+        return body
+
+    # No content-length: read until EOF (Connection: close framing).
+    # Read in chunks with a hard cap to defend against an unbounded
+    # peer.
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await reader.read(4096)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+        if total > _HTTP_BODY_MAX_BYTES:
+            raise RuntimeError(
+                f"HTTP body exceeds cap ({_HTTP_BODY_MAX_BYTES} B)"
+            )
+    return b"".join(chunks)

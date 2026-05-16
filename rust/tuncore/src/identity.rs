@@ -1,52 +1,46 @@
+use crate::passphrase_store::{self, ARGON2_SALT_LEN, XCHACHA_NONCE_LEN};
 use crate::secure_memory::LockedKey32;
-use argon2::{Argon2, Algorithm, Version, Params};
-use chacha20poly1305::{
-    aead::{Aead, KeyInit, Payload},
-    XChaCha20Poly1305, XNonce,
-};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac as _};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use sha2::Sha256;
 use x25519_dalek::{PublicKey, StaticSecret};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 type HmacSha256 = Hmac<Sha256>;
 
-const ARGON2_SALT_LEN: usize = 32;
-const ARGON2_MEM_COST_KIB: u32 = 524_288; // 512 MiB
-const ARGON2_TIME_COST: u32 = 4;
-const ARGON2_PARALLELISM: u32 = 2;
-const XCHACHA_NONCE_LEN: usize = 24;
+/// X25519 scalar length — used in `decrypt_from_store`'s up-front
+/// blob-length check so a too-short blob fails with "blob too short"
+/// rather than going through Argon2 + AEAD only to produce a length-
+/// mismatch error at the end.
+const SECRET_LEN: usize = 32;
 
-/// Derive a passphrase-encryption key via Argon2id into a locked 32-byte heap
-/// buffer. Expansion writes directly into the heap, so no transient copy of
-/// the derived key ever lands on the stack.
-fn derive_argon2_key(passphrase: &[u8], salt: &[u8]) -> Result<LockedKey32, String> {
-    let mut derived = LockedKey32::zeroed()?;
-    let params = Params::new(
-        ARGON2_MEM_COST_KIB,
-        ARGON2_TIME_COST,
-        ARGON2_PARALLELISM,
-        Some(32),
-    )
-    .map_err(|e| format!("argon2 params: {e}"))?;
-
-    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-    argon2
-        .hash_password_into(passphrase, salt, derived.as_mut())
-        .map_err(|e| format!("argon2 hash: {e}"))?;
-
-    Ok(derived)
-}
-
-/// Build AAD for identity store encryption: salt || nonce.
-fn build_store_aad(salt: &[u8], nonce: &[u8]) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(salt.len() + nonce.len());
-    aad.extend_from_slice(salt);
-    aad.extend_from_slice(nonce);
-    aad
+/// Compute the X25519 public key for a static secret living in mlock'd
+/// memory.
+///
+/// **Unavoidable stack copy.** `x25519_dalek::StaticSecret::from` consumes
+/// `[u8; 32]` by value (no `&[u8; 32]` constructor is exposed in
+/// x25519-dalek 2.x), so dereferencing `secret.as_array()` materializes
+/// a transient stack copy of the scalar before `StaticSecret` copies it
+/// again into its own (clamped) internal storage. Both intermediate
+/// copies are scrubbed:
+///   * `static_secret` impls `ZeroizeOnDrop`, so its internal copy is
+///     wiped at end-of-scope below.
+///   * the unnamed `*secret.as_array()` temporary lives on this function's
+///     stack frame only; the next caller's stack frame overwrites it.
+///
+/// A leak window exists between function return and the next stack-frame
+/// reuse where a debugger / `/proc/PID/mem` reader could still observe
+/// the bytes. The wrapping daemon hardens against this via
+/// `PR_SET_DUMPABLE=0` + `PR_SET_NO_NEW_PRIVS=1` (see
+/// `secure_memory::harden_process`), and the temporary is short-lived
+/// (single function call). Tighter elimination would require a
+/// `StaticSecret::from(&[u8; 32])` upstream.
+fn derive_static_pub(secret: &LockedKey32) -> [u8; 32] {
+    let static_secret = StaticSecret::from(*secret.as_array());
+    *PublicKey::from(&static_secret).as_bytes()
+    // `static_secret` drops here — ZeroizeOnDrop scrubs its internal copy.
 }
 
 /// Static X25519 identity keypair for Noise XX handshake.
@@ -62,26 +56,15 @@ impl IdentityKeyPair {
     pub fn generate() -> Result<Self, String> {
         let mut secret = LockedKey32::zeroed()?;
         OsRng.fill_bytes(secret.as_mut());
-
-        let static_secret = StaticSecret::from(*secret.as_array());
-        let public = PublicKey::from(&static_secret);
-
-        Ok(Self {
-            secret,
-            public: *public.as_bytes(),
-        })
+        let public = derive_static_pub(&secret);
+        Ok(Self { secret, public })
     }
 
     /// Build from a pre-populated `LockedKey32` (e.g. after decryption from
     /// disk). Derives the public key.
     fn from_locked(secret: LockedKey32) -> Result<Self, String> {
-        let static_secret = StaticSecret::from(*secret.as_array());
-        let public = PublicKey::from(&static_secret);
-
-        Ok(Self {
-            secret,
-            public: *public.as_bytes(),
-        })
+        let public = derive_static_pub(&secret);
+        Ok(Self { secret, public })
     }
 
     pub fn public_key(&self) -> &[u8; 32] {
@@ -96,8 +79,13 @@ impl IdentityKeyPair {
     /// Overwrite the secret key with zeros. Safe to call multiple times;
     /// the keypair is unusable afterwards. The public key is not sensitive
     /// (derivable from secret only, never secret itself) so it is left intact.
+    ///
+    /// Uses [`Zeroize::zeroize`] for the volatile, dead-store-elimination-
+    /// proof write — a plain `.fill(0)` would be a regular store that an
+    /// optimizing compiler is in principle free to elide if it could prove
+    /// the buffer was never read again.
     pub fn zeroize(&mut self) {
-        self.secret.as_mut().fill(0);
+        self.secret.as_mut().zeroize();
     }
 
     /// Compute HMAC-SHA256 over `data` using a key derived from this
@@ -122,71 +110,31 @@ impl IdentityKeyPair {
         Ok(out)
     }
 
-    /// Encrypt the keypair to a blob using a passphrase (Argon2id + XChaCha20-Poly1305).
-    /// Format: salt(32) || nonce(24) || ciphertext+tag
+    /// Encrypt the keypair to a blob using a passphrase
+    /// (Argon2id + XChaCha20-Poly1305).
+    ///
+    /// Format: `salt(32) || nonce(24) || ciphertext+tag`. The actual
+    /// sealing is delegated to [`passphrase_store::seal`] so the wire
+    /// format is identical to the attest-store wire format.
     pub fn encrypt_to_store(&self, passphrase: &[u8]) -> Result<Vec<u8>, String> {
-        if passphrase.is_empty() {
-            return Err("passphrase must not be empty".into());
-        }
-
-        let mut salt = [0u8; ARGON2_SALT_LEN];
-        OsRng.fill_bytes(&mut salt);
-
-        let derived = derive_argon2_key(passphrase, &salt)?;
-
-        let cipher = XChaCha20Poly1305::new_from_slice(derived.as_array())
-            .map_err(|e| format!("cipher init: {e}"))?;
-
-        let mut nonce_bytes = [0u8; XCHACHA_NONCE_LEN];
-        OsRng.fill_bytes(&mut nonce_bytes);
-        let nonce = XNonce::from_slice(&nonce_bytes);
-
-        let aad = build_store_aad(&salt, &nonce_bytes);
-
-        let ciphertext = cipher
-            .encrypt(nonce, Payload { msg: self.secret.as_array(), aad: &aad })
-            .map_err(|e| format!("encrypt: {e}"))?;
-
-        let mut blob = Vec::with_capacity(ARGON2_SALT_LEN + XCHACHA_NONCE_LEN + ciphertext.len());
-        blob.extend_from_slice(&salt);
-        blob.extend_from_slice(&nonce_bytes);
-        blob.extend_from_slice(&ciphertext);
-
-        Ok(blob)
+        passphrase_store::seal(self.secret.as_array(), passphrase)
     }
 
     /// Decrypt a keypair from a stored blob using a passphrase.
     pub fn decrypt_from_store(blob: &[u8], passphrase: &[u8]) -> Result<Self, String> {
-        let min_len = ARGON2_SALT_LEN + XCHACHA_NONCE_LEN + 32 + 16; // key + tag
+        // Up-front blob length check tied to the *expected* plaintext
+        // (32-byte scalar) so the failure message is the precise "blob
+        // too short" rather than a generic AEAD failure for blobs whose
+        // tag-shaped tail happens to authenticate to a too-short
+        // plaintext. The shared helper also rejects shorter blobs but at
+        // the looser `salt + nonce + tag` minimum.
+        let min_len = ARGON2_SALT_LEN + XCHACHA_NONCE_LEN + SECRET_LEN + passphrase_store::TAG_LEN;
         if blob.len() < min_len {
             return Err("blob too short".into());
         }
-        if passphrase.is_empty() {
-            return Err("passphrase must not be empty".into());
-        }
 
-        let salt = &blob[..ARGON2_SALT_LEN];
-        let nonce_bytes = &blob[ARGON2_SALT_LEN..ARGON2_SALT_LEN + XCHACHA_NONCE_LEN];
-        let ciphertext = &blob[ARGON2_SALT_LEN + XCHACHA_NONCE_LEN..];
-
-        let derived = derive_argon2_key(passphrase, salt)?;
-
-        let cipher = XChaCha20Poly1305::new_from_slice(derived.as_array())
-            .map_err(|e| format!("cipher init: {e}"))?;
-
-        let nonce = XNonce::from_slice(nonce_bytes);
-
-        let aad = build_store_aad(salt, nonce_bytes);
-
-        // AEAD decrypt returns a heap Vec<u8> — wrap in Zeroizing so the
-        // plaintext copy is scrubbed after we move it into the locked buffer.
-        let plaintext = Zeroizing::new(
-            cipher
-                .decrypt(nonce, Payload { msg: ciphertext, aad: &aad })
-                .map_err(|_| "decryption failed: wrong passphrase or corrupted data".to_string())?,
-        );
-
-        if plaintext.len() != 32 {
+        let plaintext = passphrase_store::open(blob, passphrase)?;
+        if plaintext.len() != SECRET_LEN {
             return Err("decrypted key has wrong length".into());
         }
 

@@ -5,8 +5,10 @@ pub mod device_attest_soft;
 pub mod identity;
 pub mod nonce;
 pub mod noise_xx;
+pub mod passphrase_store;
 pub mod replay_window;
 pub mod secure_memory;
+pub mod secure_noise;
 pub mod session_keys;
 
 use pyo3::prelude::*;
@@ -28,24 +30,27 @@ fn py_err(e: impl std::fmt::Display) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
 }
 
+/// Copy a Python byte slice into a fixed-size array, returning an error
+/// whose message names the expected field. `desc` is the human-readable
+/// field name (e.g. "nonce", "public key"); it appears in the Python
+/// exception so misuse from Python prints the precise mismatch.
+fn fixed_from_slice<const N: usize>(data: &[u8], desc: &str) -> PyResult<[u8; N]> {
+    if data.len() != N {
+        return Err(py_err(format!("{desc} must be {N} bytes")));
+    }
+    let mut arr = [0u8; N];
+    arr.copy_from_slice(data);
+    Ok(arr)
+}
+
 /// Parse a Python byte slice into a fixed 12-byte nonce array.
 fn nonce_from_slice(nonce: &[u8]) -> PyResult<[u8; 12]> {
-    if nonce.len() != 12 {
-        return Err(py_err("nonce must be 12 bytes"));
-    }
-    let mut n = [0u8; 12];
-    n.copy_from_slice(nonce);
-    Ok(n)
+    fixed_from_slice::<12>(nonce, "nonce")
 }
 
 /// Parse a Python byte slice into a fixed 32-byte public key array.
 fn pub_key_from_slice(data: &[u8]) -> PyResult<[u8; 32]> {
-    if data.len() != 32 {
-        return Err(py_err("public key must be 32 bytes"));
-    }
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(data);
-    Ok(arr)
+    fixed_from_slice::<32>(data, "public key")
 }
 
 /// Python-visible identity keypair.
@@ -324,59 +329,18 @@ struct PySessionKeyManager {
 
 #[pymethods]
 impl PySessionKeyManager {
-    /// Create a session key manager from the Noise handshake hash.
-    /// The initial epoch is derived from the handshake hash (same on both
-    /// peers) to avoid the deterministic "start at 1" linkability.
-    /// `rotation_packets` / `rotation_seconds` override the default base
-    /// thresholds (5000 packets / 600 s); jitter is always applied.
-    #[staticmethod]
-    #[pyo3(signature = (hash, is_initiator, rotation_packets=None, rotation_seconds=None))]
-    fn from_handshake_hash(
-        hash: &[u8],
-        is_initiator: bool,
-        rotation_packets: Option<u64>,
-        rotation_seconds: Option<u64>,
-    ) -> PyResult<Self> {
-        let inner = session_keys::SessionKeyManager::from_handshake_hash(
-            hash,
-            is_initiator,
-            rotation_packets,
-            rotation_seconds,
-        )
-        .map_err(py_err)?;
-        Ok(Self {
-            inner,
-            pending_rotation: None,
-            pending_responder_rotation: None,
-        })
-    }
-
-    /// Create a session key manager from a secret shared value (e.g., bootstrap ephemeral DH).
-    /// Unlike from_handshake_hash which uses the PUBLIC transcript hash, this derives
-    /// keys from SECRET material, preventing passive observation.
-    /// `rotation_packets` / `rotation_seconds` override the default base
-    /// thresholds (5000 packets / 600 s); jitter is always applied.
-    #[staticmethod]
-    #[pyo3(signature = (shared_secret, is_initiator, rotation_packets=None, rotation_seconds=None))]
-    fn from_bootstrap_shared_secret(
-        shared_secret: &[u8],
-        is_initiator: bool,
-        rotation_packets: Option<u64>,
-        rotation_seconds: Option<u64>,
-    ) -> PyResult<Self> {
-        let inner = session_keys::SessionKeyManager::from_bootstrap_shared_secret(
-            shared_secret,
-            is_initiator,
-            rotation_packets,
-            rotation_seconds,
-        )
-        .map_err(py_err)?;
-        Ok(Self {
-            inner,
-            pending_rotation: None,
-            pending_responder_rotation: None,
-        })
-    }
+    // Audit M2 / M4: every former Python constructor for SessionKeyManager
+    // has been retired in favor of `complete_bootstrap`.
+    //
+    //   * `from_handshake_hash` derived keys from the PUBLIC Noise transcript
+    //     hash — a passive observer could recompute it.
+    //   * `from_bootstrap_shared_secret` accepted a SECRET shared-secret
+    //     through Python `bytes`, which cannot be reliably zeroed.
+    //
+    // The underlying Rust functions still exist (gated `#[cfg(test)]` and
+    // crate-private respectively) for unit-test plumbing; only the safe
+    // path — `BootstrapEphemeral` + `complete_bootstrap` — is reachable
+    // from Python.
 
     /// Encrypt a packet. Returns (nonce, ciphertext, epoch).
     fn encrypt(&mut self, plaintext: &[u8], aad: &[u8]) -> PyResult<(Vec<u8>, Vec<u8>, u32)> {
@@ -583,12 +547,21 @@ impl PyAttestKey {
         Ok(Self { inner })
     }
 
-    /// PKCS#8 DER export of the private key. Soft backend only — used by
-    /// the `dsm enroll --csr-out` flow to hand the key to the
-    /// ``cryptography`` library's CSR builder. TPM / Keystore backends
-    /// will not expose this method; they sign the CSR via platform APIs.
-    fn private_pkcs8_der(&self) -> PyResult<Vec<u8>> {
-        self.inner.private_pkcs8_der().map_err(py_err)
+    /// Build a CA-ready DER CSR for this attest key. CN is the device's
+    /// subject CommonName; `noise_static_pub` is the 32-byte X25519 Noise
+    /// static that goes into the critical `id-dsm-noiseStaticBinding`
+    /// extension. The PKCS#8 export of the signing scalar stays inside
+    /// Rust (audit M4) — no key bytes cross the FFI boundary.
+    fn build_csr(&self, cn: &str, noise_static_pub: &[u8]) -> PyResult<Vec<u8>> {
+        self.inner.build_csr(cn, noise_static_pub).map_err(py_err)
+    }
+
+    /// Zeroize the attest signing scalar in place. After this call the
+    /// instance is unusable; callers MUST drop the wrapping reference
+    /// immediately. Mirrors `IdentityKeyPair.zeroize`. Safe to call
+    /// multiple times; idempotent.
+    fn zeroize(&mut self) {
+        self.inner.zeroize();
     }
 }
 
@@ -604,74 +577,85 @@ fn harden_process() -> PyResult<()> {
     secure_memory::harden_process().map_err(py_err)
 }
 
-/// Generate a fresh ephemeral X25519 keypair for bootstrap.
-/// Returns (secret_bytes, public_bytes) where secret must be kept secret.
-/// Caller is responsible for securely handling secret_bytes.
-#[pyfunction]
-fn generate_ephemeral() -> PyResult<(Vec<u8>, Vec<u8>)> {
-    use x25519_dalek::{PublicKey, StaticSecret};
-    use rand::RngCore;
-    use zeroize::Zeroize;
+// Audit M4: `generate_ephemeral` and `bootstrap_session_from_dh` (the older
+// "raw-bytes" bootstrap pair) were dropped from the Python surface. Both
+// moved the 32-byte X25519 scalar through a Python `bytes` object that
+// CPython cannot reliably zero on garbage collection — leaving the secret
+// scalar in process memory for the lifetime of the bytes object and any
+// of its later allocator-slot reuses. The surviving path —
+// `BootstrapEphemeral` + `complete_bootstrap` — keeps the secret in an
+// mlock'd, zeroize-on-drop Rust heap buffer and consumes it in place.
 
-    let mut secret_bytes = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut secret_bytes);
-    let secret = StaticSecret::from(secret_bytes);
-    let public = PublicKey::from(&secret);
-
-    let out_secret = secret_bytes.to_vec();
-    secret_bytes.zeroize();
-    Ok((out_secret, public.as_bytes().to_vec()))
+/// Opaque handle holding a fresh X25519 ephemeral keypair for bootstrap DH.
+///
+/// The secret scalar lives in an mlock'd, zeroize-on-drop heap buffer and
+/// never crosses the FFI boundary. Python sees only the matching public key.
+/// `complete_bootstrap` consumes the handle and derives session keys without
+/// ever copying the secret into Python-managed memory.
+#[pyclass(name = "BootstrapEphemeral")]
+struct PyBootstrapEphemeral {
+    secret: Option<secure_memory::LockedKey32>,
+    pub_bytes: [u8; 32],
 }
 
-/// Compute session keys from bootstrap ephemeral DH.
-/// This derives keys from the SECRET shared secret, not the PUBLIC handshake hash.
+#[pymethods]
+impl PyBootstrapEphemeral {
+    /// Generate a fresh X25519 ephemeral keypair. The secret is written
+    /// directly into an mlock'd heap buffer; only the public key is
+    /// reachable from Python.
+    #[staticmethod]
+    fn generate() -> PyResult<Self> {
+        use x25519_dalek::{PublicKey, StaticSecret};
+        let secret = session_keys::gen_ephemeral_secret().map_err(py_err)?;
+        let static_secret = StaticSecret::from(*secret.as_array());
+        let pub_bytes = *PublicKey::from(&static_secret).as_bytes();
+        Ok(Self { secret: Some(secret), pub_bytes })
+    }
+
+    /// Return the 32-byte X25519 public key for transmission on the wire.
+    #[getter]
+    fn public_key_bytes(&self) -> Vec<u8> {
+        self.pub_bytes.to_vec()
+    }
+
+    /// True until ``complete_bootstrap`` consumes the secret.
+    #[getter]
+    fn is_live(&self) -> bool {
+        self.secret.is_some()
+    }
+}
+
+/// Derive session keys from a `BootstrapEphemeral` and the peer's public key.
 ///
-/// Args:
-///     our_secret: 32-byte ephemeral secret (must be protected)
-///     peer_public: 32-byte peer ephemeral public key
-///     is_initiator: true for client, false for server
-///     rotation_packets: optional override for the per-epoch packet
-///         rotation base (default 5000). Jitter is always applied.
-///     rotation_seconds: optional override for the per-epoch time
-///         rotation base (default 600s).
-///
-/// Returns: SessionKeyManager instance
+/// Consumes the ephemeral's secret in place (so a second call returns an error).
+/// The X25519 DH and the subsequent HKDF expansion happen entirely in Rust;
+/// the secret scalar never crosses the FFI boundary. This is the preferred
+/// path; `bootstrap_session_from_dh` is retained for compatibility but copies
+/// the secret through a Python `bytes` object.
 #[pyfunction]
-#[pyo3(signature = (our_secret, peer_public, is_initiator, rotation_packets=None, rotation_seconds=None))]
-fn bootstrap_session_from_dh(
-    our_secret: &[u8],
+#[pyo3(signature = (ephemeral, peer_public, is_initiator,
+                    rotation_packets=None, rotation_seconds=None))]
+fn complete_bootstrap(
+    ephemeral: &mut PyBootstrapEphemeral,
     peer_public: &[u8],
     is_initiator: bool,
     rotation_packets: Option<u64>,
     rotation_seconds: Option<u64>,
 ) -> PyResult<PySessionKeyManager> {
-    use zeroize::Zeroize;
-
-    if our_secret.len() != 32 {
-        return Err(py_err("secret must be 32 bytes"));
-    }
-    if peer_public.len() != 32 {
-        return Err(py_err("peer public must be 32 bytes"));
-    }
-
-    let mut secret_arr = [0u8; 32];
-    secret_arr.copy_from_slice(our_secret);
-    let mut public_arr = [0u8; 32];
-    public_arr.copy_from_slice(peer_public);
-
-    let result = session_keys::bootstrap_keys_from_dh(
-        &secret_arr,
-        &public_arr,
+    let secret = ephemeral
+        .secret
+        .take()
+        .ok_or_else(|| py_err("BootstrapEphemeral already consumed"))?;
+    let peer = pub_key_from_slice(peer_public)?;
+    let inner = session_keys::bootstrap_keys_from_dh(
+        secret.as_array(),
+        &peer,
         is_initiator,
         rotation_packets,
         rotation_seconds,
-    );
-
-    secret_arr.zeroize();
-    public_arr.zeroize();
-
-    let inner = result.map_err(py_err)?;
-
+    )
+    .map_err(py_err)?;
+    // `secret` drops here: munlock + zeroize via LockedKey32::Drop.
     Ok(PySessionKeyManager {
         inner,
         pending_rotation: None,
@@ -690,10 +674,10 @@ fn tuncore(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PySessionKeyManager>()?;
     m.add_class::<PyAesKey>()?;
     m.add_class::<PyAttestKey>()?;
+    m.add_class::<PyBootstrapEphemeral>()?;
     m.add_function(wrap_pyfunction!(disable_core_dumps, m)?)?;
     m.add_function(wrap_pyfunction!(harden_process, m)?)?;
-    m.add_function(wrap_pyfunction!(generate_ephemeral, m)?)?;
-    m.add_function(wrap_pyfunction!(bootstrap_session_from_dh, m)?)?;
+    m.add_function(wrap_pyfunction!(complete_bootstrap, m)?)?;
     m.add("HANDSHAKE_ATTEST_PAYLOAD_SIZE", noise_xx::HANDSHAKE_ATTEST_PAYLOAD_SIZE)?;
     Ok(())
 }

@@ -10,6 +10,16 @@ from pathlib import Path
 
 from cryptography.x509.oid import ExtendedKeyUsageOID
 
+# Backoff parameters for failed handshake retries. UDP retries cycle very
+# fast because there's no kernel-side rate limit on bad packets reaching
+# the handshake coroutine; TCP retries are gated by the kernel's accept
+# queue but a malicious peer racing the listen() can still burn slots in
+# a tight loop. A small jittered sleep between retries gives legitimate
+# clients a chance to win against a flood.
+_HANDSHAKE_RETRY_BACKOFF_BASE = 0.5  # seconds
+_HANDSHAKE_RETRY_BACKOFF_MAX = 5.0   # seconds
+_HANDSHAKE_RETRY_BACKOFF_JITTER = 0.5  # ±this fraction of base
+
 from dsm.core import netaudit
 from dsm.core.config import Config
 from dsm.core.fsm import SessionFSM, State
@@ -93,7 +103,11 @@ async def run_server(
         passphrase_env_file=passphrase_env_file,
     )
     try:
-        keystore.load_or_generate_with_passphrase(passphrase)
+        try:
+            keystore.load_with_passphrase(passphrase)
+        except RuntimeError as e:
+            log.error("identity store: %s", e)
+            return
         try:
             attest_store.load_with_passphrase(passphrase)
         except RuntimeError as e:
@@ -122,23 +136,7 @@ async def run_server(
         tcp_ts.apply()
         stack.callback(tcp_ts.remove)
 
-        # Transport
-        if config.transport == "udp":
-            transport = UDPTransport()
-            await transport.bind(
-                local_port=config.listen_port,
-                pmtu_discover=config.pmtu_discover,
-            )
-        else:
-            transport = TCPTransport()
-            await transport.listen(port=config.listen_port)
-
-        stack.push_async_callback(transport.aclose)
-
-        log.info("server listening on port %d (%s)", config.listen_port, config.transport)
-
-        # Wait for handshake — cert chain + binding-extension match +
-        # CN allowlist + (optional) CRL all run inside server_handshake.
+        # Handshake error imports surfaced early so the retry loop can name them.
         from dsm.crypto.handshake import (
             CertAuthError,
             CertRevokedError,
@@ -147,55 +145,121 @@ async def run_server(
             server_handshake,
         )
 
+        # Shutdown event — set up BEFORE the handshake loop so a SIGTERM
+        # arriving while we're waiting for msg1 unblocks the loop instead of
+        # being deferred until after a successful client connects.
+        shutdown = asyncio.Event()
+        setup_signal_handlers(shutdown)
+
+        # Transport: UDP transport lives for the whole run; TCP requires a
+        # fresh transport per handshake attempt because listen() accepts one
+        # connection and closes its server socket. The TCP transport is only
+        # registered with the AsyncExitStack after a successful handshake;
+        # failed-attempt transports are closed manually inside the loop.
+        transport_obj: UDPTransport | TCPTransport | None
+        if config.transport == "udp":
+            transport_obj = UDPTransport()
+            await transport_obj.bind(
+                local_port=config.listen_port,
+                pmtu_discover=config.pmtu_discover,
+            )
+            stack.push_async_callback(transport_obj.aclose)
+            log.info("server listening on UDP port %d", config.listen_port)
+        else:
+            transport_obj = None
+
         fsm.transition(State.CONNECTING)
-        fsm.transition(State.HANDSHAKING)
+        session_keys = None
+        client_pub: bytes | None = None
+        consecutive_failures = 0
+        while not shutdown.is_set():
+            # For TCP, re-create the listening transport on each attempt
+            # (and close any previous failed-attempt transport).
+            if config.transport == "tcp":
+                if transport_obj is not None:
+                    await transport_obj.aclose()
+                transport_obj = TCPTransport()
+                await transport_obj.listen(port=config.listen_port)
+                log.info("server listening on TCP port %d", config.listen_port)
 
-        try:
-            session_keys, client_pub = await server_handshake(
-                transport,
-                keystore.identity,
-                attest_key=attest_store.attest_key,
-                cert_der=materials.cert_der,
-                ca_root=materials.ca_root,
-                cn_allowlist=cn_allowlist,
-                crl=materials.crl,
-                required_client_eku=ExtendedKeyUsageOID.CLIENT_AUTH,
-                rotation_packets=config.rotation_packets,
-                rotation_seconds=config.rotation_seconds,
-            )
-        except CNNotAllowedError as e:
-            log.warning("client CN not in allowlist: %s", e)
-            netaudit.emit(
-                "handshake_end", role="server", outcome="failed",
-                error="CNNotAllowedError", message=str(e),
-            )
-            fsm.transition(State.TEARDOWN)
-            return
-        except CertRevokedError as e:
-            log.warning("client cert revoked: %s", e)
-            netaudit.emit(
-                "handshake_end", role="server", outcome="failed",
-                error="CertRevokedError", message=str(e),
-            )
-            fsm.transition(State.TEARDOWN)
-            return
-        except CertAuthError as e:
-            log.warning("client cert auth failed: %s", e)
-            netaudit.emit(
-                "handshake_end", role="server", outcome="failed",
-                error="CertAuthError", message=str(e),
-            )
-            fsm.transition(State.TEARDOWN)
-            return
-        except HandshakeError as e:
-            log.error("handshake failed: %s", e)
-            netaudit.emit(
-                "handshake_end", role="server", outcome="failed",
-                error="HandshakeError", message=str(e),
-            )
-            fsm.transition(State.TEARDOWN)
+            fsm.transition(State.HANDSHAKING)
+            if transport_obj is None:
+                # Unreachable in practice — UDP path sets it once before the
+                # loop, TCP path sets it on every iteration above. Explicit
+                # check keeps the type narrowing for the handshake call.
+                raise RuntimeError("internal: handshake reached with no transport")
+            try:
+                session_keys, client_pub = await server_handshake(
+                    transport_obj,
+                    keystore.identity,
+                    attest_key=attest_store.attest_key,
+                    cert_der=materials.cert_der,
+                    ca_root=materials.ca_root,
+                    cn_allowlist=cn_allowlist,
+                    crl=materials.crl,
+                    required_client_eku=ExtendedKeyUsageOID.CLIENT_AUTH,
+                    rotation_packets=config.rotation_packets,
+                    rotation_seconds=config.rotation_seconds,
+                )
+                break  # success → fall through to data path
+            except (
+                CNNotAllowedError, CertRevokedError, CertAuthError, HandshakeError,
+            ) as e:
+                err_name = type(e).__name__
+                if isinstance(e, (CNNotAllowedError, CertRevokedError, CertAuthError)):
+                    log.warning("handshake rejected (%s): %s — waiting for next client", err_name, e)
+                else:
+                    log.info("handshake failed (%s): %s — waiting for next client", err_name, e)
+                netaudit.emit(
+                    "handshake_end", role="server", outcome="failed",
+                    error=err_name, message=str(e),
+                )
+                # Reset FSM for the next attempt: HANDSHAKING → TEARDOWN → IDLE → CONNECTING.
+                fsm.transition(State.TEARDOWN)
+                fsm.transition(State.IDLE)
+                fsm.transition(State.CONNECTING)
+
+                # Backoff before the next attempt. Doubles per failure up
+                # to _HANDSHAKE_RETRY_BACKOFF_MAX, with ±50% jitter so a
+                # flood of bad handshakes does not produce a deterministic
+                # retry cadence an attacker can synchronize to.
+                consecutive_failures += 1
+                base = min(
+                    _HANDSHAKE_RETRY_BACKOFF_BASE
+                    * (2 ** min(consecutive_failures - 1, 4)),
+                    _HANDSHAKE_RETRY_BACKOFF_MAX,
+                )
+                # Use the same CSPRNG-backed helper the shaper uses for
+                # jitter, then clamp. Imported lazily to avoid a top-level
+                # dependency on dsm.core.rand from server.py.
+                from dsm.core.rand import csprng_float
+                jitter = (csprng_float() - 0.5) * _HANDSHAKE_RETRY_BACKOFF_JITTER * base
+                delay = max(0.0, base + jitter)
+                try:
+                    await asyncio.wait_for(shutdown.wait(), timeout=delay)
+                    return  # shutdown arrived during backoff
+                except asyncio.TimeoutError:
+                    pass
+
+        if (
+            shutdown.is_set()
+            or session_keys is None
+            or client_pub is None
+            or transport_obj is None
+        ):
+            # Shutdown was triggered while waiting for a successful handshake;
+            # close any held TCP transport manually since it was never
+            # registered with the AsyncExitStack.
+            if config.transport == "tcp" and transport_obj is not None:
+                await transport_obj.aclose()
             return
 
+        # Successful TCP transport: register cleanup now that we keep it.
+        if config.transport == "tcp":
+            stack.push_async_callback(transport_obj.aclose)
+
+        transport: UDPTransport | TCPTransport = transport_obj
+        # name used by the rest of run_server
         client_pub_bytes = bytes(client_pub)
         log.info("client connected (noise_static=%s)", client_pub_bytes.hex()[:16])
 
@@ -241,12 +305,12 @@ async def run_server(
         liveness = LivenessState()
         reassembly = ReassemblyBuffer()
 
-        shutdown = asyncio.Event()
-        setup_signal_handlers(shutdown)
+        # shutdown + signal handlers were set up before the handshake loop.
         client_addr: list[tuple[str, int] | None] = [None]
 
         send_packet = make_send_fn(
-            session_keys, transport, lambda: client_addr[0], seq, liveness=liveness,
+            session_keys, transport, lambda: client_addr[0], seq,
+            liveness=liveness, shutdown=shutdown,
         )
 
         # Guard chaff generation until client_addr is known — the scheduler

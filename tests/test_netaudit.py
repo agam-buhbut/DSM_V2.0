@@ -162,6 +162,13 @@ class TestSchemaLock(unittest.TestCase):
         "liveness_fire",
         "shutdown_signal",
         "auto_mtu_change",
+        # Emitted by auth_loader.load_cert_materials when the configured CRL's
+        # next_update lies in the past (audit M1 — stale CRL silent acceptance).
+        "crl_stale",
+        # Emitted at the same site when no crl_file is configured at all —
+        # operationally identical risk (revoked certs silently accepted), but
+        # distinguishable in monitoring (Pass-2 follow-up).
+        "crl_missing",
     }
 
     def test_call_sites_in_repo(self) -> None:

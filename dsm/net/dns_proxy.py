@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import time
 from typing import Any
 
 import dns.exception
@@ -48,6 +49,21 @@ class LocalDNSProxy:
     # Bound task semaphore prevents unbounded growth on DoS.
     # 256 concurrent queries is reasonable for typical DNS traffic.
     _MAX_CONCURRENT_QUERIES = 256
+    # Cap on the (qname, qtype) deduplication map. Without this an authenticated
+    # peer inside the tunnel that floods unique qnames can grow the map until
+    # the box runs out of memory; the semaphore alone only bounds *upstream*
+    # fan-out, not the in-flight count of distinct queries.
+    _MAX_INFLIGHT = 4096
+    # Global cap on the total number of scheduled query-handling tasks.
+    # The inflight map bounds *distinct* queries; this bounds *all* in-flight
+    # tasks including duplicates. A malicious (or buggy) authenticated peer
+    # inside the tunnel can spam millions of duplicate queries for the same
+    # qname; each one schedules its own _handle_query task that awaits the
+    # shared upstream future. Without a global cap, the task set + their
+    # stack frames grow unboundedly even though no extra upstream queries
+    # are issued. Drop-on-overflow with SERVFAIL is the right policy — the
+    # cap is far above legitimate load.
+    _MAX_TASKS = 8192
 
     def __init__(
         self,
@@ -65,6 +81,11 @@ class LocalDNSProxy:
         self._sem = asyncio.Semaphore(self._MAX_CONCURRENT_QUERIES)
         # In-flight request deduplication: (qname, qtype) -> Future[addresses]
         self._inflight: dict[tuple[str, int], asyncio.Future[list[str]]] = {}
+        # Counter of dropped queries due to task-set saturation. Sampled into
+        # the audit log so an operator can see when the proxy is shedding
+        # load (rate-limited via _shed_log_throttle to avoid log flooding).
+        self._tasks_shed: int = 0
+        self._tasks_shed_last_log: float = 0.0
 
     async def start(self) -> None:
         loop = asyncio.get_running_loop()
@@ -84,10 +105,33 @@ class LocalDNSProxy:
             task.cancel()
         self._tasks.clear()
 
-    def _schedule(self, coro: Any) -> None:
+    def _schedule(self, coro: Any) -> bool:
+        """Schedule a query-handling coroutine. Returns False (and closes
+        the coroutine without scheduling) when the task set is saturated.
+
+        Caller decides what to do with a False return; the protocol
+        datagram_received path drops the UDP query in that case — by the
+        nature of UDP the client retries, and once the proxy catches up
+        the next retry succeeds. There is no in-band way to send SERVFAIL
+        because the dropped path is the one that would have written it.
+        """
+        if len(self._tasks) >= self._MAX_TASKS:
+            coro.close()
+            self._tasks_shed += 1
+            now = time.monotonic()
+            if now - self._tasks_shed_last_log > 5.0:
+                log.warning(
+                    "DNS proxy task cap reached (%d tasks); shed %d queries since last log",
+                    self._MAX_TASKS,
+                    self._tasks_shed,
+                )
+                self._tasks_shed_last_log = now
+                self._tasks_shed = 0
+            return False
         task = asyncio.create_task(coro)
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
+        return True
 
     async def _handle_query(
         self, data: bytes, addr: tuple[str, int], send: Any,
@@ -125,6 +169,14 @@ class LocalDNSProxy:
         query_key = (qname, qtype)
         inflight_future = self._inflight.get(query_key)
         if inflight_future is None:
+            if len(self._inflight) >= self._MAX_INFLIGHT:
+                log.debug(
+                    "inflight map full (%d entries), SERVFAIL for %s",
+                    len(self._inflight),
+                    _redact_qname(qname),
+                )
+                send(_make_error(query, dns.rcode.SERVFAIL), addr)
+                return
             inflight_future = asyncio.get_running_loop().create_future()
             self._inflight[query_key] = inflight_future
             try:

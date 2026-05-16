@@ -68,20 +68,16 @@ class NoiseTransport:
     def decrypt(self, ciphertext: bytes) -> bytes: ...
 
 class SessionKeyManager:
-    @staticmethod
-    def from_handshake_hash(
-        hash: bytes,
-        is_initiator: bool,
-        rotation_packets: int | None = None,
-        rotation_seconds: int | None = None,
-    ) -> SessionKeyManager: ...
-    @staticmethod
-    def from_bootstrap_shared_secret(
-        shared_secret: bytes,
-        is_initiator: bool,
-        rotation_packets: int | None = None,
-        rotation_seconds: int | None = None,
-    ) -> SessionKeyManager: ...
+    """Holds the symmetric session keys for one direction-pair.
+
+    Constructed only via :func:`complete_bootstrap` — the safe path that
+    keeps the X25519 secret scalar in mlock'd Rust heap. The earlier
+    constructors (``from_handshake_hash``, ``from_bootstrap_shared_secret``)
+    were removed during the audit (M4): the first derived keys from the
+    PUBLIC handshake hash, the second accepted SECRET bytes through a
+    Python ``bytes`` object that cannot be reliably zeroed.
+    """
+
     def encrypt(self, plaintext: bytes, aad: bytes) -> tuple[bytes, bytes, int]: ...
     def decrypt(
         self,
@@ -143,31 +139,53 @@ class AttestKey:
         """Restore an attest key from a stored blob (soft backend only)."""
         ...
 
-    def private_pkcs8_der(self) -> bytes:
-        """PKCS#8 DER export of the private key (soft backend only).
+    def build_csr(self, cn: str, noise_static_pub: bytes) -> bytes:
+        """Build a CA-ready DER CSR for this attest key.
 
-        Used by the ``dsm enroll`` flow so the standard ``cryptography``
-        CSR builder can sign with it. TPM / Keystore backends sign CSRs
-        internally and will not expose this method.
+        The PKCS#8 export of the signing scalar stays inside Rust — no
+        key bytes cross the FFI boundary into Python ``bytes``-managed
+        memory. ``noise_static_pub`` is the 32-byte X25519 Noise static
+        embedded in the critical ``id-dsm-noiseStaticBinding`` extension.
         """
         ...
+
+    def zeroize(self) -> None:
+        """Wipe the signing scalar in place. After this call the instance
+        is unusable; sign/encrypt_to_store/build_csr will operate on a
+        zeroed scalar. Safe to call multiple times; idempotent."""
+        ...
+
+class BootstrapEphemeral:
+    """Opaque handle holding an X25519 ephemeral keypair.
+
+    The secret scalar lives in an mlock'd, zeroize-on-drop Rust heap
+    buffer; Python only sees the matching public key. Consumed by
+    :func:`complete_bootstrap`, after which :attr:`is_live` flips to
+    ``False`` and a second use raises.
+    """
+
+    @staticmethod
+    def generate() -> BootstrapEphemeral: ...
+    @property
+    def public_key_bytes(self) -> bytes: ...
+    @property
+    def is_live(self) -> bool: ...
 
 def disable_core_dumps() -> None: ...
 def harden_process() -> None: ...
 
-# Module-level helpers for the post-handshake bootstrap exchange.
-def generate_ephemeral() -> tuple[bytes, bytes]:
-    """Return ``(secret, public)`` for an X25519 ephemeral keypair."""
-    ...
-
-def bootstrap_session_from_dh(
-    our_secret: bytes,
+def complete_bootstrap(
+    ephemeral: BootstrapEphemeral,
     peer_public: bytes,
     is_initiator: bool,
     rotation_packets: int | None = None,
     rotation_seconds: int | None = None,
 ) -> SessionKeyManager:
-    """Derive session keys from an ephemeral DH exchange.
+    """Derive session keys from a bootstrap ephemeral and the peer's public key.
+
+    Consumes ``ephemeral`` in place — a second call returns an error. The
+    X25519 DH and the subsequent HKDF expansion happen entirely in Rust;
+    the secret scalar never crosses the FFI boundary.
 
     ``rotation_packets`` / ``rotation_seconds`` override the default
     rotation thresholds (5000 / 600); jitter is always applied.

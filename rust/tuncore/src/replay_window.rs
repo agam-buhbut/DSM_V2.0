@@ -185,6 +185,76 @@ mod tests {
     }
 
     #[test]
+    fn property_seen_seq_never_accepted_again() {
+        // Property: after `update(seq)`, `check(seq)` must always return
+        // false, for any sequence of inputs. The sliding-window
+        // implementation has a few branches (ahead-of-window, within-
+        // window, too-old) that we exercise here via a randomized walk
+        // forward through seq space, recording each as seen, then
+        // re-presenting it.
+        use std::collections::HashSet;
+
+        let mut w = ReplayWindow::new();
+        let mut seen: HashSet<u64> = HashSet::new();
+
+        // Walk forward through a few thousand seqs, occasionally
+        // back-jumping into the window. Every `update` is a "seen" mark.
+        let mut seq: u64 = 1;
+        let mut step: u64 = 1;
+        for i in 0..2_000u64 {
+            assert!(w.check(seq), "seq={seq} (i={i}) should be acceptable");
+            w.update(seq);
+            assert!(seen.insert(seq));
+
+            // Replay attempt must fail.
+            assert!(
+                !w.check(seq),
+                "seq={seq} was just marked seen; check must reject"
+            );
+
+            // Occasionally jump back into the window.
+            if i % 17 == 0 && seq > ReplayWindow::WINDOW_SIZE / 2 {
+                let back = seq - (ReplayWindow::WINDOW_SIZE / 4);
+                if !seen.contains(&back) {
+                    assert!(w.check(back));
+                    w.update(back);
+                    seen.insert(back);
+                }
+                // And the back-seq is now also unaccepted on replay.
+                assert!(!w.check(back));
+            }
+
+            // Vary step to mix small and larger forward jumps.
+            seq = seq.checked_add(step).expect("no overflow at this scale");
+            step = (step % 7) + 1;
+        }
+    }
+
+    #[test]
+    fn property_too_old_seqs_always_rejected() {
+        // Property: once max_seq advances past WINDOW_SIZE, every seq
+        // strictly less than max_seq - WINDOW_SIZE + 1 must be rejected
+        // by `check`, regardless of whether it was ever seen.
+        let mut w = ReplayWindow::new();
+        w.update(10_000);
+        for stale in 1..(10_000 - ReplayWindow::WINDOW_SIZE + 1) {
+            assert!(
+                !w.check(stale),
+                "stale seq={stale} must be rejected (max_seq=10000, \
+                 window={})",
+                ReplayWindow::WINDOW_SIZE
+            );
+        }
+        // And exactly at the window edge: accepted (it's the oldest
+        // seq still inside the bitmap).
+        let edge = 10_000 - ReplayWindow::WINDOW_SIZE + 1;
+        assert!(
+            w.check(edge),
+            "edge seq={edge} should be inside the window"
+        );
+    }
+
+    #[test]
     fn test_check_rejects_after_window_advance() {
         let mut w = ReplayWindow::new();
         w.update(200);

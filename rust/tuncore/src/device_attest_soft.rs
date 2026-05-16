@@ -8,53 +8,17 @@
 //! hardware binding and is extractable by anyone with code execution as the
 //! user.
 
-use argon2::{Algorithm, Argon2, Params, Version};
-use chacha20poly1305::{
-    aead::{Aead, KeyInit, Payload},
-    XChaCha20Poly1305, XNonce,
-};
 use p256::ecdsa::{signature::Signer, Signature, SigningKey, VerifyingKey};
 use p256::pkcs8::{EncodePrivateKey, EncodePublicKey};
 use rand::rngs::OsRng;
-use rand::RngCore;
 use zeroize::Zeroizing;
 
-use crate::secure_memory::LockedKey32;
+// Argon2id + XChaCha20-Poly1305 sealed-blob shape lives in
+// `passphrase_store` and is shared with `identity::IdentityKeyPair` so
+// both stores have an identical wire format and identical Argon2 cost.
+use crate::passphrase_store::{self, ARGON2_SALT_LEN, XCHACHA_NONCE_LEN};
 
-// Argon2id + XChaCha20-Poly1305 parameters intentionally match
-// `identity::IdentityKeyPair::encrypt_to_store` so the attest store has the
-// same passphrase-cracking cost profile as the identity store.
-const ARGON2_SALT_LEN: usize = 32;
-const ARGON2_MEM_COST_KIB: u32 = 524_288; // 512 MiB
-const ARGON2_TIME_COST: u32 = 4;
-const ARGON2_PARALLELISM: u32 = 2;
-const XCHACHA_NONCE_LEN: usize = 24;
 const SCALAR_LEN: usize = 32;
-
-fn derive_argon2_key(passphrase: &[u8], salt: &[u8]) -> Result<LockedKey32, String> {
-    let mut derived = LockedKey32::zeroed()?;
-    let params = Params::new(
-        ARGON2_MEM_COST_KIB,
-        ARGON2_TIME_COST,
-        ARGON2_PARALLELISM,
-        Some(32),
-    )
-    .map_err(|e| format!("argon2 params: {e}"))?;
-
-    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-    argon2
-        .hash_password_into(passphrase, salt, derived.as_mut())
-        .map_err(|e| format!("argon2 hash: {e}"))?;
-
-    Ok(derived)
-}
-
-fn build_store_aad(salt: &[u8], nonce: &[u8]) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(salt.len() + nonce.len());
-    aad.extend_from_slice(salt);
-    aad.extend_from_slice(nonce);
-    aad
-}
 
 /// A software-resident ECDSA P-256 attestation key.
 ///
@@ -94,94 +58,144 @@ impl SoftAttestKey {
         Ok(signature.to_der().as_bytes().to_vec())
     }
 
-    /// PKCS#8 DER encoding of the private key.
+    /// Wipe the signing scalar. After this call the wrapping instance
+    /// MUST be dropped: the SPKI cache is left in place but no longer
+    /// matches the signing key, so any subsequent `sign` will produce
+    /// signatures that fail verification against the cert. Mirrors
+    /// `identity::IdentityKeyPair::zeroize`. Safe to call multiple times.
     ///
-    /// Soft backend only: this is the export that lets the `enroll`
-    /// subcommand hand the key to `cryptography.x509.CertificateSigningRequestBuilder`
-    /// for CSR generation. TPM / Keystore backends MUST NOT expose this —
-    /// they sign the CSR internally via platform APIs and never leak
-    /// private key bytes.
-    pub fn private_pkcs8_der(&self) -> Result<Vec<u8>, String> {
+    /// `SigningKey` impls `ZeroizeOnDrop` but not `Zeroize`, so the scalar
+    /// cannot be wiped in place. Instead we move the original out of the
+    /// `Box` (releasing it for `Drop` to run, which fires the ZeroizeOnDrop
+    /// wipe on its inner NonZeroScalar) and replace it with a freshly
+    /// generated key so the struct remains shape-valid for the brief
+    /// window before the Python caller drops it. The replacement is never
+    /// used for any signature the verifier accepts because the public SPKI
+    /// did not move.
+    pub fn zeroize(&mut self) {
+        let replacement = SigningKey::random(&mut OsRng);
+        let old = std::mem::replace(&mut self.signing_key, Box::new(replacement));
+        drop(old); // ZeroizeOnDrop wipes the scalar here.
+    }
+
+    /// PKCS#8 DER encoding of the private key, wrapped in [`Zeroizing`] so
+    /// the encoded scalar is scrubbed when the caller drops it.
+    ///
+    /// Soft backend only. Internal use: consumed by ``build_csr`` to feed
+    /// rcgen's key importer entirely within Rust. Not exposed to Python any
+    /// more (was previously exported via PyAttestKey, audit M4). TPM /
+    /// Keystore backends MUST NOT expose this — they sign the CSR internally
+    /// via platform APIs and never leak private key bytes.
+    ///
+    /// The return type is `Zeroizing<Vec<u8>>` rather than plain `Vec<u8>`
+    /// so a future caller cannot accidentally leave the encoded scalar in
+    /// a long-lived heap allocation. The wrapper costs nothing at the
+    /// borrow site (deref-to-slice still works) but makes the safety
+    /// invariant load-bearing in the type system.
+    pub fn private_pkcs8_der(&self) -> Result<Zeroizing<Vec<u8>>, String> {
         let pkcs8 = self
             .signing_key
             .to_pkcs8_der()
             .map_err(|e| format!("encode PKCS#8 DER: {e}"))?;
-        Ok(pkcs8.as_bytes().to_vec())
+        Ok(Zeroizing::new(pkcs8.as_bytes().to_vec()))
+    }
+
+    /// Build a DER-encoded CSR for this attest key with the given CN and
+    /// noise-static binding extension.
+    ///
+    /// The PKCS#8 export of the signing scalar stays inside Rust (wrapped in
+    /// `Zeroizing`) so the key bytes never reach a Python `bytes`/list. The
+    /// produced CSR is signed by the attest key (proof-of-possession of the
+    /// hardware-bound private key). The custom critical extension
+    /// ``id-dsm-noiseStaticBinding`` (1.3.6.1.4.1.99999.1.1) carries the
+    /// 32-byte X25519 Noise static pubkey wrapped per the conventional
+    /// OCTET STRING form.
+    pub fn build_csr(
+        &self,
+        cn: &str,
+        noise_static_pub: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        use rcgen::{CertificateParams, CustomExtension, DnType, KeyPair};
+
+        // RFC 5280 caps Subject CommonName at 64 UTF-8 bytes (ub-common-name).
+        // Cap higher than the RFC limit but still bounded so a malicious
+        // caller cannot force unbounded String/CSR allocation through this
+        // FFI entry point.
+        const CN_MAX_BYTES: usize = 255;
+        if cn.is_empty() {
+            return Err("cn must not be empty".into());
+        }
+        if cn.len() > CN_MAX_BYTES {
+            return Err(format!(
+                "cn too long: {} > {CN_MAX_BYTES}",
+                cn.len()
+            ));
+        }
+
+        if noise_static_pub.len() != 32 {
+            return Err(format!(
+                "noise_static_pub must be 32 bytes, got {}",
+                noise_static_pub.len()
+            ));
+        }
+
+        // `private_pkcs8_der` now returns the encoded scalar already wrapped
+        // in `Zeroizing`, so we just bind the result directly.
+        let pkcs8 = self.private_pkcs8_der()?;
+        let key_pair = KeyPair::try_from(pkcs8.as_slice())
+            .map_err(|e| format!("rcgen key import: {e}"))?;
+
+        let mut params = CertificateParams::default();
+        params
+            .distinguished_name
+            .push(DnType::CommonName, cn.to_string());
+
+        // DER OCTET STRING (32) || raw pub — matches Python's
+        // encode_noise_static_binding_value in dsm.crypto.cert.
+        let mut ext_value = Vec::with_capacity(2 + noise_static_pub.len());
+        ext_value.push(0x04); // OCTET STRING tag
+        ext_value.push(noise_static_pub.len() as u8);
+        ext_value.extend_from_slice(noise_static_pub);
+
+        let mut ext = CustomExtension::from_oid_content(
+            &[1, 3, 6, 1, 4, 1, 99999, 1, 1],
+            ext_value,
+        );
+        ext.set_criticality(true);
+        params.custom_extensions.push(ext);
+
+        let csr = params
+            .serialize_request(&key_pair)
+            .map_err(|e| format!("rcgen CSR serialize: {e}"))?;
+        Ok(csr.der().to_vec())
     }
 
     /// Encrypt the signing key to a passphrase-protected blob.
-    /// Format: `salt(32) || nonce(24) || ciphertext+tag`
-    /// Plaintext = the 32-byte ECDSA P-256 scalar.
+    /// Format: `salt(32) || nonce(24) || ciphertext+tag`. Plaintext is
+    /// the 32-byte ECDSA P-256 scalar.
+    ///
+    /// Sealing is delegated to [`passphrase_store::seal`] so this blob
+    /// shape is byte-identical to the identity-store blob shape.
     pub fn encrypt_to_store(&self, passphrase: &[u8]) -> Result<Vec<u8>, String> {
-        if passphrase.is_empty() {
-            return Err("passphrase must not be empty".into());
-        }
-
-        let mut salt = [0u8; ARGON2_SALT_LEN];
-        OsRng.fill_bytes(&mut salt);
-
-        let derived = derive_argon2_key(passphrase, &salt)?;
-
-        let cipher = XChaCha20Poly1305::new_from_slice(derived.as_array())
-            .map_err(|e| format!("cipher init: {e}"))?;
-
-        let mut nonce_bytes = [0u8; XCHACHA_NONCE_LEN];
-        OsRng.fill_bytes(&mut nonce_bytes);
-        let nonce = XNonce::from_slice(&nonce_bytes);
-
-        let aad = build_store_aad(&salt, &nonce_bytes);
-
-        // Wrap the scalar copy so it is scrubbed before returning.
+        // `to_bytes()` materializes the scalar; wrap in `Zeroizing` so
+        // the temporary copy is scrubbed once `seal` has copied it into
+        // the AEAD engine.
         let scalar_bytes = Zeroizing::new(self.signing_key.to_bytes());
-
-        let ciphertext = cipher
-            .encrypt(
-                nonce,
-                Payload {
-                    msg: scalar_bytes.as_slice(),
-                    aad: &aad,
-                },
-            )
-            .map_err(|e| format!("encrypt: {e}"))?;
-
-        let mut blob = Vec::with_capacity(ARGON2_SALT_LEN + XCHACHA_NONCE_LEN + ciphertext.len());
-        blob.extend_from_slice(&salt);
-        blob.extend_from_slice(&nonce_bytes);
-        blob.extend_from_slice(&ciphertext);
-
-        Ok(blob)
+        passphrase_store::seal(scalar_bytes.as_slice(), passphrase)
     }
 
     /// Decrypt a signing key from a stored blob using a passphrase.
     pub fn decrypt_from_store(blob: &[u8], passphrase: &[u8]) -> Result<Self, String> {
-        let min_len = ARGON2_SALT_LEN + XCHACHA_NONCE_LEN + SCALAR_LEN + 16; // scalar + tag
+        // Up-front "blob too short" check tied to the 32-byte scalar
+        // we are expecting — the shared helper rejects shorter blobs
+        // at the looser `salt + nonce + tag` minimum, so we tighten
+        // here to preserve the precise error message.
+        let min_len = ARGON2_SALT_LEN + XCHACHA_NONCE_LEN + SCALAR_LEN + passphrase_store::TAG_LEN;
         if blob.len() < min_len {
             return Err("blob too short".into());
         }
-        if passphrase.is_empty() {
-            return Err("passphrase must not be empty".into());
-        }
 
-        let salt = &blob[..ARGON2_SALT_LEN];
-        let nonce_bytes = &blob[ARGON2_SALT_LEN..ARGON2_SALT_LEN + XCHACHA_NONCE_LEN];
-        let ciphertext = &blob[ARGON2_SALT_LEN + XCHACHA_NONCE_LEN..];
-
-        let derived = derive_argon2_key(passphrase, salt)?;
-
-        let cipher = XChaCha20Poly1305::new_from_slice(derived.as_array())
-            .map_err(|e| format!("cipher init: {e}"))?;
-
-        let nonce = XNonce::from_slice(nonce_bytes);
-        let aad = build_store_aad(salt, nonce_bytes);
-
-        let plaintext = Zeroizing::new(
-            cipher
-                .decrypt(nonce, Payload { msg: ciphertext, aad: &aad })
-                .map_err(|_| {
-                    "decryption failed: wrong passphrase or corrupted data".to_string()
-                })?,
-        );
-
+        let plaintext = passphrase_store::open(blob, passphrase)?;
         if plaintext.len() != SCALAR_LEN {
             return Err("decrypted scalar has wrong length".into());
         }

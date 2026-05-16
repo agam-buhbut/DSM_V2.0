@@ -34,6 +34,10 @@ class AttestStore:
         self._key: tuncore.AttestKey | None = None
 
     @property
+    def path(self) -> Path:
+        return self._path
+
+    @property
     def is_loaded(self) -> bool:
         return self._key is not None
 
@@ -91,6 +95,15 @@ class AttestStore:
         return self.load(passphrase)
 
     def unload(self) -> None:
-        """Drop the attest-key reference. The Rust side zeroizes the
-        scalar bytes on drop via ``ZeroizeOnDrop``."""
-        self._key = None
+        """Zeroize and unload the attest key.
+
+        Calls the Rust-side explicit ``zeroize`` before clearing the
+        Python reference. ``ZeroizeOnDrop`` would also wipe on
+        refcount-zero, but only after every Python holder drops it; an
+        eager wipe ensures that even a stale reference held by an
+        in-flight coroutine sees a scrubbed scalar. Mirrors
+        ``KeyStore.unload``. Safe to call multiple times.
+        """
+        if self._key is not None:
+            self._key.zeroize()
+            self._key = None

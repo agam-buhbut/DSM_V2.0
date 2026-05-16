@@ -16,7 +16,7 @@ dev-soft-attest = ["dep:p256"]
 # tpm-attest = ["dep:tss-esapi"]   # Phase 1 step 5
 
 [dependencies]
-pyo3 = { version = "0.22", features = ["extension-module"] }
+pyo3 = { version = "0.24", features = ["extension-module"] }
 snow = "0.9"
 aes-gcm = "0.10"
 hkdf = "0.12"
@@ -32,6 +32,11 @@ libc = "0.2"
 subtle = "2"
 hmac = "0.12"
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8"], optional = true }
+# CSR generation entirely in Rust so the ECDSA signing scalar never crosses
+# the FFI boundary into Python's `bytes`-managed memory during `dsm enroll`.
+# Soft attest backend only; production TPM/Keystore backends will use the
+# platform-native CSR API (PKCS#11 or Android KeyAttestation) and skip this dep.
+rcgen = { version = "0.13", default-features = false, features = ["pem", "crypto", "ring"] }
 
 [profile.release]
 opt-level = 3

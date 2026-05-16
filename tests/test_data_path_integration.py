@@ -503,7 +503,15 @@ class TestDataPathRoundtrip(unittest.IsolatedAsyncioTestCase):
         )
 
         tun = _MockTun("retry-client")
-        keys = tuncore.SessionKeyManager.from_handshake_hash(b"y" * 32, True)
+        # Construct a SessionKeyManager via a real bootstrap DH (the
+        # from_handshake_hash Python binding was dropped — audit M2).
+        # Audit M4 then dropped the raw-bytes variants too, leaving only the
+        # mlock'd BootstrapEphemeral path.
+        our_eph = tuncore.BootstrapEphemeral.generate()
+        peer_eph = tuncore.BootstrapEphemeral.generate()
+        keys = tuncore.complete_bootstrap(
+            our_eph, bytes(peer_eph.public_key_bytes), is_initiator=True
+        )
         fsm = SessionFSM()
         fsm.transition(State.CONNECTING)
         fsm.transition(State.HANDSHAKING)

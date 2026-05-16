@@ -11,7 +11,7 @@ This module:
   * checks freshness (``next_update``) and surfaces stale CRLs
   * answers ``is_revoked(serial)`` for a leaf cert's serial number
 
-CRL distribution and rotation are operational concerns (CA_RUNBOOK).
+CRL distribution and rotation are operational concerns (deploy/GUIDE.txt §7e).
 This module is the runtime check.
 """
 
@@ -105,6 +105,14 @@ class CRL:
         sig_alg = crl.signature_hash_algorithm
         if sig_alg is None:
             raise CRLSignatureError("CRL has no signature hash algorithm")
+        # Reject SHA-1 / MD5 / etc — match the cert.validate_chain policy so
+        # an operator cannot accidentally accept a CRL signed under a hash
+        # that's been chosen-prefix-attackable for years.
+        if sig_alg.name not in {"sha256", "sha384", "sha512"}:
+            raise CRLSignatureError(
+                f"CRL signed with weak hash {sig_alg.name!r}; "
+                "only sha256, sha384, sha512 are accepted"
+            )
         try:
             ca_pub.verify(
                 crl.signature,

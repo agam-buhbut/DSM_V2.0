@@ -192,7 +192,7 @@ def _run_enroll(
         print(f"  noise_static_pub = {result.noise_static_pub.hex()}")
         print(
             "Walk the CSR via USB to the offline CA per "
-            "deploy/CA_RUNBOOK.md, then run "
+            "deploy/GUIDE.txt §3c, then run "
             "`dsm enroll --import <signed.crt>`."
         )
         return
@@ -204,7 +204,11 @@ def _run_enroll(
         )
         try:
             try:
-                keystore.load_or_generate_with_passphrase(passphrase)
+                # --import binds a CA-signed cert to an *existing* identity
+                # provisioned by --csr-out. Auto-generating here would yield
+                # a fresh Noise static that doesn't match the cert's
+                # noiseStaticBinding extension; better to refuse loudly.
+                keystore.load_with_passphrase(passphrase)
             except Exception as e:
                 print(
                     f"failed to unlock identity at {config.key_file}: {e}",
@@ -251,14 +255,26 @@ def _run_show_pubkey(
     passphrase_fd: int | None,
     passphrase_env_file: str | None,
 ) -> None:
+    from dsm.core.passphrase import read_passphrase, wipe_passphrase
     from dsm.crypto.keystore import KeyStore
 
     config = load(config_path)
     keystore = KeyStore(config.key_file)
-    keystore.load_or_generate(
+    # show-pubkey is strictly read-only — if no identity has been provisioned,
+    # silently auto-generating one would mislead the operator who's trying to
+    # *inspect* their existing key. Fail loudly instead.
+    passphrase = read_passphrase(
         passphrase_fd=passphrase_fd,
         passphrase_env_file=passphrase_env_file,
     )
+    try:
+        try:
+            keystore.load_with_passphrase(passphrase)
+        except RuntimeError as e:
+            print(f"show-pubkey: {e}", file=sys.stderr)
+            sys.exit(2)
+    finally:
+        wipe_passphrase(passphrase)
     try:
         pub = bytes(keystore.identity.public_key)
         print(pub.hex())

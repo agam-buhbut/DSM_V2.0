@@ -19,3 +19,6 @@ rust/tuncore/target/
 *.pem
 *.key
 .claude/
+
+# Archived documentation (superseded by deploy/GUIDE.txt)
+backup/

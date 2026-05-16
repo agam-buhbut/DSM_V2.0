@@ -87,7 +87,27 @@ def _read_from_fd(fd: int) -> bytearray:
 def _read_from_file(path: str | Path) -> bytearray:
     p = Path(path)
     check_user_file_permissions(p)
-    return bytearray(p.read_bytes().rstrip(b"\r\n"))
+    # Read into a mutable bytearray without an intermediate immutable bytes
+    # copy. p.read_bytes() would produce an unwipeable bytes object that may
+    # linger on Python's heap. os.open + os.read into a pre-sized bytearray
+    # keeps the passphrase wipeable end-to-end.
+    fd = os.open(str(p), os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        size = os.fstat(fd).st_size
+        buf = bytearray(size)
+        view = memoryview(buf)
+        offset = 0
+        while offset < size:
+            n = os.readv(fd, [view[offset:]])
+            if n == 0:
+                break
+            offset += n
+        del view
+    finally:
+        os.close(fd)
+    while buf and buf[-1] in (0x0A, 0x0D):
+        del buf[-1]
+    return buf
 
 
 def _read_noninteractive(
@@ -122,10 +142,14 @@ def _read_noninteractive(
         except (OSError, FileNotFoundError) as e:
             log.warning("DSM_PASSPHRASE_FILE %s unreadable: %s", env_file, e)
 
-    env_pass = os.environ.get("DSM_PASSPHRASE")
-    if env_pass:
+    # os.environb returns bytes (one fewer immutable str copy than
+    # os.environ.get + .encode). The fundamental limitation remains: the
+    # interpreter's environment block carries the passphrase in memory we
+    # cannot wipe. Documented as the weakest source for this reason.
+    env_pass_b = os.environb.get(b"DSM_PASSPHRASE")
+    if env_pass_b:
         log.debug("using passphrase from DSM_PASSPHRASE env var")
-        return bytearray(env_pass.encode())
+        return bytearray(env_pass_b)
 
     return None
 

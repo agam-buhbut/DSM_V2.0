@@ -28,6 +28,10 @@ class KeyStore:
         self._identity: tuncore.IdentityKeyPair | None = None
 
     @property
+    def path(self) -> Path:
+        return self._path
+
+    @property
     def is_loaded(self) -> bool:
         return self._identity is not None
 
@@ -92,14 +96,36 @@ class KeyStore:
     def exists(self) -> bool:
         return self._path.is_file()
 
+    def load_with_passphrase(self, passphrase: bytes | bytearray) -> bytes:
+        """Load an existing identity with a pre-read passphrase.
+
+        Refuses to auto-generate at runtime: the daemon (client or server)
+        must never be the place a fresh identity first appears (that's
+        `dsm enroll`). Mirrors ``AttestStore.load_with_passphrase`` —
+        previously asymmetric, where keystore auto-generated and attest
+        store refused, producing a confusing failure mode (server starts
+        with a fresh identity, then handshake fails because the saved cert
+        is bound to a different Noise static).
+        """
+        if not self.exists():
+            raise RuntimeError(
+                f"identity key file missing at {self._path}; run "
+                "`dsm enroll` to provision one"
+            )
+        pub = self.load(passphrase)
+        log.info("identity loaded")
+        return pub
+
     def load_or_generate_with_passphrase(
         self, passphrase: bytes | bytearray
     ) -> bytes:
-        """Load (or generate) the identity with a pre-read passphrase.
+        """Load or generate the identity (enroll-only).
 
-        Use this when the same passphrase must unlock multiple stores
-        (e.g. identity + attest store) so the caller can read the
-        passphrase once and pass it to each store.
+        Used by ``dsm enroll --csr-out`` for first-time provisioning. The
+        long-running daemon code (server.py / client.py / show-pubkey) must
+        use ``load_with_passphrase`` instead; if the file is missing during
+        a daemon start, that's a deployment bug, not "time to make a new
+        identity that won't match the cert anyway".
         """
         if self.exists():
             pub = self.load(passphrase)

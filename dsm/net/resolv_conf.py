@@ -34,15 +34,40 @@ class ResolvConfManager:
         self._applied = False
 
     def apply(self) -> None:
-        """Replace resolv.conf with a single-nameserver file."""
+        """Replace resolv.conf with a single-nameserver file.
+
+        Captures the prior state (symlink target or file contents) so
+        teardown can restore exactly what was there. The swap itself
+        goes through ``atomic_write`` — a sibling tempfile gets the new
+        contents, then ``os.rename`` replaces the destination atomically.
+        rename(2) overwrites both regular files AND symlinks in a single
+        syscall, so there is no window where /etc/resolv.conf is absent
+        between capturing the original and the new file appearing.
+        """
         if self._applied:
             return
 
         if RESOLV_CONF.is_symlink():
-            self._original_symlink_target = os.readlink(RESOLV_CONF)
-            RESOLV_CONF.unlink()
+            try:
+                self._original_symlink_target = os.readlink(RESOLV_CONF)
+            except OSError:
+                # Race: symlink was replaced between is_symlink() and
+                # readlink. Fall through to the regular-file branch so
+                # apply() still completes; the original target (if any)
+                # is lost from our perspective but the new state is honored.
+                self._original_symlink_target = None
+                if RESOLV_CONF.exists():
+                    try:
+                        self._original_contents = RESOLV_CONF.read_bytes()
+                    except OSError:
+                        self._original_contents = None
         elif RESOLV_CONF.exists():
-            self._original_contents = RESOLV_CONF.read_bytes()
+            try:
+                self._original_contents = RESOLV_CONF.read_bytes()
+            except OSError:
+                # File disappeared between exists() and read; treat as
+                # "no original to restore" — same as the never-existed branch.
+                self._original_contents = None
         # If the file simply didn't exist, both fields stay None and we
         # remove our override on teardown instead of restoring anything.
 
@@ -51,6 +76,9 @@ class ResolvConfManager:
             f"nameserver {self._nameserver}\n"
             f"options edns0 trust-ad\n"
         ).encode()
+        # atomic_write: tmpfile -> fchmod -> fsync -> rename. The final
+        # rename overwrites any existing file OR symlink at RESOLV_CONF
+        # atomically — no transient absence.
         atomic_write(RESOLV_CONF, payload, mode=0o644, mkdir=False)
 
         self._applied = True

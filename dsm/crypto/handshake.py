@@ -62,6 +62,12 @@ log = logging.getLogger(__name__)
 HANDSHAKE_TIMEOUT = 5.0
 MAX_RETRIES = 3
 BACKOFF_BASE = 1.0  # retry delays: 1s, 2s, 4s
+# Bound the server's wait for the FIRST client message. A spoofed UDP msg1
+# that passes the low-order check but is never followed by msg3 would
+# otherwise lock the server's single handshake coroutine indefinitely.
+# After this timeout the caller (run_server's retry loop) is free to start
+# a fresh accept.
+MSG1_WAIT_TIMEOUT = 30.0
 
 # Every frame on the wire during the handshake is exactly this many bytes.
 # The Rust side already pre-pads Noise XX output to this size; bootstrap
@@ -232,44 +238,54 @@ async def client_handshake(
     handshake_hash = bytes(initiator.get_handshake_hash())
 
     noise_transport = initiator.into_transport()
-    client_secret, client_public = tuncore.generate_ephemeral()
-    try:
-        bootstrap_init_ct = bytes(
-            noise_transport.encrypt(bytes(client_public))
-        )
-        bootstrap_init_frame = _pad_to_frame(
-            bootstrap_init_ct, BOOTSTRAP_CIPHERTEXT_SIZE
-        )
+    # BootstrapEphemeral holds the secret in mlock'd heap inside Rust; Python
+    # only sees the public key. complete_bootstrap consumes the secret in
+    # place — no transient Python bytes copy of the DH scalar ever exists.
+    client_ephemeral = tuncore.BootstrapEphemeral.generate()
+    bootstrap_init_ct = bytes(
+        noise_transport.encrypt(bytes(client_ephemeral.public_key_bytes))
+    )
+    bootstrap_init_frame = _pad_to_frame(
+        bootstrap_init_ct, BOOTSTRAP_CIPHERTEXT_SIZE
+    )
+    await _send(transport, bootstrap_init_frame, server_addr)
+
+    # Receive server ephemeral public. On timeout, resend BOTH msg3 and
+    # the bootstrap frame — we don't know which was lost, and
+    # resending only one would deadlock the protocol step.
+    async def _retransmit_bootstrap() -> None:
+        await _send(transport, msg3, server_addr)
         await _send(transport, bootstrap_init_frame, server_addr)
 
-        # Receive server ephemeral public. On timeout, resend BOTH msg3 and
-        # the bootstrap frame — we don't know which was lost, and
-        # resending only one would deadlock the protocol step.
-        async def _retransmit_bootstrap() -> None:
-            await _send(transport, msg3, server_addr)
-            await _send(transport, bootstrap_init_frame, server_addr)
+    bootstrap_resp_frame, bs_addr = await _recv(
+        transport, retransmit=_retransmit_bootstrap
+    )
+    # Pin source on the bootstrap response. AEAD already rejects forged
+    # content, but a UDP-spoofed bootstrap frame from any source would
+    # otherwise reach noise_transport.decrypt — fail AEAD, raise
+    # HandshakeError, and waste a handshake retry. Pin to server_addr so
+    # the server's legitimate response is the only one that lands here.
+    if isinstance(transport, UDPTransport) and bs_addr != server_addr:
+        raise HandshakeError(
+            f"bootstrap response from unexpected source {bs_addr}, "
+            f"expected {server_addr}"
+        )
+    bootstrap_resp_ct = _unpad_from_frame(
+        bootstrap_resp_frame, BOOTSTRAP_CIPHERTEXT_SIZE
+    )
+    server_public = noise_transport.decrypt(bootstrap_resp_ct)
+    if len(server_public) != 32:
+        raise HandshakeError(
+            "invalid bootstrap ephemeral from server"
+        )
 
-        bootstrap_resp_frame, _ = await _recv(
-            transport, retransmit=_retransmit_bootstrap
-        )
-        bootstrap_resp_ct = _unpad_from_frame(
-            bootstrap_resp_frame, BOOTSTRAP_CIPHERTEXT_SIZE
-        )
-        server_public = noise_transport.decrypt(bootstrap_resp_ct)
-        if len(server_public) != 32:
-            raise HandshakeError(
-                "invalid bootstrap ephemeral from server"
-            )
-
-        session_keys = tuncore.bootstrap_session_from_dh(
-            bytes(client_secret),
-            bytes(server_public),
-            is_initiator=True,
-            rotation_packets=rotation_packets,
-            rotation_seconds=rotation_seconds,
-        )
-    finally:
-        del client_secret
+    session_keys = tuncore.complete_bootstrap(
+        client_ephemeral,
+        bytes(server_public),
+        is_initiator=True,
+        rotation_packets=rotation_packets,
+        rotation_seconds=rotation_seconds,
+    )
 
     duration_s = asyncio.get_event_loop().time() - started_at
     log.info(
@@ -323,11 +339,10 @@ async def server_handshake(
             f"{client_addr[0]}:{client_addr[1]}" if client_addr else None
         ),
     )
-    started_at: float | None = None  # set after msg1 arrives
-
     # Message 1: -> e (capture sender address for UDP reply).
-    # Wait indefinitely — there is no peer state to time out against
-    # before any client has connected.
+    # Use the long-timeout path — there is no peer state to time out
+    # against before any client has connected, but MSG1_WAIT_TIMEOUT
+    # still bounds it so a spoofed/dropped msg1 cannot stall the loop.
     msg1, recv_addr = await _recv(transport, indefinite=True)
     started_at = asyncio.get_event_loop().time()
     responder.read_message_1(msg1)
@@ -396,7 +411,19 @@ async def server_handshake(
     noise_transport = responder.into_transport()
 
     # Bootstrap: receive client ephemeral, send server ephemeral.
-    bootstrap_init_frame, _ = await _recv(transport)
+    bootstrap_init_frame, bs_addr = await _recv(transport)
+    # Pin source: msg1 + msg3 are already source-pinned to ``addr``; the
+    # bootstrap_init must come from the same peer. AEAD blocks content forge,
+    # but a UDP-spoofed bootstrap frame would otherwise fail AEAD and abort
+    # the handshake — wasting state and a retry slot.
+    if (
+        isinstance(transport, UDPTransport)
+        and addr is not None
+        and bs_addr != addr
+    ):
+        raise HandshakeError(
+            f"bootstrap_init from unexpected source {bs_addr}, expected {addr}"
+        )
     bootstrap_init_ct = _unpad_from_frame(
         bootstrap_init_frame, BOOTSTRAP_CIPHERTEXT_SIZE
     )
@@ -404,31 +431,24 @@ async def server_handshake(
     if len(client_public) != 32:
         raise HandshakeError("invalid bootstrap ephemeral from client")
 
-    server_secret, server_public = tuncore.generate_ephemeral()
-    try:
-        bootstrap_resp_ct = bytes(
-            noise_transport.encrypt(bytes(server_public))
-        )
-        bootstrap_resp_frame = _pad_to_frame(
-            bootstrap_resp_ct, BOOTSTRAP_CIPHERTEXT_SIZE
-        )
-        await _send(transport, bootstrap_resp_frame, addr)
-
-        session_keys = tuncore.bootstrap_session_from_dh(
-            bytes(server_secret),
-            bytes(client_public),
-            is_initiator=False,
-            rotation_packets=rotation_packets,
-            rotation_seconds=rotation_seconds,
-        )
-    finally:
-        del server_secret
-
-    duration_s = (
-        asyncio.get_event_loop().time() - started_at
-        if started_at is not None
-        else 0.0
+    server_ephemeral = tuncore.BootstrapEphemeral.generate()
+    bootstrap_resp_ct = bytes(
+        noise_transport.encrypt(bytes(server_ephemeral.public_key_bytes))
     )
+    bootstrap_resp_frame = _pad_to_frame(
+        bootstrap_resp_ct, BOOTSTRAP_CIPHERTEXT_SIZE
+    )
+    await _send(transport, bootstrap_resp_frame, addr)
+
+    session_keys = tuncore.complete_bootstrap(
+        server_ephemeral,
+        bytes(client_public),
+        is_initiator=False,
+        rotation_packets=rotation_packets,
+        rotation_seconds=rotation_seconds,
+    )
+
+    duration_s = asyncio.get_event_loop().time() - started_at
     log.info(
         "handshake complete (server) — client_cn=%s",
         client_cert.subject_cn,
@@ -456,7 +476,12 @@ async def _send(
             f"handshake send size mismatch: {len(data)} != {HANDSHAKE_FRAME_SIZE}"
         )
     if isinstance(transport, UDPTransport):
-        assert addr is not None, "UDP transport requires addr"
+        if addr is None:
+            # Runtime check (not assert) so behavior is identical under
+            # python -O. UDP responder code may legitimately have a None
+            # addr if msg1 arrived without a sender — refuse rather than
+            # send to (None, *).
+            raise HandshakeError("UDP transport requires destination addr")
         await transport.send(data, addr)
     else:
         await transport.send(data)
@@ -479,11 +504,20 @@ async def _recv(
             initial msg1 wait.
     """
     if indefinite:
-        if isinstance(transport, UDPTransport):
-            frame, addr = await transport.recv()
-            return bytes(frame), addr
-        frame = await transport.recv()
-        return bytes(frame), None
+        try:
+            if isinstance(transport, UDPTransport):
+                frame, addr = await asyncio.wait_for(
+                    transport.recv(), timeout=MSG1_WAIT_TIMEOUT
+                )
+                return bytes(frame), addr
+            frame = await asyncio.wait_for(
+                transport.recv(), timeout=MSG1_WAIT_TIMEOUT
+            )
+            return bytes(frame), None
+        except asyncio.TimeoutError:
+            raise HandshakeError(
+                f"msg1 wait timed out after {MSG1_WAIT_TIMEOUT}s"
+            )
 
     for attempt in range(MAX_RETRIES):
         try:

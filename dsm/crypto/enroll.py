@@ -9,7 +9,7 @@ Two-step flow used by the offline-CA model:
      extension carrying the X25519 static pubkey.
 
   2. The operator walks the CSR over USB to the offline CA laptop, signs
-     it (per ``deploy/CA_RUNBOOK.md``), walks the cert back, and runs
+     it (per ``deploy/GUIDE.txt`` §3c), walks the cert back, and runs
      ``import_signed_cert(...)`` to verify the cert matches the local
      identity + attest material and persist it.
 
@@ -33,18 +33,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from cryptography import x509
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.x509.oid import NameOID
+from cryptography.hazmat.primitives import serialization
 
 from dsm.core.atomic_io import atomic_write
 from dsm.crypto.attest_store import AttestStore
 from dsm.crypto.cert import (
     CertError,
     DeviceCert,
-    DSM_NOISE_STATIC_BINDING_OID,
-    encode_noise_static_binding_value,
     load_ca_root,
     validate_chain,
 )
@@ -78,24 +73,6 @@ def derive_default_cn(noise_static_pub: bytes, role: str) -> str:
     return f"dsm-{digest[:4].hex()}-{role}"
 
 
-def _attest_private_key_from_soft(
-    attest_key: tuncore.AttestKey,
-) -> ec.EllipticCurvePrivateKey:
-    """Reconstruct a cryptography-library EC private key from a soft
-    AttestKey, so the standard CSR builder can sign with it.
-
-    Soft backend only. The TPM / Keystore enroll path will replace this
-    with a CSR built and signed via platform APIs.
-    """
-    pkcs8_der = bytes(attest_key.private_pkcs8_der())
-    priv = serialization.load_der_private_key(pkcs8_der, password=None)
-    if not isinstance(priv, ec.EllipticCurvePrivateKey):
-        raise EnrollError(
-            f"attest key is not ECDSA (got {type(priv).__name__})"
-        )
-    return priv
-
-
 def build_csr(
     *,
     attest_key: tuncore.AttestKey,
@@ -104,32 +81,17 @@ def build_csr(
 ) -> bytes:
     """Build and DER-encode a CSR for this device.
 
-    The CSR's subject pubkey is the attest pubkey; the CSR is signed
-    with the attest key (proof-of-possession). The custom critical
-    ``id-dsm-noiseStaticBinding`` extension carries the X25519 Noise
-    static pubkey wrapped per the conventional OCTET STRING form
-    (see ``dsm.crypto.cert``).
+    The CSR is built and signed entirely inside the Rust attest backend —
+    the PKCS#8 export of the signing scalar never crosses the FFI boundary
+    (audit M4). The CSR carries the ``id-dsm-noiseStaticBinding`` critical
+    extension with the X25519 Noise static pub wrapped per the conventional
+    OCTET STRING form (see ``dsm.crypto.cert``).
     """
     if len(noise_static_pub) != 32:
         raise EnrollError(
             f"noise_static_pub must be 32 bytes, got {len(noise_static_pub)}"
         )
-
-    priv = _attest_private_key_from_soft(attest_key)
-
-    builder = x509.CertificateSigningRequestBuilder()
-    builder = builder.subject_name(x509.Name([
-        x509.NameAttribute(NameOID.COMMON_NAME, cn),
-    ]))
-    builder = builder.add_extension(
-        x509.UnrecognizedExtension(
-            DSM_NOISE_STATIC_BINDING_OID,
-            encode_noise_static_binding_value(noise_static_pub),
-        ),
-        critical=True,
-    )
-    csr = builder.sign(priv, hashes.SHA256())
-    return csr.public_bytes(serialization.Encoding.DER)
+    return bytes(attest_key.build_csr(cn, bytes(noise_static_pub)))
 
 
 @dataclass(frozen=True)
@@ -156,12 +118,12 @@ def generate_enrollment(
     """
     if keystore.exists():
         raise EnrollError(
-            f"identity key already exists at {keystore._path}; "
+            f"identity key already exists at {keystore.path}; "
             "re-enrollment must be explicit (remove the file by hand)"
         )
     if attest_store.exists():
         raise EnrollError(
-            f"attest key already exists at {attest_store._path}; "
+            f"attest key already exists at {attest_store.path}; "
             "re-enrollment must be explicit (remove the file by hand)"
         )
 

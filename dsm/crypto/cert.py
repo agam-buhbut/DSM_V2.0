@@ -30,12 +30,31 @@ from pathlib import Path
 
 from cryptography import x509
 from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric.ec import (
     ECDSA,
     EllipticCurvePublicKey,
 )
 from cryptography.hazmat.primitives.serialization import Encoding
 from cryptography.x509.oid import ExtensionOID, NameOID
+
+# Signature-hash algorithms accepted on the leaf cert and CRL. SHA-1 and MD5
+# are explicitly excluded — both have practical collisions that allow forging
+# a TBS that hashes to the same value as a legitimately signed object. The
+# CA is configured to sign with SHA-256 (rcgen default + offline CA runbook),
+# so this allowlist is consistent with the issuance path.
+_STRONG_HASH_NAMES: frozenset[str] = frozenset({"sha256", "sha384", "sha512"})
+
+
+def _check_strong_signature_hash(
+    sig_alg: hashes.HashAlgorithm, what: str
+) -> None:
+    """Raise CertChainError unless ``sig_alg`` is a SHA-2 family hash."""
+    if sig_alg.name not in _STRONG_HASH_NAMES:
+        raise CertChainError(
+            f"{what} signed with weak hash {sig_alg.name!r}; "
+            f"only {sorted(_STRONG_HASH_NAMES)} are accepted"
+        )
 
 # Custom OID for the X25519 Noise-static-key binding extension.
 # Experimental arc — renumber to a registered IANA Private Enterprise
@@ -281,6 +300,7 @@ def validate_chain(
     sig_alg = leaf.cert.signature_hash_algorithm
     if sig_alg is None:
         raise CertChainError("leaf cert has no signature hash algorithm")
+    _check_strong_signature_hash(sig_alg, "leaf cert")
     try:
         ca_pub.verify(
             leaf.cert.signature,

@@ -79,7 +79,11 @@ async def run_client(
         passphrase_env_file=passphrase_env_file,
     )
     try:
-        keystore.load_or_generate_with_passphrase(passphrase)
+        try:
+            keystore.load_with_passphrase(passphrase)
+        except RuntimeError as e:
+            log.error("identity store: %s", e)
+            return
         try:
             attest_store.load_with_passphrase(passphrase)
         except RuntimeError as e:
@@ -176,33 +180,71 @@ async def run_client(
 
         fsm.transition(State.ESTABLISHED)
 
-        # Host-mutating resources: register each with the stack as soon as
-        # it succeeds, so any later failure unwinds only what was applied.
-        # Unwind order is the REVERSE of registration, which matches the
-        # safe teardown order (resolv → nft → tun → tcp_ts → transport →
-        # keystore).
+        # Host-mutating resources.
+        #
+        # Apply order is fixed by dependency:
+        #   tcp_ts → tun → nft → resolv
+        # (nft references tun's name; resolv goes last so the kill switch
+        # is already up when the new resolver becomes visible.)
+        #
+        # Unwind order is anonymity-critical: the kill switch (nft) MUST
+        # stay applied while the TUN is being torn down. Tun teardown
+        # briefly removes the routing rule that forces traffic through
+        # the tunnel; during that window unmarked traffic can fall to
+        # the main routing table and hit the WAN interface. If the kill
+        # switch is gone by then, that traffic leaks. If it is still up,
+        # nftables drops it.
+        #
+        # Desired unwind: resolv → tun → nft → tcp_ts
+        # Reverse of that (= AsyncExitStack registration order):
+        #         tcp_ts, nft, tun, resolv
+        # which is NOT the apply order. We use an explicit try/except
+        # block to keep partial-failure safety: if any apply between tun
+        # and resolv fails, we manually unwind what was already applied
+        # before re-raising.
 
         tcp_ts = TcpTimestampsDisabler()
         tcp_ts.apply()
         stack.callback(tcp_ts.remove)
 
-        # TUN must come BEFORE nftables: the kill-switch ruleset references
-        # the TUN interface by name (`oif "mtun0" accept`), and nft refuses
-        # to load rules that mention a nonexistent interface.
+        # TUN must be opened/configured before nftables (kill-switch rules
+        # reference TUN by name). Apply tun + nft + resolv in that order
+        # but DEFER the cleanup-callback registration so we control the
+        # unwind sequence.
         tun = TunDevice(config.tun_name)
         tun.open()
-        tun.configure(mtu=config.mtu)
-        stack.callback(tun.close)
+        try:
+            tun.configure(mtu=config.mtu)
+            nft = NFTablesManager(config.server_ip, config.server_port, config.tun_name)
+            nft.apply()
+            try:
+                resolv = ResolvConfManager(nameserver=VPN_DNS_SERVER)
+                resolv.apply()
+            except Exception:
+                # resolv failed after nft was applied. Undo nft, then
+                # let the outer except undo tun.
+                try:
+                    nft.remove()
+                except Exception:
+                    log.warning("nft.remove during failed apply also failed")
+                raise
+        except Exception:
+            # tun.configure or nft.apply (or resolv.apply if it re-raised
+            # above) failed. Undo tun.close manually since we never
+            # registered the cleanup.
+            try:
+                tun.close()
+            except Exception:
+                log.warning("tun.close during failed apply also failed")
+            raise
 
-        nft = NFTablesManager(config.server_ip, config.server_port, config.tun_name)
-        nft.apply()
+        # All three host-mutating resources are up. Register cleanups in
+        # REVERSE of desired unwind order. AsyncExitStack pops LIFO, so:
+        #   register nft.remove  → unwinds 3rd (LAST: kill switch down)
+        #   register tun.close   → unwinds 2nd (kill switch still up)
+        #   register resolv.remove → unwinds 1st (DNS reverted while kill switch up)
         stack.callback(nft.remove)
-
-        # Swap /etc/resolv.conf AFTER nft.apply so the kill switch is already
-        # up when the new resolver becomes visible — any in-flight DNS to the
-        # old resolver is dropped, not leaked.
-        resolv = ResolvConfManager(nameserver=VPN_DNS_SERVER)
-        resolv.apply()
+        stack.callback(tun.close)
         stack.callback(resolv.remove)
 
         log.info("tunnel established")
@@ -235,8 +277,12 @@ async def run_client(
         liveness = LivenessState()
         reassembly = ReassemblyBuffer()
 
+        shutdown = asyncio.Event()
+        setup_signal_handlers(shutdown)
+
         send_packet = make_send_fn(
-            session_keys, transport, lambda: server_addr, seq, liveness=liveness,
+            session_keys, transport, lambda: server_addr, seq,
+            liveness=liveness, shutdown=shutdown,
         )
 
         scheduler = SendScheduler(
@@ -248,9 +294,6 @@ async def run_client(
         )
         await scheduler.start()
         stack.push_async_callback(scheduler.stop)
-
-        shutdown = asyncio.Event()
-        setup_signal_handlers(shutdown)
 
         ctx = DataPathContext(
             tun=tun,
