@@ -67,7 +67,7 @@ TABLE OF CONTENTS
     $ sudo apt install -y \
           build-essential pkg-config \
           python3 python3-venv python3-pip python3-dev \
-          nftables iproute2 curl ca-certificates git
+          nftables iproute2 curl ca-certificates git xxd
 
 0c. Install the Rust toolchain (if you don't already have it)
 

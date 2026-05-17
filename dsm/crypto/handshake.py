@@ -179,7 +179,7 @@ async def client_handshake(
     async def _retransmit_msg1() -> None:
         await _send(transport, msg1, server_addr)
 
-    msg2, recv_addr = await _recv(transport, retransmit=_retransmit_msg1)
+    msg2, recv_addr = await _recv_with_retry(transport, retransmit=_retransmit_msg1)
     if isinstance(transport, UDPTransport) and recv_addr != server_addr:
         raise HandshakeError(
             f"msg2 from unexpected source {recv_addr}, expected {server_addr}"
@@ -257,7 +257,7 @@ async def client_handshake(
         await _send(transport, msg3, server_addr)
         await _send(transport, bootstrap_init_frame, server_addr)
 
-    bootstrap_resp_frame, bs_addr = await _recv(
+    bootstrap_resp_frame, bs_addr = await _recv_with_retry(
         transport, retransmit=_retransmit_bootstrap
     )
     # Pin source on the bootstrap response. AEAD already rejects forged
@@ -340,10 +340,11 @@ async def server_handshake(
         ),
     )
     # Message 1: -> e (capture sender address for UDP reply).
-    # Use the long-timeout path — there is no peer state to time out
-    # against before any client has connected, but MSG1_WAIT_TIMEOUT
-    # still bounds it so a spoofed/dropped msg1 cannot stall the loop.
-    msg1, recv_addr = await _recv(transport, indefinite=True)
+    # The server-msg1 wait uses a single long timeout (no retries) since
+    # there's no peer state to time out against before any client has
+    # connected; MSG1_WAIT_TIMEOUT still bounds it so a spoofed/dropped
+    # msg1 cannot stall the loop.
+    msg1, recv_addr = await _recv_initial(transport)
     started_at = asyncio.get_event_loop().time()
     responder.read_message_1(msg1)
     addr = recv_addr or client_addr
@@ -364,7 +365,7 @@ async def server_handshake(
     async def _retransmit_msg2() -> None:
         await _send(transport, msg2, addr)
 
-    msg3, msg3_addr = await _recv(transport, retransmit=_retransmit_msg2)
+    msg3, msg3_addr = await _recv_with_retry(transport, retransmit=_retransmit_msg2)
     if (
         isinstance(transport, UDPTransport)
         and addr is not None
@@ -411,7 +412,7 @@ async def server_handshake(
     noise_transport = responder.into_transport()
 
     # Bootstrap: receive client ephemeral, send server ephemeral.
-    bootstrap_init_frame, bs_addr = await _recv(transport)
+    bootstrap_init_frame, bs_addr = await _recv_with_retry(transport)
     # Pin source: msg1 + msg3 are already source-pinned to ``addr``; the
     # bootstrap_init must come from the same peer. AEAD blocks content forge,
     # but a UDP-spoofed bootstrap frame would otherwise fail AEAD and abort
@@ -487,50 +488,54 @@ async def _send(
         await transport.send(data)
 
 
-async def _recv(
+async def _recv_one(
+    transport: UDPTransport | TCPTransport,
+    timeout: float,
+) -> tuple[bytes, tuple[str, int] | None]:
+    """Receive one frame with ``timeout`` seconds.
+
+    Unifies the UDP-returns-(bytes, addr) vs TCP-returns-bytes split
+    that the original handshake code branched at six call sites. Raises
+    ``asyncio.TimeoutError`` on timeout — caller decides retry / failure.
+    """
+    if isinstance(transport, UDPTransport):
+        frame, addr = await asyncio.wait_for(transport.recv(), timeout)
+        return bytes(frame), addr
+    frame = await asyncio.wait_for(transport.recv(), timeout)
+    return bytes(frame), None
+
+
+async def _recv_initial(
+    transport: UDPTransport | TCPTransport,
+) -> tuple[bytes, tuple[str, int] | None]:
+    """Block on the first handshake frame (server side).
+
+    Single timeout, no retries — there's no peer state to time out
+    against before the client has connected. ``MSG1_WAIT_TIMEOUT`` still
+    bounds it so a spoofed/dropped msg1 cannot stall the accept loop.
+    """
+    try:
+        return await _recv_one(transport, MSG1_WAIT_TIMEOUT)
+    except asyncio.TimeoutError:
+        raise HandshakeError(
+            f"msg1 wait timed out after {MSG1_WAIT_TIMEOUT}s"
+        )
+
+
+async def _recv_with_retry(
     transport: UDPTransport | TCPTransport,
     retransmit: Callable[[], Awaitable[None]] | None = None,
-    *,
-    indefinite: bool = False,
 ) -> tuple[bytes, tuple[str, int] | None]:
-    """Receive a HANDSHAKE_FRAME_SIZE frame.
+    """Per-message handshake recv with bounded retries.
 
-    Args:
-        retransmit: optional async callback resending the last outgoing
-            message before each retry, so peer gets another chance to
-            respond if our send was lost. Ignored when ``indefinite=True``.
-        indefinite: when True, block until a packet arrives or the task
-            is cancelled — no MAX_RETRIES timeout. Used by the server's
-            initial msg1 wait.
+    ``retransmit`` (optional) resends the last outgoing message between
+    retries so the peer gets another chance to respond if our send was
+    lost. After ``MAX_RETRIES`` consecutive ``HANDSHAKE_TIMEOUT`` waits,
+    raises ``HandshakeError`` so callers can surface a typed failure.
     """
-    if indefinite:
-        try:
-            if isinstance(transport, UDPTransport):
-                frame, addr = await asyncio.wait_for(
-                    transport.recv(), timeout=MSG1_WAIT_TIMEOUT
-                )
-                return bytes(frame), addr
-            frame = await asyncio.wait_for(
-                transport.recv(), timeout=MSG1_WAIT_TIMEOUT
-            )
-            return bytes(frame), None
-        except asyncio.TimeoutError:
-            raise HandshakeError(
-                f"msg1 wait timed out after {MSG1_WAIT_TIMEOUT}s"
-            )
-
     for attempt in range(MAX_RETRIES):
         try:
-            if isinstance(transport, UDPTransport):
-                frame, addr = await asyncio.wait_for(
-                    transport.recv(), HANDSHAKE_TIMEOUT
-                )
-                return bytes(frame), addr
-            else:
-                frame = await asyncio.wait_for(
-                    transport.recv(), HANDSHAKE_TIMEOUT
-                )
-                return bytes(frame), None
+            return await _recv_one(transport, HANDSHAKE_TIMEOUT)
         except asyncio.TimeoutError:
             if attempt == MAX_RETRIES - 1:
                 raise HandshakeError(
@@ -552,3 +557,5 @@ async def _recv(
                 await retransmit()
 
     raise HandshakeError("handshake recv failed")
+
+

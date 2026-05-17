@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
 from contextlib import AsyncExitStack
 from pathlib import Path
 
@@ -23,7 +22,6 @@ _HANDSHAKE_RETRY_BACKOFF_JITTER = 0.5  # ±this fraction of base
 from dsm.core import netaudit
 from dsm.core.config import Config
 from dsm.core.fsm import SessionFSM, State
-from dsm.core.passphrase import read_passphrase, wipe_passphrase
 from dsm.crypto.attest_store import AttestStore
 from dsm.crypto.auth_loader import AuthMaterialsError, load_cert_materials
 from dsm.crypto.cert_allowlist import CNAllowlist, CNAllowlistError
@@ -33,18 +31,16 @@ from dsm.net.dns_proxy import LocalDNSProxy
 from dsm.net.forwarding import IPForwardingManager, MasqueradeManager
 from dsm.net.nftables import ServerRateLimitManager, TcpTimestampsDisabler
 from dsm.net.tunnel import TunDevice
+from dsm.net._addresses import SERVER_TUN_IP
 from dsm.net.transport.udp import UDPTransport
 from dsm.net.transport.tcp import TCPTransport
 from dsm.core.protocol import ReassemblyBuffer
 from dsm.session import (
-    DataPathContext, LivenessState, RekeyState, SequenceCounter, decrypt_packet,
-    dispatch_inner, liveness_loop, make_send_fn, send_session_close,
-    setup_signal_handlers, tun_send_loop,
+    DataPathContext, LivenessState, RekeyState, SequenceCounter,
+    make_send_fn, setup_signal_handlers,
 )
 from dsm.traffic.shaper import TrafficShaper, make_chaff_packet
 from dsm.traffic.scheduler import SendScheduler
-
-SERVER_TUN_IP = "10.8.0.1"
 
 log = logging.getLogger(__name__)
 
@@ -96,26 +92,15 @@ async def run_server(
     log.info("CN allowlist loaded (%d entries)", len(cn_allowlist))
 
     # Read the passphrase once and unlock both stores.
+    from dsm.crypto._stores import load_daemon_stores
     keystore = KeyStore(config.key_file)
     attest_store = AttestStore(config.attest_key_file)
-    passphrase = read_passphrase(
+    if not load_daemon_stores(
+        keystore, attest_store,
         passphrase_fd=passphrase_fd,
         passphrase_env_file=passphrase_env_file,
-    )
-    try:
-        try:
-            keystore.load_with_passphrase(passphrase)
-        except RuntimeError as e:
-            log.error("identity store: %s", e)
-            return
-        try:
-            attest_store.load_with_passphrase(passphrase)
-        except RuntimeError as e:
-            log.error("attest store: %s", e)
-            keystore.unload()
-            return
-    finally:
-        wipe_passphrase(passphrase)
+    ):
+        return
 
     async with AsyncExitStack() as stack:
         # Sync cleanup callbacks use stack.callback; async ones use
@@ -349,49 +334,25 @@ async def run_server(
             reassembly=reassembly,
         )
 
-        async def recv_loop() -> None:
-            while not shutdown.is_set():
-                recv_addr: tuple[str, int] | None = None
-                try:
-                    if isinstance(transport, UDPTransport):
-                        data, recv_addr = await asyncio.wait_for(transport.recv(), timeout=0.1)
-                    else:
-                        data = await asyncio.wait_for(transport.recv(), timeout=0.1)
-                except asyncio.TimeoutError:
-                    session_keys.tick()
-                    continue
-                except ConnectionError as e:
-                    log.info("transport closed by peer: %s", e)
-                    shutdown.set()
-                    return
+        # Hand off the steady-state recv/send/liveness loops to the
+        # shared driver. Server-specific bit: post_authenticate records
+        # the source addr of the first authenticated packet into the
+        # mutable cell that send_fn dereferences. No udp_addr_filter —
+        # the server has no single expected peer addr until that first
+        # authenticated packet lands. No extra_loops — auto_mtu_loop is
+        # client-only.
+        def _record_client_addr(addr: tuple[str, int]) -> None:
+            client_addr[0] = addr
 
-                result = decrypt_packet(data, session_keys, replay)
-                if result is None:
-                    continue
-
-                liveness.last_recv_time = time.monotonic()
-
-                # Update peer address only after successful authentication
-                if recv_addr is not None:
-                    client_addr[0] = recv_addr
-
-                inner, _prev_epoch = result
-                await dispatch_inner(ctx, inner)
-
-        try:
-            await asyncio.gather(
-                recv_loop(),
-                tun_send_loop(ctx),
-                liveness_loop(ctx),
-            )
-        except asyncio.CancelledError:
-            pass
-        finally:
-            log.info("server shutting down")
-            # Notify peer first (before scheduler + transport tear down),
-            # so it sees a fast graceful close rather than DEAD_PEER_TIMEOUT.
-            await send_session_close(ctx)
-            fsm.transition(State.TEARDOWN)
-            fsm.transition(State.IDLE)
-            # AsyncExitStack cleanup happens automatically here
-            # (including keystore.unload — see top of stack).
+        from dsm.session import run_data_loops
+        await run_data_loops(
+            ctx,
+            transport,
+            session_keys,
+            replay,
+            fsm,
+            post_authenticate=_record_client_addr,
+            shutdown_log="server shutting down",
+        )
+        # AsyncExitStack cleanup happens automatically here
+        # (including keystore.unload — see top of stack).

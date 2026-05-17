@@ -16,6 +16,7 @@ import logging
 import os
 import sys
 import termios
+from collections.abc import Callable
 from pathlib import Path
 
 from dsm.core.path_security import check_user_file_permissions
@@ -48,24 +49,30 @@ def _read_from_tty(prompt: str) -> bytearray:
     old_attrs = termios.tcgetattr(fd)
     buf = bytearray()
     try:
+        # The bytes-collection loop is the ONLY region where ``buf`` can
+        # grow past empty, so it's the only region whose exception path
+        # needs to wipe. tcsetattr/tcgetattr around it cannot leak the
+        # passphrase even on failure, but the surrounding ``finally``
+        # still restores terminal state.
         new_attrs = termios.tcgetattr(fd)
         new_attrs[3] = new_attrs[3] & ~termios.ECHO
         termios.tcsetattr(fd, termios.TCSADRAIN, new_attrs)
 
-        while True:
-            ch = os.read(fd, 1)
-            if not ch:
-                break
-            if ch in (b"\n", b"\r"):
-                break
-            if ch == b"\x03":
-                raise KeyboardInterrupt
-            if ch == b"\x04" and not buf:
-                break
-            buf.extend(ch)
-    except BaseException:
-        wipe_passphrase(buf)
-        raise
+        try:
+            while True:
+                ch = os.read(fd, 1)
+                if not ch:
+                    break
+                if ch in (b"\n", b"\r"):
+                    break
+                if ch == b"\x03":
+                    raise KeyboardInterrupt
+                if ch == b"\x04" and not buf:
+                    break
+                buf.extend(ch)
+        except BaseException:
+            wipe_passphrase(buf)
+            raise
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
         sys.stderr.write("\n")
@@ -110,6 +117,26 @@ def _read_from_file(path: str | Path) -> bytearray:
     return buf
 
 
+def _try_source(
+    fn: Callable[[], bytearray],
+    warn_msg: str,
+    *warn_args: object,
+) -> bytearray | None:
+    """Run ``fn()``; on OSError-family failure log ``warn_msg``-formatted
+    with the exception appended and return None.
+
+    The three file/fd sources share the same shape ("try read; on OS-level
+    failure log and fall through"); centralising the try/except keeps the
+    fallback chain readable without changing observable behavior (each
+    source still emits its caller-supplied warning string).
+    """
+    try:
+        return fn()
+    except (OSError, ValueError) as e:
+        log.warning("%s: %s", warn_msg % warn_args, e)
+        return None
+
+
 def _read_noninteractive(
     passphrase_fd: int | None,
     passphrase_env_file: str | None,
@@ -122,25 +149,30 @@ def _read_noninteractive(
     4. ``DSM_PASSPHRASE`` env var (weakest; visible in /proc)
     """
     if passphrase_fd is not None:
-        try:
-            return _read_from_fd(passphrase_fd)
-        except (OSError, ValueError) as e:
-            log.warning("failed to read from passphrase-fd %d: %s", passphrase_fd, e)
-            return None
+        return _try_source(
+            lambda: _read_from_fd(passphrase_fd),
+            "failed to read from passphrase-fd %d",
+            passphrase_fd,
+        )
 
     if passphrase_env_file is not None:
-        try:
-            return _read_from_file(passphrase_env_file)
-        except (OSError, FileNotFoundError) as e:
-            log.warning("failed to read passphrase from %s: %s", passphrase_env_file, e)
-            return None
+        return _try_source(
+            lambda: _read_from_file(passphrase_env_file),
+            "failed to read passphrase from %s",
+            passphrase_env_file,
+        )
 
     env_file = os.environ.get("DSM_PASSPHRASE_FILE")
     if env_file:
-        try:
-            return _read_from_file(env_file)
-        except (OSError, FileNotFoundError) as e:
-            log.warning("DSM_PASSPHRASE_FILE %s unreadable: %s", env_file, e)
+        result = _try_source(
+            lambda: _read_from_file(env_file),
+            "DSM_PASSPHRASE_FILE %s unreadable",
+            env_file,
+        )
+        if result is not None:
+            return result
+        # Note: fall through to DSM_PASSPHRASE (matches the original
+        # behavior — DSM_PASSPHRASE_FILE failure did NOT stop the chain).
 
     # os.environb returns bytes (one fewer immutable str copy than
     # os.environ.get + .encode). The fundamental limitation remains: the

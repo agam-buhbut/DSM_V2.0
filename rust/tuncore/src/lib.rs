@@ -129,7 +129,7 @@ impl PyReplayWindow {
 
     /// Mark seq as seen. Call only after successful authentication.
     fn update(&mut self, seq: u64) {
-        self.inner.update(seq)
+        self.inner.update(seq);
     }
 
     #[getter]

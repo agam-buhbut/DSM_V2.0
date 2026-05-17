@@ -7,6 +7,7 @@ import struct
 import time
 from typing import TYPE_CHECKING, Awaitable, Callable
 
+from dsm.core import netaudit
 from dsm.core.fsm import SessionFSM, State
 from dsm.core.protocol import InnerPacket, PacketType
 from dsm.traffic.shaper import TrafficShaper
@@ -28,6 +29,29 @@ MAX_REKEY_RETRIES = 3
 
 
 SendFn = Callable[[bytes, int], Awaitable[None]]
+
+
+async def _send_rekey_packet(
+    ptype: PacketType,
+    payload: bytes,
+    session_keys: "tuncore.SessionKeyManager",
+    shaper: TrafficShaper,
+    send_fn: SendFn,
+) -> None:
+    """Build a rekey-family inner packet, pad, and send it.
+
+    All four REKEY_INIT/REKEY_ACK construction sites share the same
+    shape — same epoch_id derivation, same shaper.pad_packet call,
+    same send_fn invocation. Centralised here so future protocol
+    fields (e.g. an explicit rekey reason) land in one place.
+    """
+    inner = InnerPacket(
+        ptype=ptype,
+        epoch_id=session_keys.epoch & 0x03,
+        payload=payload,
+    )
+    padded, target_size = shaper.pad_packet(inner)
+    await send_fn(padded, target_size)
 
 
 def _is_rate_limited(last_rekey_time: float | None) -> bool:
@@ -66,13 +90,9 @@ async def initiate_rekey(
     fsm.transition(State.REKEYING)
     new_epoch, ephemeral_pub = session_keys.initiate_rotation()
     payload = struct.pack("!I", new_epoch) + bytes(ephemeral_pub)
-    inner = InnerPacket(
-        ptype=PacketType.REKEY_INIT,
-        epoch_id=session_keys.epoch & 0x03,
-        payload=payload,
+    await _send_rekey_packet(
+        PacketType.REKEY_INIT, payload, session_keys, shaper, send_fn,
     )
-    padded, target_size = shaper.pad_packet(inner)
-    await send_fn(padded, target_size)
     log.info("rekey initiated, new epoch=%d", new_epoch)
     return time.monotonic(), new_epoch, payload
 
@@ -91,13 +111,9 @@ async def resend_rekey_init(
     re-randomized per call via ``shaper.pad_packet``; an observer
     cannot see a byte-identical retransmit.
     """
-    inner = InnerPacket(
-        ptype=PacketType.REKEY_INIT,
-        epoch_id=session_keys.epoch & 0x03,
-        payload=payload,
+    await _send_rekey_packet(
+        PacketType.REKEY_INIT, payload, session_keys, shaper, send_fn,
     )
-    padded, target_size = shaper.pad_packet(inner)
-    await send_fn(padded, target_size)
 
 
 async def handle_rekey_init(
@@ -144,13 +160,10 @@ async def handle_rekey_init(
             "duplicate REKEY_INIT for epoch %d — re-sending cached ACK",
             new_epoch,
         )
-        inner = InnerPacket(
-            ptype=PacketType.REKEY_ACK,
-            epoch_id=session_keys.epoch & 0x03,
-            payload=cached_ack_payload,
+        await _send_rekey_packet(
+            PacketType.REKEY_ACK, cached_ack_payload,
+            session_keys, shaper, send_fn,
         )
-        padded, target_size = shaper.pad_packet(inner)
-        await send_fn(padded, target_size)
         return last_rekey_time, cached_ack_epoch, cached_ack_payload
 
     if _is_rate_limited(last_rekey_time):
@@ -172,13 +185,9 @@ async def handle_rekey_init(
 
     # Send ACK under old keys (session_keys epoch not yet rotated).
     ack_payload = struct.pack("!I", prepared_epoch) + bytes(our_ephemeral_pub)
-    inner = InnerPacket(
-        ptype=PacketType.REKEY_ACK,
-        epoch_id=session_keys.epoch & 0x03,
-        payload=ack_payload,
+    await _send_rekey_packet(
+        PacketType.REKEY_ACK, ack_payload, session_keys, shaper, send_fn,
     )
-    padded, target_size = shaper.pad_packet(inner)
-    await send_fn(padded, target_size)
 
     # Now apply the rotation.
     try:
@@ -190,7 +199,6 @@ async def handle_rekey_init(
 
     fsm.transition(State.ESTABLISHED)
     log.info("rekey completed as responder, epoch=%d", completed_epoch)
-    from dsm.core import netaudit
     netaudit.emit("rekey_epoch", role="responder", new_epoch=completed_epoch)
     # Cache the ACK we just sent under the NEW keys (after apply) so a
     # duplicate INIT retransmitted by the client (with its stale pending
@@ -237,6 +245,5 @@ def handle_rekey_ack(
 
     fsm.transition(State.ESTABLISHED)
     log.info("rekey completed as initiator, epoch=%d", completed_epoch)
-    from dsm.core import netaudit
     netaudit.emit("rekey_epoch", role="initiator", new_epoch=completed_epoch)
     return time.monotonic()

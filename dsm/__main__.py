@@ -17,6 +17,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from dsm.core import log as dsm_log
+from dsm.core import netaudit
 from dsm.core.config import load
 
 
@@ -116,7 +117,6 @@ def main() -> None:
 
     # Audit stream: --debug-net CLI flag wins over config.debug_net so
     # an operator can flip it on for one run without editing the file.
-    from dsm.core import netaudit
     netaudit.configure(args.debug_net or config.debug_net)
 
     if config.mode == "client":
@@ -198,36 +198,19 @@ def _run_enroll(
         return
 
     if import_cert is not None:
-        passphrase = read_passphrase(
+        # --import binds a CA-signed cert to an *existing* identity
+        # provisioned by --csr-out. Auto-generating here would yield
+        # a fresh Noise static that doesn't match the cert's
+        # noiseStaticBinding extension; better to refuse loudly via
+        # loaded_stores_cli (sys.exit on RuntimeError).
+        from dsm.crypto._stores import loaded_stores_cli
+        with loaded_stores_cli(
+            keystore, attest_store,
             passphrase_fd=passphrase_fd,
             passphrase_env_file=passphrase_env_file,
-        )
-        try:
-            try:
-                # --import binds a CA-signed cert to an *existing* identity
-                # provisioned by --csr-out. Auto-generating here would yield
-                # a fresh Noise static that doesn't match the cert's
-                # noiseStaticBinding extension; better to refuse loudly.
-                keystore.load_with_passphrase(passphrase)
-            except Exception as e:
-                print(
-                    f"failed to unlock identity at {config.key_file}: {e}",
-                    file=sys.stderr,
-                )
-                sys.exit(2)
-            try:
-                attest_store.load_with_passphrase(passphrase)
-            except Exception as e:
-                print(
-                    f"failed to unlock attest key at {config.attest_key_file}: {e}",
-                    file=sys.stderr,
-                )
-                keystore.unload()
-                sys.exit(2)
-        finally:
-            wipe_passphrase(passphrase)
-
-        try:
+            key_file_label=config.key_file,
+            attest_key_file_label=config.attest_key_file,
+        ):
             try:
                 leaf = import_signed_cert(
                     cert_input_path=import_cert,
@@ -239,9 +222,6 @@ def _run_enroll(
             except EnrollError as e:
                 print(f"enroll: {e}", file=sys.stderr)
                 sys.exit(2)
-        finally:
-            attest_store.unload()
-            keystore.unload()
 
         print(f"Imported cert into {config.cert_file}")
         print(f"  cn = {leaf.subject_cn}")

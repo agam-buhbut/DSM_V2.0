@@ -45,6 +45,22 @@ IDLE_GAP_LAMBDA = 1.5  # Exponential distribution parameter (mean gap ~1.5s)
 SMOOTHING_WINDOW = 2.0
 SMOOTHING_LAMBDA = 0.010  # mean ≈10ms; clamped to [1ms, 25ms]
 
+# Active-mode chaff probability per scheduler tick, before
+# multiplying by the resampled rate multiplier. ~30% baseline keeps
+# chaff/real on the same order of magnitude.
+_ACTIVE_CHAFF_BASE_PROB = 0.3
+# Chaff size-class perturbation: with probability _CHAFF_SIZE_PERTURB_UP_P
+# bump the sampled chaff size one class up; with the next slice
+# (_CHAFF_SIZE_PERTURB_DOWN_P - _CHAFF_SIZE_PERTURB_UP_P) bump one class
+# down; otherwise leave it. Together they decorrelate chaff sizes from
+# the EMA-tracked real distribution.
+_CHAFF_SIZE_PERTURB_UP_P = 0.15
+_CHAFF_SIZE_PERTURB_DOWN_P = 0.30
+# Active-mode chaff rate multiplier is resampled into the half-open
+# range [_CHAFF_RATE_BASE, _CHAFF_RATE_BASE + 1.0) every 1-3 s, i.e.
+# 0.5 .. 1.5x.
+_CHAFF_RATE_BASE = 0.5
+
 
 class SizeTracker:
     """Track real traffic size class distribution via EMA."""
@@ -177,7 +193,7 @@ class TrafficShaper:
         if time_since_real < IDLE_THRESHOLD:
             # Active mode: probability-based interleaving
             self._maybe_resample(now)
-            return (csprng_float()) < (0.3 * self._chaff_rate_multiplier)
+            return (csprng_float()) < (_ACTIVE_CHAFF_BASE_PROB * self._chaff_rate_multiplier)
 
         # Idle mode: burst pattern
         return self._idle_burst_check(now)
@@ -185,14 +201,16 @@ class TrafficShaper:
     def make_chaff(self, epoch_id: int = 0) -> InnerPacket:
         """Generate a chaff packet with perturbed size distribution to prevent correlation."""
         size_class = self._size_tracker.sample()
-        # Perturb size class ±1 with 30% probability to decorrelate from real traffic
+        # Perturb size class ±1 to decorrelate from real traffic. Total
+        # perturb probability is _CHAFF_SIZE_PERTURB_DOWN_P (the upper
+        # bound), split into the first slice = up, the second slice = down.
         r = csprng_float()
         classes = self._active_classes
-        if r < 0.15:
+        if r < _CHAFF_SIZE_PERTURB_UP_P:
             idx = self._size_tracker.class_index(size_class)
             if idx + 1 < len(classes):
                 size_class = classes[idx + 1]
-        elif r < 0.30:
+        elif r < _CHAFF_SIZE_PERTURB_DOWN_P:
             idx = self._size_tracker.class_index(size_class)
             if idx > 0:
                 size_class = classes[idx - 1]
@@ -208,7 +226,7 @@ class TrafficShaper:
         """Re-sample chaff rate multiplier periodically."""
         if now < self._next_resample:
             return
-        self._chaff_rate_multiplier = 0.5 + (csprng_float())
+        self._chaff_rate_multiplier = _CHAFF_RATE_BASE + (csprng_float())
         self._next_resample = now + RESAMPLE_MIN + (csprng_float()) * (RESAMPLE_MAX - RESAMPLE_MIN)
 
     def _idle_burst_check(self, now: float) -> bool:

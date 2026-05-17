@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
 from contextlib import AsyncExitStack
 
 from cryptography.x509.oid import ExtendedKeyUsageOID
@@ -12,22 +11,24 @@ from cryptography.x509.oid import ExtendedKeyUsageOID
 from dsm.core import netaudit
 from dsm.core.config import Config
 from dsm.core.fsm import SessionFSM, State
-from dsm.core.passphrase import read_passphrase, wipe_passphrase
 from dsm.crypto.attest_store import AttestStore
 from dsm.crypto.auth_loader import AuthMaterialsError, load_cert_materials
 from dsm.crypto.keystore import KeyStore
 from dsm.net.nftables import NFTablesManager, TcpTimestampsDisabler
 from dsm.net.resolv_conf import ResolvConfManager
 from dsm.net.tunnel import TunDevice
+from dsm.net._addresses import SERVER_TUN_IP
 from dsm.net.transport.udp import UDPTransport
 from dsm.net.transport.tcp import TCPTransport
 
-VPN_DNS_SERVER = "10.8.0.1"  # server's TUN address; DNS proxy listens there
+# Re-export under the historical name for any external code that imports
+# `dsm.client.VPN_DNS_SERVER`. Internal uses go through SERVER_TUN_IP.
+VPN_DNS_SERVER = SERVER_TUN_IP
+
 from dsm.core.protocol import ReassemblyBuffer
 from dsm.session import (
     DataPathContext, LivenessState, RekeyState, SequenceCounter, auto_mtu_loop,
-    decrypt_packet, dispatch_inner, liveness_loop, make_send_fn,
-    send_session_close, setup_signal_handlers, tun_send_loop,
+    make_send_fn, setup_signal_handlers,
 )
 from dsm.traffic.shaper import TrafficShaper, make_chaff_packet
 from dsm.traffic.scheduler import SendScheduler
@@ -71,27 +72,17 @@ async def run_client(
     # Read the passphrase once and unlock both stores. Identity (X25519
     # Noise static) and attest key (ECDSA P-256) live behind the same
     # passphrase by design — they're both provisioned together by
-    # `dsm enroll`.
+    # `dsm enroll`. Daemon variant returns (not exits) on failure so the
+    # surrounding AsyncExitStack still unwinds cleanly.
+    from dsm.crypto._stores import load_daemon_stores
     keystore = KeyStore(config.key_file)
     attest_store = AttestStore(config.attest_key_file)
-    passphrase = read_passphrase(
+    if not load_daemon_stores(
+        keystore, attest_store,
         passphrase_fd=passphrase_fd,
         passphrase_env_file=passphrase_env_file,
-    )
-    try:
-        try:
-            keystore.load_with_passphrase(passphrase)
-        except RuntimeError as e:
-            log.error("identity store: %s", e)
-            return
-        try:
-            attest_store.load_with_passphrase(passphrase)
-        except RuntimeError as e:
-            log.error("attest store: %s", e)
-            keystore.unload()
-            return
-    finally:
-        wipe_passphrase(passphrase)
+    ):
+        return
 
     shaper = TrafficShaper(config.padding_min, config.padding_max)
 
@@ -127,6 +118,20 @@ async def run_client(
             client_handshake,
         )
 
+        # Per-error-class log prefix. Lookup is by exact type(e); the
+        # tuple in the except clause below preserves catch order
+        # (subclasses before parent classes is irrelevant here because
+        # every entry is checked by isinstance via the tuple, and the
+        # log prefix is then resolved from the concrete class).
+        _CLIENT_HANDSHAKE_ERR_LABELS: dict[
+            type[BaseException], str
+        ] = {
+            CNMismatchError: "server CN check failed",
+            CertRevokedError: "server cert revoked",
+            CertAuthError: "server cert auth failed",
+            HandshakeError: "handshake failed",
+        }
+
         assert config.expected_server_cn is not None, (
             "client mode requires expected_server_cn (validated in Config)"
         )
@@ -145,35 +150,24 @@ async def run_client(
                 rotation_packets=config.rotation_packets,
                 rotation_seconds=config.rotation_seconds,
             )
-        except CNMismatchError as e:
-            log.error("server CN check failed: %s", e)
-            netaudit.emit(
-                "handshake_end", role="client", outcome="failed",
-                error="CNMismatchError", message=str(e),
+        except (
+            CNMismatchError, CertRevokedError, CertAuthError, HandshakeError,
+        ) as e:
+            # Resolve the most-specific label: walk the dict in MRO order
+            # so e.g. CNMismatchError (subclass of CertAuthError) gets
+            # its dedicated prefix rather than CertAuthError's.
+            prefix = next(
+                (
+                    _CLIENT_HANDSHAKE_ERR_LABELS[cls]
+                    for cls in type(e).__mro__
+                    if cls in _CLIENT_HANDSHAKE_ERR_LABELS
+                ),
+                "handshake failed",
             )
-            fsm.transition(State.TEARDOWN)
-            return
-        except CertRevokedError as e:
-            log.error("server cert revoked: %s", e)
+            log.error("%s: %s", prefix, e)
             netaudit.emit(
                 "handshake_end", role="client", outcome="failed",
-                error="CertRevokedError", message=str(e),
-            )
-            fsm.transition(State.TEARDOWN)
-            return
-        except CertAuthError as e:
-            log.error("server cert auth failed: %s", e)
-            netaudit.emit(
-                "handshake_end", role="client", outcome="failed",
-                error="CertAuthError", message=str(e),
-            )
-            fsm.transition(State.TEARDOWN)
-            return
-        except HandshakeError as e:
-            log.error("handshake failed: %s", e)
-            netaudit.emit(
-                "handshake_end", role="client", outcome="failed",
-                error="HandshakeError", message=str(e),
+                error=type(e).__name__, message=str(e),
             )
             fsm.transition(State.TEARDOWN)
             return  # AsyncExitStack unwinds transport + keystore
@@ -218,7 +212,7 @@ async def run_client(
             nft = NFTablesManager(config.server_ip, config.server_port, config.tun_name)
             nft.apply()
             try:
-                resolv = ResolvConfManager(nameserver=VPN_DNS_SERVER)
+                resolv = ResolvConfManager(nameserver=SERVER_TUN_IP)
                 resolv.apply()
             except Exception:
                 # resolv failed after nft was applied. Undo nft, then
@@ -308,54 +302,22 @@ async def run_client(
             reassembly=reassembly,
         )
 
-        async def recv_loop() -> None:
-            while not shutdown.is_set():
-                try:
-                    if isinstance(transport, UDPTransport):
-                        data, recv_addr = await asyncio.wait_for(
-                            transport.recv(), timeout=0.1,
-                        )
-                        if recv_addr != server_addr:
-                            log.debug(
-                                "packet from unexpected source %s, dropping",
-                                recv_addr,
-                            )
-                            continue
-                    else:
-                        data = await asyncio.wait_for(transport.recv(), timeout=0.1)
-                except asyncio.TimeoutError:
-                    session_keys.tick()
-                    continue
-                except ConnectionError as e:
-                    log.info("transport closed by peer: %s", e)
-                    shutdown.set()
-                    return
-
-                result = decrypt_packet(data, session_keys, replay)
-                if result is None:
-                    continue
-
-                liveness.last_recv_time = time.monotonic()
-
-                inner, _prev_epoch = result
-                await dispatch_inner(ctx, inner)
-
-        try:
-            await asyncio.gather(
-                recv_loop(),
-                tun_send_loop(ctx),
-                liveness_loop(ctx),
-                auto_mtu_loop(ctx, transport, config),
-            )
-        except asyncio.CancelledError:
-            pass
-        finally:
-            log.info("shutting down")
-            # Notify peer first (best-effort) so it sees a fast graceful
-            # close rather than DEAD_PEER_TIMEOUT. Must fire BEFORE the
-            # AsyncExitStack unwinds — once scheduler/transport are gone
-            # the send_fn is useless.
-            await send_session_close(ctx)
-            fsm.transition(State.TEARDOWN)
-            fsm.transition(State.IDLE)
-            # AsyncExitStack unwinds remaining resources in reverse order.
+        # Hand off the steady-state recv/send/liveness loops to the
+        # shared driver. Client-specific bits passed in:
+        #   * udp_addr_filter: drop UDP datagrams not from server_addr.
+        #     TCP doesn't need this (one connection only).
+        #   * extra_loops: auto_mtu_loop is client-only.
+        # The AsyncExitStack stays in this module; ``run_data_loops``
+        # only owns the loops + the SESSION_CLOSE / FSM teardown.
+        from dsm.session import run_data_loops
+        await run_data_loops(
+            ctx,
+            transport,
+            session_keys,
+            replay,
+            fsm,
+            extra_loops=(auto_mtu_loop(ctx, transport, config),),
+            udp_addr_filter=lambda addr: addr == server_addr,
+            shutdown_log="shutting down",
+        )
+        # AsyncExitStack unwinds remaining resources in reverse order.

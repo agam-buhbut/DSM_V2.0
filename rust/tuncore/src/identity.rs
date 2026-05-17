@@ -1,9 +1,7 @@
 use crate::passphrase_store::{self, ARGON2_SALT_LEN, XCHACHA_NONCE_LEN};
-use crate::secure_memory::LockedKey32;
+use crate::secure_memory::{random_locked_key32, LockedKey32};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac as _};
-use rand::rngs::OsRng;
-use rand::RngCore;
 use sha2::Sha256;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::{Zeroize, Zeroizing};
@@ -54,17 +52,17 @@ impl IdentityKeyPair {
     /// Generate a new random identity keypair. The secret is written directly
     /// into a mlock'd heap buffer via `OsRng`.
     pub fn generate() -> Result<Self, String> {
-        let mut secret = LockedKey32::zeroed()?;
-        OsRng.fill_bytes(secret.as_mut());
+        let secret = random_locked_key32()?;
         let public = derive_static_pub(&secret);
         Ok(Self { secret, public })
     }
 
     /// Build from a pre-populated `LockedKey32` (e.g. after decryption from
-    /// disk). Derives the public key.
-    fn from_locked(secret: LockedKey32) -> Result<Self, String> {
+    /// disk). Derives the public key. Infallible — kept on the type so the
+    /// public-key derivation lives next to the field that owns it.
+    fn from_locked(secret: LockedKey32) -> Self {
         let public = derive_static_pub(&secret);
-        Ok(Self { secret, public })
+        Self { secret, public }
     }
 
     pub fn public_key(&self) -> &[u8; 32] {
@@ -141,7 +139,7 @@ impl IdentityKeyPair {
         let mut secret = LockedKey32::zeroed()?;
         secret.as_mut().copy_from_slice(&plaintext);
 
-        Self::from_locked(secret)
+        Ok(Self::from_locked(secret))
     }
 }
 

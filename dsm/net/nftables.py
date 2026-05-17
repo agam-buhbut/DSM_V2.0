@@ -8,6 +8,8 @@ import re
 import subprocess
 from pathlib import Path
 
+from dsm.core import netaudit
+
 log = logging.getLogger(__name__)
 
 TEMPLATE_PATH = Path(__file__).parent.parent.parent / "nftables" / "nftables.conf"
@@ -102,7 +104,6 @@ class NFTablesManager:
         self._tun_name = tun_name
 
     def apply(self) -> None:
-        from dsm.core import netaudit
         _apply_ruleset(self._render(), fatal=True, log_label="nftables kill switch")
         netaudit.emit(
             "nft_apply",
@@ -113,7 +114,6 @@ class NFTablesManager:
         )
 
     def remove(self) -> None:
-        from dsm.core import netaudit
         _delete_tables("dsm_killswitch", "dsm_dns_leak")
         log.info("nftables rules removed")
         netaudit.emit(
@@ -156,7 +156,6 @@ class ServerRateLimitManager:
         self._applied = False
 
     def apply(self) -> None:
-        from dsm.core import netaudit
         self._applied = _apply_ruleset(
             self._render(), fatal=False,
             log_label=f"server rate-limit (port {self._listen_port})",
@@ -171,7 +170,6 @@ class ServerRateLimitManager:
     def remove(self) -> None:
         if not self._applied:
             return
-        from dsm.core import netaudit
         _delete_tables("dsm_server_ratelimit")
         self._applied = False
         netaudit.emit("nft_remove", tables=["dsm_server_ratelimit"])

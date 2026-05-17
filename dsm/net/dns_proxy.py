@@ -133,21 +133,27 @@ class LocalDNSProxy:
         task.add_done_callback(self._tasks.discard)
         return True
 
-    async def _handle_query(
+    def _parse_or_reject(
         self, data: bytes, addr: tuple[str, int], send: Any,
-    ) -> None:
-        # Parsing and trivial-response paths run outside the semaphore —
-        # the semaphore exists to bound concurrent *upstream* resolver
-        # calls, not cheap wire parsing.
+    ) -> tuple[dns.message.Message, str, int] | None:
+        """Parse wire bytes; return (query, qname, qtype) or None if handled.
+
+        Returns ``None`` when the request was malformed (dropped), had no
+        question (FORMERR responded), or wasn't an A query (empty NOERROR
+        responded — answered here so the orchestrator can skip dedup/resolve).
+        """
         try:
             query = dns.message.from_wire(data)
         except dns.exception.DNSException as e:
-            log.debug("dropping malformed DNS query from %s: %s", addr, type(e).__name__)
-            return
+            log.debug(
+                "dropping malformed DNS query from %s: %s",
+                addr, type(e).__name__,
+            )
+            return None
 
         if not query.question:
             send(_make_error(query, dns.rcode.FORMERR), addr)
-            return
+            return None
 
         q = query.question[0]
         qname = q.name.to_text(omit_final_dot=True).lower()
@@ -159,57 +165,102 @@ class LocalDNSProxy:
             resp = dns.message.make_response(query)
             resp.flags |= dns.flags.RA
             send(resp.to_wire(), addr)
-            return
+            return None
 
-        # In-flight deduplication: coalesce identical concurrent queries.
-        # Only the *first* caller holds a semaphore slot while calling
-        # upstream; later callers await the shared future slot-free, so
-        # the semaphore actually bounds upstream fan-out (not total
-        # duplicates waiting).
+        return query, qname, qtype
+
+    async def _resolve_with_dedup(
+        self, qname: str, qtype: int,
+    ) -> list[str]:
+        """Resolve ``qname`` for A records, coalescing concurrent duplicates.
+
+        The first caller for a (qname, qtype) holds a semaphore slot while
+        calling upstream; later callers await the shared future slot-free,
+        so the semaphore actually bounds upstream fan-out (not total
+        duplicates waiting).
+
+        Returns ``[]`` on inflight-map saturation (signals SERVFAIL to
+        the caller) or on resolver failure.
+        """
         query_key = (qname, qtype)
         inflight_future = self._inflight.get(query_key)
-        if inflight_future is None:
-            if len(self._inflight) >= self._MAX_INFLIGHT:
-                log.debug(
-                    "inflight map full (%d entries), SERVFAIL for %s",
-                    len(self._inflight),
-                    _redact_qname(qname),
-                )
-                send(_make_error(query, dns.rcode.SERVFAIL), addr)
-                return
-            inflight_future = asyncio.get_running_loop().create_future()
-            self._inflight[query_key] = inflight_future
+        if inflight_future is not None:
             try:
-                async with self._sem:
-                    try:
-                        addresses = await self._resolver.resolve(qname)
-                        inflight_future.set_result(addresses)
-                    except Exception as e:
-                        log_qname = qname if self._debug_dns else f"qname-sha256={_redact_qname(qname)}"
-                        log.warning("DNS resolve failed for %s: %s", log_qname, type(e).__name__)
-                        inflight_future.set_exception(e)
-                        addresses = []
-            finally:
-                del self._inflight[query_key]
-        else:
-            try:
-                addresses = await inflight_future
+                return await inflight_future
             except Exception:
-                addresses = []
+                return []
 
-        # Send response
+        if len(self._inflight) >= self._MAX_INFLIGHT:
+            log.debug(
+                "inflight map full (%d entries), SERVFAIL for %s",
+                len(self._inflight),
+                _redact_qname(qname),
+            )
+            return []
+
+        inflight_future = asyncio.get_running_loop().create_future()
+        self._inflight[query_key] = inflight_future
+        try:
+            async with self._sem:
+                try:
+                    addresses = await self._resolver.resolve(qname)
+                    inflight_future.set_result(addresses)
+                    return addresses
+                except Exception as e:
+                    log_qname = (
+                        qname if self._debug_dns
+                        else f"qname-sha256={_redact_qname(qname)}"
+                    )
+                    log.warning(
+                        "DNS resolve failed for %s: %s",
+                        log_qname, type(e).__name__,
+                    )
+                    inflight_future.set_exception(e)
+                    return []
+        finally:
+            del self._inflight[query_key]
+
+    @staticmethod
+    def _build_response(
+        query: dns.message.Message, addresses: list[str],
+    ) -> bytes:
+        """Build an A-record response wire frame from upstream addresses.
+
+        Caller decides what to do with an empty ``addresses`` (typically
+        SERVFAIL) — this helper assumes there's at least one A record.
+        """
+        resp = dns.message.make_response(query)
+        resp.flags |= dns.flags.RA
+        q = query.question[0]
+        rrset = dns.rrset.from_text_list(
+            q.name, DEFAULT_CACHED_TTL,
+            dns.rdataclass.IN, dns.rdatatype.A, addresses,
+        )
+        resp.answer.append(rrset)
+        return resp.to_wire()
+
+    async def _handle_query(
+        self, data: bytes, addr: tuple[str, int], send: Any,
+    ) -> None:
+        """Orchestrate parse → dedup-resolve → respond for one DNS datagram.
+
+        Each step is a separate helper; this method exists solely to
+        glue them together. Parsing and trivial-response paths run
+        outside the semaphore — the semaphore exists to bound concurrent
+        upstream resolver calls, not cheap wire parsing.
+        """
+        parsed = self._parse_or_reject(data, addr, send)
+        if parsed is None:
+            return
+        query, qname, qtype = parsed
+
+        addresses = await self._resolve_with_dedup(qname, qtype)
+
         try:
             if not addresses:
                 send(_make_error(query, dns.rcode.SERVFAIL), addr)
                 return
-
-            resp = dns.message.make_response(query)
-            resp.flags |= dns.flags.RA
-            rrset = dns.rrset.from_text_list(
-                q.name, DEFAULT_CACHED_TTL, dns.rdataclass.IN, dns.rdatatype.A, addresses,
-            )
-            resp.answer.append(rrset)
-            send(resp.to_wire(), addr)
+            send(self._build_response(query, addresses), addr)
         except Exception as e:
             log.exception("failed to send DNS response to %s: %s", addr, e)
 

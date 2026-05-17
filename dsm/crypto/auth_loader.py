@@ -59,22 +59,11 @@ def _load_cert_der(cert_file: Path) -> bytes:
     """Read a leaf cert from disk in either PEM or DER form, return DER."""
     _check_perms_or_raise(cert_file, "cert_file")
     raw = cert_file.read_bytes()
-    if not raw:
-        raise AuthMaterialsError(f"cert file {cert_file} is empty")
-    # Sniff PEM vs DER. PEM always starts with '-----BEGIN'.
-    if raw.lstrip().startswith(b"-----BEGIN"):
-        try:
-            cert = DeviceCert.from_pem(raw)
-        except CertError as e:
-            raise AuthMaterialsError(
-                f"failed to parse cert PEM at {cert_file}: {e}"
-            ) from e
-        return cert.to_der()
     try:
-        cert = DeviceCert.from_der(raw)
+        cert = DeviceCert.from_pem_or_der(raw)
     except CertError as e:
         raise AuthMaterialsError(
-            f"failed to parse cert DER at {cert_file}: {e}"
+            f"failed to parse cert at {cert_file}: {e}"
         ) from e
     return cert.to_der()
 

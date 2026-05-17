@@ -11,18 +11,19 @@ import fcntl
 import json
 import logging
 import os
-import re
 import struct
 import subprocess
 from pathlib import Path
 
-log = logging.getLogger(__name__)
-
 # Linux IFNAMSIZ minus the trailing NUL gives 15 usable characters; the
 # kernel accepts only this character set in interface names. Used to
 # validate keys loaded from the persisted IPv6 state file before they are
-# interpolated into a sysctl path on restore.
-_IFACE_NAME_RE = re.compile(r"^[a-zA-Z0-9_.\-]{1,15}$")
+# interpolated into a sysctl path on restore. See dsm.core._validators
+# for the strict TUN-naming counterpart used by config / forwarding.
+from dsm.core import netaudit
+from dsm.core._validators import LINUX_IFACE_NAME_RE as _IFACE_NAME_RE
+
+log = logging.getLogger(__name__)
 
 # ioctl constants for TUN/TAP (Linux)
 TUNSETIFF = 0x400454CA
@@ -244,7 +245,6 @@ class TunDevice:
         self._configured = True
 
         log.info("TUN %s configured: %s/%d mtu=%d", self._name, local_ip, netmask, mtu)
-        from dsm.core import netaudit
         netaudit.emit(
             "tun_configure",
             iface=self._name,
@@ -293,7 +293,6 @@ class TunDevice:
         if self._configured:
             self._restore_ipv6_state()
             self._configured = False
-            from dsm.core import netaudit
             netaudit.emit("tun_deconfigure", iface=self._name)
 
     async def read(self, bufsize: int = 2048) -> bytes:

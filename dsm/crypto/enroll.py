@@ -149,17 +149,10 @@ def generate_enrollment(
 
 
 def _load_cert_any_format(raw: bytes) -> DeviceCert:
-    if not raw:
-        raise EnrollError("cert file is empty")
-    if raw.lstrip().startswith(b"-----BEGIN"):
-        try:
-            return DeviceCert.from_pem(raw)
-        except CertError as e:
-            raise EnrollError(f"failed to parse cert PEM: {e}") from e
     try:
-        return DeviceCert.from_der(raw)
+        return DeviceCert.from_pem_or_der(raw)
     except CertError as e:
-        raise EnrollError(f"failed to parse cert DER: {e}") from e
+        raise EnrollError(f"failed to parse cert: {e}") from e
 
 
 def import_signed_cert(

@@ -15,15 +15,17 @@ impl AesKey {
     /// Build an `AesKey` from a pre-allocated locked heap buffer. Preferred
     /// when the caller can write key material directly into the heap
     /// (e.g. via HKDF expand into `LockedKey32::zeroed().as_mut()`).
-    pub fn from_locked(key: LockedKey32) -> Result<Self, String> {
-        Ok(Self { key })
+    /// Infallible — kept as a method so the cipher invariant lives on the
+    /// type.
+    pub fn from_locked(key: LockedKey32) -> Self {
+        Self { key }
     }
 
     /// Convenience constructor: accepts a 32-byte array by value. Incurs
     /// a transient stack copy of the key before it reaches the heap — use
     /// `from_locked` to avoid that where possible.
     pub fn from_array(key_bytes: [u8; 32]) -> Result<Self, String> {
-        Ok(Self { key: LockedKey32::from_array(key_bytes)? })
+        Ok(Self::from_locked(LockedKey32::from_array(key_bytes)?))
     }
 
     /// Initialize cipher from the stored key.

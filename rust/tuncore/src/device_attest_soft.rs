@@ -154,6 +154,9 @@ impl SoftAttestKey {
         // encode_noise_static_binding_value in dsm.crypto.cert.
         let mut ext_value = Vec::with_capacity(2 + noise_static_pub.len());
         ext_value.push(0x04); // OCTET STRING tag
+        // Length-byte cast: bounded above by the 32-byte length check
+        // at L135–140; the truncation cannot lose information.
+        #[allow(clippy::cast_possible_truncation)]
         ext_value.push(noise_static_pub.len() as u8);
         ext_value.extend_from_slice(noise_static_pub);
 

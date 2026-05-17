@@ -30,6 +30,11 @@ const GRACE_PERIOD_SECS: u64 = 5;
 /// u64 / i64 boundary cases (`r % (2*j+1)`, `(base as i64) + jitter`).
 const ROTATION_BASE_MAX: u64 = 1 << 48;
 
+// Manual .min().max() instead of .clamp(1, ROTATION_BASE_MAX): the
+// latter panics if max < min, which is impossible here but adds a panic
+// path on a security-critical rotation-threshold callsite. Prefer the
+// explicit panic-free form.
+#[allow(clippy::manual_clamp)]
 fn clamp_base(base: u64) -> u64 {
     base.min(ROTATION_BASE_MAX).max(1)
 }
@@ -68,20 +73,18 @@ struct DirectionKeys {
 }
 
 impl DirectionKeys {
-    fn new(key: LockedKey32, epoch: u32) -> Result<Self, String> {
-        Ok(Self {
-            key: AesKey::from_locked(key)?,
+    fn new(key: LockedKey32, epoch: u32) -> Self {
+        Self {
+            key: AesKey::from_locked(key),
             nonce_gen: NonceGenerator::new(epoch),
-        })
+        }
     }
 }
 
 /// Generate a fresh ephemeral X25519 secret from CSPRNG, written directly
 /// into a mlock'd heap buffer.
 pub fn gen_ephemeral_secret() -> Result<LockedKey32, String> {
-    let mut secret = LockedKey32::zeroed()?;
-    OsRng.fill_bytes(secret.as_mut());
-    Ok(secret)
+    crate::secure_memory::random_locked_key32()
 }
 
 /// Compute DH shared secret and derive session keys from it.
@@ -275,8 +278,8 @@ impl SessionKeyManager {
         let time_base = rotation_seconds.unwrap_or(ROTATION_TIME_BASE_SECS);
         Ok(Self {
             epoch: initial_epoch,
-            send: DirectionKeys::new(send_key, initial_epoch)?,
-            recv: DirectionKeys::new(recv_key, initial_epoch)?,
+            send: DirectionKeys::new(send_key, initial_epoch),
+            recv: DirectionKeys::new(recv_key, initial_epoch),
             replay: ReplayWindow::new(),
             prev_recv: None,
             prev_replay: None,
@@ -444,13 +447,21 @@ impl SessionKeyManager {
         new_recv_key: LockedKey32,
         new_epoch: u32,
     ) -> Result<RotationComplete, String> {
-        // Pre-construct new keys before replacing (fail early on AesKey error)
-        let new_recv = DirectionKeys::new(new_recv_key, new_epoch)?;
-        let new_send = DirectionKeys::new(new_send_key, new_epoch)?;
+        // Pre-construct new keys before replacing. DirectionKeys::new is
+        // infallible since dropping the obsolete `Result<…>` on the
+        // `from_locked` chain (MED-4); kept as two statements rather than
+        // inlined into the struct literal to preserve construction-order
+        // legibility on the rotation hot path.
+        let new_recv = DirectionKeys::new(new_recv_key, new_epoch);
+        let new_send = DirectionKeys::new(new_send_key, new_epoch);
 
         // Move current recv to previous for grace period
         let old_recv = std::mem::replace(&mut self.recv, new_recv);
-        let old_replay = std::mem::replace(&mut self.replay, ReplayWindow::new());
+        // `ReplayWindow::default()` is `Self::new()` (see Default impl
+        // in replay_window.rs); using `take` is more idiomatic than an
+        // explicit `replace(..., new())` and the produced value is
+        // byte-identical.
+        let old_replay = std::mem::take(&mut self.replay);
 
         self.prev_recv = Some(old_recv);
         self.prev_replay = Some(old_replay);

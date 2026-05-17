@@ -19,19 +19,15 @@ session, and reverting on teardown.
 from __future__ import annotations
 
 import logging
-import re
 import subprocess
 from pathlib import Path
 
+from dsm.core._validators import DSM_TUN_NAME_RE as _TUN_NAME_PATTERN
+from dsm.core.sysctl import SysctlOverride
+
 log = logging.getLogger(__name__)
 
-_TUN_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9_-]{1,15}$")
-
 IP_FORWARD_PATH = Path("/proc/sys/net/ipv4/ip_forward")
-
-
-def _sysctl_path(key: str) -> Path:
-    return Path("/proc/sys") / key.replace(".", "/")
 
 
 class IPForwardingManager:
@@ -52,40 +48,23 @@ class IPForwardingManager:
 
     def __init__(self, tun_name: str | None = None) -> None:
         self._tun_name = tun_name
-        self._original: dict[str, str] = {}
-
-    def _set(self, key: str, value: str) -> None:
-        path = _sysctl_path(key)
-        try:
-            current = path.read_text().strip()
-            if current != value:
-                path.write_text(f"{value}\n")
-                self._original[key] = current
-                log.info("sysctl %s: %s -> %s", key, current, value)
-        except OSError as e:
-            log.warning("could not set %s=%s: %s", key, value, e)
+        self._sysctl = SysctlOverride()
 
     def apply(self) -> None:
-        self._set("net.ipv4.ip_forward", "1")
+        self._sysctl.set("net.ipv4.ip_forward", "1")
         # Stop the kernel from telling clients about "better" paths.
-        self._set("net.ipv4.conf.all.send_redirects", "0")
-        self._set("net.ipv4.conf.default.send_redirects", "0")
+        self._sysctl.set("net.ipv4.conf.all.send_redirects", "0")
+        self._sysctl.set("net.ipv4.conf.default.send_redirects", "0")
         # Loose reverse-path filtering for asymmetric tunnel paths.
-        self._set("net.ipv4.conf.all.rp_filter", "2")
+        self._sysctl.set("net.ipv4.conf.all.rp_filter", "2")
         if self._tun_name:
-            self._set(f"net.ipv4.conf.{self._tun_name}.send_redirects", "0")
-            self._set(f"net.ipv4.conf.{self._tun_name}.rp_filter", "2")
-            self._set(f"net.ipv4.conf.{self._tun_name}.accept_local", "1")
+            self._sysctl.set(f"net.ipv4.conf.{self._tun_name}.send_redirects", "0")
+            self._sysctl.set(f"net.ipv4.conf.{self._tun_name}.rp_filter", "2")
+            self._sysctl.set(f"net.ipv4.conf.{self._tun_name}.accept_local", "1")
         log.info("server forwarding subsystem active")
 
     def remove(self) -> None:
-        for key, value in self._original.items():
-            try:
-                _sysctl_path(key).write_text(f"{value}\n")
-                log.info("sysctl %s restored to %s", key, value)
-            except OSError as e:
-                log.warning("could not restore %s: %s", key, e)
-        self._original.clear()
+        self._sysctl.restore_all()
 
 
 class MasqueradeManager:

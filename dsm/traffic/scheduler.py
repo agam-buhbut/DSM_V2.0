@@ -24,6 +24,13 @@ log = logging.getLogger(__name__)
 # so drop-oldest does not reveal traffic shape).
 MAX_QUEUE_SIZE = 512
 
+# Inter-tick poll jitter for the send loop. A fixed 50 ms cadence would
+# fingerprint the scheduler on the wire; randomising the wake-up to
+# ``_POLL_JITTER_MIN .. _POLL_JITTER_MIN + _POLL_JITTER_RANGE`` (i.e.
+# 30-70 ms) breaks that signal without materially affecting throughput.
+_POLL_JITTER_MIN = 0.03
+_POLL_JITTER_RANGE = 0.04
+
 
 @dataclass(order=True)
 class _ScheduledPacket:
@@ -114,7 +121,7 @@ class SendScheduler:
 
             # Sleep until next packet or a jittered poll interval.
             # Jitter prevents a fixed 50ms cadence from fingerprinting the scheduler.
-            poll_jitter = 0.03 + csprng_float() * 0.04  # 30-70ms
+            poll_jitter = _POLL_JITTER_MIN + csprng_float() * _POLL_JITTER_RANGE
             if self._queue:
                 wait_time = max(0, self._queue[0].send_time - time.monotonic())
                 wait_time = min(wait_time, poll_jitter)

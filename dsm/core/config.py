@@ -2,13 +2,12 @@ from __future__ import annotations
 
 import ipaddress
 import os
-import re
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-_TUN_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9_-]{1,15}$")
+from dsm.core._validators import DSM_TUN_NAME_RE as _TUN_NAME_PATTERN
 
 CONFIG_PATH = Path("/opt/mtun/config.toml")
 
@@ -101,11 +100,12 @@ class Config:
         _validate(self)
 
 
-def _validate(c: Config) -> None:
-    # mode
+def _validate_mode(c: Config) -> None:
     if c.mode not in ("client", "server"):
         raise ValueError(f"invalid mode: {c.mode!r}")
 
+
+def _validate_server_ip(c: Config) -> None:
     # server_ip must be a literal IP — the kill-switch nftables rules
     # reference it with `ip daddr <addr>` which does not accept hostnames.
     # Auto-resolution would change behavior depending on which resolver is
@@ -119,7 +119,8 @@ def _validate(c: Config) -> None:
             f"Resolve your hostname first: `dig +short <host> | head -1`"
         ) from e
 
-    # ports
+
+def _validate_ports(c: Config) -> None:
     # server_port is always a real concrete port — clients need it to connect.
     if not (MIN_PORT <= c.server_port <= MAX_PORT):
         raise ValueError(
@@ -141,15 +142,18 @@ def _validate(c: Config) -> None:
                 f"(0 = ephemeral), got {c.listen_port}"
             )
 
-    # key_file must be a path
+
+def _validate_key_file(c: Config) -> None:
     if not c.key_file:
         raise ValueError("key_file must not be empty")
 
-    # transport
+
+def _validate_transport(c: Config) -> None:
     if c.transport not in ("udp", "tcp"):
         raise ValueError(f"invalid transport: {c.transport!r}")
 
-    # dns providers
+
+def _validate_dns(c: Config) -> None:
     if c.mode == "server" and not c.dns_providers:
         raise ValueError("server mode requires at least one dns_providers entry")
 
@@ -188,6 +192,8 @@ def _validate(c: Config) -> None:
                     f"dns_provider_pins[{provider!r}] entry {pin!r} is not valid hex"
                 ) from e
 
+
+def _validate_cert_paths(c: Config) -> None:
     # cert_file / ca_root_file / attest_key_file: required, absolute paths.
     for name, value in (
         ("cert_file", c.cert_file),
@@ -210,7 +216,8 @@ def _validate(c: Config) -> None:
                 f"crl_file must be absolute, got {c.crl_file!r}"
             )
 
-    # Role-specific cert policy fields.
+
+def _validate_role_specific(c: Config) -> None:
     if c.mode == "client":
         if not c.expected_server_cn:
             raise ValueError(
@@ -226,30 +233,36 @@ def _validate(c: Config) -> None:
                 f"allowed_cns_file must be absolute, got {c.allowed_cns_file!r}"
             )
 
-    # padding
+
+def _validate_padding(c: Config) -> None:
     if not (MIN_PADDING <= c.padding_min <= c.padding_max <= MAX_PADDING):
         raise ValueError(
             f"padding_min ({c.padding_min}) and padding_max ({c.padding_max}) "
             f"must satisfy {MIN_PADDING} <= min <= max <= {MAX_PADDING}"
         )
 
-    # jitter
+
+def _validate_jitter(c: Config) -> None:
     if not (0 <= c.jitter_ms_min <= c.jitter_ms_max <= MAX_JITTER_MS):
         raise ValueError(
             f"jitter_ms_min ({c.jitter_ms_min}) and jitter_ms_max ({c.jitter_ms_max}) "
             f"must satisfy 0 <= min <= max <= {MAX_JITTER_MS}"
         )
 
-    # rotation
+
+def _validate_rotation(c: Config) -> None:
     if c.rotation_packets < MIN_ROTATION_PACKETS:
         raise ValueError(f"rotation_packets too low: {c.rotation_packets}")
     if c.rotation_seconds < MIN_ROTATION_SECONDS:
         raise ValueError(f"rotation_seconds too low: {c.rotation_seconds}")
 
-    # log_level
+
+def _validate_log_level(c: Config) -> None:
     if c.log_level not in ("debug", "info", "warning", "error"):
         raise ValueError(f"invalid log_level: {c.log_level!r}")
 
+
+def _validate_tun_name(c: Config) -> None:
     # tun_name: Linux IFNAMSIZ is 16 (including NUL), so 15 usable chars.
     # The kill-switch ruleset and MASQUERADE rule both interpolate this into
     # nftables config; restricting to alphanumeric + dash/underscore keeps the
@@ -259,19 +272,13 @@ def _validate(c: Config) -> None:
             f"tun_name {c.tun_name!r} must be 1-15 alphanumeric/dash/underscore chars"
         )
 
+
+def _validate_mtu(c: Config) -> None:
     # TUN MTU bounds — below 576 breaks IPv4 connectivity in common
     # assumptions, above 1500 overflows Ethernet without jumbo frames.
     if not (MIN_TUN_MTU <= c.mtu <= MAX_TUN_MTU):
         raise ValueError(
             f"mtu must be {MIN_TUN_MTU}-{MAX_TUN_MTU}, got {c.mtu}"
-        )
-
-    # auto_mtu polling interval. Must be strictly positive (zero would
-    # tight-loop in asyncio.wait_for) and within an hour. The lower bound
-    # is intentionally permissive so unit tests can drive the loop fast.
-    if not (0.0 < c.pmtu_check_interval_s <= 3600.0):
-        raise ValueError(
-            f"pmtu_check_interval_s must be in (0, 3600] s, got {c.pmtu_check_interval_s}"
         )
 
     # Wire-overhead sanity warning. DSM adds ~68 bytes of outer
@@ -287,6 +294,49 @@ def _validate(c: Config) -> None:
             "but throughput stalls.",
             c.mtu, c.mtu + 68,
         )
+
+
+def _validate_pmtu_interval(c: Config) -> None:
+    # auto_mtu polling interval. Must be strictly positive (zero would
+    # tight-loop in asyncio.wait_for) and within an hour. The lower bound
+    # is intentionally permissive so unit tests can drive the loop fast.
+    if not (0.0 < c.pmtu_check_interval_s <= 3600.0):
+        raise ValueError(
+            f"pmtu_check_interval_s must be in (0, 3600] s, got {c.pmtu_check_interval_s}"
+        )
+
+
+# Section order is observable — Config(...) reports the FIRST error
+# encountered, so reordering changes which message a test sees. Keep
+# this sequence stable.
+_VALIDATORS = (
+    _validate_mode,
+    _validate_server_ip,
+    _validate_ports,
+    _validate_key_file,
+    _validate_transport,
+    _validate_dns,
+    _validate_cert_paths,
+    _validate_role_specific,
+    _validate_padding,
+    _validate_jitter,
+    _validate_rotation,
+    _validate_log_level,
+    _validate_tun_name,
+    _validate_mtu,
+    _validate_pmtu_interval,
+)
+
+
+def _validate(c: Config) -> None:
+    """Run every section validator in the fixed _VALIDATORS order.
+
+    Each validator either returns or raises ``ValueError``. Order matters
+    — the first failure short-circuits, so test cases that exercise one
+    validation rule rely on the prior rules accepting their fixture.
+    """
+    for validator in _VALIDATORS:
+        validator(c)
 
 
 def load(path: Path | None = None) -> Config:

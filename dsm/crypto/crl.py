@@ -23,6 +23,8 @@ from pathlib import Path
 
 from cryptography import x509
 from cryptography.exceptions import InvalidSignature
+
+from dsm.crypto.cert import check_strong_signature_hash
 from cryptography.hazmat.primitives.asymmetric.ec import (
     ECDSA,
     EllipticCurvePublicKey,
@@ -105,14 +107,11 @@ class CRL:
         sig_alg = crl.signature_hash_algorithm
         if sig_alg is None:
             raise CRLSignatureError("CRL has no signature hash algorithm")
-        # Reject SHA-1 / MD5 / etc — match the cert.validate_chain policy so
-        # an operator cannot accidentally accept a CRL signed under a hash
-        # that's been chosen-prefix-attackable for years.
-        if sig_alg.name not in {"sha256", "sha384", "sha512"}:
-            raise CRLSignatureError(
-                f"CRL signed with weak hash {sig_alg.name!r}; "
-                "only sha256, sha384, sha512 are accepted"
-            )
+        # Reject SHA-1 / MD5 / etc — share the same allowlist + helper used
+        # by cert.validate_chain so an operator cannot accidentally accept
+        # a CRL signed under a hash that's been chosen-prefix-attackable
+        # for years.
+        check_strong_signature_hash(sig_alg, "CRL", exc_cls=CRLSignatureError)
         try:
             ca_pub.verify(
                 crl.signature,

@@ -13,8 +13,9 @@ from collections.abc import Awaitable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable
 
+from dsm.core import netaudit
 from dsm.core.config import Config, MIN_TUN_MTU
-from dsm.core.fsm import SessionFSM
+from dsm.core.fsm import SessionFSM, State
 from dsm.core.protocol import (
     Fragment, InnerPacket, OuterPacket, PacketType, ReassemblyBuffer,
     OUTER_HEADER_SIZE, SEQ_STRUCT, SIZE_CLASSES, fragment_ip_packet,
@@ -72,8 +73,6 @@ def setup_signal_handlers(shutdown: asyncio.Event) -> None:
     """
     import signal
 
-    from dsm.core import netaudit
-
     def _on_signal(sig_name: str) -> None:
         netaudit.emit("shutdown_signal", source=sig_name)
         shutdown.set()
@@ -81,6 +80,12 @@ def setup_signal_handlers(shutdown: asyncio.Event) -> None:
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT):
         loop.add_signal_handler(sig, _on_signal, sig.name)
+
+
+# Outer sequence number is wire-encoded as `!Q` (uint64 big-endian), so
+# wraparound at 2**64 must trigger session rekey rather than silently roll
+# back to 0 (a nonce reuse risk).
+_SEQ_MAX = 2**64
 
 
 @dataclass
@@ -94,7 +99,7 @@ class SequenceCounter:
 
     def next(self) -> int:
         self.value += 1
-        if self.value >= 2**64:
+        if self.value >= _SEQ_MAX:
             raise RuntimeError("sequence number overflow — session must be rekeyed")
         return self.value
 
@@ -367,6 +372,23 @@ async def _handle_session_close(ctx: DataPathContext, inner: InnerPacket) -> Non
     ctx.shutdown.set()
 
 
+def _build_control_packet(
+    ctx: DataPathContext, ptype: PacketType
+) -> tuple[bytes, int]:
+    """Build a zero-payload control packet (KEEPALIVE / SESSION_CLOSE).
+
+    Both use the same shape: empty payload, current epoch_id, run
+    through the shaper for padding. Centralised so future control-packet
+    types pick up the right epoch/padding wiring automatically.
+    """
+    inner = InnerPacket(
+        ptype=ptype,
+        epoch_id=ctx.session_keys.epoch & 0x03,
+        payload=b"",
+    )
+    return ctx.shaper.pad_packet(inner)
+
+
 async def send_session_close(ctx: DataPathContext) -> None:
     """Send a single SESSION_CLOSE packet to notify the peer of graceful exit.
 
@@ -375,13 +397,8 @@ async def send_session_close(ctx: DataPathContext) -> None:
     the queued close packet flushed. Best-effort: errors are logged, not
     raised — shutdown must continue regardless.
     """
-    inner = InnerPacket(
-        ptype=PacketType.SESSION_CLOSE,
-        epoch_id=ctx.session_keys.epoch & 0x03,
-        payload=b"",
-    )
     try:
-        padded, target_size = ctx.shaper.pad_packet(inner)
+        padded, target_size = _build_control_packet(ctx, PacketType.SESSION_CLOSE)
         await ctx.send_fn(padded, target_size)
     except Exception as e:
         # Debug-level: the peer being gone at shutdown is the common case
@@ -434,7 +451,6 @@ async def liveness_loop(ctx: DataPathContext) -> None:
                 "dead peer: no packets received for %.1fs, tearing down session",
                 recv_idle,
             )
-            from dsm.core import netaudit
             netaudit.emit(
                 "liveness_fire",
                 reason="dead_peer_timeout",
@@ -445,13 +461,109 @@ async def liveness_loop(ctx: DataPathContext) -> None:
             return
 
         if now - ctx.liveness.last_send_time > KEEPALIVE_SEND_INTERVAL:
-            inner = InnerPacket(
-                ptype=PacketType.KEEPALIVE,
-                epoch_id=ctx.session_keys.epoch & 0x03,
-                payload=b"",
-            )
-            padded, target_size = ctx.shaper.pad_packet(inner)
+            padded, target_size = _build_control_packet(ctx, PacketType.KEEPALIVE)
             ctx.scheduler.enqueue(padded, target_size)
+
+
+async def run_data_loops(
+    ctx: DataPathContext,
+    transport: UDPTransport | TCPTransport,
+    session_keys: tuncore.SessionKeyManager,
+    replay: tuncore.ReplayWindow,
+    fsm: SessionFSM,
+    *,
+    extra_loops: tuple[Awaitable[None], ...] = (),
+    udp_addr_filter: Callable[[tuple[str, int]], bool] | None = None,
+    post_authenticate: Callable[[tuple[str, int]], None] | None = None,
+    shutdown_log: str = "shutting down",
+) -> None:
+    """Drive the steady-state recv/tun_send/liveness loops to completion.
+
+    On exit — clean shutdown OR ``CancelledError`` from the surrounding
+    AsyncExitStack — emits SESSION_CLOSE (best-effort) and transitions
+    the FSM through TEARDOWN → IDLE so the caller's stack unwinds
+    cleanly.
+
+    Role-specific differences are parameterised:
+
+    * ``udp_addr_filter`` (client): drop UDP datagrams whose source addr
+      is not the expected server. ``None`` on the server, which has no
+      single expected peer addr until the first authenticated packet.
+    * ``post_authenticate`` (server): record the source addr of an
+      authenticated packet (the server has to learn the peer's UDP
+      ephemeral port from the first valid frame).
+    * ``extra_loops``: client passes ``auto_mtu_loop(...)`` here; server
+      passes nothing.
+    * ``shutdown_log``: caller-supplied label so the log line still
+      distinguishes "shutting down" (client) vs "server shutting
+      down".
+
+    The caller owns scheduler.start() / .stop registration on the
+    AsyncExitStack — this helper deliberately does NOT pull the stack
+    inside itself, because the role module's stack registrations are
+    unwind-order-sensitive (kill switch must outlast TUN teardown).
+    """
+    async def recv_loop() -> None:
+        while not ctx.shutdown.is_set():
+            recv_addr: tuple[str, int] | None = None
+            try:
+                if isinstance(transport, UDPTransport):
+                    data, recv_addr = await asyncio.wait_for(
+                        transport.recv(), timeout=0.1,
+                    )
+                    if (
+                        udp_addr_filter is not None
+                        and not udp_addr_filter(recv_addr)
+                    ):
+                        log.debug(
+                            "packet from unexpected source %s, dropping",
+                            recv_addr,
+                        )
+                        continue
+                else:
+                    data = await asyncio.wait_for(
+                        transport.recv(), timeout=0.1,
+                    )
+            except asyncio.TimeoutError:
+                session_keys.tick()
+                continue
+            except ConnectionError as e:
+                log.info("transport closed by peer: %s", e)
+                ctx.shutdown.set()
+                return
+
+            result = decrypt_packet(data, session_keys, replay)
+            if result is None:
+                continue
+
+            ctx.liveness.last_recv_time = time.monotonic()
+
+            # Server-side only: record the authenticated peer's UDP
+            # source address so subsequent sends can reach it.
+            if post_authenticate is not None and recv_addr is not None:
+                post_authenticate(recv_addr)
+
+            inner, _prev_epoch = result
+            await dispatch_inner(ctx, inner)
+
+    try:
+        await asyncio.gather(
+            recv_loop(),
+            tun_send_loop(ctx),
+            liveness_loop(ctx),
+            *extra_loops,
+        )
+    except asyncio.CancelledError:
+        pass
+    finally:
+        log.info("%s", shutdown_log)
+        # Notify peer first (best-effort) so it sees a fast graceful
+        # close rather than DEAD_PEER_TIMEOUT. Must fire BEFORE the
+        # caller's AsyncExitStack unwinds — once scheduler/transport
+        # are gone the send_fn is useless.
+        await send_session_close(ctx)
+        fsm.transition(State.TEARDOWN)
+        fsm.transition(State.IDLE)
 
 
 async def auto_mtu_loop(
@@ -504,7 +616,6 @@ async def auto_mtu_loop(
                 "auto_mtu: lowered tun mtu %d -> %d (kernel pmtu=%d)",
                 current, usable, path_mtu,
             )
-            from dsm.core import netaudit
             netaudit.emit(
                 "auto_mtu_change",
                 direction="lower",
@@ -527,7 +638,6 @@ async def auto_mtu_loop(
                     "auto_mtu: raised tun mtu %d -> %d after %d stable observations (kernel pmtu=%d)",
                     current, usable, rises_observed, path_mtu,
                 )
-                from dsm.core import netaudit
                 netaudit.emit(
                     "auto_mtu_change",
                     direction="raise",

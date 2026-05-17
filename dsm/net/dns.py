@@ -14,7 +14,7 @@ import struct
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from collections.abc import Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from typing import cast
 from urllib.parse import urlparse
 
@@ -199,6 +199,53 @@ class DNSResolver:
         log.error("all DNS providers failed for %s", hostname)
         return []
 
+    async def _resolve_via_pinned_tls(
+        self,
+        provider: str,
+        host: str,
+        port: int,
+        timeout: float,
+        send_recv: Callable[
+            [asyncio.StreamReader, asyncio.StreamWriter], Awaitable[bytes]
+        ],
+        *,
+        reverify_pin: bool = False,
+    ) -> bytes:
+        """Shared connect → pin-check → send/recv → cleanup scaffold.
+
+        ``send_recv`` is the per-protocol body: it receives the established
+        (reader, writer) pair (with the SPKI pin already checked on the
+        TLS handshake) and returns the response wire bytes. DoH wraps the
+        DNS query in an HTTP/1.1 POST; DoT wraps it in a 2-byte length
+        prefix. The connect/pin-recheck/close scaffold around that is
+        identical and lives here.
+        """
+        from dsm.net.dns_pinning import verify_pin_on_ssl_object
+
+        reader, writer = await _open_pinned_tls_connection(
+            host, port, self._pins[provider], provider, timeout=timeout,
+        )
+        try:
+            if reverify_pin:
+                # Belt-and-braces: re-verify pin from this end of the
+                # connection after _open_pinned_tls_connection has
+                # already checked it. A second verify here catches any
+                # future regression where the helper is refactored to
+                # defer the check.
+                ssl_obj = writer.get_extra_info("ssl_object")
+                if ssl_obj is None:
+                    raise RuntimeError(
+                        f"connection to {provider} did not negotiate TLS"
+                    )
+                verify_pin_on_ssl_object(ssl_obj, self._pins[provider], provider)
+            return await send_recv(reader, writer)
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except (ConnectionError, OSError):
+                pass
+
     async def _resolve_doh(self, url: str, hostname: str) -> list[str]:
         """DNS-over-HTTPS query with SPKI pin checked BEFORE the qname
         is sent.
@@ -212,8 +259,6 @@ class DNSResolver:
         loop forever (the server's routing table sends all unmarked
         traffic via mtun0).
         """
-        from dsm.net.dns_pinning import verify_pin_on_ssl_object
-
         parsed = urlparse(url)
         if parsed.scheme != "https":
             raise ValueError(f"invalid DoH provider scheme: {url!r}")
@@ -227,23 +272,9 @@ class DNSResolver:
 
         query = _build_dns_query(hostname, A_RECORD)
 
-        reader, writer = await _open_pinned_tls_connection(
-            host,
-            port,
-            self._pins[url],
-            url,
-            timeout=DOH_TIMEOUT,
-        )
-        try:
-            # Belt-and-braces: re-verify pin from this end of the
-            # connection after _open_pinned_tls_connection has already
-            # checked it. A second verify here would catch any future
-            # regression where the helper is refactored to defer.
-            ssl_obj = writer.get_extra_info("ssl_object")
-            if ssl_obj is None:
-                raise RuntimeError(f"DoH connection to {url} did not negotiate TLS")
-            verify_pin_on_ssl_object(ssl_obj, self._pins[url], url)
-
+        async def _doh_send_recv(
+            reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
+        ) -> bytes:
             # Minimal HTTP/1.1 request. Connection: close so we don't
             # keep a pool — DNS resolutions are infrequent enough that
             # pool benefit is small, and each new query gets a fresh
@@ -260,17 +291,13 @@ class DNSResolver:
             ).encode("ascii") + query
             writer.write(request)
             await writer.drain()
-
-            body = await asyncio.wait_for(
+            return await asyncio.wait_for(
                 _read_http_response(reader), timeout=DOH_TIMEOUT,
             )
-        finally:
-            writer.close()
-            try:
-                await writer.wait_closed()
-            except (ConnectionError, OSError):
-                pass
 
+        body = await self._resolve_via_pinned_tls(
+            url, host, port, DOH_TIMEOUT, _doh_send_recv, reverify_pin=True,
+        )
         addresses, ttl = _parse_dns_response(body)
         if addresses:
             self._cache_result(hostname, addresses, ttl)
@@ -295,32 +322,26 @@ class DNSResolver:
         # DoT uses TCP with 2-byte length prefix
         framed = struct.pack("!H", len(query)) + query
 
-        reader, writer = await _open_pinned_tls_connection(
-            host,
-            port,
-            self._pins[provider],
-            provider,
-            timeout=DOT_TIMEOUT,
-        )
-        try:
+        async def _dot_send_recv(
+            reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
+        ) -> bytes:
             writer.write(framed)
             await writer.drain()
-
-            len_buf = await asyncio.wait_for(reader.readexactly(2), timeout=DOT_TIMEOUT)
-            resp_len = struct.unpack("!H", len_buf)[0]
-            resp_data = await asyncio.wait_for(
-                reader.readexactly(resp_len), timeout=DOT_TIMEOUT
+            len_buf = await asyncio.wait_for(
+                reader.readexactly(2), timeout=DOT_TIMEOUT,
             )
-            addresses, ttl = _parse_dns_response(resp_data)
-            if addresses:
-                self._cache_result(hostname, addresses, ttl)
-            return addresses
-        finally:
-            writer.close()
-            try:
-                await writer.wait_closed()
-            except (ConnectionError, OSError):
-                pass
+            resp_len = struct.unpack("!H", len_buf)[0]
+            return await asyncio.wait_for(
+                reader.readexactly(resp_len), timeout=DOT_TIMEOUT,
+            )
+
+        resp_data = await self._resolve_via_pinned_tls(
+            provider, host, port, DOT_TIMEOUT, _dot_send_recv,
+        )
+        addresses, ttl = _parse_dns_response(resp_data)
+        if addresses:
+            self._cache_result(hostname, addresses, ttl)
+        return addresses
 
     def _cache_result(self, hostname: str, addresses: list[str], ttl: int = 300) -> None:
         """Cache DNS results with TTL enforcement."""

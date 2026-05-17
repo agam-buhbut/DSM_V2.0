@@ -61,6 +61,16 @@ impl NonceGenerator {
                 Err(_) => {
                     // Lost the race; retry. A concurrent thread either took
                     // a count or saw exhaustion — the loop re-checks both.
+                    //
+                    // Belt and suspenders: an immediate exhausted-load here
+                    // is technically redundant under `Ordering::SeqCst`
+                    // because the next iteration's loop head re-reads
+                    // `exhausted` anyway. We keep the explicit check so
+                    // that any future weakening of the memory ordering
+                    // (see security review on `SeqCst` vs Acquire/Release)
+                    // still has a hard exhaustion bail at the lose-race
+                    // site. Removing this short-circuit is a security
+                    // change, not a cleanup.
                     if self.exhausted.load(Ordering::SeqCst) {
                         return None;
                     }

@@ -32,6 +32,15 @@ MAX_INNER_PAYLOAD = 1500
 # Packet size classes for padding (bytes) — more classes reduce fingerprinting
 SIZE_CLASSES = (128, 256, 384, 512, 640, 768, 896, 1024, 1152, 1280, 1400)
 
+# Sampling weights for SIZE_CLASSES — approximate a typical web-traffic
+# size distribution (smaller packets more likely). Length MUST equal
+# len(SIZE_CLASSES); the assertion below catches drift at module load
+# time rather than on first call to pick_random_size_class.
+SIZE_CLASS_WEIGHTS: tuple[int, ...] = (20, 15, 12, 10, 8, 7, 6, 6, 5, 6, 5)
+assert len(SIZE_CLASS_WEIGHTS) == len(SIZE_CLASSES), (
+    "SIZE_CLASS_WEIGHTS and SIZE_CLASSES must align"
+)
+
 # Module-level Struct instances — avoid per-packet format-string parsing on
 # the hot path. `pack_into` writes into a caller-owned buffer, saving an
 # intermediate bytes allocation per serialize.

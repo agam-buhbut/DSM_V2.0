@@ -119,7 +119,7 @@ fn pack_handshake(snow_data: &[u8], expected_len: usize) -> Result<Vec<u8>, Stri
 /// are all `<= HANDSHAKE_PAD_SIZE`, statically asserted above). The
 /// explicit check makes the slice-bounds panic impossible to reach even
 /// from a future misuse, replacing it with a typed error.
-fn unpack_handshake<'a>(buf: &'a [u8], expected_len: usize) -> Result<&'a [u8], String> {
+fn unpack_handshake(buf: &[u8], expected_len: usize) -> Result<&[u8], String> {
     if buf.len() != HANDSHAKE_PAD_SIZE {
         return Err(format!(
             "handshake frame wrong size: {} != {HANDSHAKE_PAD_SIZE}",
@@ -135,6 +135,31 @@ fn unpack_handshake<'a>(buf: &'a [u8], expected_len: usize) -> Result<&'a [u8], 
 }
 
 /// Initiator (client) side of the Noise XX handshake.
+/// Shared Noise-XX `HandshakeState` builder used by both
+/// [`NoiseInitiator::new`] and [`NoiseResponder::new`].
+///
+/// Encapsulates the `Builder::with_resolver(NOISE_PATTERN, SecureResolver)
+///   .local_private_key(...).prologue(PROLOGUE)` sequence so the
+/// audit-relevant invariants (pattern, secure resolver, prologue tag)
+/// live in one place rather than being copy-pasted at two callsites.
+/// The `finish` closure picks `.build_initiator()` vs `.build_responder()`.
+fn build_handshake_state<F>(
+    static_secret: &[u8; 32],
+    role_label: &'static str,
+    finish: F,
+) -> Result<HandshakeState, String>
+where
+    F: FnOnce(snow::Builder<'_>) -> Result<HandshakeState, snow::Error>,
+{
+    let pattern = NOISE_PATTERN
+        .parse()
+        .map_err(|e| format!("pattern: {e}"))?;
+    let builder = Builder::with_resolver(pattern, Box::new(SecureResolver::new()))
+        .local_private_key(static_secret)
+        .prologue(PROLOGUE);
+    finish(builder).map_err(|e| format!("build {role_label}: {e}"))
+}
+
 pub struct NoiseInitiator {
     state: HandshakeState,
 }
@@ -157,15 +182,9 @@ impl NoiseInitiator {
     /// the upstream leak where `Dh25519`'s `[u8; 32]` field is returned
     /// to the allocator with the scalar still in place.
     pub fn new(static_secret: &[u8; 32]) -> Result<Self, String> {
-        let state = Builder::with_resolver(
-            NOISE_PATTERN.parse().map_err(|e| format!("pattern: {e}"))?,
-            Box::new(SecureResolver::new()),
-        )
-        .local_private_key(static_secret)
-        .prologue(PROLOGUE)
-        .build_initiator()
-        .map_err(|e| format!("build initiator: {e}"))?;
-
+        let state = build_handshake_state(
+            static_secret, "initiator", snow::Builder::build_initiator,
+        )?;
         Ok(Self { state })
     }
 
@@ -272,15 +291,9 @@ impl NoiseResponder {
     /// mlock'd and zeroize-on-drop — see [`NoiseInitiator::new`] for the
     /// full rationale.
     pub fn new(static_secret: &[u8; 32]) -> Result<Self, String> {
-        let state = Builder::with_resolver(
-            NOISE_PATTERN.parse().map_err(|e| format!("pattern: {e}"))?,
-            Box::new(SecureResolver::new()),
-        )
-        .local_private_key(static_secret)
-        .prologue(PROLOGUE)
-        .build_responder()
-        .map_err(|e| format!("build responder: {e}"))?;
-
+        let state = build_handshake_state(
+            static_secret, "responder", snow::Builder::build_responder,
+        )?;
         Ok(Self { state })
     }
 

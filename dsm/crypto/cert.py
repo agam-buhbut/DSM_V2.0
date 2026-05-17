@@ -42,19 +42,32 @@ from cryptography.x509.oid import ExtensionOID, NameOID
 # are explicitly excluded — both have practical collisions that allow forging
 # a TBS that hashes to the same value as a legitimately signed object. The
 # CA is configured to sign with SHA-256 (rcgen default + offline CA runbook),
-# so this allowlist is consistent with the issuance path.
+# so this allowlist is consistent with the issuance path. Re-used by
+# ``crypto.crl`` via ``check_strong_signature_hash`` below.
 _STRONG_HASH_NAMES: frozenset[str] = frozenset({"sha256", "sha384", "sha512"})
 
 
-def _check_strong_signature_hash(
-    sig_alg: hashes.HashAlgorithm, what: str
+def check_strong_signature_hash(
+    sig_alg: hashes.HashAlgorithm,
+    what: str,
+    *,
+    exc_cls: type[Exception] | None = None,
 ) -> None:
-    """Raise CertChainError unless ``sig_alg`` is a SHA-2 family hash."""
+    """Raise ``exc_cls`` (default: :class:`CertChainError`) unless
+    ``sig_alg`` is a SHA-2 family hash.
+
+    ``what`` is interpolated into the error message ("<what> signed with
+    weak hash …") so the same helper produces context-appropriate errors
+    for "leaf cert" / "CRL" / etc.
+    """
+    target_exc: type[Exception] = exc_cls if exc_cls is not None else CertChainError
     if sig_alg.name not in _STRONG_HASH_NAMES:
-        raise CertChainError(
+        raise target_exc(
             f"{what} signed with weak hash {sig_alg.name!r}; "
             f"only {sorted(_STRONG_HASH_NAMES)} are accepted"
         )
+
+
 
 # Custom OID for the X25519 Noise-static-key binding extension.
 # Experimental arc — renumber to a registered IANA Private Enterprise
@@ -100,17 +113,13 @@ def encode_noise_static_binding_value(noise_static_pub: bytes) -> bytes:
 
 def _decode_noise_static_binding_value(raw: bytes) -> bytes:
     """Inverse of ``encode_noise_static_binding_value``."""
-    expected_total = 2 + NOISE_STATIC_PUB_LEN
-    if (
-        len(raw) != expected_total
-        or raw[0] != _OCTET_STRING_TAG
-        or raw[1] != NOISE_STATIC_PUB_LEN
-    ):
+    expected_total = len(_OCTET_STRING_PREFIX) + NOISE_STATIC_PUB_LEN
+    if len(raw) != expected_total or not raw.startswith(_OCTET_STRING_PREFIX):
         raise CertBindingError(
             "noiseStaticBinding extension malformed: "
             f"expected DER OCTET STRING ({_OCTET_STRING_TAG:#04x} {NOISE_STATIC_PUB_LEN:#04x} || 32 bytes)"
         )
-    return bytes(raw[2:])
+    return bytes(raw[len(_OCTET_STRING_PREFIX):])
 
 
 @dataclass(frozen=True)
@@ -158,6 +167,20 @@ class DeviceCert:
         except ValueError as e:
             raise CertError(f"failed to parse cert PEM: {e}") from e
         return cls(cert)
+
+    @classmethod
+    def from_pem_or_der(cls, raw: bytes) -> DeviceCert:
+        """Sniff PEM (``-----BEGIN`` prefix) vs DER and parse accordingly.
+
+        Raises :class:`CertError` on a parse failure or empty input.
+        Callers that need a module-specific exception type should catch
+        :class:`CertError` and re-raise the wrapper.
+        """
+        if not raw:
+            raise CertError("cert input is empty")
+        if raw.lstrip().startswith(b"-----BEGIN"):
+            return cls.from_pem(raw)
+        return cls.from_der(raw)
 
     def to_der(self) -> bytes:
         return self.cert.public_bytes(Encoding.DER)
@@ -300,7 +323,7 @@ def validate_chain(
     sig_alg = leaf.cert.signature_hash_algorithm
     if sig_alg is None:
         raise CertChainError("leaf cert has no signature hash algorithm")
-    _check_strong_signature_hash(sig_alg, "leaf cert")
+    check_strong_signature_hash(sig_alg, "leaf cert")
     try:
         ca_pub.verify(
             leaf.cert.signature,

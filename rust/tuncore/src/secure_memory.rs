@@ -130,11 +130,31 @@ impl LockedKey32 {
     }
 }
 
+/// Allocate a fresh mlock'd 32-byte buffer and fill it with `OsRng` bytes.
+///
+/// This is the only path that writes a fresh secret scalar directly into
+/// mlock'd memory without going through a stack copy — `LockedKey32::zeroed`
+/// reserves the page, then `OsRng.fill_bytes` writes into the heap buffer
+/// in place. Audit-relevant: this pattern previously lived inline at two
+/// callsites (`identity::IdentityKeyPair::generate` and
+/// `session_keys::gen_ephemeral_secret`); centralised so a reviewer reads
+/// the invariant once.
+pub fn random_locked_key32() -> Result<LockedKey32, String> {
+    use rand::rngs::OsRng;
+    use rand::RngCore;
+    let mut k = LockedKey32::zeroed()?;
+    OsRng.fill_bytes(k.as_mut());
+    Ok(k)
+}
+
 impl Drop for LockedKey32 {
     fn drop(&mut self) {
         // munlock before Box drops, so the kernel still has the mapping.
         // Zeroize + deallocation are handled by Box<Zeroizing<..>>'s drop.
-        let _ = munlock_slice(&**self.bytes);
+        // munlock failure during teardown is unrecoverable; the kernel
+        // will clean the mapping on process exit anyway, so we
+        // deliberately drop the error.
+        munlock_slice(&**self.bytes).ok();
     }
 }
 

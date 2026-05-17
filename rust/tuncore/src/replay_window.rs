@@ -163,8 +163,8 @@ mod tests {
     #[test]
     fn test_first_packet_any_value() {
         let mut w = ReplayWindow::new();
-        assert!(w.check_and_update(999999));
-        assert_eq!(w.max_seq(), 999999);
+        assert!(w.check_and_update(999_999));
+        assert_eq!(w.max_seq(), 999_999);
     }
 
     #[test]
@@ -237,7 +237,7 @@ mod tests {
         // by `check`, regardless of whether it was ever seen.
         let mut w = ReplayWindow::new();
         w.update(10_000);
-        for stale in 1..(10_000 - ReplayWindow::WINDOW_SIZE + 1) {
+        for stale in 1..=(10_000 - ReplayWindow::WINDOW_SIZE) {
             assert!(
                 !w.check(stale),
                 "stale seq={stale} must be rejected (max_seq=10000, \
