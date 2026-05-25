@@ -51,12 +51,10 @@ impl NonceGenerator {
             }
             // `current + 1` cannot overflow: current < u32::MAX here.
             let next = current + 1;
-            match self.counter.compare_exchange(
-                current,
-                next,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
+            match self
+                .counter
+                .compare_exchange(current, next, Ordering::SeqCst, Ordering::SeqCst)
+            {
                 Ok(_) => break current,
                 Err(_) => {
                     // Lost the race; retry. A concurrent thread either took
@@ -88,10 +86,12 @@ impl NonceGenerator {
     }
 
     /// Return the current counter value (number of nonces generated).
+    #[must_use]
     pub fn count(&self) -> u32 {
         self.counter.load(Ordering::SeqCst).saturating_sub(1)
     }
 
+    #[must_use]
     pub fn epoch(&self) -> u32 {
         self.epoch
     }
@@ -157,8 +157,8 @@ mod tests {
         // count=1 surviving the post-add check). The CAS only transitions
         // from values < u32::MAX, so once any thread sees MAX it latches
         // `exhausted` and no further `next()` produces a count <= MAX-1.
-        use std::sync::Arc;
         use std::sync::atomic::AtomicU32;
+        use std::sync::Arc;
         use std::thread;
 
         let gen = Arc::new(NonceGenerator::new(11));

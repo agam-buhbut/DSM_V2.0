@@ -36,6 +36,17 @@ Transport:
 - TCP (fallback, with 4-byte big-endian length-prefix framing; all frames
   padded to the max size class so the length prefix is constant on the wire)
 
+  IMPORTANT — TCP is "obfuscation only against simple DPI", not against
+  passive traffic analysis. The TCP handshake (SYN / SYN-ACK / ACK),
+  teardown (FIN / RST), and connection-establishment fingerprint
+  remain visible to a passive on-path adversary regardless of DSM's
+  inner padding/timing defenses. TLS-fronting (wrapping the wire in
+  a TLS connection that mimics a common origin) would close this gap
+  but is intentionally out of scope. Use UDP for the strongest
+  anonymity properties this codebase provides; reach for TCP only
+  when a network strictly blocks UDP or NAT-symmetric routing makes
+  UDP unusable.
+
 Connection:
 - Single client per server instance (server binds one socket and, for TCP,
   accepts a single connection; for UDP the server locks onto the first
@@ -222,6 +233,10 @@ Parameters:
 - ca_root_file: path to the pinned CA root cert (PEM)
 - attest_key_file: path to Argon2id-wrapped ECDSA P-256 attest key
 - crl_file: optional path to the CA's CRL (PEM or DER)
+- crl_strict: bool (default: true). When true (the default), refuse
+  to start if crl_file is absent OR the loaded CRL is past its
+  next_update. When false, absent or stale CRL surfaces only as a
+  WARNING and revoked certs are accepted (intended for lab/dev only).
 - expected_server_cn: client only; subject CN we accept on the server cert
 - allowed_cns_file: server only; one allowed client subject CN per line,
   root-owned, mode 0o600 (any group/world bit causes startup to refuse
@@ -244,13 +259,19 @@ Parameters:
   mtun0 applied", "tunnel established", "client connected" only appear
   at info or below. Use "debug" for protocol-level packet tracing.)
 - padding_min, padding_max: padding range (default: 128-1400)
-- jitter_ms_min, jitter_ms_max: jitter range in ms (default: 1-50)
+- jitter_ms_min, jitter_ms_max: jitter range in ms (default: 1-100,
+  bumped from 1-50 under M-ANON-4 to give the per-packet reorder
+  window better coverage at modern line rates). VoIP / gaming /
+  remote-shell deployments that need sub-100 ms RTT can drop
+  jitter_ms_max to 50 or lower. High-bandwidth deployments can raise
+  to 1000.
 - rotation_packets, rotation_seconds: key rotation thresholds (default: 5000/600)
 - debug_dns: log plaintext DNS queries (default: false, logs are redacted)
 - debug_net: emit structured JSON events on the `dsm.netaudit` logger
   (handshake start/end, nft apply/remove, TUN configure/deconfigure,
-  rekey, liveness, shutdown, auto_mtu_change). Default: false. May
-  also be enabled per-run via the `--debug-net` CLI flag.
+  rekey, liveness, shutdown, auto_mtu_change, crl_missing, crl_stale).
+  Default: false. May also be enabled per-run via the `--debug-net`
+  CLI flag.
 
 OPERATOR GUIDE
 

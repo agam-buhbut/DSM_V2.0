@@ -177,7 +177,8 @@ class TestConfigValidation(unittest.TestCase):
         self.assertEqual(c.padding_min, 128)
         self.assertEqual(c.padding_max, 1400)
         self.assertEqual(c.jitter_ms_min, 1)
-        self.assertEqual(c.jitter_ms_max, 50)
+        # M-ANON-4: default bumped from 50 → 100 ms for wider reorder window.
+        self.assertEqual(c.jitter_ms_max, 100)
         self.assertEqual(c.mtu, 1400)
         self.assertFalse(c.pmtu_discover)
 

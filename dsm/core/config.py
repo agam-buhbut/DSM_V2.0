@@ -19,6 +19,14 @@ MAX_PADDING = 1500
 MAX_JITTER_MS = 1000
 MIN_ROTATION_PACKETS = 100
 MIN_ROTATION_SECONDS = 60
+# Upper bound on rotation_packets. The Rust nonce counter is u32 (per
+# epoch) and saturates at 2^32 — letting an operator configure
+# rotation_packets above this means the nonce counter exhausts and the
+# session shuts down before the rekey ever fires. Cap at 2^31 so the
+# rekey always wins. Same number-of-orders-of-magnitude headroom is
+# applied to rotation_seconds (1 year ≈ 3.1e7 s).
+MAX_ROTATION_PACKETS = 1 << 31
+MAX_ROTATION_SECONDS = 365 * 24 * 3600
 # TUN MTU bounds. 576 is the IPv4 minimum path MTU (RFC 791). 1500 is
 # standard Ethernet; DSM's wire overhead (IP+UDP+outer header+GCM tag +
 # inner header ≈ 68 B) requires TUN MTU ≤ outer_link_MTU − 68 to avoid
@@ -47,15 +55,20 @@ class Config:
     attest_key_file: str
     transport: Literal["udp", "tcp"] = "udp"
     dns_providers: list[str] = field(default_factory=list[str])
-    dns_provider_pins: dict[str, list[str]] = field(default_factory=dict[str, list[str]])
+    dns_provider_pins: dict[str, list[str]] = field(
+        default_factory=dict[str, list[str]]
+    )
     # Optional CRL file (DER or PEM).
     crl_file: str | None = None
-    # When True, refuse to start if the configured CRL is past its
-    # ``next_update`` timestamp. Default False preserves the previous
-    # behavior of logging a warning and continuing — a stale CRL is
-    # operationally better than a crashloop, but security-paranoid
-    # deployments can flip this to fail closed.
-    crl_strict: bool = False
+    # When True (the default), refuse to start if either:
+    #   (a) no crl_file is configured, OR
+    #   (b) the configured CRL is past its ``next_update`` timestamp.
+    # Default fail-closed: silent revocation-bypass is the worst kind of
+    # failure for a VPN whose compromise-recovery story relies on CRL
+    # distribution. Dev / lab deployments that genuinely have no CA
+    # workflow can set ``crl_strict = false`` to fall back to a warning,
+    # which logs and continues.
+    crl_strict: bool = True
     # Client-only: subject CN we will accept on the server cert.
     expected_server_cn: str | None = None
     # Server-only: file with one allowed client subject CN per line.
@@ -65,7 +78,12 @@ class Config:
     padding_min: int = 128
     padding_max: int = 1400
     jitter_ms_min: int = 1
-    jitter_ms_max: int = 50
+    # M-ANON-4 default bump: 50→100 ms. The wider span covers more
+    # consecutive packets at line rate (10 Mbps × 100 ms = 12 packets)
+    # without adding visible latency to interactive traffic. Operators
+    # who care about sub-50 ms RTT for VoIP/gaming can configure
+    # lower; everyone else benefits from the larger reorder window.
+    jitter_ms_max: int = 100
     rotation_packets: int = 5000
     rotation_seconds: int = 600
     debug_dns: bool = False
@@ -167,6 +185,7 @@ def _validate_dns(c: Config) -> None:
     for provider in c.dns_providers:
         if not (provider.startswith("https://") or provider.startswith("tls://")):
             import logging
+
             logging.getLogger(__name__).warning(
                 "dns_provider %r has no 'https://' (DoH) or 'tls://' (DoT) "
                 "scheme; it will be silently skipped at query time. Fix the "
@@ -203,31 +222,23 @@ def _validate_cert_paths(c: Config) -> None:
         if not value:
             raise ValueError(f"{name} must not be empty")
         if not Path(value).is_absolute():
-            raise ValueError(
-                f"{name} must be absolute, got {value!r}"
-            )
+            raise ValueError(f"{name} must be absolute, got {value!r}")
 
     # crl_file: optional but absolute when present.
     if c.crl_file is not None:
         if not c.crl_file:
             raise ValueError("crl_file must not be empty")
         if not Path(c.crl_file).is_absolute():
-            raise ValueError(
-                f"crl_file must be absolute, got {c.crl_file!r}"
-            )
+            raise ValueError(f"crl_file must be absolute, got {c.crl_file!r}")
 
 
 def _validate_role_specific(c: Config) -> None:
     if c.mode == "client":
         if not c.expected_server_cn:
-            raise ValueError(
-                "client mode requires expected_server_cn"
-            )
+            raise ValueError("client mode requires expected_server_cn")
     else:  # server
         if not c.allowed_cns_file:
-            raise ValueError(
-                "server mode requires allowed_cns_file"
-            )
+            raise ValueError("server mode requires allowed_cns_file")
         if not Path(c.allowed_cns_file).is_absolute():
             raise ValueError(
                 f"allowed_cns_file must be absolute, got {c.allowed_cns_file!r}"
@@ -253,8 +264,19 @@ def _validate_jitter(c: Config) -> None:
 def _validate_rotation(c: Config) -> None:
     if c.rotation_packets < MIN_ROTATION_PACKETS:
         raise ValueError(f"rotation_packets too low: {c.rotation_packets}")
+    if c.rotation_packets > MAX_ROTATION_PACKETS:
+        raise ValueError(
+            f"rotation_packets too high: {c.rotation_packets} "
+            f"(max {MAX_ROTATION_PACKETS} — Rust nonce counter would "
+            "exhaust at 2^32 before rotation fires)"
+        )
     if c.rotation_seconds < MIN_ROTATION_SECONDS:
         raise ValueError(f"rotation_seconds too low: {c.rotation_seconds}")
+    if c.rotation_seconds > MAX_ROTATION_SECONDS:
+        raise ValueError(
+            f"rotation_seconds too high: {c.rotation_seconds} "
+            f"(max {MAX_ROTATION_SECONDS} = 1 year)"
+        )
 
 
 def _validate_log_level(c: Config) -> None:
@@ -277,9 +299,7 @@ def _validate_mtu(c: Config) -> None:
     # TUN MTU bounds — below 576 breaks IPv4 connectivity in common
     # assumptions, above 1500 overflows Ethernet without jumbo frames.
     if not (MIN_TUN_MTU <= c.mtu <= MAX_TUN_MTU):
-        raise ValueError(
-            f"mtu must be {MIN_TUN_MTU}-{MAX_TUN_MTU}, got {c.mtu}"
-        )
+        raise ValueError(f"mtu must be {MIN_TUN_MTU}-{MAX_TUN_MTU}, got {c.mtu}")
 
     # Wire-overhead sanity warning. DSM adds ~68 bytes of outer
     # IP+UDP+header+GCM tag+inner header. With Ethernet's 1500-byte MTU,
@@ -287,12 +307,14 @@ def _validate_mtu(c: Config) -> None:
     # on PPPoE / VPN-in-VPN paths where the link MTU is below 1500.
     if c.mtu > 1400:
         import logging
+
         logging.getLogger(__name__).warning(
             "configured tun mtu=%d is above the safe default 1400; "
             "wire packets will be ~%d B which may exceed link MTU on "
             "PPPoE/tunnel-in-tunnel paths. Lower to 1380 if ping works "
             "but throughput stalls.",
-            c.mtu, c.mtu + 68,
+            c.mtu,
+            c.mtu + 68,
         )
 
 

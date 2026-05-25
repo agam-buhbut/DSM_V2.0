@@ -70,19 +70,28 @@ class TestSymmetricShaping(unittest.TestCase):
 
         asyncio.run(_run())
 
-    def test_both_ends_report_chaff_during_idle_window(self) -> None:
-        """After idle threshold, both client and server schedulers should
-        be willing to emit chaff (should_send_chaff → True) at comparable
-        rates. Exact equality is impossible with CSPRNG; require each side
-        to fire at least once in a short polling window."""
+    def test_both_ends_report_chaff_under_poisson_model(self) -> None:
+        """Both client and server shapers must schedule chaff under the
+        same Poisson model. Tested in a single-shot manner: ``should_send_chaff``
+        fires at most once per ``_next_chaff_time`` crossing, so polling
+        a fresh shaper exactly once (with ``_next_chaff_time`` pre-armed
+        in the past) must return True on both sides.
+
+        We deliberately avoid a "fires at least N times in 1000 polls"
+        assertion: under the Poisson model that depends on real wall-clock
+        time advancing between polls, which is racy in CI."""
         client = TrafficShaper(PADDING_MIN, PADDING_MAX)
         server = TrafficShaper(PADDING_MIN, PADDING_MAX)
 
-        client_fires = sum(1 for _ in range(1000) if client.should_send_chaff())
-        server_fires = sum(1 for _ in range(1000) if server.should_send_chaff())
+        # Both shapers start with _next_chaff_time = 0.0 (in the past).
+        self.assertTrue(client.should_send_chaff())
+        self.assertTrue(server.should_send_chaff())
 
-        self.assertGreater(client_fires, 0)
-        self.assertGreater(server_fires, 0)
+        # After firing, both must reschedule into the future with the
+        # same Poisson process (same parameters → same support).
+        now = client._next_chaff_time
+        self.assertGreater(now, 0.0)
+        self.assertGreater(server._next_chaff_time, 0.0)
 
 
 if __name__ == "__main__":

@@ -49,33 +49,65 @@ impl SoftAttestKey {
         })
     }
 
-    pub fn public_spki_der(&self) -> &[u8] {
-        &self.verifying_key_spki_der
+    /// SubjectPublicKeyInfo DER of the verifying key. Returns
+    /// `Err("attest key has been zeroized")` once `zeroize()` has been
+    /// called (M-CRYPT-8: the previous code left the SPKI cache in
+    /// place after zeroize and would happily hand out a pubkey whose
+    /// corresponding scalar was the freshly-generated replacement —
+    /// signatures produced post-zeroize would not verify against the
+    /// returned SPKI). Callers can detect "already zeroized" via the
+    /// returned error rather than silently receiving stale bytes.
+    pub fn public_spki_der(&self) -> Result<&[u8], String> {
+        if self.verifying_key_spki_der.is_empty() {
+            return Err("attest key has been zeroized".into());
+        }
+        Ok(&self.verifying_key_spki_der)
     }
 
     pub fn sign(&self, msg: &[u8]) -> Result<Vec<u8>, String> {
+        if self.verifying_key_spki_der.is_empty() {
+            return Err("attest key has been zeroized".into());
+        }
+        // L-CRYPT-3: cap msg size so a malicious Python caller (or
+        // network-fed verifier challenge in a future code path) can't
+        // force the SHA-256 update through an unbounded buffer. 1 MiB
+        // is far above any legitimate use (DSM binding signatures
+        // sign 92 bytes; ECDSA can sign arbitrary-length messages but
+        // the implementation hashes them with SHA-256 first).
+        const SIGN_MSG_MAX: usize = 1 << 20;
+        if msg.len() > SIGN_MSG_MAX {
+            return Err(format!(
+                "sign msg too large: {} > {SIGN_MSG_MAX}",
+                msg.len()
+            ));
+        }
         let signature: Signature = self.signing_key.sign(msg);
         Ok(signature.to_der().as_bytes().to_vec())
     }
 
-    /// Wipe the signing scalar. After this call the wrapping instance
-    /// MUST be dropped: the SPKI cache is left in place but no longer
-    /// matches the signing key, so any subsequent `sign` will produce
-    /// signatures that fail verification against the cert. Mirrors
-    /// `identity::IdentityKeyPair::zeroize`. Safe to call multiple times.
+    /// Wipe the signing scalar AND the cached SPKI so subsequent calls
+    /// to `sign`/`public_spki_der`/`private_pkcs8_der`/`build_csr` fail
+    /// loudly rather than producing a signature that doesn't match the
+    /// cleared SPKI cache (M-CRYPT-8 fix). Safe to call multiple times.
     ///
     /// `SigningKey` impls `ZeroizeOnDrop` but not `Zeroize`, so the scalar
     /// cannot be wiped in place. Instead we move the original out of the
     /// `Box` (releasing it for `Drop` to run, which fires the ZeroizeOnDrop
     /// wipe on its inner NonZeroScalar) and replace it with a freshly
-    /// generated key so the struct remains shape-valid for the brief
-    /// window before the Python caller drops it. The replacement is never
-    /// used for any signature the verifier accepts because the public SPKI
-    /// did not move.
+    /// generated key so the struct stays valid for the brief window
+    /// before Drop. The SPKI cache is cleared, so even though the
+    /// replacement key technically has a corresponding pubkey, callers
+    /// cannot obtain it from this instance.
     pub fn zeroize(&mut self) {
         let replacement = SigningKey::random(&mut OsRng);
         let old = std::mem::replace(&mut self.signing_key, Box::new(replacement));
         drop(old); // ZeroizeOnDrop wipes the scalar here.
+                   // M-CRYPT-8: clear the cached SPKI too so the post-zeroize
+                   // state is unambiguously "consumed" — every accessor returns
+                   // Err rather than silently handing out a public key that
+                   // doesn't match any callable signing capacity.
+        use zeroize::Zeroize;
+        self.verifying_key_spki_der.zeroize();
     }
 
     /// PKCS#8 DER encoding of the private key, wrapped in [`Zeroizing`] so
@@ -110,11 +142,7 @@ impl SoftAttestKey {
     /// ``id-dsm-noiseStaticBinding`` (1.3.6.1.4.1.99999.1.1) carries the
     /// 32-byte X25519 Noise static pubkey wrapped per the conventional
     /// OCTET STRING form.
-    pub fn build_csr(
-        &self,
-        cn: &str,
-        noise_static_pub: &[u8],
-    ) -> Result<Vec<u8>, String> {
+    pub fn build_csr(&self, cn: &str, noise_static_pub: &[u8]) -> Result<Vec<u8>, String> {
         use rcgen::{CertificateParams, CustomExtension, DnType, KeyPair};
 
         // RFC 5280 caps Subject CommonName at 64 UTF-8 bytes (ub-common-name).
@@ -126,10 +154,7 @@ impl SoftAttestKey {
             return Err("cn must not be empty".into());
         }
         if cn.len() > CN_MAX_BYTES {
-            return Err(format!(
-                "cn too long: {} > {CN_MAX_BYTES}",
-                cn.len()
-            ));
+            return Err(format!("cn too long: {} > {CN_MAX_BYTES}", cn.len()));
         }
 
         if noise_static_pub.len() != 32 {
@@ -142,8 +167,8 @@ impl SoftAttestKey {
         // `private_pkcs8_der` now returns the encoded scalar already wrapped
         // in `Zeroizing`, so we just bind the result directly.
         let pkcs8 = self.private_pkcs8_der()?;
-        let key_pair = KeyPair::try_from(pkcs8.as_slice())
-            .map_err(|e| format!("rcgen key import: {e}"))?;
+        let key_pair =
+            KeyPair::try_from(pkcs8.as_slice()).map_err(|e| format!("rcgen key import: {e}"))?;
 
         let mut params = CertificateParams::default();
         params
@@ -154,16 +179,14 @@ impl SoftAttestKey {
         // encode_noise_static_binding_value in dsm.crypto.cert.
         let mut ext_value = Vec::with_capacity(2 + noise_static_pub.len());
         ext_value.push(0x04); // OCTET STRING tag
-        // Length-byte cast: bounded above by the 32-byte length check
-        // at L135–140; the truncation cannot lose information.
+                              // Length-byte cast: bounded above by the 32-byte length check
+                              // at L135–140; the truncation cannot lose information.
         #[allow(clippy::cast_possible_truncation)]
         ext_value.push(noise_static_pub.len() as u8);
         ext_value.extend_from_slice(noise_static_pub);
 
-        let mut ext = CustomExtension::from_oid_content(
-            &[1, 3, 6, 1, 4, 1, 99999, 1, 1],
-            ext_value,
-        );
+        let mut ext =
+            CustomExtension::from_oid_content(&[1, 3, 6, 1, 4, 1, 99999, 1, 1], ext_value);
         ext.set_criticality(true);
         params.custom_extensions.push(ext);
 
@@ -203,8 +226,8 @@ impl SoftAttestKey {
             return Err("decrypted scalar has wrong length".into());
         }
 
-        let signing_key = SigningKey::from_slice(&plaintext)
-            .map_err(|e| format!("invalid ECDSA scalar: {e}"))?;
+        let signing_key =
+            SigningKey::from_slice(&plaintext).map_err(|e| format!("invalid ECDSA scalar: {e}"))?;
 
         Self::from_signing_key(signing_key)
     }
@@ -219,7 +242,7 @@ mod tests {
     #[test]
     fn generate_produces_parseable_spki() {
         let key = SoftAttestKey::generate().expect("generate");
-        let spki = key.public_spki_der();
+        let spki = key.public_spki_der().unwrap();
         assert!(!spki.is_empty());
         VerifyingKey::from_public_key_der(spki).expect("parseable SPKI");
     }
@@ -230,7 +253,8 @@ mod tests {
         let msg = b"DSM-BIND-v1\x00 test handshake hash material";
         let sig_der = key.sign(msg).expect("sign");
 
-        let vk = VerifyingKey::from_public_key_der(key.public_spki_der()).expect("parse vk");
+        let vk =
+            VerifyingKey::from_public_key_der(key.public_spki_der().unwrap()).expect("parse vk");
         let sig = Signature::from_der(&sig_der).expect("parse sig");
         vk.verify(msg, &sig).expect("verify must succeed");
     }
@@ -239,7 +263,8 @@ mod tests {
     fn tampered_message_fails_verify() {
         let key = SoftAttestKey::generate().expect("generate");
         let sig_der = key.sign(b"original message").expect("sign");
-        let vk = VerifyingKey::from_public_key_der(key.public_spki_der()).expect("parse vk");
+        let vk =
+            VerifyingKey::from_public_key_der(key.public_spki_der().unwrap()).expect("parse vk");
         let sig = Signature::from_der(&sig_der).expect("parse sig");
         assert!(vk.verify(b"tampered message", &sig).is_err());
     }
@@ -250,7 +275,8 @@ mod tests {
         let key2 = SoftAttestKey::generate().expect("k2");
         let msg = b"shared message";
         let sig_der = key1.sign(msg).expect("sign with k1");
-        let vk2 = VerifyingKey::from_public_key_der(key2.public_spki_der()).expect("parse vk2");
+        let vk2 =
+            VerifyingKey::from_public_key_der(key2.public_spki_der().unwrap()).expect("parse vk2");
         let sig = Signature::from_der(&sig_der).expect("parse sig");
         assert!(vk2.verify(msg, &sig).is_err());
     }
@@ -259,23 +285,49 @@ mod tests {
     fn distinct_generations_produce_distinct_keys() {
         let k1 = SoftAttestKey::generate().expect("k1");
         let k2 = SoftAttestKey::generate().expect("k2");
-        assert_ne!(k1.public_spki_der(), k2.public_spki_der());
+        assert_ne!(k1.public_spki_der().unwrap(), k2.public_spki_der().unwrap());
     }
 
     #[test]
     fn encrypt_decrypt_roundtrip() {
         let key = SoftAttestKey::generate().expect("generate");
-        let blob = key.encrypt_to_store(b"correct horse battery staple").expect("encrypt");
+        let blob = key
+            .encrypt_to_store(b"correct horse battery staple")
+            .expect("encrypt");
         let restored = SoftAttestKey::decrypt_from_store(&blob, b"correct horse battery staple")
             .expect("decrypt");
-        assert_eq!(key.public_spki_der(), restored.public_spki_der());
+        assert_eq!(
+            key.public_spki_der().unwrap(),
+            restored.public_spki_der().unwrap()
+        );
 
         // Restored key signs verifiably under the original SPKI.
         let msg = b"roundtrip-test";
         let sig_der = restored.sign(msg).expect("sign");
-        let vk = VerifyingKey::from_public_key_der(key.public_spki_der()).expect("parse vk");
+        let vk =
+            VerifyingKey::from_public_key_der(key.public_spki_der().unwrap()).expect("parse vk");
         let sig = Signature::from_der(&sig_der).expect("parse sig");
-        vk.verify(msg, &sig).expect("verify must succeed under original SPKI");
+        vk.verify(msg, &sig)
+            .expect("verify must succeed under original SPKI");
+    }
+
+    /// Regression for M-CRYPT-8: after `zeroize()`, the SPKI cache MUST
+    /// be cleared so subsequent accessors return Err rather than silently
+    /// handing out bytes that don't match any callable signing capacity.
+    #[test]
+    fn zeroize_clears_spki_cache_and_blocks_subsequent_accessors() {
+        let mut key = SoftAttestKey::generate().expect("generate");
+        assert!(key.public_spki_der().is_ok());
+        assert!(key.sign(b"x").is_ok());
+        key.zeroize();
+        assert!(
+            key.public_spki_der().is_err(),
+            "public_spki_der must fail post-zeroize"
+        );
+        assert!(key.sign(b"x").is_err(), "sign must fail post-zeroize");
+        // Idempotent: second zeroize is safe.
+        key.zeroize();
+        assert!(key.public_spki_der().is_err());
     }
 
     #[test]

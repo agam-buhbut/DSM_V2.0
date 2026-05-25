@@ -91,7 +91,13 @@ pub fn seal(plaintext: &[u8], passphrase: &[u8]) -> Result<Vec<u8>, String> {
     let aad = build_aad(&salt, &nonce_bytes);
 
     let ciphertext = cipher
-        .encrypt(nonce, Payload { msg: plaintext, aad: &aad })
+        .encrypt(
+            nonce,
+            Payload {
+                msg: plaintext,
+                aad: &aad,
+            },
+        )
         .map_err(|e| format!("encrypt: {e}"))?;
 
     let mut blob = Vec::with_capacity(ARGON2_SALT_LEN + XCHACHA_NONCE_LEN + ciphertext.len());
@@ -134,7 +140,13 @@ pub fn open(blob: &[u8], passphrase: &[u8]) -> Result<Zeroizing<Vec<u8>>, String
     let aad = build_aad(salt, nonce_bytes);
 
     let plaintext = cipher
-        .decrypt(nonce, Payload { msg: ciphertext, aad: &aad })
+        .decrypt(
+            nonce,
+            Payload {
+                msg: ciphertext,
+                aad: &aad,
+            },
+        )
         .map_err(|_| "decryption failed: wrong passphrase or corrupted data".to_string())?;
 
     Ok(Zeroizing::new(plaintext))
@@ -226,7 +238,10 @@ mod tests {
         // accidentally reorders salt / nonce / ciphertext fails loudly.
         let blob = seal(b"abc", b"pass").expect("seal");
         // salt(32) || nonce(24) || ciphertext(3) + tag(16) = 75
-        assert_eq!(blob.len(), ARGON2_SALT_LEN + XCHACHA_NONCE_LEN + 3 + TAG_LEN);
+        assert_eq!(
+            blob.len(),
+            ARGON2_SALT_LEN + XCHACHA_NONCE_LEN + 3 + TAG_LEN
+        );
         // Salt is the first 32 bytes; nonce the next 24; ciphertext+tag
         // is the rest.
         let salt = &blob[..ARGON2_SALT_LEN];
@@ -260,10 +275,8 @@ mod tests {
         for &len in &[0usize, 1, 16, 31, 32, 33, 64, 128, 512] {
             let mut plaintext = vec![0u8; len];
             OsRng.fill_bytes(&mut plaintext);
-            let blob = seal(&plaintext, b"correct horse battery staple")
-                .expect("seal");
-            let recovered = open(&blob, b"correct horse battery staple")
-                .expect("open");
+            let blob = seal(&plaintext, b"correct horse battery staple").expect("seal");
+            let recovered = open(&blob, b"correct horse battery staple").expect("open");
             assert_eq!(&**recovered, &plaintext[..], "len={len}");
             assert_eq!(blob.len(), MIN_BLOB_LEN + len);
         }
@@ -288,9 +301,7 @@ mod tests {
             blob[byte_idx] ^= 0xFF;
             let err = open(&blob, b"pass")
                 .map(|_| ())
-                .expect_err(&format!(
-                    "flipping byte {byte_idx} must fail decryption"
-                ));
+                .expect_err(&format!("flipping byte {byte_idx} must fail decryption"));
             assert!(
                 err.contains("decryption failed"),
                 "byte {byte_idx}: unexpected error message: {err}"

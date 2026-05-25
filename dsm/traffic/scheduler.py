@@ -12,7 +12,7 @@ import heapq
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Awaitable
+from typing import Awaitable, Callable
 
 from dsm.core.rand import csprng_float
 
@@ -68,13 +68,29 @@ class SendScheduler:
         self._task: asyncio.Task[None] | None = None
         self._event = asyncio.Event()
 
-    def enqueue(self, data: bytes, target_size: int) -> None:
-        """Enqueue a packet with random jitter delay."""
+    def enqueue(
+        self,
+        data: bytes,
+        target_size: int,
+        *,
+        extra_delay: float = 0.0,
+    ) -> None:
+        """Enqueue a packet with random jitter delay.
+
+        ``extra_delay`` (default 0) is added to the per-packet jitter
+        before scheduling. Used by the fragment send path to spread out
+        the N fragments of an oversized TUN packet across multiple
+        jitter windows — otherwise all N fragments arrive within
+        jitter_max (~50 ms) of each other, producing a recognizable
+        "1 → N tightly-spaced packets" traffic-analysis signature.
+        """
         if len(self._queue) >= self._max_queue_size:
             heapq.heappop(self._queue)  # drop oldest
             log.warning("scheduler queue full, dropping oldest packet")
-        jitter = self._jitter_min + csprng_float() * (self._jitter_max - self._jitter_min)
-        send_time = time.monotonic() + jitter
+        jitter = self._jitter_min + csprng_float() * (
+            self._jitter_max - self._jitter_min
+        )
+        send_time = time.monotonic() + jitter + max(0.0, extra_delay)
         heapq.heappush(self._queue, _ScheduledPacket(send_time, data, target_size))
         self._event.set()
 
@@ -96,27 +112,39 @@ class SendScheduler:
 
     async def _run(self) -> None:
         while self._running:
+            # M-BUG-11: clear the event BEFORE checking the queue, not
+            # after sleeping. Previous order: send-loop → chaff-inject
+            # → _event.clear() → wait_for(_event.wait()). If
+            # `enqueue()` fired during the send-loop iteration (between
+            # the queue check and the clear), it called `_event.set()`;
+            # then the subsequent `clear()` discarded that signal and
+            # the loop waited the full poll_jitter (~30-70 ms) before
+            # noticing the new packet. Clearing first means any
+            # `_event.set()` during the iteration arrives AFTER our
+            # clear and survives to the next wait_for.
+            self._event.clear()
             now = time.monotonic()
 
-            # Send any packets whose time has arrived
+            # Send any packets whose time has arrived. Only transport-level
+            # failures (network down, peer closed, socket closed under us)
+            # are swallowed; programming errors (ValueError/TypeError/etc.)
+            # bubble out so silent data loss can't hide a bug. (A broad
+            # `except Exception` here previously hid the TCP-fixed-size
+            # padding wire-mismatch ValueError from view.)
             while self._queue and self._queue[0].send_time <= now:
                 pkt = heapq.heappop(self._queue)
                 try:
                     await self._send_fn(pkt.data, pkt.target_size)
-                except Exception as e:
+                except (ConnectionError, OSError, asyncio.TimeoutError) as e:
                     log.warning("send failed: %s", type(e).__name__)
 
             # Inject chaff independently of queue state to avoid leaking
             # traffic activity via chaff-only / no-chaff timing patterns.
-            if (
-                self._chaff_fn
-                and self._should_chaff_fn
-                and self._should_chaff_fn()
-            ):
+            if self._chaff_fn and self._should_chaff_fn and self._should_chaff_fn():
                 try:
                     chaff_data, chaff_size = await self._chaff_fn()
                     self.enqueue(chaff_data, chaff_size)
-                except Exception as e:
+                except (ConnectionError, OSError, asyncio.TimeoutError) as e:
                     log.warning("chaff generation failed: %s", type(e).__name__)
 
             # Sleep until next packet or a jittered poll interval.
@@ -128,7 +156,6 @@ class SendScheduler:
             else:
                 wait_time = poll_jitter
 
-            self._event.clear()
             try:
                 await asyncio.wait_for(self._event.wait(), timeout=wait_time)
             except asyncio.TimeoutError:

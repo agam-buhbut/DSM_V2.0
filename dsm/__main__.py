@@ -24,11 +24,15 @@ from dsm.core.config import load
 def _add_passphrase_args(p: argparse.ArgumentParser) -> None:
     """Non-interactive passphrase sources (stronger than DSM_PASSPHRASE env)."""
     p.add_argument(
-        "--passphrase-fd", type=int, default=None,
+        "--passphrase-fd",
+        type=int,
+        default=None,
         help="Read passphrase from file descriptor N (e.g. systemd socket pipe)",
     )
     p.add_argument(
-        "--passphrase-env-file", type=str, default=None,
+        "--passphrase-env-file",
+        type=str,
+        default=None,
         help="Read passphrase from file at PATH (must be 0600)",
     )
 
@@ -50,8 +54,8 @@ def main() -> None:
         "--debug-net",
         action="store_true",
         help="Emit structured JSON events on the dsm.netaudit logger "
-             "(handshake/nft/tun/rekey/liveness/shutdown). Overrides "
-             "config.debug_net. Used by the two-box runbook for capture.",
+        "(handshake/nft/tun/rekey/liveness/shutdown). Overrides "
+        "config.debug_net. See deploy/GUIDE.txt §9 for capture flow.",
     )
     _add_passphrase_args(parser)
 
@@ -63,15 +67,22 @@ def main() -> None:
     )
     mode = enroll_parser.add_mutually_exclusive_group(required=True)
     mode.add_argument(
-        "--csr-out", type=Path, default=None,
+        "--csr-out",
+        type=Path,
+        default=None,
         help="Generate identity + attest key and write a CSR to PATH",
     )
     mode.add_argument(
-        "--import", dest="import_cert", type=Path, default=None,
+        "--import",
+        dest="import_cert",
+        type=Path,
+        default=None,
         help="Import a CA-signed cert from PATH",
     )
     enroll_parser.add_argument(
-        "--cn", type=str, default=None,
+        "--cn",
+        type=str,
+        default=None,
         help="Override the device CN (default derived from Noise static pub)",
     )
     enroll_parser.add_argument(
@@ -121,18 +132,24 @@ def main() -> None:
 
     if config.mode == "client":
         from dsm.client import run_client
-        asyncio.run(run_client(
-            config,
-            passphrase_fd=args.passphrase_fd,
-            passphrase_env_file=args.passphrase_env_file,
-        ))
+
+        asyncio.run(
+            run_client(
+                config,
+                passphrase_fd=args.passphrase_fd,
+                passphrase_env_file=args.passphrase_env_file,
+            )
+        )
     elif config.mode == "server":
         from dsm.server import run_server
-        asyncio.run(run_server(
-            config,
-            passphrase_fd=args.passphrase_fd,
-            passphrase_env_file=args.passphrase_env_file,
-        ))
+
+        asyncio.run(
+            run_server(
+                config,
+                passphrase_fd=args.passphrase_fd,
+                passphrase_env_file=args.passphrase_env_file,
+            )
+        )
     else:
         print(f"mode {config.mode!r} is not supported", file=sys.stderr)
         sys.exit(1)
@@ -204,8 +221,10 @@ def _run_enroll(
         # noiseStaticBinding extension; better to refuse loudly via
         # loaded_stores_cli (sys.exit on RuntimeError).
         from dsm.crypto._stores import loaded_stores_cli
+
         with loaded_stores_cli(
-            keystore, attest_store,
+            keystore,
+            attest_store,
             passphrase_fd=passphrase_fd,
             passphrase_env_file=passphrase_env_file,
             key_file_label=config.key_file,

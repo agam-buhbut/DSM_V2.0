@@ -116,6 +116,14 @@ def make_leaf_cert(
         .serial_number(x509.random_serial_number())
         .not_valid_before(not_before)
         .not_valid_after(not_after)
+        # H-DEPLOY-3: leaf certs MUST carry a critical
+        # basicConstraints CA:FALSE so a misconfigured CA (or one with
+        # leaked key) cannot issue a leaf that the validate_chain code
+        # then accepts as itself capable of signing further certs.
+        .add_extension(
+            x509.BasicConstraints(ca=False, path_length=None),
+            critical=True,
+        )
         .add_extension(
             x509.KeyUsage(
                 digital_signature=True,

@@ -1,10 +1,13 @@
-use libc::{mlock, munlock, RLIMIT_CORE, rlimit, setrlimit};
+use libc::{mlock, munlock, rlimit, setrlimit, RLIMIT_CORE};
 use zeroize::Zeroizing;
 
 /// Check a libc return code, mapping non-zero to a descriptive error.
 fn syscall_check(ret: i32, name: &str) -> Result<(), String> {
     if ret != 0 {
-        Err(format!("{name} failed: {}", std::io::Error::last_os_error()))
+        Err(format!(
+            "{name} failed: {}",
+            std::io::Error::last_os_error()
+        ))
     } else {
         Ok(())
     }
@@ -41,10 +44,7 @@ pub fn disable_core_dumps() -> Result<(), String> {
         rlim_cur: 0,
         rlim_max: 0,
     };
-    syscall_check(
-        unsafe { setrlimit(RLIMIT_CORE, &rlim) },
-        "setrlimit",
-    )
+    syscall_check(unsafe { setrlimit(RLIMIT_CORE, &rlim) }, "setrlimit")
 }
 
 /// Harden the process against memory inspection and privilege elevation.
@@ -122,11 +122,12 @@ impl LockedKey32 {
     }
 
     pub fn as_array(&self) -> &[u8; 32] {
-        &**self.bytes
+        &self.bytes
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn as_mut(&mut self) -> &mut [u8; 32] {
-        &mut **self.bytes
+        &mut self.bytes
     }
 }
 
@@ -192,6 +193,9 @@ mod tests {
     fn test_harden_process_sets_dumpable_zero() {
         harden_process().expect("harden_process should succeed");
         let dumpable = unsafe { libc::prctl(libc::PR_GET_DUMPABLE) };
-        assert_eq!(dumpable, 0, "PR_GET_DUMPABLE should report 0 after harden_process");
+        assert_eq!(
+            dumpable, 0,
+            "PR_GET_DUMPABLE should report 0 after harden_process"
+        );
     }
 }

@@ -24,6 +24,7 @@ from unittest.mock import patch
 
 try:
     import tuncore
+
     _HAS_TUNCORE = True
 except ImportError:
     tuncore = None  # type: ignore[assignment]
@@ -80,7 +81,8 @@ class TestDataPathRoundtrip(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         # apply_so_mark needs CAP_NET_ADMIN; patch out for unprivileged runs.
         self._so_mark_patch = patch(
-            "dsm.net.transport.udp.apply_so_mark", lambda sock: None,
+            "dsm.net.transport.udp.apply_so_mark",
+            lambda sock: None,
         )
         self._so_mark_patch.start()
 
@@ -92,17 +94,20 @@ class TestDataPathRoundtrip(unittest.IsolatedAsyncioTestCase):
         DataPathContexts on both sides using MockTuns. Returns (client, server)
         dicts with the resources we need in the test.
         """
+        from dsm.core.fsm import SessionFSM, State
+        from dsm.core.protocol import ReassemblyBuffer
         from dsm.crypto.cert_allowlist import CNAllowlist
         from dsm.crypto.handshake import client_handshake, server_handshake
         from dsm.net.transport.udp import UDPTransport
-        from dsm.core.protocol import ReassemblyBuffer
-        from dsm.core.fsm import SessionFSM, State
         from dsm.session import (
-            DataPathContext, LivenessState, RekeyState, SequenceCounter,
+            DataPathContext,
+            LivenessState,
+            RekeyState,
+            SequenceCounter,
             make_send_fn,
         )
-        from dsm.traffic.shaper import TrafficShaper, make_chaff_packet
         from dsm.traffic.scheduler import SendScheduler
+        from dsm.traffic.shaper import TrafficShaper, make_chaff_packet
         from tests.cert_helpers import (
             CLIENT_AUTH_OID,
             SERVER_AUTH_OID,
@@ -127,23 +132,24 @@ class TestDataPathRoundtrip(unittest.IsolatedAsyncioTestCase):
         )
         server_addr = ("127.0.0.1", server_port)
 
-        (c_keys, _c_hash), (s_keys, _c_pub) = await asyncio.wait_for(
+        (c_keys, _c_hash, _s_static_pub), (s_keys, _c_pub) = await asyncio.wait_for(
             asyncio.gather(
                 client_handshake(
-                    client_transport, client.identity, server_addr,
+                    client_transport,
+                    client.identity,
+                    server_addr,
                     attest_key=client.attest_key,
                     cert_der=client.cert_der,
                     ca_root=ca.certificate,
                     expected_server_cn="dsm-data-server",
                 ),
                 server_handshake(
-                    server_transport, server.identity,
+                    server_transport,
+                    server.identity,
                     attest_key=server.attest_key,
                     cert_der=server.cert_der,
                     ca_root=ca.certificate,
-                    cn_allowlist=CNAllowlist(
-                        cns=frozenset({"dsm-data-client"})
-                    ),
+                    cn_allowlist=CNAllowlist(cns=frozenset({"dsm-data-client"})),
                 ),
             ),
             timeout=30.0,
@@ -173,7 +179,7 @@ class TestDataPathRoundtrip(unittest.IsolatedAsyncioTestCase):
             send_fn = make_send_fn(keys, transport, _dest, seq, liveness=liveness)
             scheduler = SendScheduler(
                 send_fn=send_fn,
-                chaff_fn=lambda: make_chaff_packet(shaper, keys.epoch & 0x03),
+                chaff_fn=lambda: make_chaff_packet(shaper, keys.epoch & 0x0F),
                 should_chaff_fn=lambda: False,  # no chaff interference
                 jitter_ms_min=0,
                 jitter_ms_max=0,
@@ -203,27 +209,44 @@ class TestDataPathRoundtrip(unittest.IsolatedAsyncioTestCase):
         server_dest_holder: list = [None]
 
         client_ctx, client_scheduler = _make_ctx(
-            c_keys, client_transport, client_dest_holder, client_tun,
+            c_keys,
+            client_transport,
+            client_dest_holder,
+            client_tun,
         )
         server_ctx, server_scheduler = _make_ctx(
-            s_keys, server_transport, server_dest_holder, server_tun,
+            s_keys,
+            server_transport,
+            server_dest_holder,
+            server_tun,
         )
 
         client = {
-            "transport": client_transport, "keys": c_keys, "ctx": client_ctx,
-            "scheduler": client_scheduler, "tun": client_tun,
+            "transport": client_transport,
+            "keys": c_keys,
+            "ctx": client_ctx,
+            "scheduler": client_scheduler,
+            "tun": client_tun,
             "dest_holder": client_dest_holder,
         }
         server = {
-            "transport": server_transport, "keys": s_keys, "ctx": server_ctx,
-            "scheduler": server_scheduler, "tun": server_tun,
+            "transport": server_transport,
+            "keys": s_keys,
+            "ctx": server_ctx,
+            "scheduler": server_scheduler,
+            "tun": server_tun,
             "dest_holder": server_dest_holder,
         }
         return client, server
 
     @staticmethod
     async def _recv_loop(
-        transport, session_keys, replay, ctx, *, dest_holder: list | None = None,
+        transport,
+        session_keys,
+        replay,
+        ctx,
+        *,
+        dest_holder: list | None = None,
     ) -> None:
         """Generic recv_loop adapted from client.py/server.py.
 
@@ -236,7 +259,8 @@ class TestDataPathRoundtrip(unittest.IsolatedAsyncioTestCase):
         while not ctx.shutdown.is_set():
             try:
                 data, recv_addr = await asyncio.wait_for(
-                    transport.recv(), timeout=0.1,
+                    transport.recv(),
+                    timeout=0.1,
                 )
             except asyncio.TimeoutError:
                 session_keys.tick()
@@ -255,7 +279,8 @@ class TestDataPathRoundtrip(unittest.IsolatedAsyncioTestCase):
 
     async def _run_both(
         self,
-        client: dict, server: dict,
+        client: dict,
+        server: dict,
         action,
         timeout: float = 5.0,
     ) -> None:
@@ -267,13 +292,19 @@ class TestDataPathRoundtrip(unittest.IsolatedAsyncioTestCase):
 
         async def _server_recv() -> None:
             await self._recv_loop(
-                server["transport"], server["keys"], s_replay, server["ctx"],
+                server["transport"],
+                server["keys"],
+                s_replay,
+                server["ctx"],
                 dest_holder=server["dest_holder"],
             )
 
         async def _client_recv() -> None:
             await self._recv_loop(
-                client["transport"], client["keys"], c_replay, client["ctx"],
+                client["transport"],
+                client["keys"],
+                c_replay,
+                client["ctx"],
             )
 
         await client["scheduler"].start()
@@ -336,7 +367,8 @@ class TestDataPathRoundtrip(unittest.IsolatedAsyncioTestCase):
             "server TUN never received the reassembled payload",
         )
         self.assertEqual(
-            server["tun"].received[0], payload,
+            server["tun"].received[0],
+            payload,
             "reassembled payload bytes differ from original",
         )
 
@@ -383,7 +415,9 @@ class TestDataPathRoundtrip(unittest.IsolatedAsyncioTestCase):
 
             # Initiate rekey from client side.
             ts, new_epoch, _init_payload = await initiate_rekey(
-                client["keys"], client["ctx"].fsm, client["ctx"].shaper,
+                client["keys"],
+                client["ctx"].fsm,
+                client["ctx"].shaper,
                 client["ctx"].send_fn,
             )
             client["ctx"].rekey.last_time = ts
@@ -411,11 +445,13 @@ class TestDataPathRoundtrip(unittest.IsolatedAsyncioTestCase):
         await self._run_both(client, server, _action, timeout=10.0)
 
         self.assertNotEqual(
-            client["keys"].epoch, initial_epoch,
+            client["keys"].epoch,
+            initial_epoch,
             "client did not advance epoch after rekey",
         )
         self.assertEqual(
-            client["keys"].epoch, server["keys"].epoch,
+            client["keys"].epoch,
+            server["keys"].epoch,
             "both sides must agree on new epoch after rekey",
         )
         self.assertEqual(client["ctx"].fsm.state, State.ESTABLISHED)
@@ -427,7 +463,7 @@ class TestDataPathRoundtrip(unittest.IsolatedAsyncioTestCase):
         and the server re-sends its cached ACK rather than trying to
         re-rotate (which would fail the epoch precondition)."""
         from dsm.core.fsm import State
-        from dsm.rekey import initiate_rekey, handle_rekey_init
+        from dsm.rekey import handle_rekey_init, initiate_rekey
 
         client, server = await self._build_peers()
 
@@ -439,7 +475,9 @@ class TestDataPathRoundtrip(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(0.01)
 
             ts, new_epoch, init_payload = await initiate_rekey(
-                client["keys"], client["ctx"].fsm, client["ctx"].shaper,
+                client["keys"],
+                client["ctx"].fsm,
+                client["ctx"].shaper,
                 client["ctx"].send_fn,
             )
             client["ctx"].rekey.last_time = ts
@@ -463,7 +501,9 @@ class TestDataPathRoundtrip(unittest.IsolatedAsyncioTestCase):
                 server["ctx"].rekey.cached_ack_payload,
             ) = await handle_rekey_init(
                 init_payload,  # same INIT as the first one
-                server["keys"], server["ctx"].fsm, server["ctx"].shaper,
+                server["keys"],
+                server["ctx"].fsm,
+                server["ctx"].shaper,
                 server["ctx"].send_fn,
                 server["ctx"].rekey.last_time,
                 cached_ack_epoch=server["ctx"].rekey.cached_ack_epoch,
@@ -491,10 +531,13 @@ class TestDataPathRoundtrip(unittest.IsolatedAsyncioTestCase):
         from dsm.core.fsm import SessionFSM, State
         from dsm.core.protocol import ReassemblyBuffer
         from dsm.session import (
-            DataPathContext, LivenessState, RekeyState, tun_send_loop,
+            DataPathContext,
+            LivenessState,
+            RekeyState,
+            tun_send_loop,
         )
-        from dsm.traffic.shaper import TrafficShaper, make_chaff_packet
         from dsm.traffic.scheduler import SendScheduler
+        from dsm.traffic.shaper import TrafficShaper, make_chaff_packet
 
         orig_timeout = session_mod.REKEY_ACK_TIMEOUT
         session_mod.REKEY_ACK_TIMEOUT = 0.05
@@ -526,7 +569,7 @@ class TestDataPathRoundtrip(unittest.IsolatedAsyncioTestCase):
 
         scheduler = SendScheduler(
             send_fn=capture_send,
-            chaff_fn=lambda: make_chaff_packet(shaper, keys.epoch & 0x03),
+            chaff_fn=lambda: make_chaff_packet(shaper, keys.epoch & 0x0F),
             should_chaff_fn=lambda: False,
             jitter_ms_min=0,
             jitter_ms_max=0,
@@ -567,12 +610,15 @@ class TestDataPathRoundtrip(unittest.IsolatedAsyncioTestCase):
         # At least MAX_REKEY_RETRIES retransmits must have hit send_fn;
         # after that the loop sets shutdown and exits.
         from dsm.rekey import MAX_REKEY_RETRIES
+
         self.assertGreaterEqual(
-            rekey.retries_used, MAX_REKEY_RETRIES,
+            rekey.retries_used,
+            MAX_REKEY_RETRIES,
             f"expected >= {MAX_REKEY_RETRIES} retries, got {rekey.retries_used}",
         )
         self.assertGreaterEqual(
-            len(wire_sends), MAX_REKEY_RETRIES,
+            len(wire_sends),
+            MAX_REKEY_RETRIES,
             "wire send_fn should have been called for each retry",
         )
 
@@ -604,6 +650,69 @@ class TestDataPathRoundtrip(unittest.IsolatedAsyncioTestCase):
         )
 
 
+@unittest.skipUnless(
+    _HAS_TUNCORE,
+    "tuncore (Rust crypto core) not built; run `maturin develop` in rust/tuncore/",
+)
+class TestTCPFixedSizePadding(unittest.IsolatedAsyncioTestCase):
+    """Regression: ``make_send_fn`` over TCP MUST pad the inner plaintext
+    to ``tcp_fixed_size - OUTER_HEADER_SIZE - GCM_TAG_SIZE`` (1364), NOT
+    to ``tcp_fixed_size`` (1400). The latter caused
+    ``OuterPacket.serialize(target_size=1400)`` to fail with a wire-size
+    mismatch on every send below the max class — silently dropped by the
+    scheduler's broad ``except Exception``.
+    """
+
+    async def test_small_target_size_produces_1400_byte_wire(self) -> None:
+        import tuncore
+
+        from dsm.core.protocol import GCM_TAG_SIZE, OUTER_HEADER_SIZE, SIZE_CLASSES
+        from dsm.net.transport.tcp import TCPTransport
+        from dsm.session import SequenceCounter, make_send_fn
+
+        local = tuncore.BootstrapEphemeral.generate()
+        peer = tuncore.BootstrapEphemeral.generate()
+        peer_pub = bytes(peer.public_key_bytes)
+        sk = tuncore.complete_bootstrap(local, peer_pub, is_initiator=True)
+
+        sent: list[bytes] = []
+
+        class _StubTCP(TCPTransport):
+            def __init__(self) -> None:
+                pass  # skip real socket setup
+
+            async def send(self, data: bytes) -> None:  # type: ignore[override]
+                sent.append(data)
+
+        transport = _StubTCP()
+        seq = SequenceCounter()
+        send = make_send_fn(sk, transport, lambda: None, seq)
+
+        # Smallest class — would fail before the fix because plaintext
+        # was padded to 1400 then encrypted to 1416, mismatching target=1400.
+        smallest = SIZE_CLASSES[0]  # 128
+        inner_for_smallest = smallest - OUTER_HEADER_SIZE - GCM_TAG_SIZE
+        await send(b"x" * inner_for_smallest, smallest)
+
+        # Mid class
+        mid = 512
+        inner_for_mid = mid - OUTER_HEADER_SIZE - GCM_TAG_SIZE
+        await send(b"y" * inner_for_mid, mid)
+
+        # Max class — branch should NOT trigger; wire size still 1400.
+        largest = SIZE_CLASSES[-1]  # 1400
+        inner_for_largest = largest - OUTER_HEADER_SIZE - GCM_TAG_SIZE
+        await send(b"z" * inner_for_largest, largest)
+
+        self.assertEqual(len(sent), 3, "all three sends must succeed")
+        for i, frame in enumerate(sent):
+            self.assertEqual(
+                len(frame),
+                SIZE_CLASSES[-1],
+                f"send #{i}: wire size {len(frame)} != {SIZE_CLASSES[-1]}",
+            )
+
+
 class TestRotationThresholdOverride(unittest.TestCase):
     """Regression: ``config.rotation_packets`` and ``rotation_seconds``
     were dead config fields for one milestone — validated but never
@@ -618,21 +727,28 @@ class TestRotationThresholdOverride(unittest.TestCase):
         # Sample 20 sessions; with proportional ±20% jitter, every threshold
         # should land in [160, 240]. Default base of 5000 lands in [4000, 6000].
         for _ in range(20):
-            secret, public = tuncore.generate_ephemeral()
-            sk = tuncore.bootstrap_session_from_dh(
-                bytes(secret), bytes(public), is_initiator=True,
-                rotation_packets=OVERRIDE, rotation_seconds=30,
+            local = tuncore.BootstrapEphemeral.generate()
+            peer = tuncore.BootstrapEphemeral.generate()
+            peer_pub = bytes(peer.public_key_bytes)
+            sk = tuncore.complete_bootstrap(
+                local,
+                peer_pub,
+                is_initiator=True,
+                rotation_packets=OVERRIDE,
+                rotation_seconds=30,
             )
             n = 0
             while not sk.needs_rotation() and n < OVERRIDE * 2:
                 sk.encrypt(b"x", b"")
                 n += 1
             self.assertGreaterEqual(
-                n, int(OVERRIDE * 0.8),
+                n,
+                int(OVERRIDE * 0.8),
                 f"override threshold rotated too early: {n} < 160",
             )
             self.assertLessEqual(
-                n, int(OVERRIDE * 1.2),
+                n,
+                int(OVERRIDE * 1.2),
                 f"override threshold rotated too late: {n} > 240",
             )
 
@@ -640,9 +756,13 @@ class TestRotationThresholdOverride(unittest.TestCase):
         import tuncore
 
         for _ in range(5):
-            secret, public = tuncore.generate_ephemeral()
-            sk = tuncore.bootstrap_session_from_dh(
-                bytes(secret), bytes(public), is_initiator=True,
+            local = tuncore.BootstrapEphemeral.generate()
+            peer = tuncore.BootstrapEphemeral.generate()
+            peer_pub = bytes(peer.public_key_bytes)
+            sk = tuncore.complete_bootstrap(
+                local,
+                peer_pub,
+                is_initiator=True,
             )
             n = 0
             while not sk.needs_rotation() and n < 7000:

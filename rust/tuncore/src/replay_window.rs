@@ -81,6 +81,7 @@ impl ReplayWindow {
         true
     }
 
+    #[must_use]
     pub fn max_seq(&self) -> u64 {
         self.max_seq
     }
@@ -248,10 +249,7 @@ mod tests {
         // And exactly at the window edge: accepted (it's the oldest
         // seq still inside the bitmap).
         let edge = 10_000 - ReplayWindow::WINDOW_SIZE + 1;
-        assert!(
-            w.check(edge),
-            "edge seq={edge} should be inside the window"
-        );
+        assert!(w.check(edge), "edge seq={edge} should be inside the window");
     }
 
     #[test]

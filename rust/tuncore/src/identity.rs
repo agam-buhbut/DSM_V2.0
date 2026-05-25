@@ -90,11 +90,18 @@ impl IdentityKeyPair {
     /// identity's secret via HKDF-SHA256 (info = `context`). The derived key
     /// is scoped to this call, zeroized on drop, and never leaves Rust —
     /// callers receive only the 32-byte tag.
+    ///
+    /// M-CRYPT-6 SAFETY NOTE: `context` is passed straight to HKDF as
+    /// `info`. HKDF info has NO internal length-prefixing, so the API is
+    /// unsafe for callers that concatenate multiple structured fields
+    /// into `context` (e.g. `host || port`) — `("example.com", 8080)`
+    /// and `("example.com:8080", "")` would produce the same key. The
+    /// only in-tree caller (Python known-hosts HMAC) passes a single
+    /// opaque host string. If you add a new caller that concatenates
+    /// fields, you MUST length-prefix each field (or use a fixed-shape
+    /// canonical encoding) before passing — DO NOT let the splits float.
     pub fn compute_hmac(&self, context: &[u8], data: &[u8]) -> Result<[u8; 32], String> {
-        let hkdf = Hkdf::<Sha256>::new(
-            Some(b"dsm-known-hosts-hmac-v3-"),
-            self.secret.as_array(),
-        );
+        let hkdf = Hkdf::<Sha256>::new(Some(b"dsm-known-hosts-hmac-v3-"), self.secret.as_array());
         let mut key = Zeroizing::new([0u8; 32]);
         hkdf.expand(context, key.as_mut())
             .map_err(|e| format!("hkdf expand: {e}"))?;

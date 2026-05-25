@@ -169,6 +169,10 @@ class TestSchemaLock(unittest.TestCase):
         # operationally identical risk (revoked certs silently accepted), but
         # distinguishable in monitoring (Pass-2 follow-up).
         "crl_missing",
+        # H-ANON-4: emitted when the client rebinds its UDP socket to a
+        # fresh ephemeral port on rekey completion (breaks src-port
+        # session fingerprinting).
+        "udp_rebound",
     }
 
     def test_call_sites_in_repo(self) -> None:

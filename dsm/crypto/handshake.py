@@ -131,8 +131,13 @@ async def client_handshake(
     required_server_eku: ObjectIdentifier | None = None,
     rotation_packets: int | None = None,
     rotation_seconds: int | None = None,
-) -> tuple[tuncore.SessionKeyManager, bytes]:
+) -> tuple[tuncore.SessionKeyManager, bytes, bytes]:
     """Perform Noise XX handshake as initiator (client).
+
+    Returns ``(session_keys, handshake_hash, server_static_pub)``.
+    ``server_static_pub`` is the 32-byte X25519 Noise static recovered
+    from msg2 and used by the caller for the M-BUG-1 mutual-rekey
+    tie-break.
 
     Args:
         transport: UDPTransport or TCPTransport.
@@ -300,7 +305,10 @@ async def client_handshake(
         peer_serial=server_cert.serial_number,
         duration_s=round(duration_s, 4),
     )
-    return session_keys, handshake_hash
+    # Audit H1 / M-BUG-1: return the server's Noise static pub too so
+    # the data path can plumb it into DataPathContext for the
+    # mutual-rekey tie-break.
+    return session_keys, handshake_hash, bytes(server_static)
 
 
 async def server_handshake(

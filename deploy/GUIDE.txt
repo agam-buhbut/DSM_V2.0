@@ -292,7 +292,9 @@ configure clients (clients pin the server's CN via `expected_server_cn`).
     cert_file          = "/opt/mtun/device.crt"
     ca_root_file       = "/opt/mtun/dsm_ca_root.pem"
     attest_key_file    = "/opt/mtun/attest.key"
-    # crl_file         = "/opt/mtun/dsm_ca.crl"   # optional, recommended
+    crl_file           = "/opt/mtun/dsm_ca.crl"   # required by default (crl_strict=true)
+    # crl_strict       = true                     # default. Set false ONLY for
+                                                  # lab/dev with no CA workflow.
 
     # Server-only: one allowed client subject CN per line, mode 0o600.
     allowed_cns_file   = "/opt/mtun/allowed_cns.txt"
@@ -633,8 +635,10 @@ From the client (second terminal, while the VPN is running):
     Default validity:
       - Leaf cert  : 1 year   (default_days = 365 in openssl-ca.cnf)
       - CRL        : 31 days  (default_crl_days = 31)
-    dsm warns when the CRL is past its next_update timestamp. To FAIL
-    CLOSED on a stale CRL, set `crl_strict = true` in config.toml.
+    dsm FAILS CLOSED when crl_file is absent or the CRL is past its
+    next_update timestamp (crl_strict defaults to true, audit H-CRYPT-3
+    flip). To allow startup without a CRL (lab/dev only — accepts
+    revoked certs silently), set `crl_strict = false` in config.toml.
 
 7f. Disaster recovery — CA private key lost
 

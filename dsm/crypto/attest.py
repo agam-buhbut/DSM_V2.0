@@ -39,15 +39,11 @@ import tuncore
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric.ec import ECDSA
-from cryptography.x509 import ObjectIdentifier
 from cryptography.x509 import Certificate as X509Certificate
+from cryptography.x509 import ObjectIdentifier
 
 from dsm.crypto.cert import (
     NOISE_STATIC_PUB_LEN,
-    CertBindingError,
-    CertChainError,
-    CertError,
-    CertExpiredError,
     DeviceCert,
     validate_chain,
 )
@@ -170,16 +166,12 @@ def _unframe_payload(payload: bytes) -> tuple[int, bytes, bytes]:
     (cert_len,) = struct.unpack(">H", payload[8:10])
     cert_end = 10 + cert_len
     if cert_end + 2 > payload_size:
-        raise AttestPayloadFormatError(
-            "attest payload cert_len overflows frame"
-        )
+        raise AttestPayloadFormatError("attest payload cert_len overflows frame")
     cert_der = bytes(payload[10:cert_end])
     (sig_len,) = struct.unpack(">H", payload[cert_end : cert_end + 2])
     sig_end = cert_end + 2 + sig_len
     if sig_end > payload_size:
-        raise AttestPayloadFormatError(
-            "attest payload sig_len overflows frame"
-        )
+        raise AttestPayloadFormatError("attest payload sig_len overflows frame")
     sig_der = bytes(payload[cert_end + 2 : sig_end])
     return timestamp, cert_der, sig_der
 
@@ -241,9 +233,7 @@ def verify_attest_payload(
     # 1. Unframe the wire payload.
     ts_secs, cert_der, sig_der = _unframe_payload(payload)
     if not cert_der or not sig_der:
-        raise AttestPayloadFormatError(
-            "attest payload missing cert or signature"
-        )
+        raise AttestPayloadFormatError("attest payload missing cert or signature")
 
     # 2. Cert chain.
     leaf = DeviceCert.from_der(cert_der)
@@ -271,10 +261,16 @@ def verify_attest_payload(
             "binding signature does not verify under cert pubkey"
         ) from e
 
-    # 5. Timestamp window.
-    signed_ts = datetime.datetime.fromtimestamp(
-        ts_secs, tz=datetime.timezone.utc
-    )
+    # 5. Timestamp window. An attacker-controlled `ts_secs` of u64::MAX
+    # (~5.84e11 years) would raise OverflowError from fromtimestamp,
+    # which is NOT in the AttestError hierarchy and would leak out of
+    # the handshake driver's typed-error filter. Catch it explicitly.
+    try:
+        signed_ts = datetime.datetime.fromtimestamp(ts_secs, tz=datetime.timezone.utc)
+    except (OverflowError, OSError, ValueError) as e:
+        raise AttestTimestampError(
+            f"signed timestamp {ts_secs} is out of representable range"
+        ) from e
     if abs(now - signed_ts) > allowed_clock_skew:
         raise AttestTimestampError(
             f"signed timestamp {signed_ts.isoformat()} is outside "

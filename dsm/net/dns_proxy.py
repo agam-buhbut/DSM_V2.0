@@ -95,6 +95,21 @@ class LocalDNSProxy:
             reuse_port=False,
         )
         self._transport = transport  # type: ignore[assignment]
+        # M-NET-2: mark the DNS-proxy socket with SO_MARK so any reply
+        # we send out chooses the route by the marked policy rather than
+        # by the default table. Without this, on hosts with weird
+        # routing configurations a DNS reply destined for an inner-TUN
+        # client could pick the wrong egress interface.
+        try:
+            from dsm.net.transport._fwmark import apply_so_mark
+
+            sock = transport.get_extra_info("socket")
+            if sock is not None:
+                apply_so_mark(sock)
+        except OSError as e:
+            # Best-effort — SO_MARK requires CAP_NET_ADMIN; in test
+            # environments we don't have it. Don't fail startup.
+            log.debug("DNS proxy SO_MARK skipped: %s", e)
         log.info("DNS proxy listening on %s:%d", self._bind_ip, self._bind_port)
 
     def stop(self) -> None:
@@ -134,7 +149,10 @@ class LocalDNSProxy:
         return True
 
     def _parse_or_reject(
-        self, data: bytes, addr: tuple[str, int], send: Any,
+        self,
+        data: bytes,
+        addr: tuple[str, int],
+        send: Any,
     ) -> tuple[dns.message.Message, str, int] | None:
         """Parse wire bytes; return (query, qname, qtype) or None if handled.
 
@@ -147,7 +165,8 @@ class LocalDNSProxy:
         except dns.exception.DNSException as e:
             log.debug(
                 "dropping malformed DNS query from %s: %s",
-                addr, type(e).__name__,
+                addr,
+                type(e).__name__,
             )
             return None
 
@@ -170,7 +189,9 @@ class LocalDNSProxy:
         return query, qname, qtype
 
     async def _resolve_with_dedup(
-        self, qname: str, qtype: int,
+        self,
+        qname: str,
+        qtype: int,
     ) -> list[str]:
         """Resolve ``qname`` for A records, coalescing concurrent duplicates.
 
@@ -208,12 +229,14 @@ class LocalDNSProxy:
                     return addresses
                 except Exception as e:
                     log_qname = (
-                        qname if self._debug_dns
+                        qname
+                        if self._debug_dns
                         else f"qname-sha256={_redact_qname(qname)}"
                     )
                     log.warning(
                         "DNS resolve failed for %s: %s",
-                        log_qname, type(e).__name__,
+                        log_qname,
+                        type(e).__name__,
                     )
                     inflight_future.set_exception(e)
                     return []
@@ -222,7 +245,8 @@ class LocalDNSProxy:
 
     @staticmethod
     def _build_response(
-        query: dns.message.Message, addresses: list[str],
+        query: dns.message.Message,
+        addresses: list[str],
     ) -> bytes:
         """Build an A-record response wire frame from upstream addresses.
 
@@ -233,14 +257,20 @@ class LocalDNSProxy:
         resp.flags |= dns.flags.RA
         q = query.question[0]
         rrset = dns.rrset.from_text_list(
-            q.name, DEFAULT_CACHED_TTL,
-            dns.rdataclass.IN, dns.rdatatype.A, addresses,
+            q.name,
+            DEFAULT_CACHED_TTL,
+            dns.rdataclass.IN,
+            dns.rdatatype.A,
+            addresses,
         )
         resp.answer.append(rrset)
         return resp.to_wire()
 
     async def _handle_query(
-        self, data: bytes, addr: tuple[str, int], send: Any,
+        self,
+        data: bytes,
+        addr: tuple[str, int],
+        send: Any,
     ) -> None:
         """Orchestrate parse → dedup-resolve → respond for one DNS datagram.
 

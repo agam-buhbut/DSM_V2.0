@@ -55,10 +55,20 @@ class IPForwardingManager:
         # Stop the kernel from telling clients about "better" paths.
         self._sysctl.set("net.ipv4.conf.all.send_redirects", "0")
         self._sysctl.set("net.ipv4.conf.default.send_redirects", "0")
+        # L-NET-1 belt-and-braces: also refuse to ACCEPT redirects from
+        # the LAN side. nftables already drops them but a kernel that
+        # honored a stale route table entry from before nft applied is
+        # eliminated by this sysctl. Set on both `all` and `default` so
+        # interfaces brought up after dsm started inherit the secure
+        # default.
+        self._sysctl.set("net.ipv4.conf.all.accept_redirects", "0")
+        self._sysctl.set("net.ipv4.conf.default.accept_redirects", "0")
+        self._sysctl.set("net.ipv4.conf.all.secure_redirects", "0")
         # Loose reverse-path filtering for asymmetric tunnel paths.
         self._sysctl.set("net.ipv4.conf.all.rp_filter", "2")
         if self._tun_name:
             self._sysctl.set(f"net.ipv4.conf.{self._tun_name}.send_redirects", "0")
+            self._sysctl.set(f"net.ipv4.conf.{self._tun_name}.accept_redirects", "0")
             self._sysctl.set(f"net.ipv4.conf.{self._tun_name}.rp_filter", "2")
             self._sysctl.set(f"net.ipv4.conf.{self._tun_name}.accept_local", "1")
         log.info("server forwarding subsystem active")

@@ -36,7 +36,7 @@ from cryptography.hazmat.primitives.asymmetric.ec import (
     EllipticCurvePublicKey,
 )
 from cryptography.hazmat.primitives.serialization import Encoding
-from cryptography.x509.oid import ExtensionOID, NameOID
+from cryptography.x509.oid import NameOID
 
 # Signature-hash algorithms accepted on the leaf cert and CRL. SHA-1 and MD5
 # are explicitly excluded — both have practical collisions that allow forging
@@ -367,3 +367,27 @@ def validate_chain(
     #    malformed, so callers downstream can rely on
     #    ``leaf.noise_static_pub``.
     _ = leaf.noise_static_pub
+
+    # 6. basicConstraints CA:FALSE enforcement. The CA's openssl-ca.cnf
+    # leaf profile sets this critical, but a misconfigured CA (or a
+    # malicious operator with key access) could issue a leaf with
+    # CA:TRUE — that leaf could then sign further certs that this code
+    # would chain-validate. Enforce CA:FALSE at runtime so the policy
+    # doesn't depend on operator discipline.
+    try:
+        bc_ext = leaf.cert.extensions.get_extension_for_class(
+            x509.BasicConstraints,
+        )
+    except x509.ExtensionNotFound as e:
+        raise CertChainError(
+            "leaf missing basicConstraints extension"
+        ) from e
+    if not bc_ext.critical:
+        raise CertChainError(
+            "leaf basicConstraints extension must be marked critical"
+        )
+    if bc_ext.value.ca:
+        raise CertChainError(
+            "leaf cert has basicConstraints CA:TRUE — only end-entity "
+            "certs are accepted"
+        )

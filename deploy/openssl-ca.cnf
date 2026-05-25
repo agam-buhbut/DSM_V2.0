@@ -61,6 +61,10 @@ commonName       = supplied
 # ═════════════════════════════════════════════════════════════════════════
 # Only used by the initial `openssl req -new -x509 ...` invocation.
 [ req ]
+# default_bits is RSA-only and IGNORED for EC keys. The CA actually uses
+# P-384 via the `openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-384`
+# step in deploy/GUIDE.txt §2. Kept here only because some openssl
+# versions warn if the [req] section omits default_bits entirely.
 default_bits        = 384
 default_md          = sha384
 prompt              = no
@@ -75,6 +79,18 @@ CN = DSM Root CA
 basicConstraints       = critical, CA:TRUE, pathlen:0
 keyUsage               = critical, keyCertSign, cRLSign
 subjectKeyIdentifier   = hash
+# Name constraints: leaf certs MUST have a CN of the form
+# "dsm-<hex>-{client,server}". The permitted DirName pattern bounds the
+# CA's signing authority — even if the CA key were misused (lost USB,
+# coerced operator), it could not produce a cert for an arbitrary CN
+# accepted by some other system that trusts this root. Excluded DNS /
+# IP / URI / RFC822 ranges block the same key from issuing any
+# non-DSM-style certificate. cryptography &gt;=42 enforces nameConstraints
+# end-to-end on the leaf during chain validation.
+nameConstraints        = critical, permitted;DirName:dsm_permitted_dn, excluded;DNS:., excluded;IP:0.0.0.0/0, excluded;IP:::/0, excluded;URI:., excluded;email:.
+
+[ dsm_permitted_dn ]
+CN                     = dsm
 
 
 # ═════════════════════════════════════════════════════════════════════════

@@ -29,18 +29,17 @@ except ImportError:
     _HAS_TUNCORE = False
 
 if _HAS_TUNCORE:
-    from cryptography.hazmat.primitives import hashes
-    from cryptography.hazmat.primitives.asymmetric import ec
-    from cryptography.hazmat.primitives.serialization import Encoding
     from cryptography import x509
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.serialization import Encoding
 
     from dsm.crypto.cert_allowlist import CNAllowlist
     from dsm.crypto.crl import CRL
     from dsm.crypto.handshake import (
         CertAuthError,
+        CertRevokedError,
         CNMismatchError,
         CNNotAllowedError,
-        CertRevokedError,
         client_handshake,
         server_handshake,
     )
@@ -54,9 +53,7 @@ if _HAS_TUNCORE:
     )
 
 
-def _build_crl_with_revoked(
-    ca, revoked_serials: list[int]
-) -> CRL:
+def _build_crl_with_revoked(ca, revoked_serials: list[int]) -> CRL:
     """Construct a CRL signed by ``ca`` revoking the given serials,
     write it to disk, load it through the production code path, and
     return the loaded CRL object."""
@@ -101,12 +98,8 @@ class TestHandshakeRoundtrip(unittest.IsolatedAsyncioTestCase):
 
     async def asyncSetUp(self) -> None:
         self._so_mark_patches = [
-            patch(
-                "dsm.net.transport.udp.apply_so_mark", lambda sock: None
-            ),
-            patch(
-                "dsm.net.transport.tcp.apply_so_mark", lambda sock: None
-            ),
+            patch("dsm.net.transport.udp.apply_so_mark", lambda sock: None),
+            patch("dsm.net.transport.tcp.apply_so_mark", lambda sock: None),
         ]
         for p in self._so_mark_patches:
             p.start()
@@ -121,9 +114,7 @@ class TestHandshakeRoundtrip(unittest.IsolatedAsyncioTestCase):
             subject_cn="dsm-server01-server",
             eku=SERVER_AUTH_OID,
         )
-        self.allowlist = CNAllowlist(
-            cns=frozenset({self.client.cert_der and "dsm-client01-client"})
-        )
+        self.allowlist = CNAllowlist(cns=frozenset({"dsm-client01-client"}))
 
     async def asyncTearDown(self) -> None:
         for p in self._so_mark_patches:
@@ -186,15 +177,13 @@ class TestHandshakeRoundtrip(unittest.IsolatedAsyncioTestCase):
     async def test_roundtrip_establishes_matching_session_keys(
         self,
     ) -> None:
-        (client_keys, _client_hash), (
+        (client_keys, _client_hash, _server_static_pub), (
             server_keys,
             client_static_seen,
         ) = await self._run_udp_handshake()
 
         # Server sees the client's Noise static post-handshake.
-        self.assertEqual(
-            len(bytes(client_static_seen)), 32
-        )
+        self.assertEqual(len(bytes(client_static_seen)), 32)
 
         # Both sides agreed on key material: ciphertext from one side
         # decrypts on the other.
@@ -211,8 +200,9 @@ class TestHandshakeRoundtrip(unittest.IsolatedAsyncioTestCase):
         """Each session must derive its own keys via ephemeral DH; two
         runs with the same identity pairs still produce independent
         SessionKeyManagers (forward secrecy)."""
-        c1_keys, _ = (await self._run_udp_handshake())[0]
+        c1_keys, _h1, _spp1 = (await self._run_udp_handshake())[0]
         _, (s2_keys, _) = await self._run_udp_handshake()
+        del _
 
         aad = b"\x00" * 8
         nonce, ct, _ = c1_keys.encrypt(b"session-1-secret", aad)
@@ -231,9 +221,7 @@ class TestCertPolicyEnforcement(unittest.IsolatedAsyncioTestCase):
 
     async def asyncSetUp(self) -> None:
         self._so_mark_patches = [
-            patch(
-                "dsm.net.transport.udp.apply_so_mark", lambda sock: None
-            ),
+            patch("dsm.net.transport.udp.apply_so_mark", lambda sock: None),
         ]
         for p in self._so_mark_patches:
             p.start()
@@ -319,33 +307,23 @@ class TestCertPolicyEnforcement(unittest.IsolatedAsyncioTestCase):
 
     async def test_client_rejects_server_wrong_cn(self) -> None:
         results = await self._run(
-            allowlist=CNAllowlist(
-                cns=frozenset({"dsm-client-policy-client"})
-            ),
+            allowlist=CNAllowlist(cns=frozenset({"dsm-client-policy-client"})),
             expected_server_cn="dsm-imposter-server",
         )
         self._expect_failure(results, CNMismatchError)
 
     async def test_revoked_client_cert_rejected(self) -> None:
-        crl = _build_crl_with_revoked(
-            self.ca, [self.client.cert.serial_number]
-        )
+        crl = _build_crl_with_revoked(self.ca, [self.client.cert.serial_number])
         results = await self._run(
-            allowlist=CNAllowlist(
-                cns=frozenset({"dsm-client-policy-client"})
-            ),
+            allowlist=CNAllowlist(cns=frozenset({"dsm-client-policy-client"})),
             crl=crl,
         )
         self._expect_failure(results, CertRevokedError)
 
     async def test_revoked_server_cert_rejected(self) -> None:
-        crl = _build_crl_with_revoked(
-            self.ca, [self.server.cert.serial_number]
-        )
+        crl = _build_crl_with_revoked(self.ca, [self.server.cert.serial_number])
         results = await self._run(
-            allowlist=CNAllowlist(
-                cns=frozenset({"dsm-client-policy-client"})
-            ),
+            allowlist=CNAllowlist(cns=frozenset({"dsm-client-policy-client"})),
             crl=crl,
         )
         self._expect_failure(results, CertRevokedError)
@@ -353,9 +331,7 @@ class TestCertPolicyEnforcement(unittest.IsolatedAsyncioTestCase):
     async def test_client_pinned_to_other_ca_rejected(self) -> None:
         other_ca = make_test_ca("Foreign CA")
         results = await self._run(
-            allowlist=CNAllowlist(
-                cns=frozenset({"dsm-client-policy-client"})
-            ),
+            allowlist=CNAllowlist(cns=frozenset({"dsm-client-policy-client"})),
             client_ca=other_ca.certificate,
         )
         # CertAuthError covers CertChainError + CertSignatureError etc.
@@ -371,12 +347,8 @@ class TestHandshakeRoundtripTCP(unittest.IsolatedAsyncioTestCase):
 
     async def asyncSetUp(self) -> None:
         self._so_mark_patches = [
-            patch(
-                "dsm.net.transport.udp.apply_so_mark", lambda sock: None
-            ),
-            patch(
-                "dsm.net.transport.tcp.apply_so_mark", lambda sock: None
-            ),
+            patch("dsm.net.transport.udp.apply_so_mark", lambda sock: None),
+            patch("dsm.net.transport.tcp.apply_so_mark", lambda sock: None),
         ]
         for p in self._so_mark_patches:
             p.start()
@@ -395,8 +367,9 @@ class TestHandshakeRoundtripTCP(unittest.IsolatedAsyncioTestCase):
     async def test_tcp_roundtrip_establishes_matching_session_keys(
         self,
     ) -> None:
-        from dsm.net.transport.tcp import TCPTransport
         import socket
+
+        from dsm.net.transport.tcp import TCPTransport
 
         server_t = TCPTransport()
         client_t = TCPTransport()
@@ -416,9 +389,7 @@ class TestHandshakeRoundtripTCP(unittest.IsolatedAsyncioTestCase):
                 attest_key=self.server.attest_key,
                 cert_der=self.server.cert_der,
                 ca_root=self.ca.certificate,
-                cn_allowlist=CNAllowlist(
-                    cns=frozenset({"dsm-client-tcp-client"})
-                ),
+                cn_allowlist=CNAllowlist(cns=frozenset({"dsm-client-tcp-client"})),
             )
 
         async def _connect_then_handshake():
@@ -443,14 +414,12 @@ class TestHandshakeRoundtripTCP(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(server_t.aclose)
         self.addAsyncCleanup(client_t.aclose)
 
-        (server_result, client_result) = await asyncio.wait_for(
-            asyncio.gather(
-                _listen_then_handshake(), _connect_then_handshake()
-            ),
+        server_result, client_result = await asyncio.wait_for(
+            asyncio.gather(_listen_then_handshake(), _connect_then_handshake()),
             timeout=30.0,
         )
         server_keys, client_static_seen = server_result
-        client_keys, _client_hash = client_result
+        client_keys, _client_hash, _server_static_pub = client_result
 
         self.assertEqual(len(bytes(client_static_seen)), 32)
         aad = b"\x00" * 8
@@ -458,9 +427,7 @@ class TestHandshakeRoundtripTCP(unittest.IsolatedAsyncioTestCase):
         pt = server_keys.decrypt(bytes(nonce), bytes(ct), aad, 1, False)
         self.assertEqual(bytes(pt), b"ping-tcp")
         nonce2, ct2, _ = server_keys.encrypt(b"pong-tcp", aad)
-        pt2 = client_keys.decrypt(
-            bytes(nonce2), bytes(ct2), aad, 1, False
-        )
+        pt2 = client_keys.decrypt(bytes(nonce2), bytes(ct2), aad, 1, False)
         self.assertEqual(bytes(pt2), b"pong-tcp")
 
 
@@ -468,18 +435,14 @@ class TestHandshakeRoundtripTCP(unittest.IsolatedAsyncioTestCase):
     _HAS_TUNCORE,
     "tuncore not built; run `maturin develop` in rust/tuncore/",
 )
-class TestServerWaitsIndefinitelyForFirstMsg1(
-    unittest.IsolatedAsyncioTestCase
-):
+class TestServerWaitsIndefinitelyForFirstMsg1(unittest.IsolatedAsyncioTestCase):
     """Regression: server's initial msg1 recv must NOT have a
     MAX_RETRIES × HANDSHAKE_TIMEOUT bound; it blocks until either a
     client connects or the task is cancelled."""
 
     async def asyncSetUp(self) -> None:
         self._so_mark_patches = [
-            patch(
-                "dsm.net.transport.udp.apply_so_mark", lambda sock: None
-            ),
+            patch("dsm.net.transport.udp.apply_so_mark", lambda sock: None),
         ]
         for p in self._so_mark_patches:
             p.start()

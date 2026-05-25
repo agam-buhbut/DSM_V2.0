@@ -135,6 +135,33 @@ class TestBootstrapSessionDH(unittest.TestCase):
         with self.assertRaises(Exception):
             tuncore.complete_bootstrap(eph, peer_pub, is_initiator=True)
 
+    def test_session_key_manager_encrypt_decrypt_return_bytes(self) -> None:
+        """H-PERF-3 contract: ``SessionKeyManager.encrypt`` returns a
+        ``(bytes, bytes, int)`` tuple and ``SessionKeyManager.decrypt``
+        returns ``bytes``. The Rust side returns ``PyBytes`` directly so
+        Python callers can drop the historical ``bytes(...)`` coercion on
+        the AEAD hot path. Regression guard: if a future Rust change
+        reverts to ``Vec<u8>``, this test trips and ``struct.unpack_from``
+        downstream of decrypt starts failing in production.
+        """
+        a_eph = tuncore.BootstrapEphemeral.generate()
+        b_eph = tuncore.BootstrapEphemeral.generate()
+        a_pub = bytes(a_eph.public_key_bytes)
+        b_pub = bytes(b_eph.public_key_bytes)
+        a_keys = tuncore.complete_bootstrap(a_eph, b_pub, is_initiator=True)
+        b_keys = tuncore.complete_bootstrap(b_eph, a_pub, is_initiator=False)
+
+        aad = b"\x00" * 8
+        nonce, ct, epoch = a_keys.encrypt(b"payload", aad)
+        self.assertIsInstance(nonce, bytes)
+        self.assertIsInstance(ct, bytes)
+        self.assertIsInstance(epoch, int)
+        self.assertEqual(len(nonce), 12)
+
+        pt = b_keys.decrypt(nonce, ct, aad, 1, False)
+        self.assertIsInstance(pt, bytes)
+        self.assertEqual(pt, b"payload")
+
 
 if __name__ == "__main__":
     unittest.main()

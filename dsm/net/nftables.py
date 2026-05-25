@@ -14,6 +14,9 @@ log = logging.getLogger(__name__)
 
 TEMPLATE_PATH = Path(__file__).parent.parent.parent / "nftables" / "nftables.conf"
 SERVER_TEMPLATE_PATH = Path(__file__).parent.parent.parent / "nftables" / "server.conf"
+PRE_HANDSHAKE_TEMPLATE_PATH = (
+    Path(__file__).parent.parent.parent / "nftables" / "pre_handshake.conf"
+)
 TCP_TIMESTAMPS_PATH = Path("/proc/sys/net/ipv4/tcp_timestamps")
 
 
@@ -90,6 +93,70 @@ class TcpTimestampsDisabler:
         self._original = None
 
 
+class PreHandshakeKillSwitch:
+    """Minimal pre-handshake kill switch.
+
+    Apply BEFORE binding the transport socket so a stuck or failed
+    handshake never leaks user traffic. Allows only:
+      * loopback
+      * DHCP (so a roaming client can keep its lease)
+      * the configured server IP + port (UDP and TCP)
+      * basic ICMP for path-MTU discovery (rate-limited)
+    Everything else is dropped by the chain's default policy.
+
+    Upgraded to the full :class:`NFTablesManager` ruleset (which also
+    handles the TUN interface, DNS leak prevention, etc.) atomically by
+    `NFTablesManager.apply()` once the TUN device is up.
+    """
+
+    TABLE_NAME = "dsm_killswitch_pre"
+
+    def __init__(self, server_ip: str, server_port: int) -> None:
+        ipaddress.ip_address(server_ip)  # raises on bad input
+        if not (1 <= server_port <= 65535):
+            raise ValueError(f"invalid server_port: {server_port}")
+        self._server_ip = server_ip
+        self._server_port = server_port
+        self._applied = False
+
+    def apply(self) -> None:
+        _apply_ruleset(
+            self._render(),
+            fatal=True,
+            log_label="pre-handshake kill switch",
+        )
+        self._applied = True
+        netaudit.emit(
+            "nft_apply",
+            tables=[self.TABLE_NAME],
+            server_ip=self._server_ip,
+            server_port=self._server_port,
+            phase="pre_handshake",
+        )
+
+    def remove(self) -> None:
+        """Tear down the pre-handshake table. Idempotent."""
+        if not self._applied:
+            return
+        _delete_tables(self.TABLE_NAME)
+        self._applied = False
+        netaudit.emit(
+            "nft_remove",
+            tables=[self.TABLE_NAME],
+            phase="pre_handshake",
+        )
+
+    def _render(self) -> str:
+        addr = ipaddress.ip_address(self._server_ip)
+        ip_proto = "ip6" if addr.version == 6 else "ip"
+        template = PRE_HANDSHAKE_TEMPLATE_PATH.read_text()
+        return (
+            template.replace("{SERVER_IP}", self._server_ip)
+            .replace("{SERVER_PORT}", str(int(self._server_port)))
+            .replace("{IP_PROTO}", ip_proto)
+        )
+
+
 class NFTablesManager:
     """Apply and remove nftables kill switch rules."""
 
@@ -104,13 +171,34 @@ class NFTablesManager:
         self._tun_name = tun_name
 
     def apply(self) -> None:
-        _apply_ruleset(self._render(), fatal=True, log_label="nftables kill switch")
+        """Install the full kill switch + DNS-leak tables.
+
+        Bundles the pre-handshake table teardown in the SAME `nft -f`
+        transaction so there's no atomicity gap between "pre table goes
+        away" and "full table is in place" — nft processes the whole
+        ruleset as one commit.
+        """
+        rules = (
+            f"delete table inet {PreHandshakeKillSwitch.TABLE_NAME}\n" + self._render()
+        )
+        try:
+            _apply_ruleset(rules, fatal=True, log_label="nftables kill switch")
+        except RuntimeError:
+            # The pre-handshake table may not exist (e.g. operator wired
+            # apply() manually without the pre-handshake step). Retry
+            # without the delete.
+            _apply_ruleset(
+                self._render(),
+                fatal=True,
+                log_label="nftables kill switch",
+            )
         netaudit.emit(
             "nft_apply",
             tables=["dsm_killswitch", "dsm_dns_leak"],
             tun_name=self._tun_name,
             server_ip=self._server_ip,
             server_port=self._server_port,
+            phase="full",
         )
 
     def remove(self) -> None:
@@ -130,12 +218,11 @@ class NFTablesManager:
         # IPv4 servers.
         addr = ipaddress.ip_address(self._server_ip)
         ip_proto = "ip6" if addr.version == 6 else "ip"
-        if not re.match(r'^[a-zA-Z0-9_-]{1,15}$', self._tun_name):
+        if not re.match(r"^[a-zA-Z0-9_-]{1,15}$", self._tun_name):
             raise ValueError(f"invalid tun_name: {self._tun_name!r}")
         template = TEMPLATE_PATH.read_text()
         return (
-            template
-            .replace("{SERVER_IP}", self._server_ip)
+            template.replace("{SERVER_IP}", self._server_ip)
             .replace("{SERVER_PORT}", str(int(self._server_port)))
             .replace("{TUN_NAME}", self._tun_name)
             .replace("{IP_PROTO}", ip_proto)
@@ -157,7 +244,8 @@ class ServerRateLimitManager:
 
     def apply(self) -> None:
         self._applied = _apply_ruleset(
-            self._render(), fatal=False,
+            self._render(),
+            fatal=False,
             log_label=f"server rate-limit (port {self._listen_port})",
         )
         if self._applied:
@@ -176,5 +264,6 @@ class ServerRateLimitManager:
 
     def _render(self) -> str:
         return SERVER_TEMPLATE_PATH.read_text().replace(
-            "{SERVER_PORT}", str(int(self._listen_port)),
+            "{SERVER_PORT}",
+            str(int(self._listen_port)),
         )

@@ -95,14 +95,38 @@ fn validate_ephemeral_not_low_order(pub_bytes: &[u8]) -> Result<(), String> {
 /// Pack a handshake message: [snow_data || random_padding].
 /// Snow data is always placed at offset 0 with a protocol-constant length;
 /// the remainder is uniform random padding. No length field on the wire.
+///
+/// M-CRYPT-9 SECURITY NOTE: the trailing pad bytes are NOT
+/// authenticated. An on-path attacker can replace them with arbitrary
+/// content; `unpack_handshake` accepts any frame of `HANDSHAKE_PAD_SIZE`
+/// bytes and returns ONLY the `snow_data` prefix to the caller. No
+/// in-tree caller reads past `expected_len`, so the attacker-controlled
+/// trailer is currently inert — but if any future code path reads past
+/// the snow prefix (e.g. extends the attest payload, adds extra header
+/// fields), those bytes MUST be treated as adversary-controlled. The
+/// covert channel cannot be closed without either dropping handshake-
+/// size padding or adding an outer MAC; both are protocol-format
+/// changes. For now, the inert-trailer invariant is the security
+/// guarantee.
 fn pack_handshake(snow_data: &[u8], expected_len: usize) -> Result<Vec<u8>, String> {
     if snow_data.len() < expected_len {
         return Err("snow produced shorter payload than expected".into());
     }
-    let mut out = vec![0u8; HANDSHAKE_PAD_SIZE];
-    out[..expected_len].copy_from_slice(&snow_data[..expected_len]);
-    OsRng.fill_bytes(&mut out[expected_len..]);
-    Ok(out)
+    // L-CRYPT-5: build the packed frame inside a Zeroizing buffer so
+    // when the caller (write_message_*) clones into the final Vec for
+    // the network send, both the staging buffer AND any in-place
+    // overwrite of `snow_data` are scrubbed when this function returns.
+    // The encrypted handshake prefix carries session-static state that,
+    // while encrypted, is still a deterministic-per-session fingerprint
+    // an attacker with later key compromise could use to correlate the
+    // session's start.
+    let mut staging = zeroize::Zeroizing::new(vec![0u8; HANDSHAKE_PAD_SIZE]);
+    staging[..expected_len].copy_from_slice(&snow_data[..expected_len]);
+    OsRng.fill_bytes(&mut staging[expected_len..]);
+    // Caller needs Vec<u8> (the wire frame); the clone here is one
+    // unavoidable copy, but the staging buffer scrubs on Drop at end-
+    // of-scope so the in-Rust pre-send copy doesn't linger.
+    Ok(staging.to_vec())
 }
 
 /// Unpack a handshake message: extract the protocol-constant prefix.
@@ -151,9 +175,7 @@ fn build_handshake_state<F>(
 where
     F: FnOnce(snow::Builder<'_>) -> Result<HandshakeState, snow::Error>,
 {
-    let pattern = NOISE_PATTERN
-        .parse()
-        .map_err(|e| format!("pattern: {e}"))?;
+    let pattern = NOISE_PATTERN.parse().map_err(|e| format!("pattern: {e}"))?;
     let builder = Builder::with_resolver(pattern, Box::new(SecureResolver::new()))
         .local_private_key(static_secret)
         .prologue(PROLOGUE);
@@ -182,9 +204,7 @@ impl NoiseInitiator {
     /// the upstream leak where `Dh25519`'s `[u8; 32]` field is returned
     /// to the allocator with the scalar still in place.
     pub fn new(static_secret: &[u8; 32]) -> Result<Self, String> {
-        let state = build_handshake_state(
-            static_secret, "initiator", snow::Builder::build_initiator,
-        )?;
+        let state = build_handshake_state(static_secret, "initiator", |b| b.build_initiator())?;
         Ok(Self { state })
     }
 
@@ -202,7 +222,9 @@ impl NoiseInitiator {
             .write_message(&[], &mut buf)
             .map_err(|e| format!("write msg1: {e}"))?;
         if len != MSG1_SNOW_LEN {
-            return Err(format!("msg1 length mismatch: got {len}, expected {MSG1_SNOW_LEN}"));
+            return Err(format!(
+                "msg1 length mismatch: got {len}, expected {MSG1_SNOW_LEN}"
+            ));
         }
         pack_handshake(&buf, MSG1_SNOW_LEN)
     }
@@ -265,7 +287,9 @@ impl NoiseInitiator {
             .write_message(attest_payload, &mut buf)
             .map_err(|e| format!("write msg3: {e}"))?;
         if len != MSG3_SNOW_LEN {
-            return Err(format!("msg3 length mismatch: got {len}, expected {MSG3_SNOW_LEN}"));
+            return Err(format!(
+                "msg3 length mismatch: got {len}, expected {MSG3_SNOW_LEN}"
+            ));
         }
         pack_handshake(&buf, MSG3_SNOW_LEN)
     }
@@ -291,9 +315,7 @@ impl NoiseResponder {
     /// mlock'd and zeroize-on-drop — see [`NoiseInitiator::new`] for the
     /// full rationale.
     pub fn new(static_secret: &[u8; 32]) -> Result<Self, String> {
-        let state = build_handshake_state(
-            static_secret, "responder", snow::Builder::build_responder,
-        )?;
+        let state = build_handshake_state(static_secret, "responder", |b| b.build_responder())?;
         Ok(Self { state })
     }
 
@@ -338,7 +360,9 @@ impl NoiseResponder {
             .write_message(attest_payload, &mut buf)
             .map_err(|e| format!("write msg2: {e}"))?;
         if len != MSG2_SNOW_LEN {
-            return Err(format!("msg2 length mismatch: got {len}, expected {MSG2_SNOW_LEN}"));
+            return Err(format!(
+                "msg2 length mismatch: got {len}, expected {MSG2_SNOW_LEN}"
+            ));
         }
         pack_handshake(&buf, MSG2_SNOW_LEN)
     }
@@ -778,12 +802,27 @@ mod tests {
         // Covers the defensive `expected_len > HANDSHAKE_PAD_SIZE` branch
         // that protects against a future caller passing a value larger
         // than the protocol-constant prefix.
-        for buf_len in [0usize, 1, MSG1_SNOW_LEN, MSG2_SNOW_LEN, MSG3_SNOW_LEN,
-                        HANDSHAKE_PAD_SIZE - 1, HANDSHAKE_PAD_SIZE,
-                        HANDSHAKE_PAD_SIZE + 1, HANDSHAKE_PAD_SIZE * 2] {
-            for expected_len in [0usize, 1, MSG1_SNOW_LEN, MSG2_SNOW_LEN,
-                                 MSG3_SNOW_LEN, HANDSHAKE_PAD_SIZE,
-                                 HANDSHAKE_PAD_SIZE + 1, usize::MAX / 2] {
+        for buf_len in [
+            0usize,
+            1,
+            MSG1_SNOW_LEN,
+            MSG2_SNOW_LEN,
+            MSG3_SNOW_LEN,
+            HANDSHAKE_PAD_SIZE - 1,
+            HANDSHAKE_PAD_SIZE,
+            HANDSHAKE_PAD_SIZE + 1,
+            HANDSHAKE_PAD_SIZE * 2,
+        ] {
+            for expected_len in [
+                0usize,
+                1,
+                MSG1_SNOW_LEN,
+                MSG2_SNOW_LEN,
+                MSG3_SNOW_LEN,
+                HANDSHAKE_PAD_SIZE,
+                HANDSHAKE_PAD_SIZE + 1,
+                usize::MAX / 2,
+            ] {
                 let buf = vec![0u8; buf_len];
                 let result = unpack_handshake(&buf, expected_len);
                 match result {
@@ -794,8 +833,7 @@ mod tests {
                     }
                     Err(_) => {
                         assert!(
-                            buf_len != HANDSHAKE_PAD_SIZE
-                                || expected_len > HANDSHAKE_PAD_SIZE,
+                            buf_len != HANDSHAKE_PAD_SIZE || expected_len > HANDSHAKE_PAD_SIZE,
                             "valid (buf_len, expected_len) was rejected: \
                              buf_len={buf_len}, expected_len={expected_len}"
                         );
@@ -838,7 +876,8 @@ mod tests {
         let mut server_keys =
             SessionKeyManager::from_handshake_hash(&server_hash, false, None, None).unwrap();
 
-        let aad = b"e2e";
+        // H-CRYPT-1: aad must equal seq.to_be_bytes() (defensive check).
+        let aad = &1u64.to_be_bytes();
         let initial_epoch = client_keys.epoch();
         let (nonce, ct, _) = client_keys.encrypt(b"client msg", aad).unwrap();
         let pt = server_keys.decrypt(&nonce, &ct, aad, 1, false).unwrap();

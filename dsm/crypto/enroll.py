@@ -69,8 +69,14 @@ def derive_default_cn(noise_static_pub: bytes, role: str) -> str:
         raise ValueError(
             f"noise_static_pub must be 32 bytes, got {len(noise_static_pub)}"
         )
-    digest = hashlib.sha256(noise_static_pub).digest()
-    return f"dsm-{digest[:4].hex()}-{role}"
+    # Bind role into the hash input so the same Noise static enrolled as
+    # both client and server cannot produce the same hex prefix — and so
+    # the role suffix isn't a non-binding decoration. Extend the prefix
+    # to 12 hex (6 bytes) so collisions on a fleet are ~birthday-bounded
+    # at ~2^24 devices per role instead of ~2^16 with the old 4-byte
+    # truncation. CNs of either width parse identically by the allowlist.
+    digest = hashlib.sha256(noise_static_pub + role.encode("ascii")).digest()
+    return f"dsm-{digest[:6].hex()}-{role}"
 
 
 def build_csr(

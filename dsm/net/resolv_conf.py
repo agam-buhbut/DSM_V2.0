@@ -43,9 +43,36 @@ class ResolvConfManager:
         rename(2) overwrites both regular files AND symlinks in a single
         syscall, so there is no window where /etc/resolv.conf is absent
         between capturing the original and the new file appearing.
+
+        M-NET-1 WARNING: on systems running NetworkManager or systemd-
+        resolved, our /etc/resolv.conf swap is fighting against another
+        component that ALSO claims the file. systemd-resolved keeps
+        listening on 127.0.0.53:53 (with libc resolvers reaching it via
+        nsswitch.conf even when /etc/resolv.conf says otherwise) and
+        NetworkManager rewrites /etc/resolv.conf on every DHCP renew
+        (typically every few hours on consumer networks), restoring its
+        own nameserver and locking the user out of DNS until dsm is
+        restarted. We log a one-shot warning at apply() so operators
+        can disable the conflicting service (`systemctl disable
+        systemd-resolved`, `nmcli connection modify ... ipv4.dns-priority
+        -1`) before deploying. The kill switch's port-53 block prevents
+        leaks either way — this warning is about usability, not security.
         """
         if self._applied:
             return
+
+        # M-NET-1 detection: warn if a known DNS-managing service is
+        # running. Detection is best-effort — we don't fail startup.
+        for path in ("/run/systemd/resolve/stub-resolv.conf", "/run/NetworkManager"):
+            if Path(path).exists():
+                log.warning(
+                    "detected %s — DNS-managing service may overwrite "
+                    "/etc/resolv.conf mid-session (M-NET-1). DSM's kill "
+                    "switch will block the resulting plaintext queries; "
+                    "to avoid lost DNS, disable the conflicting service.",
+                    path,
+                )
+                break
 
         if RESOLV_CONF.is_symlink():
             try:
@@ -85,20 +112,51 @@ class ResolvConfManager:
         log.info("resolv.conf -> nameserver %s", self._nameserver)
 
     def remove(self) -> None:
-        """Restore the original resolv.conf (symlink or contents)."""
+        """Restore the original resolv.conf (symlink or contents).
+
+        Audit L-AUDIT-3: use atomic rename (or symlinkat + rename) so
+        /etc/resolv.conf is never absent during teardown. The previous
+        ``unlink → symlink`` sequence opened a microsecond window
+        where libc resolvers from co-running processes would hit
+        ENOENT. atomic_write already does tmpfile→rename for the
+        file path; for the symlink case we create the symlink at a
+        temp path then rename it over the target.
+        """
         if not self._applied:
             return
 
         try:
-            if RESOLV_CONF.exists() or RESOLV_CONF.is_symlink():
-                RESOLV_CONF.unlink()
-
             if self._original_symlink_target is not None:
-                os.symlink(self._original_symlink_target, RESOLV_CONF)
+                # Symlink restore: create a sibling temp symlink, then
+                # rename it over RESOLV_CONF. rename(2) replaces
+                # files/symlinks atomically — never an ENOENT window.
+                tmp = RESOLV_CONF.with_suffix(
+                    RESOLV_CONF.suffix + ".dsm-restore"
+                )
+                # If a stale temp exists from a previous crash, unlink it.
+                try:
+                    tmp.unlink()
+                except FileNotFoundError:
+                    pass
+                os.symlink(self._original_symlink_target, tmp)
+                os.rename(tmp, RESOLV_CONF)
             elif self._original_contents is not None:
-                atomic_write(RESOLV_CONF, self._original_contents, mode=0o644, mkdir=False)
-            # else: no original to restore; leaving it absent matches the
-            # pre-apply state.
+                # atomic_write uses tmpfile → fchmod → fsync → rename;
+                # already atomic over both files AND symlinks.
+                atomic_write(
+                    RESOLV_CONF,
+                    self._original_contents,
+                    mode=0o644,
+                    mkdir=False,
+                )
+            else:
+                # No original to restore — explicitly remove our file.
+                # Brief absence here matches the pre-apply state by
+                # definition (file didn't exist then either).
+                try:
+                    RESOLV_CONF.unlink()
+                except FileNotFoundError:
+                    pass
         except OSError as e:
             log.error("failed to restore resolv.conf: %s", e)
         finally:

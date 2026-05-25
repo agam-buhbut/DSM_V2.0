@@ -8,20 +8,18 @@ key SPKI, foreign CA, expired cert, malformed cert input.
 from __future__ import annotations
 
 import datetime
-import os
 import tempfile
 import unittest
 from pathlib import Path
 
 from cryptography import x509
-from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
 from dsm.crypto.attest_store import AttestStore
 from dsm.crypto.cert import (
     DSM_NOISE_STATIC_BINDING_OID,
-    encode_noise_static_binding_value,
 )
 from dsm.crypto.enroll import (
     EnrollError,
@@ -31,7 +29,6 @@ from dsm.crypto.enroll import (
     import_signed_cert,
 )
 from dsm.crypto.keystore import KeyStore
-
 from tests.cert_helpers import IssuingCA, make_leaf_cert, make_test_ca
 
 
@@ -46,9 +43,7 @@ def _sign_csr(ca: IssuingCA, csr_der: bytes, *, validity_days: int = 365) -> byt
     assert len(cn_attr) == 1
     cn = cn_attr[0].value
 
-    bind_ext = csr.extensions.get_extension_for_oid(
-        DSM_NOISE_STATIC_BINDING_OID
-    )
+    bind_ext = csr.extensions.get_extension_for_oid(DSM_NOISE_STATIC_BINDING_OID)
     assert bind_ext.critical
     raw = bind_ext.value.value
     assert raw[0] == 0x04 and raw[1] == 0x20 and len(raw) == 34
@@ -70,10 +65,28 @@ def _sign_csr(ca: IssuingCA, csr_der: bytes, *, validity_days: int = 365) -> byt
 
 class TestDeriveDefaultCN(unittest.TestCase):
     def test_format(self) -> None:
+        import hashlib
+
         pub = b"\x01" * 32
-        self.assertEqual(
-            derive_default_cn(pub, "client"),
-            f"dsm-{__import__('hashlib').sha256(pub).digest()[:4].hex()}-client",
+        # Format is dsm-<12 hex>-<role> where the 12 hex are the first
+        # 6 bytes of SHA-256(pub || role.encode()). Role is bound INTO
+        # the hash so the same Noise static produces different prefixes
+        # for client vs server enrollment.
+        expected = f"dsm-{hashlib.sha256(pub + b'client').digest()[:6].hex()}-client"
+        self.assertEqual(derive_default_cn(pub, "client"), expected)
+
+    def test_role_binding_changes_hash(self) -> None:
+        """Same Noise static, different role → different hex prefix."""
+        pub = b"\x02" * 32
+        client_cn = derive_default_cn(pub, "client")
+        server_cn = derive_default_cn(pub, "server")
+        # Strip the suffix and compare the hex middle.
+        client_hex = client_cn[len("dsm-") : -len("-client")]
+        server_hex = server_cn[len("dsm-") : -len("-server")]
+        self.assertNotEqual(
+            client_hex,
+            server_hex,
+            "role must be bound into the hash, not just appended as a suffix",
         )
 
     def test_role_must_be_valid(self) -> None:
@@ -98,6 +111,7 @@ class TestEnrollRoundtrip(unittest.TestCase):
 
     def tearDown(self) -> None:
         import shutil
+
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def _build_enrollment(self, role: str = "client"):
@@ -182,9 +196,7 @@ class TestEnrollRoundtrip(unittest.TestCase):
     def test_csr_carries_critical_binding_extension(self) -> None:
         _, _, result = self._build_enrollment()
         csr = x509.load_der_x509_csr(result.csr_der)
-        ext = csr.extensions.get_extension_for_oid(
-            DSM_NOISE_STATIC_BINDING_OID
-        )
+        ext = csr.extensions.get_extension_for_oid(DSM_NOISE_STATIC_BINDING_OID)
         self.assertTrue(ext.critical)
         # Conventional OCTET STRING wrapping
         raw = ext.value.value
@@ -217,10 +229,16 @@ class TestImportFailureModes(unittest.TestCase):
 
     def tearDown(self) -> None:
         import shutil
+
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
-    def _import(self, cert_pem: bytes, *, ca_path: Path | None = None,
-                now: datetime.datetime | None = None) -> None:
+    def _import(
+        self,
+        cert_pem: bytes,
+        *,
+        ca_path: Path | None = None,
+        now: datetime.datetime | None = None,
+    ) -> None:
         self.cert_in.write_bytes(cert_pem)
         import_signed_cert(
             cert_input_path=self.cert_in,
@@ -301,6 +319,7 @@ class TestBuildCsrUnit(unittest.TestCase):
 
     def test_csr_subject_pubkey_matches_attest_key(self) -> None:
         import tuncore
+
         attest = tuncore.AttestKey.generate()
         noise_static = b"\x42" * 32
         csr_der = build_csr(
@@ -319,6 +338,7 @@ class TestBuildCsrUnit(unittest.TestCase):
 
     def test_csr_rejects_wrong_length_static(self) -> None:
         import tuncore
+
         attest = tuncore.AttestKey.generate()
         with self.assertRaises(EnrollError):
             build_csr(

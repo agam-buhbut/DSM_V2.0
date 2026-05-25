@@ -152,8 +152,9 @@ class TestHandshakeRetryUnderOutage(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(transport.sends_dropped, 1)
         self.assertGreaterEqual(transport.sends_passed, 2)  # msg1 retry + msg3 + maybe bootstrap
 
-        # Both sides converged on session keys.
-        client_keys, _ = client_result
+        # Both sides converged on session keys. M-BUG-1: client_handshake
+        # returns 3-tuple incl. server's noise static pub.
+        client_keys, _client_hash, _server_static_pub = client_result
         server_keys, _ = server_result
         self.assertIsNotNone(client_keys)
         self.assertIsNotNone(server_keys)
@@ -164,7 +165,7 @@ class TestHandshakeRetryUnderOutage(unittest.IsolatedAsyncioTestCase):
         retry budget."""
         transport, client_result, server_result = await self._run(client_drop_first=2)
         self.assertEqual(transport.sends_dropped, 2)
-        client_keys, _ = client_result
+        client_keys, _client_hash, _server_static_pub = client_result
         server_keys, _ = server_result
         self.assertIsNotNone(client_keys)
         self.assertIsNotNone(server_keys)

@@ -27,11 +27,52 @@ class TCPTransport:
         self._closed = False
 
     async def connect(self, host: str, port: int, timeout: float = 10.0) -> None:
-        """Connect to a remote TCP endpoint."""
-        self._reader, self._writer = await asyncio.wait_for(
-            asyncio.open_connection(host, port),
-            timeout=timeout,
-        )
+        """Connect to a remote TCP endpoint.
+
+        The SO_MARK fwmark MUST be set BEFORE the initial SYN — otherwise
+        an unmarked SYN can be routed through a stale TUN/ip-rule from a
+        prior dsm run, leaking the connection attempt onto the wrong
+        interface. asyncio.open_connection does the full 3-way handshake
+        before returning, so we cannot mark the socket post-hoc; instead
+        we create the socket, mark it, connect manually, then hand it to
+        open_connection via the ``sock`` parameter. Mirrors the pattern
+        used by ``dsm/net/dns.py:_open_pinned_tls_connection``.
+        """
+        import socket as socket_mod
+
+        loop = asyncio.get_running_loop()
+        infos = await loop.getaddrinfo(host, port, type=socket_mod.SOCK_STREAM)
+        if not infos:
+            raise OSError(f"no addrinfo for {host}:{port}")
+        family, sock_type, proto, _canon, sockaddr = infos[0]
+
+        sock = socket_mod.socket(family, sock_type, proto)
+        try:
+            sock.setblocking(False)
+            apply_so_mark(sock)  # BEFORE connect — see docstring above.
+            await asyncio.wait_for(
+                loop.sock_connect(sock, sockaddr),
+                timeout=timeout,
+            )
+        except BaseException:
+            sock.close()
+            raise
+
+        try:
+            self._reader, self._writer = await asyncio.wait_for(
+                asyncio.open_connection(sock=sock),
+                timeout=timeout,
+            )
+        except BaseException:
+            try:
+                sock.close()
+            except OSError:
+                pass
+            raise
+        # Belt-and-suspenders: re-apply via the writer's socket too. The
+        # socket above and the writer's socket are the same fd; this is a
+        # no-op if SO_MARK already set but cheap insurance against future
+        # asyncio changes that re-wrap.
         self._apply_fwmark()
         log.debug("TCP connected to %s:%d", host, port)
 
@@ -93,9 +134,19 @@ class TCPTransport:
                 len_buf = await reader.readexactly(LEN_PREFIX_SIZE)
                 (length,) = struct.unpack("!I", len_buf)
                 if length > MAX_FRAME_SIZE:
-                    raise ValueError(f"frame length {length} exceeds max {MAX_FRAME_SIZE}")
+                    raise ValueError(
+                        f"frame length {length} exceeds max {MAX_FRAME_SIZE}"
+                    )
+                # L-NET-6: reject zero-length frames. They have no meaning
+                # in the DSM wire protocol (smallest legitimate frame is
+                # OUTER_HEADER_SIZE + GCM_TAG_SIZE = 36 bytes for an
+                # empty inner payload) and a peer spamming `\x00\x00\x00\x00`
+                # would otherwise burn an event-loop iteration + a doomed
+                # decrypt attempt per "frame", a small DoS amplifier.
                 if length == 0:
-                    return b""
+                    raise ConnectionError(
+                        "TCP peer sent zero-length frame — invalid DSM wire"
+                    )
                 return await reader.readexactly(length)
             except asyncio.IncompleteReadError as e:
                 raise ConnectionError(

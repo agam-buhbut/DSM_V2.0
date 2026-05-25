@@ -1,14 +1,32 @@
+use crate::secure_memory::LockedKey32;
 use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
 };
-use crate::secure_memory::LockedKey32;
 
 /// Opaque AES-256-GCM key handle. Key bytes never cross FFI boundary.
-/// The key lives at a stable heap address via `LockedKey32` — mlock'd and
-/// zeroized on drop, resilient to ownership moves.
+///
+/// Holds BOTH the raw key in mlock'd, zeroize-on-drop `LockedKey32` AND
+/// the pre-expanded `Aes256Gcm` cipher (the AES-256 round-key schedule
+/// + GHASH H precomputation). The expansion runs once in `from_locked`
+///   rather than per-call — caching cut a measured 2-3x throughput hit on
+///   the data path where every packet was paying the schedule cost.
+///
+/// Security note: the cached `Aes256Gcm` holds ~240 bytes of derived
+/// round-key state on the regular (non-mlock'd) heap. The aes-gcm
+/// `zeroize` feature is enabled in `Cargo.toml`, so `Aes256Gcm` runs
+/// `ZeroizeOnDrop` and the round-key buffer is wiped when this struct
+/// drops — preserving the wipe-on-drop guarantee for the lifetime of
+/// the `AesKey`. The cache is still on regular heap (not mlock'd), so
+/// it CAN be swapped to disk under memory pressure; this is mitigated
+/// by the process-wide `disable_core_dumps` + `PR_SET_DUMPABLE=0` hardening
+/// applied at startup.
 pub struct AesKey {
-    key: LockedKey32,
+    cipher: Aes256Gcm,
+    // _key kept around so the LockedKey32's munlock + zeroize on Drop
+    // runs after `cipher` is dropped (Rust drops fields in declaration
+    // order: `cipher` first, then `_key`).
+    _key: LockedKey32,
 }
 
 impl AesKey {
@@ -18,7 +36,13 @@ impl AesKey {
     /// Infallible — kept as a method so the cipher invariant lives on the
     /// type.
     pub fn from_locked(key: LockedKey32) -> Self {
-        Self { key }
+        // new_from_slice on a 32-byte slice cannot fail — Aes256Gcm
+        // accepts exactly KeySize=32. Documented invariant of the
+        // aes-gcm crate; calling unwrap is the idiomatic form for an
+        // infallible-by-key-length construction.
+        let cipher = Aes256Gcm::new_from_slice(key.as_array())
+            .expect("Aes256Gcm::new_from_slice on 32-byte LockedKey32 is infallible");
+        Self { cipher, _key: key }
     }
 
     /// Convenience constructor: accepts a 32-byte array by value. Incurs
@@ -28,29 +52,40 @@ impl AesKey {
         Ok(Self::from_locked(LockedKey32::from_array(key_bytes)?))
     }
 
-    /// Initialize cipher from the stored key.
-    fn cipher(&self) -> Result<Aes256Gcm, String> {
-        Aes256Gcm::new_from_slice(self.key.as_array()).map_err(|e| format!("cipher: {e}"))
-    }
-
     /// Encrypt plaintext with the given 96-bit nonce and additional authenticated data.
     /// Returns ciphertext || 16-byte GCM tag.
-    pub fn encrypt(&self, nonce: &[u8; 12], plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, String> {
-        self.cipher()?
+    pub fn encrypt(
+        &self,
+        nonce: &[u8; 12],
+        plaintext: &[u8],
+        aad: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        self.cipher
             .encrypt(
                 Nonce::from_slice(nonce),
-                aes_gcm::aead::Payload { msg: plaintext, aad },
+                aes_gcm::aead::Payload {
+                    msg: plaintext,
+                    aad,
+                },
             )
             .map_err(|e| format!("encrypt: {e}"))
     }
 
     /// Decrypt ciphertext (with appended GCM tag) using the given nonce and AAD.
     /// Returns plaintext, or error if authentication fails.
-    pub fn decrypt(&self, nonce: &[u8; 12], ciphertext: &[u8], aad: &[u8]) -> Result<Vec<u8>, String> {
-        self.cipher()?
+    pub fn decrypt(
+        &self,
+        nonce: &[u8; 12],
+        ciphertext: &[u8],
+        aad: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        self.cipher
             .decrypt(
                 Nonce::from_slice(nonce),
-                aes_gcm::aead::Payload { msg: ciphertext, aad },
+                aes_gcm::aead::Payload {
+                    msg: ciphertext,
+                    aad,
+                },
             )
             .map_err(|_| "decryption failed: authentication tag mismatch".into())
     }
@@ -65,7 +100,7 @@ mod tests {
         use rand::RngCore;
         let mut locked = LockedKey32::zeroed().unwrap();
         OsRng.fill_bytes(locked.as_mut());
-        AesKey::from_locked(locked).unwrap()
+        AesKey::from_locked(locked)
     }
 
     #[test]

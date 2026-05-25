@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import struct
 import time
@@ -15,6 +16,8 @@ from dsm.traffic.shaper import TrafficShaper
 if TYPE_CHECKING:
     import tuncore
 
+    from dsm.session import RekeyState
+
 log = logging.getLogger(__name__)
 
 REKEY_PAYLOAD_SIZE = 36  # 4 (epoch) + 32 (ephemeral pub)
@@ -24,8 +27,16 @@ MIN_REKEY_INTERVAL = 60  # seconds — minimum time between rekey operations
 # REKEY_INIT (same ephemeral, same new_epoch) up to MAX_REKEY_RETRIES
 # times, each separated by REKEY_ACK_TIMEOUT, before giving up and
 # tearing down the session.
-REKEY_ACK_TIMEOUT = 5.0
-MAX_REKEY_RETRIES = 3
+#
+# Total retry window MUST exceed MIN_REKEY_INTERVAL (60s) so that a
+# responder that just completed a rekey and is silently rate-limiting
+# our INIT (because its 60s window hasn't elapsed) still has time to
+# accept us on a later retransmit. Previous values (5s × 3 = 15s) gave
+# up well before the responder's rate-limit window cleared, causing
+# spurious teardowns under tight-budget configs (H-CRYPT-6 audit).
+# 8s × 9 = 72s comfortably crosses the 60s threshold.
+REKEY_ACK_TIMEOUT = 8.0
+MAX_REKEY_RETRIES = 9
 
 
 SendFn = Callable[[bytes, int], Awaitable[None]]
@@ -47,7 +58,7 @@ async def _send_rekey_packet(
     """
     inner = InnerPacket(
         ptype=ptype,
-        epoch_id=session_keys.epoch & 0x03,
+        epoch_id=session_keys.epoch & 0x0F,
         payload=payload,
     )
     padded, target_size = shaper.pad_packet(inner)
@@ -91,7 +102,11 @@ async def initiate_rekey(
     new_epoch, ephemeral_pub = session_keys.initiate_rotation()
     payload = struct.pack("!I", new_epoch) + bytes(ephemeral_pub)
     await _send_rekey_packet(
-        PacketType.REKEY_INIT, payload, session_keys, shaper, send_fn,
+        PacketType.REKEY_INIT,
+        payload,
+        session_keys,
+        shaper,
+        send_fn,
     )
     log.info("rekey initiated, new epoch=%d", new_epoch)
     return time.monotonic(), new_epoch, payload
@@ -112,7 +127,11 @@ async def resend_rekey_init(
     cannot see a byte-identical retransmit.
     """
     await _send_rekey_packet(
-        PacketType.REKEY_INIT, payload, session_keys, shaper, send_fn,
+        PacketType.REKEY_INIT,
+        payload,
+        session_keys,
+        shaper,
+        send_fn,
     )
 
 
@@ -125,6 +144,12 @@ async def handle_rekey_init(
     last_rekey_time: float | None = None,
     cached_ack_epoch: int | None = None,
     cached_ack_payload: bytes | None = None,
+    *,
+    # rekey_state typed under TYPE_CHECKING only to avoid cyclic import
+    # at runtime (session.py imports from rekey.py).
+    rekey_state: "RekeyState | None" = None,
+    local_static_pub: bytes | None = None,
+    remote_static_pub: bytes | None = None,
 ) -> tuple[float | None, int | None, bytes | None]:
     """Process a REKEY_INIT: complete rotation as responder, send REKEY_ACK.
 
@@ -135,10 +160,48 @@ async def handle_rekey_init(
     rather than trying to re-rotate — the second `prepare_rotation_responder`
     would fail its ``new_epoch == current_epoch + 1`` precondition after
     the first one applied.
+
+    Mutual-init tie-break (audit M-BUG-1): if our own rekey is in
+    flight (``rekey_state.in_progress``) AND the incoming INIT arrives
+    in REKEYING state, both sides have initiated within an RTT. Without
+    a tie-break, each side's `handle_rekey_init` rejects the other's
+    INIT (state != ESTABLISHED), both ACK timeouts fire, both tear
+    down. With static-pub-based tie-break: the side with the LOWER
+    canonical pub is the "winning initiator", the side with the higher
+    pub yields its own init and processes the peer's. Requires the
+    caller to pass both ``local_static_pub`` and ``remote_static_pub``;
+    if either is omitted (older call sites), the tie-break is skipped
+    and behavior matches the pre-fix code.
     """
     if fsm.state != State.ESTABLISHED:
-        log.warning("rekey init received in state %s, ignoring", fsm.state.name)
-        return last_rekey_time, cached_ack_epoch, cached_ack_payload
+        # Mutual-init tie-break point.
+        if (
+            fsm.state == State.REKEYING
+            and rekey_state is not None
+            and rekey_state.in_progress
+            and local_static_pub is not None
+            and remote_static_pub is not None
+        ):
+            # Compare canonically. Lower pub "wins" — its INIT prevails.
+            if bytes(local_static_pub) < bytes(remote_static_pub):
+                log.info(
+                    "mutual REKEY_INIT race — local pub is lower; "
+                    "keeping our INIT, ignoring peer's",
+                )
+                return last_rekey_time, cached_ack_epoch, cached_ack_payload
+            # Local pub is higher → we yield: abort our in-flight init,
+            # fall through to process peer's INIT.
+            log.info(
+                "mutual REKEY_INIT race — local pub is higher; "
+                "yielding to peer's INIT, aborting our pending one",
+            )
+            rekey_state.in_progress = False
+            rekey_state.reset_retry()
+            rekey_state.pending_epoch = None
+            fsm.transition(State.ESTABLISHED)
+        else:
+            log.warning("rekey init received in state %s, ignoring", fsm.state.name)
+            return last_rekey_time, cached_ack_epoch, cached_ack_payload
 
     if len(payload) < REKEY_PAYLOAD_SIZE:
         log.warning("rekey init payload too short, ignoring")
@@ -160,13 +223,37 @@ async def handle_rekey_init(
             "duplicate REKEY_INIT for epoch %d — re-sending cached ACK",
             new_epoch,
         )
-        await _send_rekey_packet(
-            PacketType.REKEY_ACK, cached_ack_payload,
-            session_keys, shaper, send_fn,
-        )
+        # M-BUG-12: bound the await so a stuck TCP send (peer backpressure)
+        # can't pin the recv loop for arbitrary time.
+        try:
+            await asyncio.wait_for(
+                _send_rekey_packet(
+                    PacketType.REKEY_ACK,
+                    cached_ack_payload,
+                    session_keys,
+                    shaper,
+                    send_fn,
+                ),
+                timeout=5.0,
+            )
+        except asyncio.TimeoutError:
+            log.warning("REKEY_ACK retransmit timed out — peer may be wedged")
         return last_rekey_time, cached_ack_epoch, cached_ack_payload
 
     if _is_rate_limited(last_rekey_time):
+        # H-CRYPT-6: previous code logged this at DEBUG so a stalled
+        # rekey was invisible to operators. Bump to WARNING so the
+        # symptom shows up in journald before the initiator hits its
+        # extended retry budget. The initiator's MAX_REKEY_RETRIES *
+        # REKEY_ACK_TIMEOUT is now > MIN_REKEY_INTERVAL so eventually
+        # one of the retries lands after our rate-limit clears and the
+        # rekey completes; the WARNING flags the transient stall.
+        log.warning(
+            "REKEY_INIT received but our last rekey was <%ds ago; "
+            "silently dropping (initiator will retransmit until our "
+            "rate-limit window clears)",
+            MIN_REKEY_INTERVAL,
+        )
         return last_rekey_time, cached_ack_epoch, cached_ack_payload
 
     fsm.transition(State.REKEYING)
@@ -176,7 +263,8 @@ async def handle_rekey_init(
     # peer (still at old epoch) could not decrypt the ACK.
     try:
         our_ephemeral_pub, prepared_epoch = session_keys.prepare_rotation_responder(
-            remote_ephemeral_pub, new_epoch,
+            remote_ephemeral_pub,
+            new_epoch,
         )
     except Exception as e:
         log.warning("rekey responder prepare failed: %s", e)
@@ -184,10 +272,24 @@ async def handle_rekey_init(
         return last_rekey_time, cached_ack_epoch, cached_ack_payload
 
     # Send ACK under old keys (session_keys epoch not yet rotated).
+    # M-BUG-12: bound the send so TCP backpressure doesn't stall the
+    # recv loop indefinitely.
     ack_payload = struct.pack("!I", prepared_epoch) + bytes(our_ephemeral_pub)
-    await _send_rekey_packet(
-        PacketType.REKEY_ACK, ack_payload, session_keys, shaper, send_fn,
-    )
+    try:
+        await asyncio.wait_for(
+            _send_rekey_packet(
+                PacketType.REKEY_ACK,
+                ack_payload,
+                session_keys,
+                shaper,
+                send_fn,
+            ),
+            timeout=5.0,
+        )
+    except asyncio.TimeoutError:
+        log.warning("REKEY_ACK send timed out — peer may be wedged")
+        fsm.transition(State.ESTABLISHED)
+        return last_rekey_time, cached_ack_epoch, cached_ack_payload
 
     # Now apply the rotation.
     try:
@@ -231,7 +333,9 @@ def handle_rekey_ack(
 
     ack_epoch = struct.unpack("!I", payload[:4])[0]
     if ack_epoch != expected_epoch:
-        log.warning("rekey ack epoch mismatch: got %d, expected %d", ack_epoch, expected_epoch)
+        log.warning(
+            "rekey ack epoch mismatch: got %d, expected %d", ack_epoch, expected_epoch
+        )
         return None
 
     remote_ephemeral_pub = payload[4:36]

@@ -12,14 +12,22 @@ from dsm.core import netaudit
 from dsm.core.config import Config
 from dsm.core.fsm import SessionFSM, State
 from dsm.crypto.attest_store import AttestStore
-from dsm.crypto.auth_loader import AuthMaterialsError, load_cert_materials
+from dsm.crypto.auth_loader import (
+    AuthMaterialsError,
+    load_cert_materials,
+    verify_cert_matches_identity,
+)
 from dsm.crypto.keystore import KeyStore
-from dsm.net.nftables import NFTablesManager, TcpTimestampsDisabler
-from dsm.net.resolv_conf import ResolvConfManager
-from dsm.net.tunnel import TunDevice
 from dsm.net._addresses import SERVER_TUN_IP
-from dsm.net.transport.udp import UDPTransport
+from dsm.net.nftables import (
+    NFTablesManager,
+    PreHandshakeKillSwitch,
+    TcpTimestampsDisabler,
+)
+from dsm.net.resolv_conf import ResolvConfManager
 from dsm.net.transport.tcp import TCPTransport
+from dsm.net.transport.udp import UDPTransport
+from dsm.net.tunnel import TunDevice
 
 # Re-export under the historical name for any external code that imports
 # `dsm.client.VPN_DNS_SERVER`. Internal uses go through SERVER_TUN_IP.
@@ -27,11 +35,16 @@ VPN_DNS_SERVER = SERVER_TUN_IP
 
 from dsm.core.protocol import ReassemblyBuffer
 from dsm.session import (
-    DataPathContext, LivenessState, RekeyState, SequenceCounter, auto_mtu_loop,
-    make_send_fn, setup_signal_handlers,
+    DataPathContext,
+    LivenessState,
+    RekeyState,
+    SequenceCounter,
+    auto_mtu_loop,
+    make_send_fn,
+    setup_signal_handlers,
 )
-from dsm.traffic.shaper import TrafficShaper, make_chaff_packet
 from dsm.traffic.scheduler import SendScheduler
+from dsm.traffic.shaper import TrafficShaper, make_chaff_packet
 
 log = logging.getLogger(__name__)
 
@@ -75,13 +88,27 @@ async def run_client(
     # `dsm enroll`. Daemon variant returns (not exits) on failure so the
     # surrounding AsyncExitStack still unwinds cleanly.
     from dsm.crypto._stores import load_daemon_stores
+
     keystore = KeyStore(config.key_file)
     attest_store = AttestStore(config.attest_key_file)
     if not load_daemon_stores(
-        keystore, attest_store,
+        keystore,
+        attest_store,
         passphrase_fd=passphrase_fd,
         passphrase_env_file=passphrase_env_file,
     ):
+        return
+
+    # With both stores unlocked, confirm the loaded cert was issued for
+    # THIS device's keys. Catches the cert_file substitution failure mode
+    # at startup with a clear error, rather than at server's
+    # AttestBindingMismatchError much later in the handshake.
+    try:
+        verify_cert_matches_identity(materials.cert_der, keystore, attest_store)
+    except AuthMaterialsError as e:
+        log.error("cert/identity consistency check failed: %s", e)
+        attest_store.unload()
+        keystore.unload()
         return
 
     shaper = TrafficShaper(config.padding_min, config.padding_max)
@@ -92,6 +119,16 @@ async def run_client(
         # of the session.
         stack.callback(keystore.unload)
         stack.callback(attest_store.unload)
+
+        # Pre-handshake kill switch: applied BEFORE any socket bind/connect
+        # so a stuck or failed handshake never leaks user traffic during
+        # the connection window. Allows only loopback, DHCP renewal, and
+        # the configured server endpoint. Upgraded atomically to the full
+        # kill switch (which also covers the TUN interface and DNS leaks)
+        # by NFTablesManager.apply() below, once the TUN is up.
+        pre_killswitch = PreHandshakeKillSwitch(config.server_ip, config.server_port)
+        pre_killswitch.apply()
+        stack.callback(pre_killswitch.remove)
 
         # Transport
         if config.transport == "udp":
@@ -123,21 +160,19 @@ async def run_client(
         # (subclasses before parent classes is irrelevant here because
         # every entry is checked by isinstance via the tuple, and the
         # log prefix is then resolved from the concrete class).
-        _CLIENT_HANDSHAKE_ERR_LABELS: dict[
-            type[BaseException], str
-        ] = {
+        _CLIENT_HANDSHAKE_ERR_LABELS: dict[type[BaseException], str] = {
             CNMismatchError: "server CN check failed",
             CertRevokedError: "server cert revoked",
             CertAuthError: "server cert auth failed",
             HandshakeError: "handshake failed",
         }
 
-        assert config.expected_server_cn is not None, (
-            "client mode requires expected_server_cn (validated in Config)"
-        )
+        assert (
+            config.expected_server_cn is not None
+        ), "client mode requires expected_server_cn (validated in Config)"
 
         try:
-            session_keys, _handshake_hash = await client_handshake(
+            session_keys, _handshake_hash, server_static_pub = await client_handshake(
                 transport,
                 keystore.identity,
                 server_addr,
@@ -151,7 +186,10 @@ async def run_client(
                 rotation_seconds=config.rotation_seconds,
             )
         except (
-            CNMismatchError, CertRevokedError, CertAuthError, HandshakeError,
+            CNMismatchError,
+            CertRevokedError,
+            CertAuthError,
+            HandshakeError,
         ) as e:
             # Resolve the most-specific label: walk the dict in MRO order
             # so e.g. CNMismatchError (subclass of CertAuthError) gets
@@ -166,8 +204,11 @@ async def run_client(
             )
             log.error("%s: %s", prefix, e)
             netaudit.emit(
-                "handshake_end", role="client", outcome="failed",
-                error=type(e).__name__, message=str(e),
+                "handshake_end",
+                role="client",
+                outcome="failed",
+                error=type(e).__name__,
+                message=str(e),
             )
             fsm.transition(State.TEARDOWN)
             return  # AsyncExitStack unwinds transport + keystore
@@ -255,6 +296,7 @@ async def run_client(
             if path_mtu is not None:
                 # See dsm.session.WIRE_OVERHEAD for the breakdown.
                 from dsm.session import WIRE_OVERHEAD
+
                 usable = path_mtu - WIRE_OVERHEAD
                 log.info("kernel path MTU = %d (usable inner %d)", path_mtu, usable)
                 if usable < config.mtu and not config.auto_mtu:
@@ -262,7 +304,9 @@ async def run_client(
                         "configured tun mtu=%d exceeds usable inner %d "
                         "(path MTU %d); enable `auto_mtu` or lower `mtu` "
                         "in config to avoid fragmentation",
-                        config.mtu, usable, path_mtu,
+                        config.mtu,
+                        usable,
+                        path_mtu,
                     )
 
         seq = SequenceCounter()
@@ -275,13 +319,17 @@ async def run_client(
         setup_signal_handlers(shutdown)
 
         send_packet = make_send_fn(
-            session_keys, transport, lambda: server_addr, seq,
-            liveness=liveness, shutdown=shutdown,
+            session_keys,
+            transport,
+            lambda: server_addr,
+            seq,
+            liveness=liveness,
+            shutdown=shutdown,
         )
 
         scheduler = SendScheduler(
             send_fn=send_packet,
-            chaff_fn=lambda: make_chaff_packet(shaper, session_keys.epoch & 0x03),
+            chaff_fn=lambda: make_chaff_packet(shaper, session_keys.epoch & 0x0F),
             should_chaff_fn=shaper.should_send_chaff,
             jitter_ms_min=config.jitter_ms_min,
             jitter_ms_max=config.jitter_ms_max,
@@ -300,6 +348,12 @@ async def run_client(
             liveness=liveness,
             shutdown=shutdown,
             reassembly=reassembly,
+            # H-ANON-4: pass the UDPTransport so post-rekey hook can
+            # rebind to a fresh ephemeral src port; None on TCP.
+            udp_transport=transport if isinstance(transport, UDPTransport) else None,
+            # M-BUG-1 / audit H1: static pubs for mutual-init tie-break.
+            local_static_pub=bytes(keystore.identity.public_key),
+            remote_static_pub=server_static_pub,
         )
 
         # Hand off the steady-state recv/send/liveness loops to the
@@ -310,6 +364,7 @@ async def run_client(
         # The AsyncExitStack stays in this module; ``run_data_loops``
         # only owns the loops + the SESSION_CLOSE / FSM teardown.
         from dsm.session import run_data_loops
+
         await run_data_loops(
             ctx,
             transport,

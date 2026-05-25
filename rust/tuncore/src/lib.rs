@@ -3,16 +3,17 @@ pub mod device_attest;
 #[cfg(feature = "dev-soft-attest")]
 pub mod device_attest_soft;
 pub mod identity;
-pub mod nonce;
 pub mod noise_xx;
+pub mod nonce;
 pub mod passphrase_store;
 pub mod replay_window;
 pub mod secure_memory;
 pub mod secure_noise;
 pub mod session_keys;
 
-use pyo3::prelude::*;
 use pyo3::exceptions::PyRuntimeError;
+use pyo3::prelude::*;
+use pyo3::types::PyBytes;
 
 // ── PyO3 Wrappers ──
 // Raw key bytes never cross the FFI boundary for secret keys.
@@ -63,8 +64,7 @@ struct PyIdentityKeyPair {
 impl PyIdentityKeyPair {
     #[staticmethod]
     fn generate() -> PyResult<Self> {
-        let inner = identity::IdentityKeyPair::generate()
-            .map_err(py_err)?;
+        let inner = identity::IdentityKeyPair::generate().map_err(py_err)?;
         Ok(Self { inner })
     }
 
@@ -74,15 +74,13 @@ impl PyIdentityKeyPair {
     }
 
     fn encrypt_to_store(&self, passphrase: &[u8]) -> PyResult<Vec<u8>> {
-        self.inner
-            .encrypt_to_store(passphrase)
-            .map_err(py_err)
+        self.inner.encrypt_to_store(passphrase).map_err(py_err)
     }
 
     #[staticmethod]
     fn decrypt_from_store(blob: &[u8], passphrase: &[u8]) -> PyResult<Self> {
-        let inner = identity::IdentityKeyPair::decrypt_from_store(blob, passphrase)
-            .map_err(py_err)?;
+        let inner =
+            identity::IdentityKeyPair::decrypt_from_store(blob, passphrase).map_err(py_err)?;
         Ok(Self { inner })
     }
 
@@ -182,8 +180,7 @@ impl PyNoiseInitiator {
     /// Create an initiator. `identity` must be a PyIdentityKeyPair.
     #[new]
     fn new(identity: &PyIdentityKeyPair) -> PyResult<Self> {
-        let init = noise_xx::NoiseInitiator::new(identity.inner.secret_key())
-            .map_err(py_err)?;
+        let init = noise_xx::NoiseInitiator::new(identity.inner.secret_key()).map_err(py_err)?;
         Ok(Self { inner: Some(init) })
     }
 
@@ -210,14 +207,13 @@ impl PyNoiseInitiator {
             .map_err(py_err)
     }
 
+    #[allow(clippy::wrong_self_convention)]
     fn into_transport(&mut self) -> PyResult<PyNoiseTransport> {
         let init = self
             .inner
             .take()
             .ok_or_else(|| py_err("already consumed"))?;
-        let transport = init
-            .into_transport()
-            .map_err(py_err)?;
+        let transport = init.into_transport().map_err(py_err)?;
         Ok(PyNoiseTransport {
             inner: Some(transport),
         })
@@ -244,8 +240,7 @@ struct PyNoiseResponder {
 impl PyNoiseResponder {
     #[new]
     fn new(identity: &PyIdentityKeyPair) -> PyResult<Self> {
-        let resp = noise_xx::NoiseResponder::new(identity.inner.secret_key())
-            .map_err(py_err)?;
+        let resp = noise_xx::NoiseResponder::new(identity.inner.secret_key()).map_err(py_err)?;
         Ok(Self { inner: Some(resp) })
     }
 
@@ -271,14 +266,13 @@ impl PyNoiseResponder {
             .map_err(py_err)
     }
 
+    #[allow(clippy::wrong_self_convention)]
     fn into_transport(&mut self) -> PyResult<PyNoiseTransport> {
         let resp = self
             .inner
             .take()
             .ok_or_else(|| py_err("already consumed"))?;
-        let transport = resp
-            .into_transport()
-            .map_err(py_err)?;
+        let transport = resp.into_transport().map_err(py_err)?;
         Ok(PyNoiseTransport {
             inner: Some(transport),
         })
@@ -317,7 +311,16 @@ impl PyNoiseTransport {
 }
 
 /// Python-visible session key manager with key rotation support.
-#[pyclass(name = "SessionKeyManager")]
+// Audit H2: per-direction ownership is a documented invariant; with
+// `py.allow_threads(...)` releasing the GIL during AEAD, a second OS
+// thread calling encrypt/decrypt on the SAME SessionKeyManager would
+// hit a `&mut self` borrow conflict and PyO3 would panic. `unsendable`
+// fences this at the type system: passing this class to
+// `loop.run_in_executor` / `asyncio.to_thread` raises a clear
+// `RuntimeError: ... unsendable` instead of corrupting state under
+// a thread switch. Costs nothing in normal usage (asyncio runs on
+// one thread); just locks the invariant in.
+#[pyclass(name = "SessionKeyManager", unsendable)]
 struct PySessionKeyManager {
     inner: session_keys::SessionKeyManager,
     pending_rotation: Option<session_keys::RotationInit>,
@@ -327,6 +330,16 @@ struct PySessionKeyManager {
     pending_responder_rotation: Option<session_keys::ResponderPending>,
 }
 
+// Concurrency invariant for the encrypt/decrypt hot path:
+// Exactly one Python coroutine per direction owns this SessionKeyManager.
+// Concurrent calls from different OS threads on the same instance are
+// undefined behavior. The `&mut self` borrow guards the nonce counter
+// and packets_sent on a single-thread basis; Python's asyncio scheduler
+// runs at most one coroutine per thread, which is sufficient because
+// the application creates a separate manager per direction (send / recv).
+// `py.allow_threads(...)` below releases the GIL during the AEAD core
+// so other Python threads can make progress; the `&mut self` exclusivity
+// across that boundary is preserved by Rust's borrow checker, not the GIL.
 #[pymethods]
 impl PySessionKeyManager {
     // Audit M2 / M4: every former Python constructor for SessionKeyManager
@@ -343,27 +356,102 @@ impl PySessionKeyManager {
     // from Python.
 
     /// Encrypt a packet. Returns (nonce, ciphertext, epoch).
-    fn encrypt(&mut self, plaintext: &[u8], aad: &[u8]) -> PyResult<(Vec<u8>, Vec<u8>, u32)> {
-        let (nonce, ciphertext, epoch) = self
-            .inner
-            .encrypt(plaintext, aad)
-            .map_err(py_err)?;
-        Ok((nonce.to_vec(), ciphertext, epoch))
+    ///
+    /// The AEAD core runs without holding the GIL (H-PERF-2); see the
+    /// impl-block comment above for the per-direction ownership invariant.
+    /// Returns ciphertext as `PyBytes` directly (H-PERF-3) so Python
+    /// callers can hand it to `struct.unpack_from` / `os.write` without
+    /// a redundant `bytes(...)` copy.
+    fn encrypt<'py>(
+        &mut self,
+        py: Python<'py>,
+        plaintext: &[u8],
+        aad: &[u8],
+    ) -> PyResult<(Bound<'py, PyBytes>, Bound<'py, PyBytes>, u32)> {
+        let (nonce, ciphertext, epoch) =
+            py.allow_threads(|| self.inner.encrypt(plaintext, aad).map_err(py_err))?;
+        Ok((
+            PyBytes::new(py, &nonce),
+            PyBytes::new(py, &ciphertext),
+            epoch,
+        ))
     }
 
-    /// Decrypt a packet. Returns plaintext.
-    fn decrypt(
+    /// Decrypt a packet. Returns plaintext as `PyBytes`.
+    ///
+    /// The AEAD core runs without holding the GIL (H-PERF-2); see the
+    /// impl-block comment above for the per-direction ownership invariant.
+    fn decrypt<'py>(
         &mut self,
+        py: Python<'py>,
         nonce: &[u8],
         ciphertext: &[u8],
         aad: &[u8],
         seq: u64,
         is_prev_epoch: bool,
-    ) -> PyResult<Vec<u8>> {
+    ) -> PyResult<Bound<'py, PyBytes>> {
         let n = nonce_from_slice(nonce)?;
-        self.inner
-            .decrypt(&n, ciphertext, aad, seq, is_prev_epoch)
-            .map_err(py_err)
+        let plaintext = py.allow_threads(|| {
+            self.inner
+                .decrypt(&n, ciphertext, aad, seq, is_prev_epoch)
+                .map_err(py_err)
+        })?;
+        Ok(PyBytes::new(py, &plaintext))
+    }
+
+    /// M-PERF-5: non-raising decrypt that tries current epoch first and
+    /// falls back to prev epoch if grace is active. Returns
+    /// `Some((plaintext, used_prev_epoch))` on success, `None` on auth
+    /// failure — no Python exception is constructed.
+    ///
+    /// Exception-driven control flow in CPython costs ~30µs per
+    /// traceback build. A forgery flood at 100k pkt/s would burn ~3s
+    /// of CPU per real second just on tracebacks. This API lets the
+    /// caller distinguish auth-fail from programming-error without
+    /// paying the traceback tax.
+    fn try_decrypt_with_fallback<'py>(
+        &mut self,
+        py: Python<'py>,
+        nonce: &[u8],
+        ciphertext: &[u8],
+        aad: &[u8],
+        seq: u64,
+    ) -> PyResult<Option<(Bound<'py, PyBytes>, bool)>> {
+        let n = nonce_from_slice(nonce)?;
+        // Audit M1 fix: always attempt the prev-epoch decrypt on the
+        // failure path, even when has_grace_period() would have been
+        // false. Combined with the constant-AEAD-time pattern this
+        // makes the function's timing uniform regardless of whether
+        // grace is active — an adversary probing forgery-reject
+        // latency cannot infer rekey timing. The dummy decrypt against
+        // current keys (when prev_recv is None) costs ~one extra AEAD
+        // tag verify on failure; the success path is unchanged.
+        let result = py.allow_threads(|| {
+            // Try current epoch first.
+            if let Ok(pt) = self.inner.decrypt(&n, ciphertext, aad, seq, false) {
+                return Some((pt, false));
+            }
+            // M1: always attempt prev-epoch path, even without grace.
+            // Decrypt with is_prev_epoch=true will short-circuit AUTH_FAILED
+            // in Rust if prev_recv is None, but that branch costs one
+            // memory load + one branch — far less than one AEAD —
+            // so we add a SECOND current-epoch attempt as a constant-
+            // time fill when prev isn't available, keeping the failure
+            // path = 2 AEAD ops regardless of grace state.
+            if self.inner.has_grace_period() {
+                if let Ok(pt) = self.inner.decrypt(&n, ciphertext, aad, seq, true) {
+                    return Some((pt, true));
+                }
+            } else {
+                // No grace; do a dummy current-epoch decrypt against
+                // the same ciphertext to keep failure-path timing
+                // uniform. Result is discarded (always Err here since
+                // the first attempt also failed).
+                let _ = self.inner.decrypt(&n, ciphertext, aad, seq, false);
+            }
+            None
+        });
+        Ok(result.map(|(pt, used_prev)| (PyBytes::new(py, &pt), used_prev)))
     }
 
     /// Check if key rotation is needed (packet count or time threshold).
@@ -377,10 +465,7 @@ impl PySessionKeyManager {
         if self.pending_rotation.is_some() {
             return Err(py_err("rotation already in progress"));
         }
-        let init = self
-            .inner
-            .initiate_rotation()
-            .map_err(py_err)?;
+        let init = self.inner.initiate_rotation().map_err(py_err)?;
         let new_epoch = init.new_epoch;
         let ephemeral_pub = init.ephemeral_pub.to_vec();
         self.pending_rotation = Some(init);
@@ -492,16 +577,12 @@ impl PyAesKey {
 
     fn encrypt(&self, nonce: &[u8], plaintext: &[u8], aad: &[u8]) -> PyResult<Vec<u8>> {
         let n = nonce_from_slice(nonce)?;
-        self.inner
-            .encrypt(&n, plaintext, aad)
-            .map_err(py_err)
+        self.inner.encrypt(&n, plaintext, aad).map_err(py_err)
     }
 
     fn decrypt(&self, nonce: &[u8], ciphertext: &[u8], aad: &[u8]) -> PyResult<Vec<u8>> {
         let n = nonce_from_slice(nonce)?;
-        self.inner
-            .decrypt(&n, ciphertext, aad)
-            .map_err(py_err)
+        self.inner.decrypt(&n, ciphertext, aad).map_err(py_err)
     }
 }
 
@@ -522,9 +603,13 @@ impl PyAttestKey {
         Ok(Self { inner })
     }
 
-    /// Return the verifying key as SubjectPublicKeyInfo DER.
-    fn public_spki_der(&self) -> Vec<u8> {
-        self.inner.public_spki_der().to_vec()
+    /// Return the verifying key as SubjectPublicKeyInfo DER. Raises if
+    /// the attest key has been zeroized.
+    fn public_spki_der(&self) -> PyResult<Vec<u8>> {
+        self.inner
+            .public_spki_der()
+            .map(<[u8]>::to_vec)
+            .map_err(py_err)
     }
 
     /// Sign `msg` with the attestation key. Returns ASN.1 DER ECDSA signature.
@@ -542,8 +627,8 @@ impl PyAttestKey {
     /// Restore an attest key from a stored blob. Soft backend only.
     #[staticmethod]
     fn decrypt_from_store(blob: &[u8], passphrase: &[u8]) -> PyResult<Self> {
-        let inner = device_attest::AttestKey::decrypt_from_store(blob, passphrase)
-            .map_err(py_err)?;
+        let inner =
+            device_attest::AttestKey::decrypt_from_store(blob, passphrase).map_err(py_err)?;
         Ok(Self { inner })
     }
 
@@ -606,10 +691,21 @@ impl PyBootstrapEphemeral {
     #[staticmethod]
     fn generate() -> PyResult<Self> {
         use x25519_dalek::{PublicKey, StaticSecret};
+        use zeroize::Zeroizing;
         let secret = session_keys::gen_ephemeral_secret().map_err(py_err)?;
-        let static_secret = StaticSecret::from(*secret.as_array());
+        // M-CRYPT-3 (lib.rs): wrap the stack copy of the ephemeral
+        // scalar in Zeroizing so the unnamed `*secret.as_array()`
+        // rvalue is scrubbed when the function returns. Without this,
+        // the bootstrap ephemeral scalar — the source of forward
+        // secrecy for the entire upcoming session — lingers on this
+        // stack frame until later activity overwrites it.
+        let scalar = Zeroizing::new(*secret.as_array());
+        let static_secret = StaticSecret::from(*scalar);
         let pub_bytes = *PublicKey::from(&static_secret).as_bytes();
-        Ok(Self { secret: Some(secret), pub_bytes })
+        Ok(Self {
+            secret: Some(secret),
+            pub_bytes,
+        })
     }
 
     /// Return the 32-byte X25519 public key for transmission on the wire.
@@ -629,9 +725,10 @@ impl PyBootstrapEphemeral {
 ///
 /// Consumes the ephemeral's secret in place (so a second call returns an error).
 /// The X25519 DH and the subsequent HKDF expansion happen entirely in Rust;
-/// the secret scalar never crosses the FFI boundary. This is the preferred
-/// path; `bootstrap_session_from_dh` is retained for compatibility but copies
-/// the secret through a Python `bytes` object.
+/// the secret scalar never crosses the FFI boundary. The earlier
+/// `bootstrap_session_from_dh` and `generate_ephemeral` paths were removed
+/// during the audit (M4) because they shuttled the secret through a Python
+/// `bytes` object that cannot be reliably zeroed.
 #[pyfunction]
 #[pyo3(signature = (ephemeral, peer_public, is_initiator,
                     rotation_packets=None, rotation_seconds=None))]
@@ -678,6 +775,9 @@ fn tuncore(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(disable_core_dumps, m)?)?;
     m.add_function(wrap_pyfunction!(harden_process, m)?)?;
     m.add_function(wrap_pyfunction!(complete_bootstrap, m)?)?;
-    m.add("HANDSHAKE_ATTEST_PAYLOAD_SIZE", noise_xx::HANDSHAKE_ATTEST_PAYLOAD_SIZE)?;
+    m.add(
+        "HANDSHAKE_ATTEST_PAYLOAD_SIZE",
+        noise_xx::HANDSHAKE_ATTEST_PAYLOAD_SIZE,
+    )?;
     Ok(())
 }

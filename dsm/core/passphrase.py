@@ -177,10 +177,26 @@ def _read_noninteractive(
     # os.environb returns bytes (one fewer immutable str copy than
     # os.environ.get + .encode). The fundamental limitation remains: the
     # interpreter's environment block carries the passphrase in memory we
-    # cannot wipe. Documented as the weakest source for this reason.
+    # cannot wipe — it lives at /proc/PID/environ for the process
+    # lifetime and is visible to any same-uid reader, debugger, or core
+    # dump. The returned bytearray is wipeable but the env block + the
+    # internal `bytes` returned by os.environb.get are not.
     env_pass_b = os.environb.get(b"DSM_PASSPHRASE")
     if env_pass_b:
-        log.debug("using passphrase from DSM_PASSPHRASE env var")
+        log.warning(
+            "DSM_PASSPHRASE env var is process-visible (readable via "
+            "/proc/PID/environ for the process lifetime); prefer "
+            "DSM_PASSPHRASE_FILE or --passphrase-fd. Continuing because "
+            "the env var is set."
+        )
+        # Best-effort: unset env so subsequent reads (e.g. via fork+exec)
+        # do not see it. Does NOT scrub the kernel-allocated env block
+        # in this process — that lives until exit.
+        try:
+            os.unsetenv("DSM_PASSPHRASE")
+            del os.environb[b"DSM_PASSPHRASE"]
+        except KeyError:
+            pass
         return bytearray(env_pass_b)
 
     return None

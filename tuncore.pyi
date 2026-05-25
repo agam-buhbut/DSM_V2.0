@@ -6,6 +6,13 @@ callers that hand the value to anything strict (struct.unpack_from,
 hmac.compare_digest, os.write) MUST coerce with `bytes(...)`. The cost of
 this small lie in the stub is one explicit wrap per call site; the
 benefit is that everything downstream type-checks correctly.
+
+EXCEPTION (H-PERF-3): ``SessionKeyManager.encrypt`` and
+``SessionKeyManager.decrypt`` return ``PyBytes`` directly from Rust — the
+hot path does the conversion once on the Rust side instead of forcing
+every Python caller to allocate again. Those two stubs match reality
+without a coercion lie; callers may pass the returned values straight to
+``struct.unpack_from`` / ``os.write`` / the wire serializer.
 """
 
 class IdentityKeyPair:
@@ -87,6 +94,21 @@ class SessionKeyManager:
         seq: int,
         is_prev_epoch: bool,
     ) -> bytes: ...
+    def try_decrypt_with_fallback(
+        self,
+        nonce: bytes,
+        ciphertext: bytes,
+        aad: bytes,
+        seq: int,
+    ) -> tuple[bytes, bool] | None:
+        """M-PERF-5: non-raising decrypt with grace-period fallback.
+
+        Returns ``(plaintext, used_prev_epoch)`` on success, ``None`` on
+        auth failure. The failure path executes a constant 2 AEAD ops
+        regardless of grace state so an adversary cannot infer rekey
+        timing via forgery-reject latency (audit M1).
+        """
+        ...
     def needs_rotation(self) -> bool: ...
     def initiate_rotation(self) -> tuple[int, bytes]: ...
     def complete_rotation_initiator(self, remote_ephemeral_pub: bytes) -> int: ...
@@ -104,6 +126,12 @@ class SessionKeyManager:
     def packets_sent(self) -> int: ...
     @property
     def has_grace_period(self) -> bool: ...
+    @property
+    def has_pending_send_swap(self) -> bool:
+        """H-BUG-2/3: True between the responder's `apply_rotation_responder`
+        and `tick()` promoting `pending_new_send` (GRACE_PERIOD_SECS).
+        """
+        ...
 
 class AesKey:
     def encrypt(self, nonce: bytes, plaintext: bytes, aad: bytes) -> bytes: ...

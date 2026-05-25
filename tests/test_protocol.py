@@ -34,7 +34,8 @@ class TestInnerPacket(unittest.TestCase):
             self.assertEqual(got.payload, b"\x00\x01\x02")
 
     def test_epoch_id_bits(self) -> None:
-        for epoch_id in range(4):
+        # Audit M3: epoch_id widened to 4 bits (16 distinct values, was 4).
+        for epoch_id in range(16):
             pkt = InnerPacket(ptype=PacketType.DATA, epoch_id=epoch_id, payload=b"x")
             raw = pkt.serialize()
             got = InnerPacket.deserialize(raw)

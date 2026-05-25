@@ -27,7 +27,7 @@ use snow::params::{CipherChoice, DHChoice, HashChoice};
 use snow::resolvers::{CryptoResolver, DefaultResolver};
 use snow::types::{Cipher, Dh, Hash, Random};
 use x25519_dalek::{PublicKey, StaticSecret};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::secure_memory::LockedKey32;
 
@@ -68,11 +68,10 @@ impl Default for SecureDh25519 {
         // mlock failure here means the process cannot get a locked page
         // (RLIMIT_MEMLOCK exhausted or kernel refusal). The PyO3 layer
         // converts the panic into a Python exception.
-        let secret = LockedKey32::zeroed()
-            .expect(
-                "LockedKey32 allocation failed inside SecureDh25519::default \
+        let secret = LockedKey32::zeroed().expect(
+            "LockedKey32 allocation failed inside SecureDh25519::default \
                  — RLIMIT_MEMLOCK exhausted or out of memory",
-            );
+        );
         Self {
             secret,
             pubkey: [0u8; 32],
@@ -83,10 +82,14 @@ impl Default for SecureDh25519 {
 
 impl SecureDh25519 {
     fn derive_pubkey(&mut self) {
-        // StaticSecret::from copies the 32 bytes into a fresh stack value;
-        // its `ZeroizeOnDrop` impl scrubs that copy when the local goes
-        // out of scope at the end of this function.
-        let s = StaticSecret::from(*self.secret.as_array());
+        // M-CRYPT-3: wrap the unnamed `*self.secret.as_array()` rvalue
+        // copy in Zeroizing so the stack slot is scrubbed when this
+        // function returns, not just `s`'s internal scalar buffer.
+        // Without this wrap the dereference produces a [u8; 32] on the
+        // stack frame that StaticSecret moves from but does NOT
+        // zeroize.
+        let scalar = Zeroizing::new(*self.secret.as_array());
+        let s = StaticSecret::from(*scalar);
         self.pubkey = *PublicKey::from(&s).as_bytes();
     }
 
@@ -162,7 +165,10 @@ impl Dh for SecureDh25519 {
 
         // Build a fresh StaticSecret per call so the dalek-side scalar
         // copy is short-lived and ZeroizeOnDrop scrubs it at end-of-scope.
-        let s = StaticSecret::from(*self.secret.as_array());
+        // M-CRYPT-3: same Zeroizing wrap as derive_pubkey for the
+        // dereferenced stack copy of the scalar bytes.
+        let scalar = Zeroizing::new(*self.secret.as_array());
+        let s = StaticSecret::from(*scalar);
         let shared = s.diffie_hellman(&PublicKey::from(pk_arr));
 
         // Reject low-order points: a non-contributory shared secret would
@@ -186,7 +192,9 @@ pub struct SecureResolver {
 
 impl SecureResolver {
     pub fn new() -> Self {
-        Self { inner: DefaultResolver }
+        Self {
+            inner: DefaultResolver,
+        }
     }
 }
 
@@ -231,8 +239,8 @@ mod tests {
     fn secure_dh_set_then_pubkey_matches_x25519_dalek() {
         let mut dh = SecureDh25519::default();
         let priv_bytes = [
-            0x42u8, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
-            17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 0x99,
+            0x42u8, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
+            23, 24, 25, 26, 27, 28, 29, 30, 0x99,
         ];
         dh.set(&priv_bytes);
 

@@ -50,7 +50,11 @@ def _run_commands(cmds: list[list[str]], *, strict: bool = True) -> None:
                 raise RuntimeError(f"TUN configure timed out: {' '.join(cmd)}")
         except subprocess.CalledProcessError as e:
             if strict:
-                log.error("cmd failed: %s — %s", " ".join(cmd), e.stderr.decode(errors="replace"))
+                log.error(
+                    "cmd failed: %s — %s",
+                    " ".join(cmd),
+                    e.stderr.decode(errors="replace"),
+                )
                 raise RuntimeError(f"TUN configure failed: {' '.join(cmd)}")
         except Exception:
             if strict:
@@ -121,6 +125,7 @@ class TunDevice:
         parent.
         """
         from dsm.core.atomic_io import atomic_write
+
         try:
             parent = self._IPV6_STATE_PATH.parent
             parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -171,9 +176,7 @@ class TunDevice:
                     continue
                 iface: str = raw_iface
                 if not _IFACE_NAME_RE.match(iface):
-                    log.warning(
-                        "IPv6 state: skipping invalid iface name %r", iface
-                    )
+                    log.warning("IPv6 state: skipping invalid iface name %r", iface)
                     continue
                 if not isinstance(raw_value, bool):
                     log.warning(
@@ -181,7 +184,9 @@ class TunDevice:
                     )
                     continue
                 value = "1" if raw_value else "0"
-                cmds.append(["sysctl", "-w", f"net.ipv6.conf.{iface}.disable_ipv6={value}"])
+                cmds.append(
+                    ["sysctl", "-w", f"net.ipv6.conf.{iface}.disable_ipv6={value}"]
+                )
             if cmds:
                 _run_commands(cmds, strict=False)
             self._IPV6_STATE_PATH.unlink(missing_ok=True)
@@ -233,11 +238,18 @@ class TunDevice:
         ]
         # ip rule has no 'replace' — delete first (ignore if absent), then add
         rule_args = [
-            "not", "fwmark", str(FWMARK), "table", "100", "priority", "10",
+            "not",
+            "fwmark",
+            str(FWMARK),
+            "table",
+            "100",
+            "priority",
+            "10",
         ]
         subprocess.run(
             ["ip", "rule", "del", *rule_args],
-            capture_output=True, timeout=5,
+            capture_output=True,
+            timeout=5,
         )  # ignore errors — rule may not exist yet
         cmds.append(["ip", "rule", "add", *rule_args])
 
@@ -262,6 +274,7 @@ class TunDevice:
         any other out-of-range value) cannot corrupt the device.
         """
         from dsm.core.config import MAX_TUN_MTU, MIN_TUN_MTU
+
         clamped = max(MIN_TUN_MTU, min(MAX_TUN_MTU, int(mtu)))
         _run_commands([["ip", "link", "set", self._name, "mtu", str(clamped)]])
 
@@ -296,7 +309,15 @@ class TunDevice:
             netaudit.emit("tun_deconfigure", iface=self._name)
 
     async def read(self, bufsize: int = 2048) -> bytes:
-        """Read a packet from the TUN device (async)."""
+        """Read a packet from the TUN device (async).
+
+        IMPORTANT: callers that wrap this in ``asyncio.wait_for(...)``
+        rely on the outer ``try/finally`` here to deregister the reader
+        callback when the wait_for times out and cancels ``fut``. Without
+        it, ``_readable`` stays registered and the next time the fd
+        becomes readable it consumes (and discards) a kernel-buffered
+        packet — silent intermittent packet loss every poll cycle.
+        """
         loop = asyncio.get_running_loop()
         fut = loop.create_future()
 
@@ -310,11 +331,12 @@ class TunDevice:
             except Exception as e:
                 if not fut.done():
                     fut.set_exception(e)
-            finally:
-                loop.remove_reader(self.fd)
 
         loop.add_reader(self.fd, _readable)
-        return await fut
+        try:
+            return await fut
+        finally:
+            loop.remove_reader(self.fd)
 
     def write(self, data: bytes) -> int:
         """Write a packet to the TUN device (synchronous, non-blocking)."""

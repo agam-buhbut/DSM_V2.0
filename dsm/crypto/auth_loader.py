@@ -16,6 +16,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from cryptography import x509
+from cryptography.hazmat.primitives.serialization import (
+    Encoding,
+    PublicFormat,
+)
 
 from dsm.core import netaudit
 from dsm.core.config import Config
@@ -23,8 +27,10 @@ from dsm.core.path_security import (
     InsecureFilePermissionsError,
     check_user_file_permissions,
 )
+from dsm.crypto.attest_store import AttestStore
 from dsm.crypto.cert import CertError, DeviceCert, load_ca_root
 from dsm.crypto.crl import CRL, CRLError
+from dsm.crypto.keystore import KeyStore
 
 log = logging.getLogger(__name__)
 
@@ -62,9 +68,7 @@ def _load_cert_der(cert_file: Path) -> bytes:
     try:
         cert = DeviceCert.from_pem_or_der(raw)
     except CertError as e:
-        raise AuthMaterialsError(
-            f"failed to parse cert at {cert_file}: {e}"
-        ) from e
+        raise AuthMaterialsError(f"failed to parse cert at {cert_file}: {e}") from e
     return cert.to_der()
 
 
@@ -78,8 +82,7 @@ def load_cert_materials(config: Config) -> CertAuthMaterials:
 
     if not cert_file.is_file():
         raise AuthMaterialsError(
-            f"cert_file missing at {cert_file}; run `dsm enroll` to "
-            "provision one"
+            f"cert_file missing at {cert_file}; run `dsm enroll` to " "provision one"
         )
     if not ca_root_file.is_file():
         raise AuthMaterialsError(
@@ -99,23 +102,29 @@ def load_cert_materials(config: Config) -> CertAuthMaterials:
 
     crl: CRL | None = None
     if not config.crl_file:
-        # CRL is optional in config but its absence means revoked certs are
-        # silently accepted. Surface it as a WARNING so misconfigured
-        # deployments don't get a silent revocation-check bypass. A separate
-        # event from "crl_stale" so monitoring can distinguish "no CRL at
-        # all" from "CRL is past its next_update".
+        # CRL absent means revoked certs are silently accepted. Under
+        # crl_strict (the default), refuse to start; under crl_strict=
+        # false, log a WARNING and continue. A separate netaudit event
+        # from "crl_stale" so monitoring can distinguish "no CRL at all"
+        # from "CRL is past its next_update".
+        if config.crl_strict:
+            netaudit.emit("crl_missing", action="refused_start")
+            raise AuthMaterialsError(
+                "no crl_file configured and crl_strict=true; refusing to "
+                "start. Either provision a CRL via the CA workflow per "
+                "deploy/GUIDE.txt §7e, or set crl_strict=false in config "
+                "to accept revoked certs (NOT recommended for production)."
+            )
         log.warning(
-            "no crl_file configured; revoked client/server certs will be "
-            "accepted until the operator wires a CRL through per "
-            "deploy/GUIDE.txt §7e"
+            "no crl_file configured and crl_strict=false; revoked "
+            "client/server certs will be accepted. Wire a CRL via "
+            "deploy/GUIDE.txt §7e for revocation enforcement."
         )
-        netaudit.emit("crl_missing")
+        netaudit.emit("crl_missing", action="warned")
     if config.crl_file:
         crl_path = Path(config.crl_file)
         if not crl_path.is_file():
-            raise AuthMaterialsError(
-                f"crl_file configured but missing at {crl_path}"
-            )
+            raise AuthMaterialsError(f"crl_file configured but missing at {crl_path}")
         _check_perms_or_raise(crl_path, "crl_file")
         try:
             # Pass now=None so a stale CRL surfaces via is_stale() rather
@@ -123,9 +132,7 @@ def load_cert_materials(config: Config) -> CertAuthMaterials:
             # policy below based on config.crl_strict.
             crl = CRL.load(crl_path, ca_root, now=None)
         except CRLError as e:
-            raise AuthMaterialsError(
-                f"CRL at {crl_path} failed validation: {e}"
-            ) from e
+            raise AuthMaterialsError(f"CRL at {crl_path} failed validation: {e}") from e
         log.info("loaded CRL crl_number=%s", crl.crl_number)
         _now = datetime.datetime.now(datetime.timezone.utc)
         if crl.is_stale(_now):
@@ -161,3 +168,45 @@ def load_cert_materials(config: Config) -> CertAuthMaterials:
             )
 
     return CertAuthMaterials(cert_der=cert_der, ca_root=ca_root, crl=crl)
+
+
+def verify_cert_matches_identity(
+    cert_der: bytes,
+    keystore: KeyStore,
+    attest_store: AttestStore,
+) -> None:
+    """Assert that the loaded cert binds the loaded identity + attest keys.
+
+    Call AFTER `load_daemon_stores` succeeds. Catches the failure mode
+    where ``cert_file`` was swapped (by a typo or a co-resident attacker
+    with file-write access but no key access) for a syntactically valid
+    different cert — without this check the daemon would happily start,
+    broadcast the wrong cert's CN / serial / Noise-binding-extension on
+    every handshake attempt, and only fail at the peer's
+    ``AttestBindingMismatchError`` / ``AttestSignatureError`` boundary,
+    with no clear local symptom.
+
+    Raises ``AuthMaterialsError`` on mismatch.
+    """
+    cert = DeviceCert.from_der(cert_der)
+
+    bound_noise_static = cert.noise_static_pub
+    local_noise_static = keystore.identity.public_key
+    if bytes(bound_noise_static) != bytes(local_noise_static):
+        raise AuthMaterialsError(
+            "cert_file noiseStaticBinding extension does not match the "
+            "loaded identity key — cert was issued for a different X25519 "
+            "static. Re-enroll, or restore the matching cert from backup."
+        )
+
+    cert_spki_der = cert.public_key.public_bytes(
+        Encoding.DER,
+        PublicFormat.SubjectPublicKeyInfo,
+    )
+    local_attest_spki = attest_store.public_spki_der()
+    if bytes(cert_spki_der) != bytes(local_attest_spki):
+        raise AuthMaterialsError(
+            "cert_file SubjectPublicKeyInfo does not match the loaded "
+            "attest key — cert was issued for a different ECDSA pubkey. "
+            "Re-enroll, or restore the matching cert from backup."
+        )

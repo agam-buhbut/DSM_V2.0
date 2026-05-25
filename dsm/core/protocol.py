@@ -37,9 +37,9 @@ SIZE_CLASSES = (128, 256, 384, 512, 640, 768, 896, 1024, 1152, 1280, 1400)
 # len(SIZE_CLASSES); the assertion below catches drift at module load
 # time rather than on first call to pick_random_size_class.
 SIZE_CLASS_WEIGHTS: tuple[int, ...] = (20, 15, 12, 10, 8, 7, 6, 6, 5, 6, 5)
-assert len(SIZE_CLASS_WEIGHTS) == len(SIZE_CLASSES), (
-    "SIZE_CLASS_WEIGHTS and SIZE_CLASSES must align"
-)
+assert len(SIZE_CLASS_WEIGHTS) == len(
+    SIZE_CLASSES
+), "SIZE_CLASS_WEIGHTS and SIZE_CLASSES must align"
 
 # Module-level Struct instances — avoid per-packet format-string parsing on
 # the hot path. `pack_into` writes into a caller-owned buffer, saving an
@@ -65,12 +65,26 @@ class InnerPacket:
     """Decrypted inner packet."""
 
     ptype: PacketType
-    epoch_id: int  # 2-bit epoch identifier (0-3), replaces single bool
+    epoch_id: int  # 4-bit epoch identifier (0-15) — extended from 2-bit
     payload: bytes
 
     def serialize(self) -> bytes:
-        """Serialize to inner plaintext format."""
-        flags = (self.epoch_id & 0x03) << 6  # 2 MSBs = epoch_id
+        """Serialize to inner plaintext format.
+
+        Audit M3: epoch_id widened from 2 bits → 4 bits (top nibble of
+        the flags byte). With 2 bits, epoch_id repeats every 4
+        rotations (~40 min at default cadence); a captured packet
+        could replay back into the SAME epoch_id slot 4 rotations
+        later. AEAD key rotation invalidates the replay (different
+        nonce-key) but eliminating the slot collision is cheap and
+        removes that as a "future code path could rely on epoch_id
+        uniqueness within a session lifetime" subtle hazard.
+        4-bit space cycles every 16 rotations (~2.6 hours at default),
+        still well below the 64-bit seq exhaustion + outside any
+        realistic session lifetime under normal operation.
+        Bottom 4 bits stay reserved.
+        """
+        flags = (self.epoch_id & 0x0F) << 4  # 4 MSBs = epoch_id, 4 LSBs reserved
         inner_len = len(self.payload)
         if inner_len > MAX_INNER_PAYLOAD:
             raise ValueError(f"payload too large: {inner_len} > {MAX_INNER_PAYLOAD}")
@@ -89,12 +103,15 @@ class InnerPacket:
             ptype = PacketType(ptype_raw)
         except ValueError:
             raise ValueError(f"unknown packet type: {ptype_raw:#x}")
-        epoch_id = (flags >> 6) & 0x03
-        # Reserved bits (lower 6) must be zero
-        if flags & 0x3F:
+        # Audit M3: 4-bit epoch_id (top nibble); bottom 4 bits reserved.
+        epoch_id = (flags >> 4) & 0x0F
+        # Reserved bits (lower 4) must be zero.
+        if flags & 0x0F:
             raise ValueError(f"reserved flag bits set: {flags:#x}")
         if inner_len > MAX_INNER_PAYLOAD:
-            raise ValueError(f"inner payload too large: {inner_len} > {MAX_INNER_PAYLOAD}")
+            raise ValueError(
+                f"inner payload too large: {inner_len} > {MAX_INNER_PAYLOAD}"
+            )
         payload_end = INNER_HEADER_SIZE + inner_len
         if payload_end > len(data):
             raise ValueError("inner length exceeds data")
@@ -170,14 +187,10 @@ class OuterPacket:
 
 def pick_random_size_class() -> int:
     """Pick a random size class weighted toward smaller packets."""
-    # Weights approximate typical web traffic distribution (11 classes)
-    weights = (20, 15, 12, 10, 8, 7, 6, 6, 5, 6, 5)
-    if len(weights) != len(SIZE_CLASSES):
-        raise ValueError("weights must match SIZE_CLASSES")
-    total = sum(weights)
+    total = sum(SIZE_CLASS_WEIGHTS)
     r = secrets.randbelow(total)
     cumulative = 0
-    for sc, w in zip(SIZE_CLASSES, weights):
+    for sc, w in zip(SIZE_CLASSES, SIZE_CLASS_WEIGHTS):
         cumulative += w
         if r < cumulative:
             return sc
@@ -223,7 +236,9 @@ class Fragment:
 #
 #     max outer (1400) - outer header (20) - GCM tag (16) - inner header (4)
 #   = 1360 bytes of inner payload.
-MAX_INNER_PAYLOAD_ON_WIRE = SIZE_CLASSES[-1] - OUTER_HEADER_SIZE - GCM_TAG_SIZE - INNER_HEADER_SIZE
+MAX_INNER_PAYLOAD_ON_WIRE = (
+    SIZE_CLASSES[-1] - OUTER_HEADER_SIZE - GCM_TAG_SIZE - INNER_HEADER_SIZE
+)
 
 # Per-fragment data budget: one more header (the Fragment struct) shaves
 # 4 bytes off the inner budget.
@@ -265,11 +280,13 @@ def fragment_ip_packet(
     for i in range(total):
         chunk = packet[i * MAX_FRAGMENT_DATA : (i + 1) * MAX_FRAGMENT_DATA]
         frag = Fragment(fragment_id=fid, index=i, total=total, data=chunk)
-        out.append(InnerPacket(
-            ptype=PacketType.FRAGMENT,
-            epoch_id=epoch_id,
-            payload=frag.serialize(),
-        ))
+        out.append(
+            InnerPacket(
+                ptype=PacketType.FRAGMENT,
+                epoch_id=epoch_id,
+                payload=frag.serialize(),
+            )
+        )
     return out
 
 
@@ -282,6 +299,7 @@ REASSEMBLY_TIMEOUT_S = 5.0
 @dataclass
 class _PendingReassembly:
     """Tracks fragments for a single fragment_id."""
+
     total: int
     received: dict[int, bytes] = field(default_factory=lambda: {})
     first_seen: float = field(default_factory=time.monotonic)
@@ -319,7 +337,12 @@ class ReassemblyBuffer:
 
         # Validate consistency
         if entry.total != frag.total:
-            log.debug("fragment total mismatch for id=%d: %d != %d", fid, frag.total, entry.total)
+            log.debug(
+                "fragment total mismatch for id=%d: %d != %d",
+                fid,
+                frag.total,
+                entry.total,
+            )
             return None
 
         # Duplicate check
@@ -340,7 +363,8 @@ class ReassemblyBuffer:
         """Remove entries that have timed out."""
         now = time.monotonic()
         expired = [
-            fid for fid, e in self._pending.items()
+            fid
+            for fid, e in self._pending.items()
             if now - e.first_seen > self._timeout_s
         ]
         for fid in expired:

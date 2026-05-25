@@ -7,14 +7,15 @@ No DNS traffic ever leaves the client machine directly.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import heapq
 import ipaddress
 import logging
 import struct
 import time
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from collections.abc import Awaitable, Callable, Iterable
 from typing import cast
 from urllib.parse import urlparse
 
@@ -65,9 +66,16 @@ class DNSResolver:
         providers: list[str],
         provider_pins: dict[str, list[str]],
         hosts_file: str = "/opt/mtun/hosts.txt",
+        debug_dns: bool = False,
     ) -> None:
         if not providers:
             raise ValueError("DNSResolver requires at least one provider")
+        # debug_dns mirrors the LocalDNSProxy flag — when False (the
+        # default), qnames are replaced with an opaque sha256 prefix in
+        # WARNING/ERROR-level logs so an operator tailing journald cannot
+        # reconstruct the user's browsing history from pinning failures
+        # or fallthrough errors.
+        self._debug_dns = debug_dns
         self._pins: dict[str, list[bytes]] = {}
         for provider in providers:
             hex_pins = provider_pins.get(provider)
@@ -183,20 +191,34 @@ class DNSResolver:
                 # network errors stay at DEBUG. Import locally to avoid a
                 # top-level dependency cycle with dns_pinning.
                 from dsm.net.dns_pinning import PinMismatchError
+
+                redacted = (
+                    hostname
+                    if self._debug_dns
+                    else f"qname-sha256={hashlib.sha256(hostname.encode('utf-8', 'replace')).hexdigest()[:16]}"
+                )
                 if isinstance(e, PinMismatchError):
                     log.warning(
                         "DNS provider %s SPKI pin MISMATCH for %s — possible MITM; "
                         "refusing and falling through",
-                        provider, hostname,
+                        provider,
+                        redacted,
                     )
                 else:
                     log.debug(
                         "DNS provider %s failed for %s: %s",
-                        provider, hostname, type(e).__name__,
+                        provider,
+                        redacted,
+                        type(e).__name__,
                     )
                 continue
 
-        log.error("all DNS providers failed for %s", hostname)
+        redacted = (
+            hostname
+            if self._debug_dns
+            else f"qname-sha256={hashlib.sha256(hostname.encode('utf-8', 'replace')).hexdigest()[:16]}"
+        )
+        log.error("all DNS providers failed for %s", redacted)
         return []
 
     async def _resolve_via_pinned_tls(
@@ -223,7 +245,11 @@ class DNSResolver:
         from dsm.net.dns_pinning import verify_pin_on_ssl_object
 
         reader, writer = await _open_pinned_tls_connection(
-            host, port, self._pins[provider], provider, timeout=timeout,
+            host,
+            port,
+            self._pins[provider],
+            provider,
+            timeout=timeout,
         )
         try:
             if reverify_pin:
@@ -273,7 +299,8 @@ class DNSResolver:
         query = _build_dns_query(hostname, A_RECORD)
 
         async def _doh_send_recv(
-            reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
+            reader: asyncio.StreamReader,
+            writer: asyncio.StreamWriter,
         ) -> bytes:
             # Minimal HTTP/1.1 request. Connection: close so we don't
             # keep a pool — DNS resolutions are infrequent enough that
@@ -292,11 +319,17 @@ class DNSResolver:
             writer.write(request)
             await writer.drain()
             return await asyncio.wait_for(
-                _read_http_response(reader), timeout=DOH_TIMEOUT,
+                _read_http_response(reader),
+                timeout=DOH_TIMEOUT,
             )
 
         body = await self._resolve_via_pinned_tls(
-            url, host, port, DOH_TIMEOUT, _doh_send_recv, reverify_pin=True,
+            url,
+            host,
+            port,
+            DOH_TIMEOUT,
+            _doh_send_recv,
+            reverify_pin=True,
         )
         addresses, ttl = _parse_dns_response(body)
         if addresses:
@@ -323,27 +356,36 @@ class DNSResolver:
         framed = struct.pack("!H", len(query)) + query
 
         async def _dot_send_recv(
-            reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
+            reader: asyncio.StreamReader,
+            writer: asyncio.StreamWriter,
         ) -> bytes:
             writer.write(framed)
             await writer.drain()
             len_buf = await asyncio.wait_for(
-                reader.readexactly(2), timeout=DOT_TIMEOUT,
+                reader.readexactly(2),
+                timeout=DOT_TIMEOUT,
             )
             resp_len = struct.unpack("!H", len_buf)[0]
             return await asyncio.wait_for(
-                reader.readexactly(resp_len), timeout=DOT_TIMEOUT,
+                reader.readexactly(resp_len),
+                timeout=DOT_TIMEOUT,
             )
 
         resp_data = await self._resolve_via_pinned_tls(
-            provider, host, port, DOT_TIMEOUT, _dot_send_recv,
+            provider,
+            host,
+            port,
+            DOT_TIMEOUT,
+            _dot_send_recv,
         )
         addresses, ttl = _parse_dns_response(resp_data)
         if addresses:
             self._cache_result(hostname, addresses, ttl)
         return addresses
 
-    def _cache_result(self, hostname: str, addresses: list[str], ttl: int = 300) -> None:
+    def _cache_result(
+        self, hostname: str, addresses: list[str], ttl: int = 300
+    ) -> None:
         """Cache DNS results with TTL enforcement."""
         # Evict expired or soonest-expiring entries via min-heap (O(log n)).
         while len(self._cache) >= MAX_CACHE_ENTRIES and self._cache_heap:
@@ -450,8 +492,6 @@ async def _open_pinned_tls_connection(
             entry in expected_pins (connection is closed before raise).
         RuntimeError if TLS does not negotiate.
     """
-    from dsm.net.dns_pinning import build_pinned_ssl_context, verify_pin_on_ssl_object
-
     # Create the raw TCP socket first so we can set SO_MARK BEFORE
     # connect. asyncio.open_connection does not expose a pre-connect
     # socket-config hook, so we drive the connect + start_tls dance
@@ -459,12 +499,16 @@ async def _open_pinned_tls_connection(
     # asyncio.StreamReader/Writer over a transport.
     import socket as socket_mod
 
+    from dsm.net.dns_pinning import build_pinned_ssl_context, verify_pin_on_ssl_object
+
     loop = asyncio.get_running_loop()
 
     # Resolve the host (may be IP literal or hostname). getaddrinfo is
     # blocking, so dispatch via the loop's resolver.
     infos = await loop.getaddrinfo(
-        host, port, type=socket_mod.SOCK_STREAM,
+        host,
+        port,
+        type=socket_mod.SOCK_STREAM,
     )
     if not infos:
         raise OSError(f"no addrinfo for {host}:{port}")
@@ -478,7 +522,8 @@ async def _open_pinned_tls_connection(
         # routed through mtun0 and cause the loop we're trying to avoid.
         apply_so_mark(sock)
         await asyncio.wait_for(
-            loop.sock_connect(sock, sockaddr), timeout=timeout,
+            loop.sock_connect(sock, sockaddr),
+            timeout=timeout,
         )
     except BaseException:
         sock.close()
@@ -573,9 +618,7 @@ async def _read_http_response(reader: asyncio.StreamReader) -> bytes:
 
     transfer = headers.get("transfer-encoding", "").lower()
     if transfer and transfer != "identity":
-        raise RuntimeError(
-            f"HTTP transfer-encoding {transfer!r} not supported"
-        )
+        raise RuntimeError(f"HTTP transfer-encoding {transfer!r} not supported")
 
     cl = headers.get("content-length")
     if cl is not None:
@@ -602,7 +645,5 @@ async def _read_http_response(reader: asyncio.StreamReader) -> bytes:
         chunks.append(chunk)
         total += len(chunk)
         if total > _HTTP_BODY_MAX_BYTES:
-            raise RuntimeError(
-                f"HTTP body exceeds cap ({_HTTP_BODY_MAX_BYTES} B)"
-            )
+            raise RuntimeError(f"HTTP body exceeds cap ({_HTTP_BODY_MAX_BYTES} B)")
     return b"".join(chunks)

@@ -19,7 +19,8 @@ class TestUDPPMTU(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         # apply_so_mark needs CAP_NET_ADMIN; disable for the test.
         self._so_mark_patch = patch(
-            "dsm.net.transport.udp.apply_so_mark", lambda sock: None,
+            "dsm.net.transport.udp.apply_so_mark",
+            lambda sock: None,
         )
         self._so_mark_patch.start()
 
@@ -72,6 +73,7 @@ class TestUDPPMTU(unittest.IsolatedAsyncioTestCase):
 
         def failing_setsockopt(self_, level, optname, value):  # type: ignore[no-untyped-def]
             from dsm.net.transport.udp import _IP_MTU_DISCOVER
+
             if level == socket.IPPROTO_IP and optname == _IP_MTU_DISCOVER:
                 raise OSError("simulated rejection")
             return orig_setsockopt(self_, level, optname, value)
@@ -84,6 +86,71 @@ class TestUDPPMTU(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNone(t.get_path_mtu())
             finally:
                 await t.aclose()
+
+
+class TestUDPRebind(unittest.IsolatedAsyncioTestCase):
+    """H-ANON-4: ``rebind_to_fresh_port`` swaps the underlying socket to
+    a new ephemeral port while preserving the recv queue."""
+
+    async def asyncSetUp(self) -> None:
+        self._so_mark_patch = patch(
+            "dsm.net.transport.udp.apply_so_mark",
+            lambda sock: None,
+        )
+        self._so_mark_patch.start()
+
+    async def asyncTearDown(self) -> None:
+        self._so_mark_patch.stop()
+
+    async def test_rebind_changes_port_preserves_queue(self) -> None:
+        t = UDPTransport()
+        await t.bind("127.0.0.1", 0)
+        try:
+            old_port = t._transport.get_extra_info("sockname")[1]  # type: ignore[union-attr]
+            old_queue = t._recv_queue
+            new_port = await t.rebind_to_fresh_port()
+            self.assertNotEqual(old_port, new_port, "port must change")
+            self.assertIs(
+                t._recv_queue,
+                old_queue,
+                "recv queue must be preserved across rebind",
+            )
+            # New transport is functional: send to self over loopback
+            # actually requires another socket to talk to — verify only
+            # that send() doesn't raise immediately on the new socket.
+            current_port = t._transport.get_extra_info("sockname")[1]  # type: ignore[union-attr]
+            self.assertEqual(current_port, new_port)
+        finally:
+            await t.aclose()
+
+    async def test_rebind_bind_failure_preserves_old_transport(self) -> None:
+        """If new bind raises, the old transport stays alive — caller
+        catches the OSError without losing the session."""
+        t = UDPTransport()
+        await t.bind("127.0.0.1", 0)
+        try:
+            old_transport = t._transport
+            old_port = old_transport.get_extra_info("sockname")[1]  # type: ignore[union-attr]
+
+            orig_bind = socket.socket.bind
+            failed = {"count": 0}
+
+            def failing_bind(self_, addr):  # type: ignore[no-untyped-def]
+                # Fail only the rebind's bind, not the test setup.
+                if failed["count"] == 0:
+                    failed["count"] += 1
+                    raise OSError("simulated bind failure")
+                return orig_bind(self_, addr)
+
+            with patch.object(socket.socket, "bind", failing_bind):
+                with self.assertRaises(OSError):
+                    await t.rebind_to_fresh_port()
+            # Old transport still bound to old port.
+            self.assertIs(t._transport, old_transport)
+            current_port = t._transport.get_extra_info("sockname")[1]  # type: ignore[union-attr]
+            self.assertEqual(current_port, old_port)
+        finally:
+            await t.aclose()
 
 
 if __name__ == "__main__":
