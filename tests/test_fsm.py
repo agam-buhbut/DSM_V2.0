@@ -77,7 +77,9 @@ class TestSessionFSM(unittest.TestCase):
 
     def test_on_enter_failure_noncritical(self) -> None:
         fsm = SessionFSM()
-        fsm.on_enter(State.CONNECTING, lambda: (_ for _ in ()).throw(RuntimeError("oops")))
+        fsm.on_enter(
+            State.CONNECTING, lambda: (_ for _ in ()).throw(RuntimeError("oops"))
+        )
         # Non-critical state: callback fails but transition still happens
         fsm.transition(State.CONNECTING)
         self.assertEqual(fsm.state, State.CONNECTING)
@@ -86,7 +88,9 @@ class TestSessionFSM(unittest.TestCase):
         fsm = SessionFSM()
         fsm.transition(State.CONNECTING)
         fsm.transition(State.HANDSHAKING)
-        fsm.on_enter(State.ESTABLISHED, lambda: (_ for _ in ()).throw(RuntimeError("critical")))
+        fsm.on_enter(
+            State.ESTABLISHED, lambda: (_ for _ in ()).throw(RuntimeError("critical"))
+        )
         with self.assertRaises(RuntimeError):
             fsm.transition(State.ESTABLISHED)
         # Critical state failure forces TEARDOWN

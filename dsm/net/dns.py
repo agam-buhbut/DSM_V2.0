@@ -183,7 +183,7 @@ class DNSResolver:
 
                 if result:
                     return result
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001  # see linter report
                 # SPKI pin failures surface as PinMismatchError and indicate
                 # a possible MITM (cert chains to a trusted CA but is not
                 # the pinned key). Promote those to WARNING so an operator
@@ -195,7 +195,7 @@ class DNSResolver:
                 redacted = (
                     hostname
                     if self._debug_dns
-                    else f"qname-sha256={hashlib.sha256(hostname.encode('utf-8', 'replace')).hexdigest()[:16]}"
+                    else f"qname-sha256={hashlib.sha256(hostname.encode('utf-8', 'replace')).hexdigest()[:16]}"  # noqa: E501  # single sha256(...).hexdigest()[:16] expr; splitting needs a temp var (logic change)
                 )
                 if isinstance(e, PinMismatchError):
                     log.warning(
@@ -216,7 +216,7 @@ class DNSResolver:
         redacted = (
             hostname
             if self._debug_dns
-            else f"qname-sha256={hashlib.sha256(hostname.encode('utf-8', 'replace')).hexdigest()[:16]}"
+            else f"qname-sha256={hashlib.sha256(hostname.encode('utf-8', 'replace')).hexdigest()[:16]}"  # noqa: E501  # single sha256(...).hexdigest()[:16] expr; splitting needs a temp var (logic change)
         )
         log.error("all DNS providers failed for %s", redacted)
         return []
@@ -628,7 +628,8 @@ async def _read_http_response(reader: asyncio.StreamReader) -> bytes:
             raise RuntimeError(f"HTTP malformed content-length {cl!r}") from e
         if length < 0 or length > _HTTP_BODY_MAX_BYTES:
             raise RuntimeError(
-                f"HTTP content-length {length} out of bounds (max {_HTTP_BODY_MAX_BYTES})"
+                f"HTTP content-length {length} out of bounds "
+                f"(max {_HTTP_BODY_MAX_BYTES})"
             )
         body = await reader.readexactly(length)
         return body

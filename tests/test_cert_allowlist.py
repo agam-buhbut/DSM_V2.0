@@ -27,10 +27,7 @@ class TestCNAllowlist(unittest.TestCase):
         os.chmod(self.tmp, mode)
 
     def test_load_simple_list(self) -> None:
-        self._write(
-            "dsm-a3f29c81-client\n"
-            "dsm-9f001122-client\n"
-        )
+        self._write("dsm-a3f29c81-client\n" "dsm-9f001122-client\n")
         al = CNAllowlist.from_file(self.tmp)
         self.assertEqual(len(al), 2)
         self.assertTrue(al.is_allowed("dsm-a3f29c81-client"))
@@ -66,9 +63,7 @@ class TestCNAllowlist(unittest.TestCase):
 
     def test_missing_file_rejected(self) -> None:
         with self.assertRaises(CNAllowlistError):
-            CNAllowlist.from_file(
-                Path("/nonexistent/path/should/not/exist")
-            )
+            CNAllowlist.from_file(Path("/nonexistent/path/should/not/exist"))
 
     def test_empty_allowlist(self) -> None:
         self._write("# nobody allowed\n")
@@ -77,10 +72,7 @@ class TestCNAllowlist(unittest.TestCase):
         self.assertFalse(al.is_allowed("anyone"))
 
     def test_duplicate_entries_collapse(self) -> None:
-        self._write(
-            "dsm-a3f29c81-client\n"
-            "dsm-a3f29c81-client\n"
-        )
+        self._write("dsm-a3f29c81-client\n" "dsm-a3f29c81-client\n")
         al = CNAllowlist.from_file(self.tmp)
         self.assertEqual(len(al), 1)
 

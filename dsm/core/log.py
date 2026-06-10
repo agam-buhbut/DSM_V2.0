@@ -5,7 +5,9 @@ from __future__ import annotations
 import logging
 import sys
 
-_configured = False
+_configured = (
+    False  # pylint: disable=invalid-name  # intentional/false positive (see report)
+)
 
 
 def configure(level: str = "warning") -> None:

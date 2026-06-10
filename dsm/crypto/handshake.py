@@ -219,8 +219,7 @@ async def client_handshake(
         try:
             if crl.is_revoked(server_cert.serial_number):
                 raise CertRevokedError(
-                    f"server cert serial {server_cert.serial_number} "
-                    "is revoked"
+                    f"server cert serial {server_cert.serial_number} " "is revoked"
                 )
         except CRLError as e:
             raise CertAuthError(f"CRL check failed: {e}") from e
@@ -250,9 +249,7 @@ async def client_handshake(
     bootstrap_init_ct = bytes(
         noise_transport.encrypt(bytes(client_ephemeral.public_key_bytes))
     )
-    bootstrap_init_frame = _pad_to_frame(
-        bootstrap_init_ct, BOOTSTRAP_CIPHERTEXT_SIZE
-    )
+    bootstrap_init_frame = _pad_to_frame(bootstrap_init_ct, BOOTSTRAP_CIPHERTEXT_SIZE)
     await _send(transport, bootstrap_init_frame, server_addr)
 
     # Receive server ephemeral public. On timeout, resend BOTH msg3 and
@@ -280,9 +277,7 @@ async def client_handshake(
     )
     server_public = noise_transport.decrypt(bootstrap_resp_ct)
     if len(server_public) != 32:
-        raise HandshakeError(
-            "invalid bootstrap ephemeral from server"
-        )
+        raise HandshakeError("invalid bootstrap ephemeral from server")
 
     session_keys = tuncore.complete_bootstrap(
         client_ephemeral,
@@ -343,9 +338,7 @@ async def server_handshake(
     netaudit.emit(
         "handshake_start",
         role="server",
-        client_addr=(
-            f"{client_addr[0]}:{client_addr[1]}" if client_addr else None
-        ),
+        client_addr=(f"{client_addr[0]}:{client_addr[1]}" if client_addr else None),
     )
     # Message 1: -> e (capture sender address for UDP reply).
     # The server-msg1 wait uses a single long timeout (no retries) since
@@ -374,19 +367,13 @@ async def server_handshake(
         await _send(transport, msg2, addr)
 
     msg3, msg3_addr = await _recv_with_retry(transport, retransmit=_retransmit_msg2)
-    if (
-        isinstance(transport, UDPTransport)
-        and addr is not None
-        and msg3_addr != addr
-    ):
+    if isinstance(transport, UDPTransport) and addr is not None and msg3_addr != addr:
         raise HandshakeError(
             f"msg3 from unexpected source {msg3_addr}, expected {addr}"
         )
 
     binding_hash_for_msg3 = bytes(responder.get_handshake_hash())
-    client_static_raw, client_attest_payload = responder.read_message_3(
-        msg3
-    )
+    client_static_raw, client_attest_payload = responder.read_message_3(msg3)
     client_static = bytes(client_static_raw)
 
     try:
@@ -409,8 +396,7 @@ async def server_handshake(
         try:
             if crl.is_revoked(client_cert.serial_number):
                 raise CertRevokedError(
-                    f"client cert serial {client_cert.serial_number} "
-                    "is revoked"
+                    f"client cert serial {client_cert.serial_number} " "is revoked"
                 )
         except CRLError as e:
             raise CertAuthError(f"CRL check failed: {e}") from e
@@ -425,11 +411,7 @@ async def server_handshake(
     # bootstrap_init must come from the same peer. AEAD blocks content forge,
     # but a UDP-spoofed bootstrap frame would otherwise fail AEAD and abort
     # the handshake — wasting state and a retry slot.
-    if (
-        isinstance(transport, UDPTransport)
-        and addr is not None
-        and bs_addr != addr
-    ):
+    if isinstance(transport, UDPTransport) and addr is not None and bs_addr != addr:
         raise HandshakeError(
             f"bootstrap_init from unexpected source {bs_addr}, expected {addr}"
         )
@@ -444,9 +426,7 @@ async def server_handshake(
     bootstrap_resp_ct = bytes(
         noise_transport.encrypt(bytes(server_ephemeral.public_key_bytes))
     )
-    bootstrap_resp_frame = _pad_to_frame(
-        bootstrap_resp_ct, BOOTSTRAP_CIPHERTEXT_SIZE
-    )
+    bootstrap_resp_frame = _pad_to_frame(bootstrap_resp_ct, BOOTSTRAP_CIPHERTEXT_SIZE)
     await _send(transport, bootstrap_resp_frame, addr)
 
     session_keys = tuncore.complete_bootstrap(
@@ -524,10 +504,8 @@ async def _recv_initial(
     """
     try:
         return await _recv_one(transport, MSG1_WAIT_TIMEOUT)
-    except asyncio.TimeoutError:
-        raise HandshakeError(
-            f"msg1 wait timed out after {MSG1_WAIT_TIMEOUT}s"
-        )
+    except TimeoutError:
+        raise HandshakeError(f"msg1 wait timed out after {MSG1_WAIT_TIMEOUT}s")
 
 
 async def _recv_with_retry(
@@ -544,7 +522,7 @@ async def _recv_with_retry(
     for attempt in range(MAX_RETRIES):
         try:
             return await _recv_one(transport, HANDSHAKE_TIMEOUT)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             if attempt == MAX_RETRIES - 1:
                 raise HandshakeError(
                     f"handshake recv timed out after {MAX_RETRIES} attempts"
@@ -565,5 +543,3 @@ async def _recv_with_retry(
                 await retransmit()
 
     raise HandshakeError("handshake recv failed")
-
-

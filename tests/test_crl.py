@@ -37,7 +37,7 @@ def _build_crl(
     if revoked_serials is None:
         revoked_serials = []
     if this_update is None:
-        this_update = datetime.datetime.now(datetime.timezone.utc)
+        this_update = datetime.datetime.now(datetime.UTC)
     if next_update is None:
         next_update = this_update + datetime.timedelta(days=30)
     if signing_key is None:
@@ -110,7 +110,7 @@ class TestCRLLoad(unittest.TestCase):
 
     def test_freshness_check_at_load(self) -> None:
         # Build a CRL whose nextUpdate is yesterday.
-        now = datetime.datetime.now(datetime.timezone.utc)
+        now = datetime.datetime.now(datetime.UTC)
         stale_der = _build_crl(
             self.ca,
             this_update=now - datetime.timedelta(days=10),
@@ -166,9 +166,7 @@ class TestCRLRejections(unittest.TestCase):
 
     def test_missing_file_rejected(self) -> None:
         with self.assertRaises(CRLLoadError):
-            CRL.load(
-                Path("/nonexistent/path/dsm.crl"), self.ca.certificate
-            )
+            CRL.load(Path("/nonexistent/path/dsm.crl"), self.ca.certificate)
 
     def test_empty_revocation_list(self) -> None:
         empty = _build_crl(self.ca, revoked_serials=[])

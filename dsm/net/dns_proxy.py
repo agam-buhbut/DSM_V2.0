@@ -136,7 +136,8 @@ class LocalDNSProxy:
             now = time.monotonic()
             if now - self._tasks_shed_last_log > 5.0:
                 log.warning(
-                    "DNS proxy task cap reached (%d tasks); shed %d queries since last log",
+                    "DNS proxy task cap reached (%d tasks); "
+                    "shed %d queries since last log",
                     self._MAX_TASKS,
                     self._tasks_shed,
                 )
@@ -208,7 +209,7 @@ class LocalDNSProxy:
         if inflight_future is not None:
             try:
                 return await inflight_future
-            except Exception:
+            except Exception:  # noqa: BLE001  # see linter report
                 return []
 
         if len(self._inflight) >= self._MAX_INFLIGHT:
@@ -227,7 +228,7 @@ class LocalDNSProxy:
                     addresses = await self._resolver.resolve(qname)
                     inflight_future.set_result(addresses)
                     return addresses
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001  # see linter report
                     log_qname = (
                         qname
                         if self._debug_dns
@@ -311,7 +312,7 @@ class _ProxyProtocol(asyncio.DatagramProtocol):
         def _send(wire: bytes, to: tuple[str, int]) -> None:
             transport.sendto(wire, to)
 
-        self._proxy._schedule(self._proxy._handle_query(data, addr, _send))  # type: ignore[arg-type]
+        self._proxy._schedule(self._proxy._handle_query(data, addr, _send))  # type: ignore[arg-type]  # pylint: disable=protected-access  # intentional sibling-internal access
 
     def error_received(self, exc: Exception) -> None:  # pragma: no cover
         log.warning("DNS proxy socket error: %s", type(exc).__name__)

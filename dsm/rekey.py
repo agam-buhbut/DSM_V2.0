@@ -6,7 +6,8 @@ import asyncio
 import logging
 import struct
 import time
-from typing import TYPE_CHECKING, Awaitable, Callable
+from collections.abc import Awaitable, Callable
+from typing import TYPE_CHECKING
 
 from dsm.core import netaudit
 from dsm.core.fsm import SessionFSM, State
@@ -15,7 +16,6 @@ from dsm.traffic.shaper import TrafficShaper
 
 if TYPE_CHECKING:
     import tuncore
-
     from dsm.session import RekeyState
 
 log = logging.getLogger(__name__)
@@ -45,7 +45,7 @@ SendFn = Callable[[bytes, int], Awaitable[None]]
 async def _send_rekey_packet(
     ptype: PacketType,
     payload: bytes,
-    session_keys: "tuncore.SessionKeyManager",
+    session_keys: tuncore.SessionKeyManager,
     shaper: TrafficShaper,
     send_fn: SendFn,
 ) -> None:
@@ -147,7 +147,7 @@ async def handle_rekey_init(
     *,
     # rekey_state typed under TYPE_CHECKING only to avoid cyclic import
     # at runtime (session.py imports from rekey.py).
-    rekey_state: "RekeyState | None" = None,
+    rekey_state: RekeyState | None = None,
     local_static_pub: bytes | None = None,
     remote_static_pub: bytes | None = None,
 ) -> tuple[float | None, int | None, bytes | None]:
@@ -195,6 +195,18 @@ async def handle_rekey_init(
                 "mutual REKEY_INIT race — local pub is higher; "
                 "yielding to peer's INIT, aborting our pending one",
             )
+            # DSM-003: drop the Rust-side pending_rotation that our own
+            # initiate_rotation() set. Clearing only the Python rekey_state
+            # leaves the abandoned initiator init inside the SessionKeyManager,
+            # so the next needs_rotation()-driven initiate_rotation() raises
+            # "rotation already in progress" and tears down a healthy session.
+            # abort_rotation() is idempotent and zeroizes the abandoned
+            # ephemeral (LockedKey32 drop).
+            if not session_keys.abort_rotation():
+                log.warning(
+                    "mutual-init yield: no pending rotation to abort "
+                    "(unexpected — our initiate_rotation should have set one)"
+                )
             rekey_state.in_progress = False
             rekey_state.reset_retry()
             rekey_state.pending_epoch = None
@@ -236,7 +248,7 @@ async def handle_rekey_init(
                 ),
                 timeout=5.0,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             log.warning("REKEY_ACK retransmit timed out — peer may be wedged")
         return last_rekey_time, cached_ack_epoch, cached_ack_payload
 
@@ -266,7 +278,7 @@ async def handle_rekey_init(
             remote_ephemeral_pub,
             new_epoch,
         )
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  # see linter report
         log.warning("rekey responder prepare failed: %s", e)
         fsm.transition(State.ESTABLISHED)
         return last_rekey_time, cached_ack_epoch, cached_ack_payload
@@ -286,7 +298,7 @@ async def handle_rekey_init(
             ),
             timeout=5.0,
         )
-    except asyncio.TimeoutError:
+    except TimeoutError:
         log.warning("REKEY_ACK send timed out — peer may be wedged")
         fsm.transition(State.ESTABLISHED)
         return last_rekey_time, cached_ack_epoch, cached_ack_payload
@@ -294,7 +306,7 @@ async def handle_rekey_init(
     # Now apply the rotation.
     try:
         completed_epoch = session_keys.apply_rotation_responder()
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  # see linter report
         log.warning("rekey responder apply failed: %s", e)
         fsm.transition(State.ESTABLISHED)
         return last_rekey_time, cached_ack_epoch, cached_ack_payload
@@ -342,7 +354,7 @@ def handle_rekey_ack(
 
     try:
         completed_epoch = session_keys.complete_rotation_initiator(remote_ephemeral_pub)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  # see linter report
         log.warning("rekey initiator completion failed: %s", e)
         fsm.transition(State.ESTABLISHED)
         return None

@@ -35,13 +35,13 @@ import enum
 import os
 import struct
 
-import tuncore
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric.ec import ECDSA
 from cryptography.x509 import Certificate as X509Certificate
 from cryptography.x509 import ObjectIdentifier
 
+import tuncore
 from dsm.crypto.cert import (
     NOISE_STATIC_PUB_LEN,
     DeviceCert,
@@ -52,7 +52,8 @@ BINDING_DOMAIN = b"DSM-BIND-v1\x00"
 BINDING_VERSION = 0x01
 HANDSHAKE_HASH_LEN = 32
 
-# Signed pre-image: 12 (domain) + 1 (version) + 8 (ts) + 32 (h) + 32 (s) + 1 (role) = 86.
+# Signed pre-image: 12 (domain) + 1 (version) + 8 (ts) + 32 (h) + 32 (s)
+# + 1 (role) = 86.
 _BINDING_PRE_IMAGE_LEN = (
     len(BINDING_DOMAIN) + 1 + 8 + HANDSHAKE_HASH_LEN + NOISE_STATIC_PUB_LEN + 1
 )
@@ -97,11 +98,13 @@ def _binding_pre_image(
 ) -> bytes:
     if len(handshake_hash) != HANDSHAKE_HASH_LEN:
         raise ValueError(
-            f"handshake_hash must be {HANDSHAKE_HASH_LEN} bytes, got {len(handshake_hash)}"
+            f"handshake_hash must be {HANDSHAKE_HASH_LEN} bytes, "
+            f"got {len(handshake_hash)}"
         )
     if len(noise_static_pub) != NOISE_STATIC_PUB_LEN:
         raise ValueError(
-            f"noise_static_pub must be {NOISE_STATIC_PUB_LEN} bytes, got {len(noise_static_pub)}"
+            f"noise_static_pub must be {NOISE_STATIC_PUB_LEN} bytes, "
+            f"got {len(noise_static_pub)}"
         )
     return (
         BINDING_DOMAIN
@@ -190,7 +193,7 @@ def build_attest_payload(
     payload's binding extension on the cert MUST match
     ``our_static_pub`` (verified by the peer)."""
     if timestamp is None:
-        timestamp = datetime.datetime.now(datetime.timezone.utc)
+        timestamp = datetime.datetime.now(datetime.UTC)
     ts_secs = int(timestamp.timestamp())
     pre_image = _binding_pre_image(
         timestamp=ts_secs,
@@ -228,7 +231,7 @@ def verify_attest_payload(
         AttestTimestampError on out-of-skew timestamps.
     """
     if now is None:
-        now = datetime.datetime.now(datetime.timezone.utc)
+        now = datetime.datetime.now(datetime.UTC)
 
     # 1. Unframe the wire payload.
     ts_secs, cert_der, sig_der = _unframe_payload(payload)
@@ -266,7 +269,7 @@ def verify_attest_payload(
     # which is NOT in the AttestError hierarchy and would leak out of
     # the handshake driver's typed-error filter. Catch it explicitly.
     try:
-        signed_ts = datetime.datetime.fromtimestamp(ts_secs, tz=datetime.timezone.utc)
+        signed_ts = datetime.datetime.fromtimestamp(ts_secs, tz=datetime.UTC)
     except (OverflowError, OSError, ValueError) as e:
         raise AttestTimestampError(
             f"signed timestamp {ts_secs} is out of representable range"

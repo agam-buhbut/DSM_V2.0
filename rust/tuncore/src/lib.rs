@@ -1,3 +1,38 @@
+// CI runs clippy with `-D warnings -W clippy::pedantic -W clippy::unwrap_used`.
+// The pedantic-group lints allowed below are opt-in style/doc lints that are
+// noise for this FFI crypto core; declining them disables NO default clippy
+// lint (correctness / suspicious / complexity / perf / style stay -D blocking):
+//   doc_markdown, missing_errors_doc, missing_panics_doc, must_use_candidate
+//     - exhaustive rustdoc is not required on this internal, fully-tested crate.
+//   cast_possible_truncation / cast_sign_loss / cast_possible_wrap
+//     - the casts are intentional, audited width conversions (u32 nonce
+//       counters/epochs, byte lengths); flagged for a one-time reviewer glance.
+//   items_after_statements, needless_pass_by_value, map_unwrap_or, ptr_as_ptr,
+//   borrow_as_ptr, match_wildcard_for_single_variants, unnecessary_wraps,
+//   module_name_repetitions, redundant_closure_for_method_calls
+//     - stylistic; not worth restructuring audited code in a lint pass.
+#![allow(
+    clippy::doc_markdown,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    clippy::must_use_candidate,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::items_after_statements,
+    clippy::needless_pass_by_value,
+    clippy::map_unwrap_or,
+    clippy::ptr_as_ptr,
+    clippy::borrow_as_ptr,
+    clippy::match_wildcard_for_single_variants,
+    clippy::unnecessary_wraps,
+    clippy::module_name_repetitions,
+    clippy::redundant_closure_for_method_calls
+)]
+// unwrap()/expect() are fine in tests — a panic IS the failure signal — so
+// allow clippy::unwrap_used in test builds only; it stays denied in lib code.
+#![cfg_attr(test, allow(clippy::unwrap_used))]
+
 pub mod aes_gcm;
 pub mod device_attest;
 #[cfg(feature = "dev-soft-attest")]
@@ -484,6 +519,22 @@ impl PySessionKeyManager {
             .complete_rotation_initiator(init, &pub_bytes)
             .map_err(py_err)?;
         Ok(complete.new_epoch)
+    }
+
+    /// Abort a pending *initiator* rotation, discarding the stored ephemeral.
+    ///
+    /// Idempotent: returns true if a pending rotation was dropped, false if
+    /// none was pending; never errors. Used on the mutual-init tie-break
+    /// "yield" path (dsm/rekey.py) — the yielding side has already called
+    /// `initiate_rotation` (which set `pending_rotation`) but will never call
+    /// `complete_rotation_initiator`. Without dropping that pending init the
+    /// next `initiate_rotation` fails with "rotation already in progress" and
+    /// tears down a healthy session (DSM-003). `Option::take` drops the
+    /// `RotationInit`, whose `ephemeral_secret: LockedKey32` is munlock'd and
+    /// zeroized on drop, so the abandoned ephemeral scalar is wiped. No secret
+    /// crosses the FFI — the method returns only a bool.
+    fn abort_rotation(&mut self) -> bool {
+        self.pending_rotation.take().is_some()
     }
 
     /// Complete rotation as the responder. Returns (our_ephemeral_pub, new_epoch).

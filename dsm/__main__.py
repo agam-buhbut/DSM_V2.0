@@ -269,7 +269,12 @@ def _run_show_pubkey(
     try:
         try:
             keystore.load_with_passphrase(passphrase)
-        except RuntimeError as e:
+        except (RuntimeError, OSError) as e:
+            # DSM-018: widen to OSError so a key file with insecure perms
+            # (InsecureFilePermissionsError, an OSError subclass) produces the
+            # clean "show-pubkey: <msg>" + exit 2 instead of a raw traceback —
+            # the same UX as the missing-file path. Still excludes
+            # ValueError/TypeError programming errors.
             print(f"show-pubkey: {e}", file=sys.stderr)
             sys.exit(2)
     finally:

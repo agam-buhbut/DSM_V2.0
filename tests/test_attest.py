@@ -4,14 +4,13 @@ binding-attestation payload."""
 from __future__ import annotations
 
 import datetime
-import os
 import secrets
 import struct
 import unittest
 
-import tuncore
 from cryptography.hazmat.primitives.serialization import Encoding
 
+import tuncore
 from dsm.crypto.attest import (
     BINDING_DOMAIN,
     BINDING_VERSION,
@@ -96,9 +95,7 @@ class TestAttestRoundtrip(unittest.TestCase):
 
     def test_payload_size_is_constant(self) -> None:
         _, _, _, payload, _ = _build_responder_payload(self.ca)
-        self.assertEqual(
-            len(payload), tuncore.HANDSHAKE_ATTEST_PAYLOAD_SIZE
-        )
+        self.assertEqual(len(payload), tuncore.HANDSHAKE_ATTEST_PAYLOAD_SIZE)
 
     def test_happy_path_responder(self) -> None:
         _, _, ns, payload, h = _build_responder_payload(self.ca)
@@ -180,13 +177,9 @@ class TestAttestRejections(unittest.TestCase):
     def test_tampered_signature_byte_rejected(self) -> None:
         # Locate sig in the framed payload and flip a byte.
         ts_field_end = 8
-        cert_len = struct.unpack(
-            ">H", self.payload[ts_field_end : ts_field_end + 2]
-        )[0]
+        cert_len = struct.unpack(">H", self.payload[ts_field_end : ts_field_end + 2])[0]
         cert_end = ts_field_end + 2 + cert_len
-        sig_len = struct.unpack(">H", self.payload[cert_end : cert_end + 2])[
-            0
-        ]
+        sig_len = struct.unpack(">H", self.payload[cert_end : cert_end + 2])[0]
         sig_start = cert_end + 2
         # Flip a middle byte of the signature.
         bad = bytearray(self.payload)
@@ -220,20 +213,14 @@ class TestAttestRejections(unittest.TestCase):
     def test_cert_len_overflow_rejected(self) -> None:
         bad = bytearray(self.payload)
         # Overwrite the cert_len field with a value that overflows.
-        bad[8:10] = struct.pack(
-            ">H", tuncore.HANDSHAKE_ATTEST_PAYLOAD_SIZE
-        )
+        bad[8:10] = struct.pack(">H", tuncore.HANDSHAKE_ATTEST_PAYLOAD_SIZE)
         with self.assertRaises(AttestPayloadFormatError):
             self._verify(payload=bytes(bad))
 
     def test_clock_skew_too_large_rejected(self) -> None:
         # Build with timestamp 1h in the past; verify with default ±300s.
-        past = datetime.datetime.now(
-            datetime.timezone.utc
-        ) - datetime.timedelta(hours=1)
-        _, _, _, stale_payload, h = _build_responder_payload(
-            self.ca, timestamp=past
-        )
+        past = datetime.datetime.now(datetime.UTC) - datetime.timedelta(hours=1)
+        _, _, _, stale_payload, h = _build_responder_payload(self.ca, timestamp=past)
         with self.assertRaises(AttestTimestampError):
             verify_attest_payload(
                 payload=stale_payload,
@@ -245,9 +232,7 @@ class TestAttestRejections(unittest.TestCase):
 
     def test_expired_cert_rejected(self) -> None:
         # Build a cert that's already expired.
-        old = datetime.datetime.now(
-            datetime.timezone.utc
-        ) - datetime.timedelta(days=400)
+        old = datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=400)
         attest_key = tuncore.AttestKey.generate()
         ns = secrets.token_bytes(32)
         expired_leaf = make_leaf_cert(
@@ -284,9 +269,7 @@ class TestAttestRejections(unittest.TestCase):
 
     def _extract_ns(self, payload: bytes) -> bytes:
         ts_end = 8
-        cert_len = struct.unpack(
-            ">H", payload[ts_end : ts_end + 2]
-        )[0]
+        cert_len = struct.unpack(">H", payload[ts_end : ts_end + 2])[0]
         cert_der = payload[ts_end + 2 : ts_end + 2 + cert_len]
         return DeviceCert.from_der(cert_der).noise_static_pub
 

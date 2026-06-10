@@ -68,9 +68,7 @@ class TestDeviceCertParsing(unittest.TestCase):
         self.assertEqual(self.dc.noise_static_pub, self.noise_static)
 
     def test_public_key_is_ec(self) -> None:
-        self.assertIsInstance(
-            self.dc.public_key, ec.EllipticCurvePublicKey
-        )
+        self.assertIsInstance(self.dc.public_key, ec.EllipticCurvePublicKey)
 
     def test_der_roundtrip(self) -> None:
         der = self.dc.to_der()
@@ -109,13 +107,11 @@ class TestNoiseStaticBindingExtension(unittest.TestCase):
         # but only provide 16 bytes.
         leaf_priv = ec.generate_private_key(ec.SECP256R1())
         bad_value = bytes([0x04, 0x20]) + b"\x00" * 16
-        now = datetime.datetime.now(datetime.timezone.utc)
+        now = datetime.datetime.now(datetime.UTC)
         leaf = (
             x509.CertificateBuilder()
             .subject_name(
-                x509.Name(
-                    [x509.NameAttribute(x509.NameOID.COMMON_NAME, "x")]
-                )
+                x509.Name([x509.NameAttribute(x509.NameOID.COMMON_NAME, "x")])
             )
             .issuer_name(self.ca.certificate.subject)
             .public_key(leaf_priv.public_key())
@@ -123,9 +119,7 @@ class TestNoiseStaticBindingExtension(unittest.TestCase):
             .not_valid_before(now)
             .not_valid_after(now + datetime.timedelta(days=30))
             .add_extension(
-                x509.UnrecognizedExtension(
-                    DSM_NOISE_STATIC_BINDING_OID, bad_value
-                ),
+                x509.UnrecognizedExtension(DSM_NOISE_STATIC_BINDING_OID, bad_value),
                 critical=True,
             )
             .sign(self.ca.private_key, hashes.SHA384())
@@ -173,13 +167,11 @@ class TestValidateChain(unittest.TestCase):
         # through; only the signature check catches it).
         other_priv = ec.generate_private_key(ec.SECP384R1())
         leaf_priv = ec.generate_private_key(ec.SECP256R1())
-        now = datetime.datetime.now(datetime.timezone.utc)
+        now = datetime.datetime.now(datetime.UTC)
         forged = (
             x509.CertificateBuilder()
             .subject_name(
-                x509.Name(
-                    [x509.NameAttribute(x509.NameOID.COMMON_NAME, "forged")]
-                )
+                x509.Name([x509.NameAttribute(x509.NameOID.COMMON_NAME, "forged")])
             )
             .issuer_name(self.ca.certificate.subject)
             .public_key(leaf_priv.public_key())
@@ -189,9 +181,7 @@ class TestValidateChain(unittest.TestCase):
             .add_extension(
                 x509.UnrecognizedExtension(
                     DSM_NOISE_STATIC_BINDING_OID,
-                    encode_noise_static_binding_value(
-                        secrets.token_bytes(32)
-                    ),
+                    encode_noise_static_binding_value(secrets.token_bytes(32)),
                 ),
                 critical=True,
             )
@@ -201,9 +191,7 @@ class TestValidateChain(unittest.TestCase):
             validate_chain(DeviceCert(forged), self.ca.certificate)
 
     def test_not_yet_valid_rejected(self) -> None:
-        future = datetime.datetime.now(
-            datetime.timezone.utc
-        ) + datetime.timedelta(days=10)
+        future = datetime.datetime.now(datetime.UTC) + datetime.timedelta(days=10)
         _, leaf, _ = _fresh_leaf(
             self.ca,
             not_before=future,
@@ -213,9 +201,7 @@ class TestValidateChain(unittest.TestCase):
             validate_chain(DeviceCert(leaf), self.ca.certificate)
 
     def test_expired_rejected(self) -> None:
-        old_start = datetime.datetime.now(
-            datetime.timezone.utc
-        ) - datetime.timedelta(days=400)
+        old_start = datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=400)
         _, leaf, _ = _fresh_leaf(
             self.ca,
             not_before=old_start,
@@ -227,18 +213,14 @@ class TestValidateChain(unittest.TestCase):
     def test_validate_chain_now_override(self) -> None:
         # Pin "now" inside the validity window even after real-clock
         # expiry to confirm the override path works.
-        old_start = datetime.datetime.now(
-            datetime.timezone.utc
-        ) - datetime.timedelta(days=400)
+        old_start = datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=400)
         _, leaf, _ = _fresh_leaf(
             self.ca,
             not_before=old_start,
             not_after=old_start + datetime.timedelta(days=30),
         )
         pinned_now = old_start + datetime.timedelta(days=10)
-        validate_chain(
-            DeviceCert(leaf), self.ca.certificate, now=pinned_now
-        )
+        validate_chain(DeviceCert(leaf), self.ca.certificate, now=pinned_now)
 
     def test_missing_binding_extension_rejected(self) -> None:
         _, leaf, _ = _fresh_leaf(self.ca, omit_binding=True)
@@ -285,6 +267,202 @@ class TestLoadCARoot(unittest.TestCase):
                 load_ca_root(leaf_path)
         finally:
             leaf_path.unlink()
+
+
+def _ca_keyusage(*, key_cert_sign: bool) -> x509.KeyUsage:
+    return x509.KeyUsage(
+        digital_signature=False,
+        content_commitment=False,
+        key_encipherment=False,
+        data_encipherment=False,
+        key_agreement=False,
+        key_cert_sign=key_cert_sign,
+        crl_sign=True,
+        encipher_only=False,
+        decipher_only=False,
+    )
+
+
+def _build_ca(
+    *,
+    not_before: datetime.datetime,
+    not_after: datetime.datetime,
+    key_usage: x509.KeyUsage | None,
+) -> tuple[ec.EllipticCurvePrivateKey, x509.Certificate]:
+    """Hand-build a self-signed CA with caller-controlled validity +
+    keyUsage (or no keyUsage when ``key_usage`` is None). basicConstraints
+    is CA:TRUE so the DSM-010 keyUsage / validity gates are what fails,
+    not the CA:TRUE check that precedes them in ``load_ca_root``."""
+    priv = ec.generate_private_key(ec.SECP384R1())
+    name = x509.Name(
+        [x509.NameAttribute(x509.NameOID.COMMON_NAME, "DSM Hand-Built CA")]
+    )
+    builder = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(priv.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(not_before)
+        .not_valid_after(not_after)
+        .add_extension(
+            x509.BasicConstraints(ca=True, path_length=0),
+            critical=True,
+        )
+    )
+    if key_usage is not None:
+        builder = builder.add_extension(key_usage, critical=True)
+    cert = builder.sign(private_key=priv, algorithm=hashes.SHA384())
+    return priv, cert
+
+
+def _write_ca_pem_600(cert: x509.Certificate) -> Path:
+    path = Path(os.environ.get("TMPDIR", "/tmp")) / (
+        f"dsm-handbuilt-ca-{os.getpid()}-{secrets.token_hex(4)}.pem"
+    )
+    path.write_bytes(cert.public_bytes(Encoding.PEM))
+    os.chmod(path, 0o600)
+    return path
+
+
+def _leaf_with_keyusage(
+    ca,
+    *,
+    key_usage: x509.KeyUsage | None,
+) -> x509.Certificate:
+    """Hand-build a leaf signed by ``ca`` carrying a critical CA:FALSE,
+    the noiseStaticBinding extension, and a caller-supplied keyUsage (or
+    none). Issuer/signature/validity/binding/basicConstraints are all
+    valid so ``validate_chain`` reaches — and fails at — the DSM-010
+    keyUsage gate specifically."""
+    leaf_priv = ec.generate_private_key(ec.SECP256R1())
+    now = datetime.datetime.now(datetime.UTC)
+    builder = (
+        x509.CertificateBuilder()
+        .subject_name(
+            x509.Name([x509.NameAttribute(x509.NameOID.COMMON_NAME, "dsm-ku-leaf")])
+        )
+        .issuer_name(ca.certificate.subject)
+        .public_key(leaf_priv.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(minutes=1))
+        .not_valid_after(now + datetime.timedelta(days=30))
+        .add_extension(
+            x509.BasicConstraints(ca=False, path_length=None),
+            critical=True,
+        )
+        .add_extension(
+            x509.UnrecognizedExtension(
+                DSM_NOISE_STATIC_BINDING_OID,
+                encode_noise_static_binding_value(secrets.token_bytes(32)),
+            ),
+            critical=True,
+        )
+    )
+    if key_usage is not None:
+        builder = builder.add_extension(key_usage, critical=True)
+    return builder.sign(ca.private_key, hashes.SHA384())
+
+
+class TestStrictLeafKeyUsage(unittest.TestCase):
+    """DSM-010: ``validate_chain`` requires a leaf keyUsage that asserts
+    digitalSignature (the leaf signs the per-handshake binding attestation)."""
+
+    def setUp(self) -> None:
+        self.ca = make_test_ca()
+
+    def test_leaf_keyusage_without_digital_signature_rejected(self) -> None:
+        ku = x509.KeyUsage(
+            digital_signature=False,
+            content_commitment=True,
+            key_encipherment=False,
+            data_encipherment=False,
+            key_agreement=False,
+            key_cert_sign=False,
+            crl_sign=False,
+            encipher_only=False,
+            decipher_only=False,
+        )
+        leaf = _leaf_with_keyusage(self.ca, key_usage=ku)
+        with self.assertRaises(CertChainError):
+            validate_chain(DeviceCert(leaf), self.ca.certificate)
+
+    def test_leaf_missing_keyusage_rejected(self) -> None:
+        leaf = _leaf_with_keyusage(self.ca, key_usage=None)
+        with self.assertRaises(CertChainError) as ctx:
+            validate_chain(DeviceCert(leaf), self.ca.certificate)
+        self.assertIn("leaf missing keyUsage", str(ctx.exception))
+
+
+class TestStrictCaKeyUsageAndValidity(unittest.TestCase):
+    """DSM-010: ``load_ca_root`` requires keyUsage keyCertSign and enforces
+    the CA's own validity window (a pinned root is otherwise trusted
+    forever). ``now`` is injectable for deterministic expiry testing."""
+
+    def test_ca_keyusage_without_key_cert_sign_rejected(self) -> None:
+        now = datetime.datetime.now(datetime.UTC)
+        _, cert = _build_ca(
+            not_before=now - datetime.timedelta(days=1),
+            not_after=now + datetime.timedelta(days=3650),
+            key_usage=_ca_keyusage(key_cert_sign=False),
+        )
+        path = _write_ca_pem_600(cert)
+        try:
+            with self.assertRaises(CertChainError):
+                load_ca_root(path)
+        finally:
+            path.unlink()
+
+    def test_ca_missing_keyusage_rejected(self) -> None:
+        now = datetime.datetime.now(datetime.UTC)
+        _, cert = _build_ca(
+            not_before=now - datetime.timedelta(days=1),
+            not_after=now + datetime.timedelta(days=3650),
+            key_usage=None,
+        )
+        path = _write_ca_pem_600(cert)
+        try:
+            with self.assertRaises(CertChainError):
+                load_ca_root(path)
+        finally:
+            path.unlink()
+
+    def test_expired_ca_rejected_with_pinned_now(self) -> None:
+        # CA whose validity ended well in the past; pin `now` after it.
+        base = datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=400)
+        _, cert = _build_ca(
+            not_before=base,
+            not_after=base + datetime.timedelta(days=30),
+            key_usage=_ca_keyusage(key_cert_sign=True),
+        )
+        path = _write_ca_pem_600(cert)
+        pinned_now = base + datetime.timedelta(days=200)  # past not_after
+        try:
+            with self.assertRaises(CertExpiredError):
+                load_ca_root(path, now=pinned_now)
+        finally:
+            path.unlink()
+
+
+class TestStrictKeyUsageRegression(unittest.TestCase):
+    """DSM-010 regression: a valid CA + valid leaf (correct keyUsage /
+    validity) still pass both ``validate_chain`` and ``load_ca_root``.
+    Guards against the strict checks over-rejecting good material."""
+
+    def test_valid_ca_and_leaf_still_pass(self) -> None:
+        ca = make_test_ca()
+        _, leaf, _ = _fresh_leaf(ca)
+
+        # validate_chain accepts the well-formed leaf.
+        validate_chain(DeviceCert(leaf), ca.certificate)
+
+        # load_ca_root accepts the well-formed CA (and pin still works).
+        path = _write_ca_pem_600(ca.certificate)
+        try:
+            loaded = load_ca_root(path)
+            self.assertEqual(loaded.subject, ca.certificate.subject)
+        finally:
+            path.unlink()
 
 
 if __name__ == "__main__":

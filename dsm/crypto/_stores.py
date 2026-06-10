@@ -62,7 +62,7 @@ def loaded_stores_cli(
     try:
         try:
             keystore.load_with_passphrase(passphrase)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  # see linter report
             print(
                 f"failed to unlock identity at {key_file_label}: "
                 f"{type(e).__name__}: {e}",
@@ -71,7 +71,7 @@ def loaded_stores_cli(
             sys.exit(2)
         try:
             attest_store.load_with_passphrase(passphrase)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  # see linter report
             print(
                 f"failed to unlock attest key at {attest_key_file_label}: "
                 f"{type(e).__name__}: {e}",
@@ -111,12 +111,22 @@ def load_daemon_stores(
     try:
         try:
             keystore.load_with_passphrase(passphrase)
-        except RuntimeError as e:
+        except (RuntimeError, OSError) as e:
+            # DSM-012: widen from RuntimeError to also catch OSError so the
+            # documented "log + return False" contract holds for the
+            # insecure-permissions case. KeyStore.load →
+            # check_user_file_permissions raises InsecureFilePermissionsError
+            # (an OSError subclass) and read_bytes() raises OSError; neither is
+            # a RuntimeError, so they previously escaped as an unhandled
+            # traceback out of asyncio.run instead of failing closed. Still
+            # narrow — ValueError/TypeError (programming bugs) propagate.
             log.error("identity store: %s", e)
             return False
         try:
             attest_store.load_with_passphrase(passphrase)
-        except RuntimeError as e:
+        except (RuntimeError, OSError) as e:
+            # DSM-012: see the identity-store handler above — widen to OSError
+            # so insecure-perms / read errors honor the return-False contract.
             log.error("attest store: %s", e)
             keystore.unload()
             return False

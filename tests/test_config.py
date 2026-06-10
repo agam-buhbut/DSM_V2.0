@@ -30,13 +30,15 @@ class TestConfigValidation(unittest.TestCase):
         self.assertEqual(c.mode, "client")
 
     def test_valid_server(self) -> None:
-        c = Config(**_base(
-            mode="server",
-            dns_providers=["8.8.8.8"],
-            dns_provider_pins={"8.8.8.8": ["a" * 64]},
-            allowed_cns_file="/tmp/test-allowed-cns.txt",
-            expected_server_cn=None,
-        ))
+        c = Config(
+            **_base(
+                mode="server",
+                dns_providers=["8.8.8.8"],
+                dns_provider_pins={"8.8.8.8": ["a" * 64]},
+                allowed_cns_file="/tmp/test-allowed-cns.txt",
+                expected_server_cn=None,
+            )
+        )
         self.assertEqual(c.mode, "server")
 
     def test_server_requires_pin_for_each_provider(self) -> None:
@@ -45,19 +47,23 @@ class TestConfigValidation(unittest.TestCase):
 
     def test_pin_must_be_hex(self) -> None:
         with self.assertRaises(ValueError):
-            Config(**_base(
-                mode="server",
-                dns_providers=["8.8.8.8"],
-                dns_provider_pins={"8.8.8.8": ["nothex" * 10 + "abcd"]},
-            ))
+            Config(
+                **_base(
+                    mode="server",
+                    dns_providers=["8.8.8.8"],
+                    dns_provider_pins={"8.8.8.8": ["nothex" * 10 + "abcd"]},
+                )
+            )
 
     def test_pin_must_be_64_chars(self) -> None:
         with self.assertRaises(ValueError):
-            Config(**_base(
-                mode="server",
-                dns_providers=["8.8.8.8"],
-                dns_provider_pins={"8.8.8.8": ["deadbeef"]},
-            ))
+            Config(
+                **_base(
+                    mode="server",
+                    dns_providers=["8.8.8.8"],
+                    dns_provider_pins={"8.8.8.8": ["deadbeef"]},
+                )
+            )
 
     def test_cert_file_must_be_absolute(self) -> None:
         with self.assertRaises(ValueError):
@@ -85,23 +91,27 @@ class TestConfigValidation(unittest.TestCase):
 
     def test_server_requires_allowed_cns_file(self) -> None:
         with self.assertRaises(ValueError):
-            Config(**_base(
-                mode="server",
-                dns_providers=["8.8.8.8"],
-                dns_provider_pins={"8.8.8.8": ["a" * 64]},
-                expected_server_cn=None,
-                allowed_cns_file=None,
-            ))
+            Config(
+                **_base(
+                    mode="server",
+                    dns_providers=["8.8.8.8"],
+                    dns_provider_pins={"8.8.8.8": ["a" * 64]},
+                    expected_server_cn=None,
+                    allowed_cns_file=None,
+                )
+            )
 
     def test_server_allowed_cns_file_must_be_absolute(self) -> None:
         with self.assertRaises(ValueError):
-            Config(**_base(
-                mode="server",
-                dns_providers=["8.8.8.8"],
-                dns_provider_pins={"8.8.8.8": ["a" * 64]},
-                expected_server_cn=None,
-                allowed_cns_file="rel.txt",
-            ))
+            Config(
+                **_base(
+                    mode="server",
+                    dns_providers=["8.8.8.8"],
+                    dns_provider_pins={"8.8.8.8": ["a" * 64]},
+                    expected_server_cn=None,
+                    allowed_cns_file="rel.txt",
+                )
+            )
 
     def test_invalid_mode(self) -> None:
         with self.assertRaises(ValueError):
@@ -119,14 +129,16 @@ class TestConfigValidation(unittest.TestCase):
     def test_listen_port_zero_rejected_in_server_mode(self) -> None:
         # In server mode listen_port is the bind, must be a real port
         with self.assertRaises(ValueError):
-            Config(**_base(
-                mode="server",
-                listen_port=0,
-                dns_providers=["8.8.8.8"],
-                dns_provider_pins={"8.8.8.8": ["a" * 64]},
-                allowed_cns_file="/tmp/allowed.txt",
-                expected_server_cn=None,
-            ))
+            Config(
+                **_base(
+                    mode="server",
+                    listen_port=0,
+                    dns_providers=["8.8.8.8"],
+                    dns_provider_pins={"8.8.8.8": ["a" * 64]},
+                    allowed_cns_file="/tmp/allowed.txt",
+                    expected_server_cn=None,
+                )
+            )
 
     def test_listen_port_zero_allowed_in_client_mode(self) -> None:
         # 0 means "kernel picks an ephemeral source port" — standard for clients
@@ -197,6 +209,23 @@ class TestConfigValidation(unittest.TestCase):
     def test_pmtu_discover_flag(self) -> None:
         c = Config(**_base(pmtu_discover=True))
         self.assertTrue(c.pmtu_discover)
+
+    def test_ca_root_sha256_valid_hex_accepted(self) -> None:
+        # DSM-005: a 64-char hex SHA-256 digest is accepted at the config
+        # layer. (Presence is enforced later, at CA-load time.)
+        pin = "ab" * 32
+        c = Config(**_base(ca_root_sha256=pin))
+        self.assertEqual(c.ca_root_sha256, pin)
+
+    def test_ca_root_sha256_wrong_length_rejected(self) -> None:
+        # 63 hex chars — valid hex but wrong digest length.
+        with self.assertRaises(ValueError):
+            Config(**_base(ca_root_sha256="ab" * 31 + "a"))
+
+    def test_ca_root_sha256_non_hex_rejected(self) -> None:
+        # 64 chars but not hex (contains 'z').
+        with self.assertRaises(ValueError):
+            Config(**_base(ca_root_sha256="z" * 64))
 
 
 if __name__ == "__main__":

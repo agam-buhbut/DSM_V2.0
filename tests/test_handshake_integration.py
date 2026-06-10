@@ -28,29 +28,32 @@ except ImportError:
     tuncore = None  # type: ignore[assignment]
     _HAS_TUNCORE = False
 
-if _HAS_TUNCORE:
-    from cryptography import x509
-    from cryptography.hazmat.primitives import hashes
-    from cryptography.hazmat.primitives.serialization import Encoding
+# These imports are tuncore-build-independent (dsm.crypto.handshake imports the
+# native extension lazily inside functions; cert_helpers does too), so they are
+# unconditional — the test classes below stay @skipUnless(_HAS_TUNCORE), which
+# is what actually gates execution when the extension isn't built.
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.serialization import Encoding
 
-    from dsm.crypto.cert_allowlist import CNAllowlist
-    from dsm.crypto.crl import CRL
-    from dsm.crypto.handshake import (
-        CertAuthError,
-        CertRevokedError,
-        CNMismatchError,
-        CNNotAllowedError,
-        client_handshake,
-        server_handshake,
-    )
-    from tests.cert_helpers import (
-        CLIENT_AUTH_OID,
-        SERVER_AUTH_OID,
-        EnrolledDevice,
-        IssuingCA,
-        make_enrolled_device,
-        make_test_ca,
-    )
+from dsm.crypto.cert_allowlist import CNAllowlist
+from dsm.crypto.crl import CRL
+from dsm.crypto.handshake import (
+    CertAuthError,
+    CertRevokedError,
+    CNMismatchError,
+    CNNotAllowedError,
+    client_handshake,
+    server_handshake,
+)
+from tests.cert_helpers import (
+    CLIENT_AUTH_OID,
+    SERVER_AUTH_OID,
+    EnrolledDevice,
+    IssuingCA,
+    make_enrolled_device,
+    make_test_ca,
+)
 
 
 def _build_crl_with_revoked(ca, revoked_serials: list[int]) -> CRL:
@@ -59,7 +62,7 @@ def _build_crl_with_revoked(ca, revoked_serials: list[int]) -> CRL:
     return the loaded CRL object."""
     import datetime
 
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = datetime.datetime.now(datetime.UTC)
     builder = (
         x509.CertificateRevocationListBuilder()
         .issuer_name(ca.certificate.subject)
@@ -187,7 +190,9 @@ class TestHandshakeRoundtrip(unittest.IsolatedAsyncioTestCase):
 
         # Both sides agreed on key material: ciphertext from one side
         # decrypts on the other.
-        aad = b"\x00" * 8
+        aad = (1).to_bytes(
+            8, "big"
+        )  # AAD must equal the seq passed to decrypt (H-CRYPT-1)
         nonce, ct, _epoch = client_keys.encrypt(b"ping", aad)
         pt = server_keys.decrypt(bytes(nonce), bytes(ct), aad, 1, False)
         self.assertEqual(bytes(pt), b"ping")
@@ -204,7 +209,9 @@ class TestHandshakeRoundtrip(unittest.IsolatedAsyncioTestCase):
         _, (s2_keys, _) = await self._run_udp_handshake()
         del _
 
-        aad = b"\x00" * 8
+        aad = (1).to_bytes(
+            8, "big"
+        )  # AAD must equal the seq passed to decrypt (H-CRYPT-1)
         nonce, ct, _ = c1_keys.encrypt(b"session-1-secret", aad)
         # Session-1 ciphertext must NOT decrypt under session-2 keys.
         with self.assertRaises(Exception):
@@ -422,7 +429,9 @@ class TestHandshakeRoundtripTCP(unittest.IsolatedAsyncioTestCase):
         client_keys, _client_hash, _server_static_pub = client_result
 
         self.assertEqual(len(bytes(client_static_seen)), 32)
-        aad = b"\x00" * 8
+        aad = (1).to_bytes(
+            8, "big"
+        )  # AAD must equal the seq passed to decrypt (H-CRYPT-1)
         nonce, ct, _ = client_keys.encrypt(b"ping-tcp", aad)
         pt = server_keys.decrypt(bytes(nonce), bytes(ct), aad, 1, False)
         self.assertEqual(bytes(pt), b"ping-tcp")

@@ -1,7 +1,8 @@
 """DSM packet format: serialization and deserialization.
 
 Outer packet (visible to observer):
-    [Sequence Number: 8 bytes][Nonce: 12 bytes][Ciphertext + GCM Tag: variable][Random Padding]
+    [Sequence Number: 8 bytes][Nonce: 12 bytes]
+    [Ciphertext + GCM Tag: variable][Random Padding]
 
 Inner plaintext (after AEAD decryption):
     [Type: 1 byte][Epoch|Flags: 1 byte][Inner Length: 2 bytes][Payload][Inner Padding]

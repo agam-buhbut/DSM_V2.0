@@ -112,6 +112,16 @@ class SessionKeyManager:
     def needs_rotation(self) -> bool: ...
     def initiate_rotation(self) -> tuple[int, bytes]: ...
     def complete_rotation_initiator(self, remote_ephemeral_pub: bytes) -> int: ...
+    def abort_rotation(self) -> bool:
+        """Drop a pending initiator rotation; True if one was discarded.
+
+        Idempotent. Used on the mutual-init rekey tie-break yield path so a
+        later ``initiate_rotation`` doesn't fail with "rotation already in
+        progress" (DSM-003). The abandoned ephemeral secret is zeroized on
+        drop; no key material crosses the FFI.
+        """
+        ...
+
     def complete_rotation_responder(
         self, remote_ephemeral_pub: bytes, new_epoch: int
     ) -> tuple[bytes, int]: ...

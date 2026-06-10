@@ -16,7 +16,7 @@ from __future__ import annotations
 import asyncio
 import unittest
 
-from dsm.core.protocol import InnerPacket, PacketType, SIZE_CLASSES
+from dsm.core.protocol import SIZE_CLASSES, InnerPacket, PacketType
 from dsm.traffic.shaper import TrafficShaper, make_chaff_packet
 
 PADDING_MIN = 128

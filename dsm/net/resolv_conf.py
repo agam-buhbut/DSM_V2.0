@@ -130,9 +130,7 @@ class ResolvConfManager:
                 # Symlink restore: create a sibling temp symlink, then
                 # rename it over RESOLV_CONF. rename(2) replaces
                 # files/symlinks atomically — never an ENOENT window.
-                tmp = RESOLV_CONF.with_suffix(
-                    RESOLV_CONF.suffix + ".dsm-restore"
-                )
+                tmp = RESOLV_CONF.with_suffix(RESOLV_CONF.suffix + ".dsm-restore")
                 # If a stale temp exists from a previous crash, unlink it.
                 try:
                     tmp.unlink()

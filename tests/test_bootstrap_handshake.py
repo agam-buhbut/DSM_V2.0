@@ -21,13 +21,17 @@ import unittest
 
 try:
     import tuncore
+
     _HAS_TUNCORE = True
 except ImportError:
     tuncore = None  # type: ignore[assignment]
     _HAS_TUNCORE = False
 
 
-@unittest.skipUnless(_HAS_TUNCORE, "tuncore (Rust crypto core) not built; run `maturin develop` in rust/tuncore/")
+@unittest.skipUnless(
+    _HAS_TUNCORE,
+    "tuncore (Rust crypto core) not built; run `maturin develop` in rust/tuncore/",
+)
 class TestBootstrapSessionDH(unittest.TestCase):
     """Exercise tuncore.complete_bootstrap directly."""
 
@@ -45,8 +49,11 @@ class TestBootstrapSessionDH(unittest.TestCase):
 
         # A (initiator) sends -> B (responder) decrypts with is_prev_epoch=False.
         # tuncore.encrypt returns list[int] for Vec<u8>; decrypt wants PyBytes.
-        # Seq starts at 1 to satisfy the replay window (see Rust test_from_handshake_hash_roundtrip).
-        aad = b"\x00" * 8
+        # Seq starts at 1 to satisfy the replay window
+        # (see Rust test_from_handshake_hash_roundtrip).
+        aad = (1).to_bytes(
+            8, "big"
+        )  # AAD must equal the seq passed to decrypt (H-CRYPT-1)
         nonce, ct, _epoch = a_keys.encrypt(b"hello from initiator", aad)
         pt = b_keys.decrypt(bytes(nonce), bytes(ct), aad, 1, False)
         self.assertEqual(bytes(pt), b"hello from initiator")
@@ -64,7 +71,9 @@ class TestBootstrapSessionDH(unittest.TestCase):
         a_eph = tuncore.BootstrapEphemeral.generate()
         b_eph = tuncore.BootstrapEphemeral.generate()
         bootstrap_keys = tuncore.complete_bootstrap(
-            a_eph, bytes(b_eph.public_key_bytes), is_initiator=True,
+            a_eph,
+            bytes(b_eph.public_key_bytes),
+            is_initiator=True,
         )
 
         # Second, unrelated bootstrap pair (different secrets/publics).
@@ -74,10 +83,14 @@ class TestBootstrapSessionDH(unittest.TestCase):
         c_eph = tuncore.BootstrapEphemeral.generate()
         d_eph = tuncore.BootstrapEphemeral.generate()
         unrelated_keys = tuncore.complete_bootstrap(
-            c_eph, bytes(d_eph.public_key_bytes), is_initiator=False,
+            c_eph,
+            bytes(d_eph.public_key_bytes),
+            is_initiator=False,
         )
 
-        aad = b"\x00" * 8
+        aad = (1).to_bytes(
+            8, "big"
+        )  # AAD must equal the seq passed to decrypt (H-CRYPT-1)
         nonce, ct, _epoch = bootstrap_keys.encrypt(b"secret", aad)
 
         # The unrelated peer should NOT be able to decrypt the bootstrap
@@ -95,7 +108,7 @@ class TestBootstrapSessionDH(unittest.TestCase):
         msg = str(ctx.exception).lower()
         self.assertTrue(
             "non-contributory" in msg or "low-order" in msg or "contrib" in msg,
-            f"expected rejection message about non-contributory/low-order, got: {msg!r}",
+            f"expected rejection message about non-contributory/low-order, got: {msg!r}",  # noqa: E501  # assertion failure message; not splitting to avoid touching test logic
         )
 
     def test_wrong_size_peer_public_rejected(self) -> None:
@@ -151,7 +164,9 @@ class TestBootstrapSessionDH(unittest.TestCase):
         a_keys = tuncore.complete_bootstrap(a_eph, b_pub, is_initiator=True)
         b_keys = tuncore.complete_bootstrap(b_eph, a_pub, is_initiator=False)
 
-        aad = b"\x00" * 8
+        aad = (1).to_bytes(
+            8, "big"
+        )  # AAD must equal the seq passed to decrypt (H-CRYPT-1)
         nonce, ct, epoch = a_keys.encrypt(b"payload", aad)
         self.assertIsInstance(nonce, bytes)
         self.assertIsInstance(ct, bytes)

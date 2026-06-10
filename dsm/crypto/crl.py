@@ -23,12 +23,12 @@ from pathlib import Path
 
 from cryptography import x509
 from cryptography.exceptions import InvalidSignature
-
-from dsm.crypto.cert import check_strong_signature_hash
 from cryptography.hazmat.primitives.asymmetric.ec import (
     ECDSA,
     EllipticCurvePublicKey,
 )
+
+from dsm.crypto.cert import check_strong_signature_hash
 
 
 class CRLError(Exception):
@@ -155,9 +155,7 @@ class CRL:
     @property
     def crl_number(self) -> int | None:
         try:
-            ext = self.crl.extensions.get_extension_for_class(
-                x509.CRLNumber
-            ).value
+            ext = self.crl.extensions.get_extension_for_class(x509.CRLNumber).value
         except x509.ExtensionNotFound:
             return None
         return ext.crl_number
@@ -174,9 +172,7 @@ class CRL:
         return len(self._revoked_serials)
 
 
-def _parse_crl(
-    raw: bytes, source: str
-) -> x509.CertificateRevocationList:
+def _parse_crl(raw: bytes, source: str) -> x509.CertificateRevocationList:
     # Try PEM first, then DER. Either is acceptable on disk.
     try:
         return x509.load_pem_x509_crl(raw)
@@ -185,6 +181,4 @@ def _parse_crl(
     try:
         return x509.load_der_x509_crl(raw)
     except ValueError as e:
-        raise CRLLoadError(
-            f"failed to parse CRL at {source}: {e}"
-        ) from e
+        raise CRLLoadError(f"failed to parse CRL at {source}: {e}") from e

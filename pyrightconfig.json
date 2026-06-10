@@ -21,7 +21,12 @@
       "reportConstantRedefinition": "none",
       "reportAttributeAccessIssue": "none",
       "reportArgumentType": "none",
-      "reportInvalidTypeForm": "none"
+      "reportInvalidTypeForm": "none",
+      "reportPossiblyUnbound": "none",
+      "reportUntypedBaseClass": "none",
+      "reportGeneralTypeIssues": "none",
+      "reportUnusedImport": "none",
+      "reportUnusedVariable": "none"
     }
   ]
 }

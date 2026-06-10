@@ -169,6 +169,12 @@ class TestSchemaLock(unittest.TestCase):
         # operationally identical risk (revoked certs silently accepted), but
         # distinguishable in monitoring (Pass-2 follow-up).
         "crl_missing",
+        # DSM-005: emitted by auth_loader.load_cert_materials when the required
+        # ca_root_sha256 pin is unset — the daemon refuses to start.
+        "ca_pin_missing",
+        # DSM-030: emitted when a configured CRL has no nextUpdate, so its
+        # freshness cannot be verified (fail-closed under crl_strict).
+        "crl_no_nextupdate",
         # H-ANON-4: emitted when the client rebinds its UDP socket to a
         # fresh ephemeral port on rekey completion (breaks src-port
         # session fingerprinting).

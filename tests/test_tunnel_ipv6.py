@@ -30,7 +30,7 @@ class TestSaveIpv6State(unittest.TestCase):
             tun._save_ipv6_state({"eth0": True, "wlan0": False})
 
         self.assertTrue(self.state_path.exists())
-        with open(self.state_path, "r") as f:
+        with open(self.state_path) as f:
             got = json.load(f)
         self.assertEqual(got, {"eth0": True, "wlan0": False})
         mode = os.stat(self.state_path).st_mode & 0o777
@@ -46,8 +46,10 @@ class TestRestoreIpv6State(unittest.TestCase):
     def test_restore_noop_if_file_missing(self) -> None:
         # File intentionally does not exist.
         self.assertFalse(self.state_path.exists())
-        with patch.object(TunDevice, "_IPV6_STATE_PATH", self.state_path), \
-             patch.object(tunnel, "_run_commands") as run_mock:
+        with (
+            patch.object(TunDevice, "_IPV6_STATE_PATH", self.state_path),
+            patch.object(tunnel, "_run_commands") as run_mock,
+        ):
             tun = TunDevice(name="mtun0")
             tun._restore_ipv6_state()
             run_mock.assert_not_called()
@@ -57,8 +59,10 @@ class TestRestoreIpv6State(unittest.TestCase):
         with open(self.state_path, "w") as f:
             json.dump({"eth0": True, "wlan0": False}, f)
 
-        with patch.object(TunDevice, "_IPV6_STATE_PATH", self.state_path), \
-             patch.object(tunnel, "_run_commands") as run_mock:
+        with (
+            patch.object(TunDevice, "_IPV6_STATE_PATH", self.state_path),
+            patch.object(tunnel, "_run_commands") as run_mock,
+        ):
             tun = TunDevice(name="mtun0")
             tun._restore_ipv6_state()
 
@@ -79,8 +83,10 @@ class TestRestoreIpv6State(unittest.TestCase):
         with open(self.state_path, "w") as f:
             json.dump({"eth0": True}, f)
 
-        with patch.object(TunDevice, "_IPV6_STATE_PATH", self.state_path), \
-             patch.object(tunnel, "_run_commands"):
+        with (
+            patch.object(TunDevice, "_IPV6_STATE_PATH", self.state_path),
+            patch.object(tunnel, "_run_commands"),
+        ):
             tun = TunDevice(name="mtun0")
             tun._restore_ipv6_state()
 
@@ -91,8 +97,10 @@ class TestRestoreIpv6State(unittest.TestCase):
         with open(self.state_path, "w") as f:
             f.write("{not valid json")
 
-        with patch.object(TunDevice, "_IPV6_STATE_PATH", self.state_path), \
-             patch.object(tunnel, "_run_commands") as run_mock:
+        with (
+            patch.object(TunDevice, "_IPV6_STATE_PATH", self.state_path),
+            patch.object(tunnel, "_run_commands") as run_mock,
+        ):
             tun = TunDevice(name="mtun0")
             # Should not raise.
             tun._restore_ipv6_state()
@@ -105,16 +113,20 @@ class TestDeconfigureGuard(unittest.TestCase):
     crashed earlier process run."""
 
     def test_deconfigure_skips_restore_when_not_configured(self) -> None:
-        with patch.object(tunnel, "_run_commands"), \
-             patch.object(TunDevice, "_restore_ipv6_state") as restore_mock:
+        with (
+            patch.object(tunnel, "_run_commands"),
+            patch.object(TunDevice, "_restore_ipv6_state") as restore_mock,
+        ):
             tun = TunDevice(name="mtun0")
             self.assertFalse(tun._configured)
             tun.deconfigure()
             restore_mock.assert_not_called()
 
     def test_deconfigure_calls_restore_when_configured(self) -> None:
-        with patch.object(tunnel, "_run_commands"), \
-             patch.object(TunDevice, "_restore_ipv6_state") as restore_mock:
+        with (
+            patch.object(tunnel, "_run_commands"),
+            patch.object(TunDevice, "_restore_ipv6_state") as restore_mock,
+        ):
             tun = TunDevice(name="mtun0")
             tun._configured = True  # simulate a successful configure()
             tun.deconfigure()
@@ -135,8 +147,10 @@ class TestCloseTryFinally(unittest.TestCase):
         class Boom(RuntimeError):
             pass
 
-        with patch.object(tun, "deconfigure", side_effect=Boom("deconfig failed")), \
-             patch("dsm.net.tunnel.os.close") as close_mock:
+        with (
+            patch.object(tun, "deconfigure", side_effect=Boom("deconfig failed")),
+            patch("dsm.net.tunnel.os.close") as close_mock,
+        ):
             with self.assertRaises(Boom):
                 tun.close()
             close_mock.assert_called_once_with(12345)
@@ -147,8 +161,10 @@ class TestCloseTryFinally(unittest.TestCase):
     def test_close_is_noop_if_fd_never_opened(self) -> None:
         tun = TunDevice(name="mtun0")
         self.assertIsNone(tun._fd)
-        with patch("dsm.net.tunnel.os.close") as close_mock, \
-             patch.object(tun, "deconfigure") as deconfig_mock:
+        with (
+            patch("dsm.net.tunnel.os.close") as close_mock,
+            patch.object(tun, "deconfigure") as deconfig_mock,
+        ):
             tun.close()
             close_mock.assert_not_called()
             deconfig_mock.assert_not_called()

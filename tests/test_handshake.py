@@ -35,15 +35,23 @@ class TestHandshakeFraming(unittest.TestCase):
     def test_wrong_payload_size_rejected(self) -> None:
         # Caller passed a ct that's a different size than the protocol expects.
         with self.assertRaises(HandshakeError):
-            _pad_to_frame(b"x" * (BOOTSTRAP_CIPHERTEXT_SIZE - 1), BOOTSTRAP_CIPHERTEXT_SIZE)
+            _pad_to_frame(
+                b"x" * (BOOTSTRAP_CIPHERTEXT_SIZE - 1), BOOTSTRAP_CIPHERTEXT_SIZE
+            )
         with self.assertRaises(HandshakeError):
-            _pad_to_frame(b"x" * (BOOTSTRAP_CIPHERTEXT_SIZE + 1), BOOTSTRAP_CIPHERTEXT_SIZE)
+            _pad_to_frame(
+                b"x" * (BOOTSTRAP_CIPHERTEXT_SIZE + 1), BOOTSTRAP_CIPHERTEXT_SIZE
+            )
 
     def test_wrong_frame_size_rejected(self) -> None:
         with self.assertRaises(HandshakeError):
-            _unpad_from_frame(b"x" * (HANDSHAKE_FRAME_SIZE - 1), BOOTSTRAP_CIPHERTEXT_SIZE)
+            _unpad_from_frame(
+                b"x" * (HANDSHAKE_FRAME_SIZE - 1), BOOTSTRAP_CIPHERTEXT_SIZE
+            )
         with self.assertRaises(HandshakeError):
-            _unpad_from_frame(b"x" * (HANDSHAKE_FRAME_SIZE + 1), BOOTSTRAP_CIPHERTEXT_SIZE)
+            _unpad_from_frame(
+                b"x" * (HANDSHAKE_FRAME_SIZE + 1), BOOTSTRAP_CIPHERTEXT_SIZE
+            )
 
 
 if __name__ == "__main__":

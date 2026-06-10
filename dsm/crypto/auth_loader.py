@@ -93,8 +93,26 @@ def load_cert_materials(config: Config) -> CertAuthMaterials:
     cert_der = _load_cert_der(cert_file)
 
     _check_perms_or_raise(ca_root_file, "ca_root_file")
+    # DSM-005: the CA-root SHA-256 pin is REQUIRED for the daemon. Without
+    # it, an attacker who can overwrite the on-disk CA PEM (within file
+    # perms) substitutes the trust anchor undetected. Refuse to start when
+    # unset, and verify the file against the pin on load.
+    if not config.ca_root_sha256:
+        netaudit.emit("ca_pin_missing", action="refused_start")
+        raise AuthMaterialsError(
+            "ca_root_sha256 is required but not set in config; refusing to "
+            "start. Compute it with `sha256sum <ca_root_file> | cut -d' ' -f1` "
+            'and set ca_root_sha256 = "<hex>" in config.toml '
+            "(see deploy/GUIDE.txt)."
+        )
     try:
-        ca_root = load_ca_root(ca_root_file)
+        expected_ca_sha256 = bytes.fromhex(config.ca_root_sha256)
+    except ValueError as e:
+        raise AuthMaterialsError(
+            f"ca_root_sha256 is not valid hex: {config.ca_root_sha256!r}"
+        ) from e
+    try:
+        ca_root = load_ca_root(ca_root_file, expected_sha256=expected_ca_sha256)
     except CertError as e:
         raise AuthMaterialsError(
             f"CA root at {ca_root_file} failed validation: {e}"
@@ -134,8 +152,36 @@ def load_cert_materials(config: Config) -> CertAuthMaterials:
         except CRLError as e:
             raise AuthMaterialsError(f"CRL at {crl_path} failed validation: {e}") from e
         log.info("loaded CRL crl_number=%s", crl.crl_number)
-        _now = datetime.datetime.now(datetime.timezone.utc)
-        if crl.is_stale(_now):
+        _now = datetime.datetime.now(datetime.UTC)
+        # DSM-030: a CRL with no nextUpdate is never reported "stale"
+        # (is_stale returns False without the field), so it would slip past
+        # crl_strict's freshness gate and be trusted forever. Treat a
+        # missing nextUpdate as its own fail-closed / warn case.
+        try:
+            _next_update = crl.next_update
+        except CRLError:
+            _next_update = None
+        if _next_update is None:
+            if config.crl_strict:
+                netaudit.emit(
+                    "crl_no_nextupdate",
+                    path=str(crl_path),
+                    action="refused_start",
+                )
+                raise AuthMaterialsError(
+                    f"CRL at {crl_path} has no nextUpdate and crl_strict=true; "
+                    "refusing to start — CRL freshness cannot be verified. "
+                    "Issue a CRL with a nextUpdate via the CA workflow, or set "
+                    "crl_strict=false to accept it with a warning."
+                )
+            log.warning(
+                "CRL at %s has no nextUpdate; freshness cannot be checked and "
+                "revocation may be arbitrarily stale. Set crl_strict=true to "
+                "refuse to start in this case.",
+                crl_path,
+            )
+            netaudit.emit("crl_no_nextupdate", path=str(crl_path), action="warned")
+        elif crl.is_stale(_now):
             if config.crl_strict:
                 # Fail closed: refuse to start under a stale CRL. The
                 # daemon's revocation surface is incomplete and a

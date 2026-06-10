@@ -47,6 +47,13 @@ class IPForwardingManager:
     """
 
     def __init__(self, tun_name: str | None = None) -> None:
+        # Same interpolation hazard as MasqueradeManager: tun_name is spliced
+        # into per-iface sysctl keys in apply(). Validate against the strict
+        # DSM_TUN_NAME_RE so an attacker-controlled name cannot escape into
+        # the sysctl path. None is allowed (those per-iface sysctls are
+        # skipped) and is not validated.
+        if tun_name is not None and not _TUN_NAME_PATTERN.match(tun_name):
+            raise ValueError(f"invalid tun_name: {tun_name!r}")
         self._tun_name = tun_name
         self._sysctl = SysctlOverride()
 
@@ -128,7 +135,7 @@ table inet {self.TABLE} {{
         if not self._applied:
             return
         try:
-            subprocess.run(
+            subprocess.run(  # pylint: disable=subprocess-run-check  # FLAGGED: explicit check= (see report)
                 ["nft", "delete", "table", "inet", self.TABLE],
                 capture_output=True,
                 timeout=5,

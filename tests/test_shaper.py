@@ -12,7 +12,6 @@ These tests pin down the post-H-ANON-2/H-ANON-3 redesign properties:
   the burst onset would re-create the very leak it once masked.
 """
 
-import math
 import statistics
 import time
 import unittest

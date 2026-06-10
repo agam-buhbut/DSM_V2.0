@@ -5,7 +5,7 @@ import unittest
 import dns.edns
 import dns.message
 
-from dsm.net.dns import EDNS_PADDING_BLOCK, _build_dns_query, A_RECORD
+from dsm.net.dns import A_RECORD, EDNS_PADDING_BLOCK, _build_dns_query
 
 
 class TestEdnsPadding(unittest.TestCase):
@@ -19,7 +19,8 @@ class TestEdnsPadding(unittest.TestCase):
         ):
             wire = _build_dns_query(hostname, A_RECORD)
             self.assertEqual(
-                len(wire) % EDNS_PADDING_BLOCK, 0,
+                len(wire) % EDNS_PADDING_BLOCK,
+                0,
                 f"query for {hostname!r} is not {EDNS_PADDING_BLOCK}-byte aligned: "
                 f"len={len(wire)}",
             )

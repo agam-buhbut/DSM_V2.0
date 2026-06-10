@@ -44,9 +44,7 @@ class AttestStore:
     @property
     def attest_key(self) -> tuncore.AttestKey:
         if self._key is None:
-            raise RuntimeError(
-                "attest key not loaded — call load() or generate()"
-            )
+            raise RuntimeError("attest key not loaded — call load() or generate()")
         return self._key
 
     def public_spki_der(self) -> bytes:

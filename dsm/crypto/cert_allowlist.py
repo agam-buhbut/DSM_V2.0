@@ -45,9 +45,7 @@ class CNAllowlist:
         try:
             text = path.read_text(encoding="utf-8")
         except OSError as e:
-            raise CNAllowlistError(
-                f"failed to read CN allowlist {path}: {e}"
-            ) from e
+            raise CNAllowlistError(f"failed to read CN allowlist {path}: {e}") from e
         cns: set[str] = set()
         for lineno, raw in enumerate(text.splitlines(), start=1):
             line = raw.strip()

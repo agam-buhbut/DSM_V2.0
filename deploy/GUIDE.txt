@@ -11,9 +11,19 @@ material you reach when you need them.
 Architecture in one sentence:  one client connects to one operator-owned
 server over UDP (default) or TCP. Both ends authenticate with X.509
 device certs signed by your offline CA; the cert binds the device's
-hardware-bound ECDSA signing key AND the device's X25519 Noise static
+ECDSA attestation signing key AND the device's X25519 Noise static
 via a custom critical extension, so a stolen cert OR a stolen Noise key
 alone is useless.
+
+ATTESTATION CAVEAT (read before trusting the binding):  the shipped/
+default build uses the SOFTWARE attestation backend (the dev-soft-attest
+Cargo feature). Its ECDSA P-256 attest key is stored Argon2id-wrapped on
+disk and is EXTRACTABLE from process memory by anyone who can run code as
+the dsm user (or read the unwrapped key while the daemon runs). It is NOT
+hardware-bound today. Hardware binding — TPM 2.0 on Linux, Android
+Keystore/StrongBox on Android — is PLANNED (Phase 1 step 5) but not yet
+implemented. Treat the cert/attest binding as a software credential, not a
+hardware root of trust, when reasoning about device-theft scenarios.
 
 Companion files in this directory:
   deploy/openssl-ca.cnf  — OpenSSL config used by the offline CA in §3.
@@ -106,32 +116,64 @@ NOT a venv, NOT a --user install. Every Python module dsm imports
 
 All commands below are from the top-level repo directory.
 
-1a. Build the tuncore wheel
+1a. Build the dsm wheel (ONE wheel: dsm package + tuncore extension)
 
-    maturin produces a Python wheel containing the compiled Rust
-    extension. Building requires a venv (maturin quirk) — we throw it
-    away once the wheel is built.
+    maturin, run FROM THE REPO ROOT, produces a single Python wheel that
+    contains BOTH the compiled Rust extension (tuncore) AND the pure-
+    Python `dsm` package. Run it from the repo root (NOT from
+    rust/tuncore) — the root pyproject.toml's [tool.maturin] manifest-path
+    points maturin at rust/tuncore/Cargo.toml and bundles the `dsm`
+    package alongside the extension. Building requires a venv (maturin
+    quirk) — we throw it away once the wheel is built.
 
     $ python3 -m venv /tmp/dsm-build-venv
     $ /tmp/dsm-build-venv/bin/pip install --upgrade pip maturin
 
-    $ cd rust/tuncore
     $ /tmp/dsm-build-venv/bin/maturin build --release
-    $ ls target/wheels/                        # confirm a .whl appeared
-    $ cd ../..
+    # maturin writes the wheel under the Cargo target dir, i.e.
+    # rust/tuncore/target/wheels/ (NOT <repo>/target/wheels/):
+    $ ls rust/tuncore/target/wheels/            # confirm dsm-0.1.0-*.whl appeared
+
+    The wheel is named dsm-0.1.0-<pytag>-<platform>.whl. Confirm it
+    bundles both halves (and does NOT ship the test suite):
+
+    $ unzip -l rust/tuncore/target/wheels/dsm-0.1.0-*.whl \
+          | grep -E 'dsm/__main__|tuncore.*\.so'
+    # expect both a dsm/__main__.py line and a tuncore/...so line
 
     You can `rm -rf /tmp/dsm-build-venv` at the end of section 1.
 
-1b. Install the wheel + runtime deps into the system Python
+1b. Install the wheel into the system Python (pins runtime deps)
+
+    Installing the dsm wheel ALSO installs its runtime dependencies at the
+    versions pinned in pyproject.toml ([project].dependencies:
+    cryptography>=46.0.7,<49 and dnspython>=2.6,<3.0). Do NOT install
+    `dnspython cryptography` unpinned by hand — let the wheel's metadata
+    pin them so a surprise major release can't be pulled in:
 
     $ sudo /usr/bin/python3 -m pip install --break-system-packages \
-          "$(ls $PWD/rust/tuncore/target/wheels/dsm_tuncore-*.whl | tail -1)" \
-          dnspython cryptography
+          "$(ls $PWD/rust/tuncore/target/wheels/dsm-0.1.0-*.whl | tail -1)"
 
     --break-system-packages is required on PEP-668 distros (Debian 12+,
     Ubuntu 23.10+, Fedora 38+). It's the right flag here: we're
     knowingly installing into the system Python because root needs to
     see these packages.
+
+    For a fully reproducible, exactly-pinned install (recommended for
+    production), the repo ships requirements.lock (a uv-compiled pin set:
+    cryptography==48.0.0, dnspython==2.8.0, plus their transitive deps).
+    Pre-install those exact versions, then add the wheel without letting
+    pip re-resolve the transitive set:
+
+    $ sudo /usr/bin/python3 -m pip install --break-system-packages \
+          -r requirements.lock
+    $ sudo /usr/bin/python3 -m pip install --break-system-packages \
+          --no-deps "$(ls $PWD/rust/tuncore/target/wheels/dsm-0.1.0-*.whl | tail -1)"
+
+    Installing the wheel puts BOTH `import dsm` and `import tuncore` on
+    /usr/bin/python3's path, so `python3 -m dsm` resolves from any working
+    directory — including under systemd (cwd=/), which is why
+    deploy/dsm.service needs no WorkingDirectory= or PYTHONPATH=.
 
     NOTE: dsm has NO httpx dependency. The DoH client is a hand-rolled
     asyncio TLS + HTTP/1.1 path so the SPKI pin is checked on the live
@@ -139,14 +181,21 @@ All commands below are from the top-level repo directory.
 
 1c. Verify the install
 
-    Run this EXACT command; it confirms root's Python sees every import
-    dsm needs:
+    Run this EXACT command FROM A DIRECTORY THAT IS NOT THE REPO (e.g.
+    /tmp) — running from the repo root would let cwd-on-sys.path mask a
+    bad install. It confirms root's Python sees every import dsm needs,
+    including the `dsm` package itself out of the installed wheel:
 
-    $ sudo /usr/bin/python3 -c \
-          "import tuncore, dns, cryptography; print('all 3 imports ok')"
+    $ cd /tmp && sudo /usr/bin/python3 -c \
+          "import dsm, tuncore, dns, cryptography; print('all 4 imports ok')"
 
-    You must see "all 3 imports ok" before continuing. If any import
+    You must see "all 4 imports ok" before continuing. If any import
     fails:
+      - "No module named 'dsm'"          — wheel install in 1b failed, or
+                                           you built only the old
+                                           extension-only wheel. Rebuild
+                                           from the REPO ROOT (1a) and
+                                           re-run 1b.
       - "No module named 'tuncore'"      — wheel install in 1b failed
                                            silently. Re-run 1b and read
                                            pip's output.
@@ -240,8 +289,16 @@ Custom OID used by DSM:
     $ openssl x509 -in dsm_ca_root.pem -noout -fingerprint -sha256
     $ sha256sum dsm_ca_root.pem
 
-    Print BOTH outputs. The SHA-256 of the file is the value every dsm
-    host will cross-check at install time. Store the printout in the safe.
+    Print BOTH outputs and store the printout in the safe.
+
+    The bare 64-hex SHA-256 of the FILE (second command) is also the
+    REQUIRED `ca_root_sha256` config value (see §2e and §3a). The daemon
+    refuses to start unless config.toml sets `ca_root_sha256` and it
+    matches the on-disk dsm_ca_root.pem — this pins the trust anchor so a
+    swapped CA PEM is rejected. Capture it in config-ready form now:
+
+    $ sha256sum dsm_ca_root.pem | cut -d' ' -f1
+    # -> 64 hex chars; this goes verbatim into ca_root_sha256 = "<hex>"
 
 2d. Snapshot the CA directory onto your encrypted USB sticks
 
@@ -259,12 +316,16 @@ USB RW, sign, unmount, return to safe.
     On each dsm host:
       $ sudo install -m 0600 -o root -g root /mnt/transport/dsm_ca_root.pem \
             /opt/mtun/dsm_ca_root.pem
-      $ sha256sum /opt/mtun/dsm_ca_root.pem    # cross-check vs safe printout
+      $ sha256sum /opt/mtun/dsm_ca_root.pem | cut -d' ' -f1
+            # cross-check this 64-hex value vs the safe printout (§2c),
+            # then paste it into config.toml as ca_root_sha256 (§3a).
 
     The CA root cert is a public document, but dsm's path-security check
     refuses to load any file (even certs) that has group/world bits, so
     install it 0o600. Substitution of dsm_ca_root.pem changes the trust
-    anchor — defense-in-depth is appropriate.
+    anchor — defense-in-depth is appropriate, and the REQUIRED
+    `ca_root_sha256` config pin makes the swap fatal at startup rather
+    than silently trusting the new anchor.
 
     Re-wipe Stick B (`shred -v`) before reusing it.
 
@@ -291,6 +352,10 @@ configure clients (clients pin the server's CN via `expected_server_cn`).
     key_file           = "/opt/mtun/identity.key"
     cert_file          = "/opt/mtun/device.crt"
     ca_root_file       = "/opt/mtun/dsm_ca_root.pem"
+    # REQUIRED: 64-hex SHA-256 of ca_root_file (§2c / §2e). The daemon refuses
+    # to start without it and rejects a swapped CA PEM. Compute with:
+    #   sha256sum /opt/mtun/dsm_ca_root.pem | cut -d' ' -f1
+    ca_root_sha256     = "REPLACE_WITH_64_HEX_SHA256_OF_dsm_ca_root.pem"
     attest_key_file    = "/opt/mtun/attest.key"
     crl_file           = "/opt/mtun/dsm_ca.crl"   # required by default (crl_strict=true)
     # crl_strict       = true                     # default. Set false ONLY for
@@ -681,6 +746,7 @@ leaves no residue.
     key_file = "/opt/mtun/identity.key"
     cert_file = "/opt/mtun/device.crt"
     ca_root_file = "/opt/mtun/dsm_ca_root.pem"
+    ca_root_sha256 = "REPLACE_WITH_64_HEX_SHA256_OF_dsm_ca_root.pem"  # REQUIRED (§2c)
     attest_key_file = "/opt/mtun/attest.key"
     allowed_cns_file = "/opt/mtun/allowed_cns.txt"
     transport = "udp"
@@ -690,7 +756,9 @@ leaves no residue.
     EOF
 
     Place /opt/mtun/dsm_ca_root.pem per §2e. Cross-check its SHA-256
-    against the safe printout.
+    against the safe printout, and set ca_root_sha256 to that 64-hex
+    value (`sha256sum /opt/mtun/dsm_ca_root.pem | cut -d' ' -f1`) — the
+    daemon refuses to start without it.
 
 8c. Enroll the server (§3b–§3d)
 
@@ -1079,9 +1147,13 @@ nftables rules stuck after a crashed client
 ──────────────────────────────────────────────────────────────────────────────
 ImportError / ModuleNotFoundError: No module named '<X>'
 
+  - X = dsm      → the dsm wheel never landed in /usr/bin/python3, or you
+    built the old extension-only wheel. Rebuild from the REPO ROOT (§1a)
+    and re-run §1b; confirm pip output reports "Successfully installed
+    dsm-0.1.0".
   - X = tuncore  → wheel never landed in /usr/bin/python3. Re-run §1b
-    and confirm pip output reports "Successfully installed
-    dsm-tuncore-0.1.0".
+    and confirm pip output reports "Successfully installed dsm-0.1.0"
+    (the tuncore extension ships inside the dsm wheel).
   - X = dns      → dnspython missing. Re-run §1b.
   - X = cryptography → same fix.
   - Did you create a venv and install there instead? `sudo python3`
@@ -1093,12 +1165,12 @@ TypeError or AttributeError mentioning a tuncore object
 (e.g. "a bytes-like object is required, not 'list'")
 
   Almost certainly a stale wheel: you rebuilt the Rust source but
-  didn't reinstall the wheel. Rebuild and force-reinstall:
-    $ cd rust/tuncore
+  didn't reinstall the wheel. Rebuild FROM THE REPO ROOT and
+  force-reinstall:
     $ /tmp/dsm-build-venv/bin/maturin build --release
     $ sudo /usr/bin/python3 -m pip install --break-system-packages \
           --force-reinstall \
-          "$(ls $PWD/target/wheels/dsm_tuncore-*.whl | tail -1)"
+          "$(ls $PWD/rust/tuncore/target/wheels/dsm-0.1.0-*.whl | tail -1)"
 
 
 ================================================================================
@@ -1107,7 +1179,7 @@ TypeError or AttributeError mentioning a tuncore object
 
   $ sudo systemctl disable --now dsm
   $ sudo rm -rf /opt/mtun /etc/dsm /run/dsm
-  $ sudo pip uninstall dsm-tuncore                  # if pip-installed
+  $ sudo /usr/bin/python3 -m pip uninstall --break-system-packages dsm   # if pip-installed
   $ sudo rm /etc/systemd/system/dsm.service
   $ sudo systemctl daemon-reload
 

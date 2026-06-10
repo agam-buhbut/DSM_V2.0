@@ -19,11 +19,10 @@ from dataclasses import dataclass
 from typing import Any
 from unittest.mock import MagicMock
 
-from dsm.core.config import Config, MIN_TUN_MTU
+from dsm.core.config import MIN_TUN_MTU, Config
 from dsm.net.transport.tcp import TCPTransport
 from dsm.net.transport.udp import UDPTransport
 from dsm.session import (
-    AUTO_MTU_HYSTERESIS_RISES,
     WIRE_OVERHEAD,
     auto_mtu_loop,
 )
@@ -57,6 +56,7 @@ class _StubCtx:
     The loop only touches ``tun`` and ``shutdown``; we don't need the
     full session-state machinery.
     """
+
     tun: Any
     shutdown: asyncio.Event
 
@@ -99,7 +99,7 @@ async def _run_loop_for(
     if initial_mtu is not None:
         # The loop tracks `current` internally starting from config.mtu.
         # Tests parametrize via config.mtu, not initial_mtu directly.
-        pass  # noqa: silenced — initial_mtu kept for future flexibility
+        pass  # initial_mtu kept for future flexibility; tests drive via config.mtu
 
     task = asyncio.create_task(auto_mtu_loop(ctx, transport, config))
     # Each tick = pmtu_check_interval_s. Add a small slack so we don't
@@ -108,7 +108,7 @@ async def _run_loop_for(
     shutdown.set()
     try:
         await asyncio.wait_for(task, timeout=2.0)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         task.cancel()
         raise
 
@@ -147,9 +147,7 @@ class TestAutoMtuLoop(unittest.IsolatedAsyncioTestCase):
         config = _make_config(mtu=1400, pmtu_check_interval_s=0.01)
         # First: lower to 1100-68=1032. Then 3 consecutive 1300 readings
         # → after the 3rd, raise to 1300-68=1232.
-        transport = _make_udp_transport_with_pmtus(
-            _scripted(1100, 1300, 1300, 1300)
-        )
+        transport = _make_udp_transport_with_pmtus(_scripted(1100, 1300, 1300, 1300))
         _, calls = await _run_loop_for(config, transport, ticks=5)
         self.assertEqual(
             calls,
@@ -193,9 +191,7 @@ class TestAutoMtuLoop(unittest.IsolatedAsyncioTestCase):
         shutdown = asyncio.Event()
         ctx = _StubCtx(tun=tun, shutdown=shutdown)
         # No need to set shutdown; non-UDP path returns synchronously.
-        await asyncio.wait_for(
-            auto_mtu_loop(ctx, transport, config), timeout=1.0
-        )
+        await asyncio.wait_for(auto_mtu_loop(ctx, transport, config), timeout=1.0)
         tun.set_mtu.assert_not_called()
 
     async def test_no_thrash_on_oscillation_around_boundary(self) -> None:
@@ -248,11 +244,12 @@ class TestAutoMtuConfigValidation(unittest.TestCase):
             _make_config(pmtu_check_interval_s=4000.0)
 
     def test_pmtu_check_interval_default(self) -> None:
-        c = _make_config()
-        del_overrides = {k: v for k, v in {}.items()}  # no-op; default
+        c = _make_config()  # noqa: F841  # dead; see report
+        del_overrides = {k: v for k, v in {}.items()}  # noqa: F841  # no-op; see report
         # Default is 30.0 per Config (we override in _make_config to 1.0).
         # Build raw Config to verify the actual default.
         from dsm.core.config import Config as RawConfig
+
         raw = RawConfig(
             mode="client",
             server_ip="10.0.0.1",

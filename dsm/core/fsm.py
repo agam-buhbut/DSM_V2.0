@@ -8,8 +8,8 @@ Invalid transitions raise ProtocolError and trigger TEARDOWN.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from enum import Enum, auto
-from typing import Callable
 
 log = logging.getLogger(__name__)
 
@@ -81,7 +81,10 @@ class SessionFSM:
                 cb()
             except Exception:
                 if target in _CRITICAL_ENTER_STATES:
-                    log.critical("critical on_enter callback failed for %s, forcing TEARDOWN", target.name)
+                    log.critical(
+                        "critical on_enter callback failed for %s, forcing TEARDOWN",
+                        target.name,
+                    )
                     self._state = State.TEARDOWN
                     raise
                 log.exception("on_enter callback failed for %s", target.name)

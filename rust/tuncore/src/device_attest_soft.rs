@@ -72,7 +72,7 @@ impl SoftAttestKey {
         // network-fed verifier challenge in a future code path) can't
         // force the SHA-256 update through an unbounded buffer. 1 MiB
         // is far above any legitimate use (DSM binding signatures
-        // sign 92 bytes; ECDSA can sign arbitrary-length messages but
+        // sign 86 bytes; ECDSA can sign arbitrary-length messages but
         // the implementation hashes them with SHA-256 first).
         const SIGN_MSG_MAX: usize = 1 << 20;
         if msg.len() > SIGN_MSG_MAX {

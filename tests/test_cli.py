@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import os
+import secrets
 import tempfile
 import unittest
 from pathlib import Path
 
 from dsm.core.config import load as config_load
-
 
 _VALID_TOML = b"""\
 mode = "client"
@@ -74,6 +76,72 @@ class TestConfigDirPrecedence(unittest.TestCase):
                 del os.environ["DSM_CONFIG_DIR"]
             else:
                 os.environ["DSM_CONFIG_DIR"] = prev
+
+
+class TestShowPubkeyInsecurePerms(unittest.TestCase):
+    """DSM-018: ``_run_show_pubkey`` against a key file with insecure
+    permissions must exit 2 with a clean ``show-pubkey:`` message on
+    stderr — not surface a raw ``InsecureFilePermissionsError`` traceback.
+    """
+
+    def setUp(self) -> None:
+        self._tmpdir = Path(tempfile.mkdtemp())
+        # Insecure (group/world readable) key file — perms are checked
+        # BEFORE the file content is read, so an empty dummy suffices.
+        self.key_path = self._tmpdir / "id.key"
+        self.key_path.write_bytes(b"")
+        os.chmod(self.key_path, 0o644)
+
+        # 0o600 passphrase env-file so read_passphrase has a source and
+        # does not fall through to an interactive tty prompt.
+        self.pass_path = self._tmpdir / "pass"
+        self.pass_path.write_bytes(b"correct horse\n")
+        os.chmod(self.pass_path, 0o600)
+
+        self.config_path = self._tmpdir / "config.toml"
+        self.config_path.write_bytes(
+            b"".join(
+                [
+                    b'mode = "client"\n',
+                    b'server_ip = "10.0.0.1"\n',
+                    b"server_port = 51820\n",
+                    b"listen_port = 51821\n",
+                    b'key_file = "' + str(self.key_path).encode() + b'"\n',
+                    b'cert_file = "/tmp/dsm-cli-'
+                    + secrets.token_hex(4).encode()
+                    + b'.crt"\n',
+                    b'ca_root_file = "/tmp/dsm-cli-ca.pem"\n',
+                    b'attest_key_file = "/tmp/dsm-cli-attest.key"\n',
+                    b'expected_server_cn = "dsm-test-server"\n',
+                    b'transport = "udp"\n',
+                ]
+            )
+        )
+
+    def tearDown(self) -> None:
+        for p in (self.key_path, self.pass_path, self.config_path):
+            try:
+                p.unlink()
+            except FileNotFoundError:
+                pass
+        try:
+            self._tmpdir.rmdir()
+        except OSError:
+            pass
+
+    def test_insecure_key_file_exits_2_with_message(self) -> None:
+        from dsm.__main__ import _run_show_pubkey
+
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as ctx:
+                _run_show_pubkey(
+                    self.config_path,
+                    passphrase_fd=None,
+                    passphrase_env_file=str(self.pass_path),
+                )
+        self.assertEqual(ctx.exception.code, 2)
+        self.assertIn("show-pubkey:", stderr.getvalue())
 
 
 if __name__ == "__main__":

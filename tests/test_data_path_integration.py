@@ -160,7 +160,7 @@ class TestDataPathRoundtrip(unittest.IsolatedAsyncioTestCase):
         # constrained shaper config.
 
         def _make_ctx(
-            keys: "tuncore.SessionKeyManager",
+            keys: tuncore.SessionKeyManager,
             transport: UDPTransport,
             dest_holder: list,
             tun: _MockTun,
@@ -262,7 +262,7 @@ class TestDataPathRoundtrip(unittest.IsolatedAsyncioTestCase):
                     transport.recv(),
                     timeout=0.1,
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 session_keys.tick()
                 continue
 
@@ -665,7 +665,6 @@ class TestTCPFixedSizePadding(unittest.IsolatedAsyncioTestCase):
 
     async def test_small_target_size_produces_1400_byte_wire(self) -> None:
         import tuncore
-
         from dsm.core.protocol import GCM_TAG_SIZE, OUTER_HEADER_SIZE, SIZE_CLASSES
         from dsm.net.transport.tcp import TCPTransport
         from dsm.session import SequenceCounter, make_send_fn
@@ -739,7 +738,7 @@ class TestRotationThresholdOverride(unittest.TestCase):
             )
             n = 0
             while not sk.needs_rotation() and n < OVERRIDE * 2:
-                sk.encrypt(b"x", b"")
+                sk.encrypt(b"x", b"\x00" * 8)  # encrypt requires an 8-byte AAD
                 n += 1
             self.assertGreaterEqual(
                 n,
@@ -766,11 +765,136 @@ class TestRotationThresholdOverride(unittest.TestCase):
             )
             n = 0
             while not sk.needs_rotation() and n < 7000:
-                sk.encrypt(b"x", b"")
+                sk.encrypt(b"x", b"\x00" * 8)  # encrypt requires an 8-byte AAD
                 n += 1
             # Default base 5000 ± 20% → [4000, 6000]
             self.assertGreaterEqual(n, 4000)
             self.assertLessEqual(n, 6000)
+
+
+@unittest.skipUnless(
+    _HAS_TUNCORE,
+    "tuncore (Rust crypto core) not built; run `maturin develop` in rust/tuncore/",
+)
+class TestDataPathReplayRejection(unittest.TestCase):
+    """DSM-009: the Python data-path drops replayed and rotated-out
+    packets at ``dsm.session.decrypt_packet``.
+
+    These exercise ``decrypt_packet`` directly with a real
+    ``tuncore.SessionKeyManager`` + ``tuncore.ReplayWindow`` (no sockets,
+    no event loop) so the replay/epoch logic is locked deterministically.
+    Framing mirrors ``make_send_fn``: seq ‖ nonce ‖ AEAD(inner, aad=seq).
+    """
+
+    @staticmethod
+    def _bootstrap_pair():
+        a = tuncore.BootstrapEphemeral.generate()
+        b = tuncore.BootstrapEphemeral.generate()
+        a_pub = bytes(a.public_key_bytes)
+        b_pub = bytes(b.public_key_bytes)
+        a_keys = tuncore.complete_bootstrap(a, b_pub, is_initiator=True)
+        b_keys = tuncore.complete_bootstrap(b, a_pub, is_initiator=False)
+        return a_keys, b_keys
+
+    @staticmethod
+    def _frame(keys, seq_counter, payload, ptype=None):
+        """Build a wire packet the way ``make_send_fn`` does."""
+        from dsm.core.protocol import (
+            SEQ_STRUCT,
+            InnerPacket,
+            OuterPacket,
+            PacketType,
+        )
+
+        if ptype is None:
+            ptype = PacketType.DATA
+        n = seq_counter.next()
+        inner = InnerPacket(ptype=ptype, epoch_id=keys.epoch & 0x0F, payload=payload)
+        buf = bytearray(inner.serialize())
+        # Mirror make_send_fn: stamp the live epoch nibble into byte 1.
+        if len(buf) >= 2:
+            buf[1] = (buf[1] & 0x0F) | ((keys.epoch & 0x0F) << 4)
+        nonce, ct, _epoch = keys.encrypt(bytes(buf), SEQ_STRUCT.pack(n))
+        wire = OuterPacket(seq=n, nonce=nonce, ciphertext=ct).serialize()
+        return wire, n
+
+    @staticmethod
+    def _rotate(initiator, responder) -> None:
+        """Drive one full rekey at the SessionKeyManager level (the same
+        two-phase API ``initiate_rekey`` / ``handle_rekey_init`` /
+        ``handle_rekey_ack`` use), advancing both peers one epoch."""
+        new_epoch, init_eph = initiator.initiate_rotation()
+        resp_eph, _prepared = responder.prepare_rotation_responder(
+            bytes(init_eph), new_epoch
+        )
+        responder.apply_rotation_responder()
+        initiator.complete_rotation_initiator(bytes(resp_eph))
+
+    def test_duplicate_packet_dropped_window_still_advances(self) -> None:
+        from dsm.core.protocol import InnerPacket
+        from dsm.session import SequenceCounter, decrypt_packet
+
+        a_keys, b_keys = self._bootstrap_pair()
+        seq = SequenceCounter()
+        replay = tuncore.ReplayWindow()
+
+        wire, n1 = self._frame(a_keys, seq, b"first packet")
+
+        # First delivery succeeds and yields the inner packet.
+        first = decrypt_packet(wire, b_keys, replay)
+        self.assertIsNotNone(first)
+        inner, prev = first  # type: ignore[misc]
+        self.assertIsInstance(inner, InnerPacket)
+        self.assertEqual(inner.payload, b"first packet")
+        self.assertFalse(prev)
+
+        # The window now rejects this seq on a re-check.
+        self.assertFalse(replay.check(n1))
+
+        # Same bytes again → dropped (None), not a second decode.
+        second = decrypt_packet(wire, b_keys, replay)
+        self.assertIsNone(second)
+
+        # A fresh higher-seq packet still decodes — proving the window
+        # advanced rather than blanket-dropping everything after a replay.
+        wire2, _n2 = self._frame(a_keys, seq, b"second packet")
+        third = decrypt_packet(wire2, b_keys, replay)
+        self.assertIsNotNone(third)
+        assert third is not None  # narrow for the index access below
+        self.assertEqual(third[0].payload, b"second packet")
+
+    def test_pre_rekey_packet_rejected_after_epoch_advances(self) -> None:
+        from dsm.session import SequenceCounter, decrypt_packet
+
+        a_keys, b_keys = self._bootstrap_pair()
+        seq = SequenceCounter()
+
+        # Capture a packet's wire bytes under the CURRENT epoch.
+        old_wire, _n = self._frame(a_keys, seq, b"pre-rekey payload")
+        start_epoch = a_keys.epoch
+
+        # Drive TWO full rekeys. One rekey is not enough: the
+        # SessionKeyManager keeps a one-epoch grace window
+        # (decrypt-with-fallback / has_grace_period), so a packet from the
+        # immediately-previous epoch still decrypts by design. After two
+        # rotations the captured packet is two epochs behind — outside the
+        # grace window — and must be dropped.
+        self._rotate(a_keys, b_keys)
+        self._rotate(a_keys, b_keys)
+        self.assertEqual(a_keys.epoch, b_keys.epoch)
+        self.assertEqual(a_keys.epoch - start_epoch, 2)
+
+        # Feed the OLD captured packet to a fresh replay window so the drop
+        # is attributable to the epoch advance, not to the replay check.
+        replay = tuncore.ReplayWindow()
+        self.assertIsNone(decrypt_packet(old_wire, b_keys, replay))
+
+        # Sanity: a freshly-framed packet under the NEW epoch still decodes.
+        fresh_wire, _n2 = self._frame(a_keys, seq, b"post-rekey payload")
+        result = decrypt_packet(fresh_wire, b_keys, replay)
+        self.assertIsNotNone(result)
+        assert result is not None  # narrow for the index access below
+        self.assertEqual(result[0].payload, b"post-rekey payload")
 
 
 if __name__ == "__main__":

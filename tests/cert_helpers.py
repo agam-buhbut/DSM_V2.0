@@ -46,12 +46,8 @@ def make_test_ca(
     the past so freshly-issued leaves with ``not_before == now`` still
     chain inside the CA's validity window."""
     priv = ec.generate_private_key(ec.SECP384R1())
-    now = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
-        seconds=60
-    )
-    name = x509.Name(
-        [x509.NameAttribute(NameOID.COMMON_NAME, common_name)]
-    )
+    now = datetime.datetime.now(datetime.UTC) - datetime.timedelta(seconds=60)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, common_name)])
     cert = (
         x509.CertificateBuilder()
         .subject_name(name)
@@ -99,18 +95,14 @@ def make_leaf_cert(
     """Issue a leaf cert signed by ``ca`` with the DSM
     ``noiseStaticBinding`` extension."""
     if not_before is None:
-        not_before = datetime.datetime.now(datetime.timezone.utc)
+        not_before = datetime.datetime.now(datetime.UTC)
     if not_after is None:
         not_after = not_before + datetime.timedelta(days=validity_days)
 
     leaf_pub = _load_public_key_from_spki_der(leaf_public_spki_der)
     builder = (
         x509.CertificateBuilder()
-        .subject_name(
-            x509.Name(
-                [x509.NameAttribute(NameOID.COMMON_NAME, subject_cn)]
-            )
-        )
+        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, subject_cn)]))
         .issuer_name(ca.certificate.subject)
         .public_key(leaf_pub)
         .serial_number(x509.random_serial_number())
@@ -151,9 +143,7 @@ def make_leaf_cert(
             ),
             critical=binding_critical,
         )
-    return builder.sign(
-        private_key=ca.private_key, algorithm=hashes.SHA384()
-    )
+    return builder.sign(private_key=ca.private_key, algorithm=hashes.SHA384())
 
 
 def _load_public_key_from_spki_der(
@@ -165,9 +155,7 @@ def _load_public_key_from_spki_der(
 
     pub = load_der_public_key(bytes(spki_der))
     if not isinstance(pub, ec.EllipticCurvePublicKey):
-        raise TypeError(
-            f"expected EC pubkey, got {type(pub).__name__}"
-        )
+        raise TypeError(f"expected EC pubkey, got {type(pub).__name__}")
     return pub
 
 
@@ -225,6 +213,4 @@ def make_enrolled_device(
         not_before=not_before,
         not_after=not_after,
     )
-    return EnrolledDevice(
-        identity=identity, attest_key=attest_key, cert=cert
-    )
+    return EnrolledDevice(identity=identity, attest_key=attest_key, cert=cert)

@@ -100,6 +100,10 @@ impl IdentityKeyPair {
     /// opaque host string. If you add a new caller that concatenates
     /// fields, you MUST length-prefix each field (or use a fixed-shape
     /// canonical encoding) before passing — DO NOT let the splits float.
+    ///
+    /// NOTE: currently has no in-tree caller — reserved for the
+    /// known-hosts HMAC path (exposed via PyO3 in lib.rs). Kept
+    /// intentionally; do not assume a live caller exists.
     pub fn compute_hmac(&self, context: &[u8], data: &[u8]) -> Result<[u8; 32], String> {
         let hkdf = Hkdf::<Sha256>::new(Some(b"dsm-known-hosts-hmac-v3-"), self.secret.as_array());
         let mut key = Zeroizing::new([0u8; 32]);

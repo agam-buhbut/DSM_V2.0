@@ -58,6 +58,14 @@ class Config:
     dns_provider_pins: dict[str, list[str]] = field(
         default_factory=dict[str, list[str]]
     )
+    # Pinned CA-root SHA-256 (64-char hex). REQUIRED for the daemon to
+    # start (DSM-005): auth_loader.load_cert_materials refuses to start
+    # without it, so an attacker who can overwrite the on-disk CA PEM
+    # cannot substitute the trust anchor undetected. Format is validated
+    # here; presence is enforced at CA-load time (not in this validator)
+    # so non-daemon commands like `dsm enroll --csr-out` that never load
+    # the CA aren't blocked.
+    ca_root_sha256: str | None = None
     # Optional CRL file (DER or PEM).
     crl_file: str | None = None
     # When True (the default), refuse to start if either:
@@ -232,6 +240,25 @@ def _validate_cert_paths(c: Config) -> None:
             raise ValueError(f"crl_file must be absolute, got {c.crl_file!r}")
 
 
+def _validate_ca_root_sha256(c: Config) -> None:
+    # Format only: when set, must be 64-char hex (a SHA-256 digest).
+    # Presence is REQUIRED for daemon startup but enforced at CA-load time
+    # (auth_loader.load_cert_materials) rather than here, so non-daemon
+    # commands (e.g. `dsm enroll --csr-out`) that never load the CA are not
+    # blocked by config validation.
+    if c.ca_root_sha256 is None:
+        return
+    if len(c.ca_root_sha256) != 64:
+        raise ValueError(
+            f"ca_root_sha256 must be 64 hex chars (SHA-256), "
+            f"got {len(c.ca_root_sha256)}"
+        )
+    try:
+        bytes.fromhex(c.ca_root_sha256)
+    except ValueError as e:
+        raise ValueError("ca_root_sha256 is not valid hex") from e
+
+
 def _validate_role_specific(c: Config) -> None:
     if c.mode == "client":
         if not c.expected_server_cn:
@@ -324,7 +351,8 @@ def _validate_pmtu_interval(c: Config) -> None:
     # is intentionally permissive so unit tests can drive the loop fast.
     if not (0.0 < c.pmtu_check_interval_s <= 3600.0):
         raise ValueError(
-            f"pmtu_check_interval_s must be in (0, 3600] s, got {c.pmtu_check_interval_s}"
+            "pmtu_check_interval_s must be in (0, 3600] s, "
+            f"got {c.pmtu_check_interval_s}"
         )
 
 
@@ -339,6 +367,7 @@ _VALIDATORS = (
     _validate_transport,
     _validate_dns,
     _validate_cert_paths,
+    _validate_ca_root_sha256,
     _validate_role_specific,
     _validate_padding,
     _validate_jitter,

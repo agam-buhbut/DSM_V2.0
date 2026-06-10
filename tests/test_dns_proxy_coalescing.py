@@ -136,11 +136,14 @@ class TestInflightCoalescing(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-        self.assertEqual(stub.calls, 10, "expected one upstream resolve per distinct qname")
+        self.assertEqual(
+            stub.calls, 10, "expected one upstream resolve per distinct qname"
+        )
         self.assertEqual(len(sent), 10)
 
     async def test_coalesced_failure_propagates_to_all_callers(self) -> None:
-        """Five concurrent identical queries should all get SERVFAIL from one failed call."""
+        """Five concurrent identical queries should all get SERVFAIL from
+        one failed call."""
         stub = _RaisingResolver(sleep=0.02)
         proxy = LocalDNSProxy(stub, bind_ip="127.0.0.1")  # type: ignore[arg-type]
         sent: list[tuple[bytes, tuple[str, int]]] = []
@@ -156,12 +159,15 @@ class TestInflightCoalescing(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-        self.assertEqual(stub.calls, 1, "expected exactly one upstream call despite 5 callers")
+        self.assertEqual(
+            stub.calls, 1, "expected exactly one upstream call despite 5 callers"
+        )
         self.assertEqual(len(sent), 5, "expected every caller to receive a response")
         for raw, _addr in sent:
             resp = _parse_response(raw)
             self.assertEqual(
-                resp.rcode(), dns.rcode.SERVFAIL,
+                resp.rcode(),
+                dns.rcode.SERVFAIL,
                 "coalesced failure must propagate as SERVFAIL to every caller",
             )
 
@@ -195,7 +201,8 @@ class TestSemaphoreBounds(unittest.IsolatedAsyncioTestCase):
             # 10 tasks, 2 at a time, 0.1s each => 5 batches => ~0.5s floor.
             # Allow small slack for scheduler jitter.
             self.assertGreaterEqual(
-                elapsed, 0.45,
+                elapsed,
+                0.45,
                 f"semaphore did not serialize: took {elapsed:.3f}s, expected >=0.45s",
             )
             self.assertEqual(stub.calls, 10)
@@ -214,7 +221,9 @@ class TestInflightCleanup(unittest.IsolatedAsyncioTestCase):
             sent.append((wire, to))
 
         await proxy._handle_query(
-            _build_query_wire("example.com"), ("127.0.0.1", 12345), _send,
+            _build_query_wire("example.com"),
+            ("127.0.0.1", 12345),
+            _send,
         )
 
         # Key should have been removed in the finally block.
@@ -230,7 +239,9 @@ class TestInflightCleanup(unittest.IsolatedAsyncioTestCase):
             sent.append((wire, to))
 
         await proxy._handle_query(
-            _build_query_wire("broken.example"), ("127.0.0.1", 12345), _send,
+            _build_query_wire("broken.example"),
+            ("127.0.0.1", 12345),
+            _send,
         )
 
         # Even on upstream failure the finally clause must clear the entry.

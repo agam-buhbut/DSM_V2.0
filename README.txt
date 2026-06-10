@@ -94,9 +94,17 @@ Key Exchange:
 - Handshake messages padded to 1400 bytes (constant size)
 - Each peer carries a CA-signed device cert (X.509, ECDSA P-256 leaf
   signed by an internal P-384 CA) inside the Noise XX msg2/msg3 payload
-- The cert binds the device's hardware-bound ECDSA signing pubkey AND
+- The cert binds the device's ECDSA attestation signing pubkey AND
   the device's X25519 Noise static (via custom critical extension
   id-dsm-noiseStaticBinding 1.3.6.1.4.1.99999.1.1)
+- ATTESTATION CAVEAT: the shipped/default build uses the SOFTWARE
+  attest backend (`dev-soft-attest`). Its ECDSA P-256 attest key is
+  Argon2id-wrapped on disk but EXTRACTABLE from process memory by anyone
+  who can execute code as the dsm user. It is NOT hardware-bound today.
+  Hardware binding (TPM 2.0 on Linux, Android Keystore/StrongBox on
+  Android) is PLANNED (Phase 1 step 5), not implemented. Treat the
+  cert/attest binding as a software credential, not a hardware root of
+  trust, in device-theft reasoning.
 - Per-handshake binding signature over the Noise handshake hash +
   remote_static + role, signed by the attest key — replay-resistant
 - Server enforces a CN allowlist (one CN per line in allowed_cns_file);
@@ -231,6 +239,11 @@ Parameters:
 - key_file: path to Argon2id-wrapped X25519 Noise static key
 - cert_file: path to the device's CA-signed leaf cert (PEM or DER)
 - ca_root_file: path to the pinned CA root cert (PEM)
+- ca_root_sha256: REQUIRED. 64-hex SHA-256 of ca_root_file. The daemon
+  refuses to start if unset, and rejects a ca_root_file whose hash does
+  not match — pinning the trust anchor so a swapped on-disk CA PEM is
+  fatal at startup, not silently trusted. Compute with:
+  `sha256sum <ca_root_file> | cut -d' ' -f1`
 - attest_key_file: path to Argon2id-wrapped ECDSA P-256 attest key
 - crl_file: optional path to the CA's CRL (PEM or DER)
 - crl_strict: bool (default: true). When true (the default), refuse
@@ -336,12 +349,18 @@ ROADMAP
 
 The current build (Phase 1 + Phase 2A) ships single-client, single-server,
 Linux-only with cert-based auth (CA-signed device certs binding the
-hardware ECDSA attest key to the X25519 Noise static via a custom
-critical X.509 extension). Live items on the punch list:
+ECDSA attest key to the X25519 Noise static via a custom critical X.509
+extension). The default attest backend is SOFTWARE (`dev-soft-attest`):
+the attest key is extractable from process memory, NOT hardware-bound —
+hardware binding is the Phase 1 step 5 item below. Live items on the
+punch list:
 
 - Phase 1 step 5 — TPM 2.0 attest backend (`tpm-attest` Cargo feature
-  via tss-esapi). Parked until TPM hardware is available for empirical
-  testing; the soft attest backend is the default and works end-to-end.
+  via tss-esapi). This is what makes the attest key hardware-bound and
+  non-extractable; until it lands, the default soft backend's key can be
+  lifted with code execution. Parked until TPM hardware is available for
+  empirical testing; the soft attest backend is the default and works
+  end-to-end.
 - Phase 2B — real-network demo on two physical Linux boxes across two
   ISPs (home Wi-Fi server + cellular client). Procedure in
   deploy/GUIDE.txt §9; once the strace-audit step there closes,

@@ -23,15 +23,19 @@ from pathlib import Path
 from dsm.core import netaudit
 from dsm.core._validators import LINUX_IFACE_NAME_RE as _IFACE_NAME_RE
 
+# VPN fwmark to prevent routing loops. Single source of truth lives in the
+# transport layer (_fwmark.SO_MARK_VALUE) so the SO_MARK set on the socket and
+# the ip-rule / nftables match here cannot drift apart. The nftables templates
+# (nftables/*.conf: `meta mark 0x1`) hard-code the same literal and MUST stay
+# in sync with this value.
+from dsm.net.transport._fwmark import SO_MARK_VALUE as FWMARK
+
 log = logging.getLogger(__name__)
 
 # ioctl constants for TUN/TAP (Linux)
 TUNSETIFF = 0x400454CA
 IFF_TUN = 0x0001
 IFF_NO_PI = 0x1000  # No packet info header
-
-# VPN fwmark to prevent routing loops
-FWMARK = 0x1
 
 
 def _run_commands(cmds: list[list[str]], *, strict: bool = True) -> None:
@@ -105,7 +109,9 @@ class TunDevice:
                     continue
                 sysctl_path = Path(f"/proc/sys/net/ipv6/conf/{iface}/disable_ipv6")
                 try:
-                    state[iface] = sysctl_path.read_text().strip() == "1"
+                    state[iface] = (
+                        sysctl_path.read_text().strip() == "1"
+                    )  # pylint: disable=unspecified-encoding  # FLAGGED: explicit encoding= (see report)
                 except OSError:
                     # Some virtual interfaces (e.g., removed between iterdir
                     # and read) or IPv6-less kernels won't have this knob.
@@ -139,7 +145,7 @@ class TunDevice:
                 mode=0o600,
             )
             log.debug("saved IPv6 state to %s", self._IPV6_STATE_PATH)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  # see linter report
             log.warning("failed to save IPv6 state: %s", e)
 
     def _restore_ipv6_state(self) -> None:
@@ -158,7 +164,9 @@ class TunDevice:
             log.debug("no IPv6 state file found, skipping restore")
             return
         try:
-            with open(self._IPV6_STATE_PATH, "r") as f:
+            with open(
+                self._IPV6_STATE_PATH
+            ) as f:  # pylint: disable=unspecified-encoding  # FLAGGED: explicit encoding= (see report)
                 raw_state: object = json.load(f)
             if not isinstance(raw_state, dict):
                 log.warning(
@@ -191,7 +199,7 @@ class TunDevice:
                 _run_commands(cmds, strict=False)
             self._IPV6_STATE_PATH.unlink(missing_ok=True)
             log.debug("restored IPv6 state from %s", self._IPV6_STATE_PATH)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  # see linter report
             log.warning("failed to restore IPv6 state: %s", e)
 
     def open(self) -> None:
@@ -246,7 +254,7 @@ class TunDevice:
             "priority",
             "10",
         ]
-        subprocess.run(
+        subprocess.run(  # pylint: disable=subprocess-run-check  # FLAGGED: explicit check= (see report)
             ["ip", "rule", "del", *rule_args],
             capture_output=True,
             timeout=5,
@@ -328,7 +336,7 @@ class TunDevice:
                     fut.set_result(data)
             except BlockingIOError:
                 pass  # Spurious wakeup
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001  # see linter report
                 if not fut.done():
                     fut.set_exception(e)
 

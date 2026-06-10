@@ -16,8 +16,8 @@ import unittest
 
 from dsm.core.protocol import (
     INNER_HEADER_SIZE,
-    MAX_FRAGMENTS,
     MAX_FRAGMENTABLE_PACKET,
+    MAX_FRAGMENTS,
     MAX_INNER_PAYLOAD_ON_WIRE,
     Fragment,
     PacketType,
@@ -65,7 +65,9 @@ class TestFragmenter(unittest.TestCase):
             # FRAGMENT_HEADER_SIZE + fragment data. Bounded by wire budget.
             self.assertLessEqual(len(ip.payload), MAX_INNER_PAYLOAD_ON_WIRE)
             raw = ip.serialize()
-            self.assertLessEqual(len(raw), INNER_HEADER_SIZE + MAX_INNER_PAYLOAD_ON_WIRE)
+            self.assertLessEqual(
+                len(raw), INNER_HEADER_SIZE + MAX_INNER_PAYLOAD_ON_WIRE
+            )
 
     def test_roundtrip_via_reassembly_buffer(self) -> None:
         payload = bytes((i * 7 + 3) & 0xFF for i in range(2500))

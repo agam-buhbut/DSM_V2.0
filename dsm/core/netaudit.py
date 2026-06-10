@@ -44,7 +44,9 @@ _log.propagate = False
 # Default: muted. configure(True) raises level + attaches a handler.
 _log.setLevel(logging.CRITICAL + 1)
 
-_enabled = False
+_enabled = (
+    False  # pylint: disable=invalid-name  # intentional/false positive (see report)
+)
 
 
 def is_enabled() -> bool:
@@ -65,7 +67,7 @@ def configure(enabled: bool) -> None:
         if not any(getattr(h, "_dsm_netaudit", False) for h in _log.handlers):
             handler = logging.StreamHandler(sys.stderr)
             handler.setFormatter(logging.Formatter("%(message)s"))
-            handler._dsm_netaudit = True  # type: ignore[attr-defined]
+            handler._dsm_netaudit = True  # type: ignore[attr-defined]  # pylint: disable=protected-access  # intentional sibling-internal access
             _log.addHandler(handler)
         _log.setLevel(logging.INFO)
     else:
@@ -93,7 +95,7 @@ def emit(event: str, **fields: Any) -> None:
     if not _enabled:
         return
     payload = {
-        "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "ts": datetime.datetime.now(datetime.UTC).isoformat(),
         "event": event,
         **fields,
     }
@@ -104,7 +106,7 @@ def emit(event: str, **fields: Any) -> None:
         # event so the operator can see the audit had a hole.
         line = json.dumps(
             {
-                "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "ts": datetime.datetime.now(datetime.UTC).isoformat(),
                 "event": "audit_serialization_error",
                 "original_event": event,
             }

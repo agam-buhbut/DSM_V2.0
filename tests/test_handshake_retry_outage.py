@@ -32,7 +32,6 @@ from dsm.crypto.handshake import (
     server_handshake,
 )
 from dsm.net.transport.udp import UDPTransport
-
 from tests.cert_helpers import (
     CLIENT_AUTH_OID,
     SERVER_AUTH_OID,
@@ -150,7 +149,9 @@ class TestHandshakeRetryUnderOutage(unittest.IsolatedAsyncioTestCase):
 
         # We dropped exactly 1 send. Client must have retransmitted.
         self.assertEqual(transport.sends_dropped, 1)
-        self.assertGreaterEqual(transport.sends_passed, 2)  # msg1 retry + msg3 + maybe bootstrap
+        self.assertGreaterEqual(
+            transport.sends_passed, 2
+        )  # msg1 retry + msg3 + maybe bootstrap
 
         # Both sides converged on session keys. M-BUG-1: client_handshake
         # returns 3-tuple incl. server's noise static pub.

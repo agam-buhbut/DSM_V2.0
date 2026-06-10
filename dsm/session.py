@@ -9,9 +9,9 @@ import asyncio
 import logging
 import os
 import time
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING
 
 from dsm.core import netaudit
 from dsm.core.config import MIN_TUN_MTU, Config
@@ -58,6 +58,17 @@ LIVENESS_CHECK_INTERVAL = 5.0  # cadence at which liveness_loop wakes
 # discovered path MTU to size the inner TUN MTU.
 WIRE_OVERHEAD = 68
 
+# Outer header layout: seq(SEQ_STRUCT.size=8) ‖ nonce(12) ‖ ciphertext, with
+# the nonce occupying the bytes between the sequence number and the start of
+# the ciphertext (OUTER_HEADER_SIZE=20). Derived from the imported protocol
+# constants so it tracks any future header change; the assert pins today's
+# 12-byte AES-GCM nonce.
+NONCE_OFFSET = (
+    SEQ_STRUCT.size
+)  # pylint: disable=invalid-name  # intentional/false positive (see report)
+NONCE_SIZE = OUTER_HEADER_SIZE - SEQ_STRUCT.size
+assert NONCE_SIZE == 12
+
 # auto-MTU adapter: how many consecutive same-or-higher path-MTU
 # observations are required before raising the TUN MTU back toward
 # config.mtu. Guards against transient PMTU bumps causing flap.
@@ -103,7 +114,9 @@ def setup_signal_handlers(shutdown: asyncio.Event) -> None:
 
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT):
-        loop.add_signal_handler(sig, _on_signal, sig.name)
+        loop.add_signal_handler(
+            sig, _on_signal, sig.name
+        )  # pylint: disable=no-member  # enum .name false positive
 
 
 # Outer sequence number is wire-encoded as `!Q` (uint64 big-endian), so
@@ -224,7 +237,19 @@ def make_send_fn(
         if isinstance(transport, UDPTransport):
             addr = dest_addr()
             if addr is None:
-                raise RuntimeError("UDP send requires destination address")
+                # DSM-002: destination addr not yet known (the server has no
+                # peer addr until the first authenticated client packet sets
+                # it via post_authenticate). Raising here escapes the detached
+                # SendScheduler task and silently kills it — stopping ALL
+                # egress incl. chaff with no shutdown signal. Mirror the
+                # seq/nonce-exhaustion paths: log, trigger shutdown, drop.
+                log.error(
+                    "UDP send before destination addr known — "
+                    "dropping packet and triggering shutdown"
+                )
+                if shutdown is not None:
+                    shutdown.set()
+                return
             await transport.send(wire, addr)
         else:
             await transport.send(wire)
@@ -306,7 +331,9 @@ def decrypt_packet(
         log.debug("replay detected, dropping seq=%d", seq)
         return None
 
-    nonce_bytes = data[8:20]
+    # nonce sits between the 8-byte seq and the ciphertext; see NONCE_OFFSET
+    # / NONCE_SIZE. Byte-identical to the former data[8:20].
+    nonce_bytes = data[NONCE_OFFSET : NONCE_OFFSET + NONCE_SIZE]
     ciphertext = data[OUTER_HEADER_SIZE:]
     aad = SEQ_STRUCT.pack(seq)
 
@@ -489,6 +516,7 @@ async def _handle_rekey_ack(ctx: DataPathContext, inner: InnerPacket) -> None:
 
 
 async def _handle_session_close(ctx: DataPathContext, inner: InnerPacket) -> None:
+    # pylint: disable=unused-argument  # signature fixed by the _DISPATCH table
     ctx.shutdown.set()
 
 
@@ -517,8 +545,12 @@ async def send_session_close(ctx: DataPathContext) -> None:
     """
     try:
         padded, target_size = _build_control_packet(ctx, PacketType.SESSION_CLOSE)
-        await ctx.send_fn(padded, target_size)
-    except Exception as e:
+        # DSM-024: bound the send so a wedged peer or TCP backpressure cannot
+        # pin the teardown. send_session_close runs in run_data_loops' finally,
+        # BEFORE the caller unwinds nft/tun/resolv; an unbounded drain here
+        # would delay the whole leak-safe teardown. Mirrors the rekey sends.
+        await asyncio.wait_for(ctx.send_fn(padded, target_size), timeout=5.0)
+    except Exception as e:  # noqa: BLE001  # see linter report
         # Debug-level: the peer being gone at shutdown is the common case
         # (we may be shutting down BECAUSE the peer disappeared). Warning
         # would be noise on every disconnect.
@@ -526,6 +558,7 @@ async def send_session_close(ctx: DataPathContext) -> None:
 
 
 async def _handle_noop(ctx: DataPathContext, inner: InnerPacket) -> None:
+    # pylint: disable=unused-argument  # signature fixed by the _DISPATCH table
     """No-op for CHAFF and KEEPALIVE — liveness is accounted in recv_loop."""
 
 
@@ -561,7 +594,7 @@ async def liveness_loop(ctx: DataPathContext) -> None:
         try:
             await asyncio.wait_for(ctx.shutdown.wait(), timeout=LIVENESS_CHECK_INTERVAL)
             return
-        except asyncio.TimeoutError:
+        except TimeoutError:
             pass
 
         now = time.monotonic()
@@ -650,7 +683,7 @@ async def run_data_loops(
                         transport.recv(),
                         timeout=0.1,
                     )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 session_keys.tick()
                 continue
             except ConnectionError as e:
@@ -672,12 +705,35 @@ async def run_data_loops(
             inner, _prev_epoch = result
             await dispatch_inner(ctx, inner)
 
+    async def _supervised(coro: Awaitable[None], name: str) -> None:
+        # DSM-001: contain each loop so one loop's terminal exception cannot
+        # orphan its siblings. asyncio.gather() does NOT cancel the other
+        # awaitables when one raises a non-CancelledError — it surfaces the
+        # first exception while the rest keep running as detached tasks. For
+        # the data loops that means recv/liveness/auto_mtu would keep
+        # decrypting and writing the TUN while the caller's AsyncExitStack
+        # tears down the fd/route/kill-switch — a use-after-teardown leak
+        # window. Containing each loop here means any terminal error sets
+        # ctx.shutdown (siblings then exit on their next ~0.1s poll) and is
+        # swallowed AFTER logging, so gather() returns only once every loop
+        # has actually stopped. CancelledError is NOT an Exception, so an
+        # external AsyncExitStack cancel still propagates and unwinds gather.
+        try:
+            await coro
+        except Exception:
+            log.error(
+                "data loop %r terminated unexpectedly — shutting down session",
+                name,
+                exc_info=True,
+            )
+            ctx.shutdown.set()
+
     try:
         await asyncio.gather(
-            recv_loop(),
-            tun_send_loop(ctx),
-            liveness_loop(ctx),
-            *extra_loops,
+            _supervised(recv_loop(), "recv"),
+            _supervised(tun_send_loop(ctx), "tun_send"),
+            _supervised(liveness_loop(ctx), "liveness"),
+            *(_supervised(c, f"extra[{i}]") for i, c in enumerate(extra_loops)),
         )
     except asyncio.CancelledError:
         pass
@@ -724,7 +780,7 @@ async def auto_mtu_loop(
                 timeout=config.pmtu_check_interval_s,
             )
             return  # shutdown
-        except asyncio.TimeoutError:
+        except TimeoutError:
             pass
 
         path_mtu = transport.get_path_mtu()
@@ -736,7 +792,7 @@ async def auto_mtu_loop(
         if usable < current:
             try:
                 ctx.tun.set_mtu(usable)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001  # see linter report
                 log.warning("auto_mtu: set_mtu(%d) failed: %s", usable, e)
                 continue
             log.info(
@@ -759,12 +815,13 @@ async def auto_mtu_loop(
             if rises_observed >= AUTO_MTU_HYSTERESIS_RISES:
                 try:
                     ctx.tun.set_mtu(usable)
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001  # see linter report
                     log.warning("auto_mtu: set_mtu(%d) failed: %s", usable, e)
                     rises_observed = 0
                     continue
                 log.info(
-                    "auto_mtu: raised tun mtu %d -> %d after %d stable observations (kernel pmtu=%d)",
+                    "auto_mtu: raised tun mtu %d -> %d after %d stable "
+                    "observations (kernel pmtu=%d)",
                     current,
                     usable,
                     rises_observed,
@@ -863,7 +920,7 @@ async def tun_send_loop(ctx: DataPathContext) -> None:
 
         try:
             pkt = await asyncio.wait_for(ctx.tun.read(), timeout=0.1)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             continue
 
         epoch_id = ctx.session_keys.epoch & 0x0F

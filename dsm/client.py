@@ -11,6 +11,7 @@ from cryptography.x509.oid import ExtendedKeyUsageOID
 from dsm.core import netaudit
 from dsm.core.config import Config
 from dsm.core.fsm import SessionFSM, State
+from dsm.core.protocol import ReassemblyBuffer
 from dsm.crypto.attest_store import AttestStore
 from dsm.crypto.auth_loader import (
     AuthMaterialsError,
@@ -28,12 +29,6 @@ from dsm.net.resolv_conf import ResolvConfManager
 from dsm.net.transport.tcp import TCPTransport
 from dsm.net.transport.udp import UDPTransport
 from dsm.net.tunnel import TunDevice
-
-# Re-export under the historical name for any external code that imports
-# `dsm.client.VPN_DNS_SERVER`. Internal uses go through SERVER_TUN_IP.
-VPN_DNS_SERVER = SERVER_TUN_IP
-
-from dsm.core.protocol import ReassemblyBuffer
 from dsm.session import (
     DataPathContext,
     LivenessState,
@@ -45,6 +40,10 @@ from dsm.session import (
 )
 from dsm.traffic.scheduler import SendScheduler
 from dsm.traffic.shaper import TrafficShaper, make_chaff_packet
+
+# Re-export under the historical name for any external code that imports
+# `dsm.client.VPN_DNS_SERVER`. Internal uses go through SERVER_TUN_IP.
+VPN_DNS_SERVER = SERVER_TUN_IP
 
 log = logging.getLogger(__name__)
 
@@ -65,7 +64,7 @@ async def run_client(
 
     try:
         tuncore.harden_process()
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  # see linter report
         log.warning(
             "process hardening partially failed: %s — continuing without it. "
             "Ensure the service has CAP_SYS_RESOURCE and unrestricted prctl.",
@@ -160,12 +159,14 @@ async def run_client(
         # (subclasses before parent classes is irrelevant here because
         # every entry is checked by isinstance via the tuple, and the
         # log prefix is then resolved from the concrete class).
-        _CLIENT_HANDSHAKE_ERR_LABELS: dict[type[BaseException], str] = {
-            CNMismatchError: "server CN check failed",
-            CertRevokedError: "server cert revoked",
-            CertAuthError: "server cert auth failed",
-            HandshakeError: "handshake failed",
-        }
+        _CLIENT_HANDSHAKE_ERR_LABELS: dict[type[BaseException], str] = (
+            {  # pylint: disable=invalid-name  # intentional/false positive (see report)
+                CNMismatchError: "server CN check failed",
+                CertRevokedError: "server cert revoked",
+                CertAuthError: "server cert auth failed",
+                HandshakeError: "handshake failed",
+            }
+        )
 
         assert (
             config.expected_server_cn is not None
@@ -260,7 +261,7 @@ async def run_client(
                 # let the outer except undo tun.
                 try:
                     nft.remove()
-                except Exception:
+                except Exception:  # noqa: BLE001  # see linter report
                     log.warning("nft.remove during failed apply also failed")
                 raise
         except Exception:
@@ -269,7 +270,7 @@ async def run_client(
             # registered the cleanup.
             try:
                 tun.close()
-            except Exception:
+            except Exception:  # noqa: BLE001  # see linter report
                 log.warning("tun.close during failed apply also failed")
             raise
 

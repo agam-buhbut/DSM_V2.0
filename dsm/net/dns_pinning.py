@@ -48,7 +48,9 @@ def verify_pin(der_cert: bytes, expected_pins: list[bytes], provider: str) -> No
     )
 
 
-def verify_pin_on_ssl_object(ssl_obj: Any, expected_pins: list[bytes], provider: str) -> None:
+def verify_pin_on_ssl_object(
+    ssl_obj: Any, expected_pins: list[bytes], provider: str
+) -> None:
     """Extract peer cert from an SSL object and verify its SPKI pin."""
     der = ssl_obj.getpeercert(binary_form=True)
     if not der:

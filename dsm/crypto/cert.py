@@ -68,7 +68,6 @@ def check_strong_signature_hash(
         )
 
 
-
 # Custom OID for the X25519 Noise-static-key binding extension.
 # Experimental arc — renumber to a registered IANA Private Enterprise
 # Number before any rollout that interoperates with non-DSM software.
@@ -106,7 +105,8 @@ def encode_noise_static_binding_value(noise_static_pub: bytes) -> bytes:
     binding extension's ``extnValue``. Used by the issuing/CSR side."""
     if len(noise_static_pub) != NOISE_STATIC_PUB_LEN:
         raise ValueError(
-            f"noise_static_pub must be {NOISE_STATIC_PUB_LEN} bytes, got {len(noise_static_pub)}"
+            f"noise_static_pub must be {NOISE_STATIC_PUB_LEN} bytes, "
+            f"got {len(noise_static_pub)}"
         )
     return _OCTET_STRING_PREFIX + bytes(noise_static_pub)
 
@@ -117,9 +117,10 @@ def _decode_noise_static_binding_value(raw: bytes) -> bytes:
     if len(raw) != expected_total or not raw.startswith(_OCTET_STRING_PREFIX):
         raise CertBindingError(
             "noiseStaticBinding extension malformed: "
-            f"expected DER OCTET STRING ({_OCTET_STRING_TAG:#04x} {NOISE_STATIC_PUB_LEN:#04x} || 32 bytes)"
+            f"expected DER OCTET STRING ({_OCTET_STRING_TAG:#04x} "
+            f"{NOISE_STATIC_PUB_LEN:#04x} || 32 bytes)"
         )
-    return bytes(raw[len(_OCTET_STRING_PREFIX):])
+    return bytes(raw[len(_OCTET_STRING_PREFIX) :])
 
 
 @dataclass(frozen=True)
@@ -189,9 +190,7 @@ class DeviceCert:
     def subject_cn(self) -> str:
         cns = self.cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
         if len(cns) != 1:
-            raise CertError(
-                f"cert subject must have exactly one CN, got {len(cns)}"
-            )
+            raise CertError(f"cert subject must have exactly one CN, got {len(cns)}")
         value = cns[0].value
         if not isinstance(value, str):
             raise CertError("cert CN must be a string attribute")
@@ -207,9 +206,7 @@ class DeviceCert:
                 DSM_NOISE_STATIC_BINDING_OID
             )
         except x509.ExtensionNotFound as e:
-            raise CertBindingError(
-                "cert missing noiseStaticBinding extension"
-            ) from e
+            raise CertBindingError("cert missing noiseStaticBinding extension") from e
         if not ext.critical:
             raise CertBindingError(
                 "noiseStaticBinding extension must be marked critical"
@@ -225,8 +222,7 @@ class DeviceCert:
         pk = self.cert.public_key()
         if not isinstance(pk, EllipticCurvePublicKey):
             raise CertError(
-                "cert public key must be ECDSA (got "
-                f"{type(pk).__name__})"
+                "cert public key must be ECDSA (got " f"{type(pk).__name__})"
             )
         return pk
 
@@ -247,6 +243,7 @@ def load_ca_root(
     path: Path,
     *,
     expected_sha256: bytes | None = None,
+    now: datetime.datetime | None = None,
 ) -> x509.Certificate:
     """Load and structurally validate a CA root from a PEM file.
 
@@ -254,7 +251,13 @@ def load_ca_root(
     it byte-for-byte. This pin defends against an attacker who can
     overwrite the on-disk CA cert: a hash mismatch refuses startup.
 
-    Raises ``CertChainError`` on any failure.
+    Also enforces (DSM-010) that the CA asserts ``basicConstraints
+    CA:TRUE``, carries ``keyUsage keyCertSign``, and is within its own
+    validity window. ``now`` defaults to the current UTC time and is
+    injectable for tests.
+
+    Raises ``CertChainError`` on a structural/trust failure, or
+    ``CertExpiredError`` if the CA is outside its validity window.
     """
     raw = path.read_bytes()
     if expected_sha256 is not None:
@@ -267,21 +270,39 @@ def load_ca_root(
     try:
         ca = x509.load_pem_x509_certificate(raw)
     except ValueError as e:
-        raise CertChainError(
-            f"failed to parse CA root at {path}: {e}"
-        ) from e
+        raise CertChainError(f"failed to parse CA root at {path}: {e}") from e
     try:
-        bc = ca.extensions.get_extension_for_class(
-            x509.BasicConstraints
-        ).value
+        bc = ca.extensions.get_extension_for_class(x509.BasicConstraints).value
     except x509.ExtensionNotFound as e:
-        raise CertChainError(
-            "CA root missing basicConstraints extension"
-        ) from e
+        raise CertChainError("CA root missing basicConstraints extension") from e
     if not bc.ca:
-        raise CertChainError(
-            "CA root must have basicConstraints CA:TRUE"
+        raise CertChainError("CA root must have basicConstraints CA:TRUE")
+
+    # DSM-010: enforce the CA's own validity window — a pinned root is
+    # otherwise trusted forever, so an expired root would keep validating
+    # leaves indefinitely.
+    if now is None:
+        now = datetime.datetime.now(datetime.UTC)
+    if now < ca.not_valid_before_utc:
+        raise CertExpiredError(
+            f"CA root not yet valid (not_before="
+            f"{ca.not_valid_before_utc.isoformat()}, now={now.isoformat()})"
         )
+    if now > ca.not_valid_after_utc:
+        raise CertExpiredError(
+            f"CA root expired (not_after="
+            f"{ca.not_valid_after_utc.isoformat()}, now={now.isoformat()})"
+        )
+
+    # DSM-010: the CA must assert keyCertSign in keyUsage (it signs leaf
+    # certs). Strict — the extension must be present.
+    try:
+        ca_ku = ca.extensions.get_extension_for_class(x509.KeyUsage).value
+    except x509.ExtensionNotFound as e:
+        raise CertChainError("CA root missing keyUsage extension") from e
+    if not ca_ku.key_cert_sign:
+        raise CertChainError("CA root keyUsage must assert keyCertSign")
+
     return ca
 
 
@@ -302,7 +323,7 @@ def validate_chain(
         CertBindingError if the binding extension is missing/malformed.
     """
     if now is None:
-        now = datetime.datetime.now(datetime.timezone.utc)
+        now = datetime.datetime.now(datetime.UTC)
 
     # 1. Issuer / subject DN match.
     if leaf.cert.issuer != ca_root.subject:
@@ -331,9 +352,7 @@ def validate_chain(
             ECDSA(sig_alg),
         )
     except InvalidSignature as e:
-        raise CertChainError(
-            "leaf signature does not verify under CA pubkey"
-        ) from e
+        raise CertChainError("leaf signature does not verify under CA pubkey") from e
 
     # 3. Validity window.
     if now < leaf.not_before:
@@ -355,13 +374,22 @@ def validate_chain(
                 x509.ExtendedKeyUsage
             ).value
         except x509.ExtensionNotFound as e:
-            raise CertChainError(
-                "leaf missing extendedKeyUsage extension"
-            ) from e
+            raise CertChainError("leaf missing extendedKeyUsage extension") from e
         if required_eku not in list(eku):
             raise CertChainError(
                 f"leaf EKU does not include {required_eku.dotted_string}"
             )
+
+    # 4b. keyUsage (DSM-010): the leaf signs the per-handshake binding
+    #     attestation (a digitalSignature use). Strict — the extension
+    #     must be present AND assert digitalSignature; a leaf with no
+    #     keyUsage, or one that forbids digitalSignature, is rejected.
+    try:
+        ku = leaf.cert.extensions.get_extension_for_class(x509.KeyUsage).value
+    except x509.ExtensionNotFound as e:
+        raise CertChainError("leaf missing keyUsage extension") from e
+    if not ku.digital_signature:
+        raise CertChainError("leaf keyUsage must assert digitalSignature")
 
     # 5. Force binding-extension validation; this raises if absent or
     #    malformed, so callers downstream can rely on
@@ -379,13 +407,9 @@ def validate_chain(
             x509.BasicConstraints,
         )
     except x509.ExtensionNotFound as e:
-        raise CertChainError(
-            "leaf missing basicConstraints extension"
-        ) from e
+        raise CertChainError("leaf missing basicConstraints extension") from e
     if not bc_ext.critical:
-        raise CertChainError(
-            "leaf basicConstraints extension must be marked critical"
-        )
+        raise CertChainError("leaf basicConstraints extension must be marked critical")
     if bc_ext.value.ca:
         raise CertChainError(
             "leaf cert has basicConstraints CA:TRUE — only end-entity "

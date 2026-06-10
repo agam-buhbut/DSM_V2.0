@@ -9,16 +9,6 @@ from pathlib import Path
 
 from cryptography.x509.oid import ExtendedKeyUsageOID
 
-# Backoff parameters for failed handshake retries. UDP retries cycle very
-# fast because there's no kernel-side rate limit on bad packets reaching
-# the handshake coroutine; TCP retries are gated by the kernel's accept
-# queue but a malicious peer racing the listen() can still burn slots in
-# a tight loop. A small jittered sleep between retries gives legitimate
-# clients a chance to win against a flood.
-_HANDSHAKE_RETRY_BACKOFF_BASE = 0.5  # seconds
-_HANDSHAKE_RETRY_BACKOFF_MAX = 5.0  # seconds
-_HANDSHAKE_RETRY_BACKOFF_JITTER = 0.5  # ±this fraction of base
-
 from dsm.core import netaudit
 from dsm.core.config import Config
 from dsm.core.fsm import SessionFSM, State
@@ -50,6 +40,16 @@ from dsm.session import (
 from dsm.traffic.scheduler import SendScheduler
 from dsm.traffic.shaper import TrafficShaper, make_chaff_packet
 
+# Backoff parameters for failed handshake retries. UDP retries cycle very
+# fast because there's no kernel-side rate limit on bad packets reaching
+# the handshake coroutine; TCP retries are gated by the kernel's accept
+# queue but a malicious peer racing the listen() can still burn slots in
+# a tight loop. A small jittered sleep between retries gives legitimate
+# clients a chance to win against a flood.
+_HANDSHAKE_RETRY_BACKOFF_BASE = 0.5  # seconds
+_HANDSHAKE_RETRY_BACKOFF_MAX = 5.0  # seconds
+_HANDSHAKE_RETRY_BACKOFF_JITTER = 0.5  # ±this fraction of base
+
 log = logging.getLogger(__name__)
 
 
@@ -63,7 +63,7 @@ async def run_server(
 
     try:
         tuncore.harden_process()
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  # see linter report
         log.warning(
             "process hardening partially failed: %s — continuing without it. "
             "Ensure the service has CAP_SYS_RESOURCE and unrestricted prctl.",
@@ -250,7 +250,8 @@ async def run_server(
                     error=err_name,
                     message=str(e),
                 )
-                # Reset FSM for the next attempt: HANDSHAKING → TEARDOWN → IDLE → CONNECTING.
+                # Reset FSM for the next attempt:
+                # HANDSHAKING → TEARDOWN → IDLE → CONNECTING.
                 fsm.transition(State.TEARDOWN)
                 fsm.transition(State.IDLE)
                 fsm.transition(State.CONNECTING)
@@ -275,7 +276,7 @@ async def run_server(
                 try:
                     await asyncio.wait_for(shutdown.wait(), timeout=delay)
                     return  # shutdown arrived during backoff
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     pass
 
         if (

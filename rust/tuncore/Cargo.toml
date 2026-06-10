@@ -12,8 +12,13 @@ default = ["dev-soft-attest"]
 # Software ECDSA P-256 attestation backend. Dev/CI/test only — keys are
 # extractable from process memory. Replaced by `tpm-attest` (Linux) and the
 # Android Keystore JNI backend (Android) for production builds.
-dev-soft-attest = ["dep:p256"]
-# tpm-attest = ["dep:tss-esapi"]   # Phase 1 step 5
+dev-soft-attest = ["dep:p256", "dep:rcgen"]
+# Placeholder so the device_attest.rs "exactly one backend" compile guard can
+# reference `feature = "tpm-attest"` without a check-cfg "unexpected cfg value"
+# warning. Declares the feature NAME only — no backend deps yet (Phase 1 step 5
+# adds `dep:tss-esapi`). Enabling it alone fails to compile (no TPM AttestKey is
+# provided), which is the intended "not implemented" behavior.
+tpm-attest = []
 
 [dependencies]
 pyo3 = { version = "0.24", features = ["extension-module"] }
@@ -36,7 +41,7 @@ p256 = { version = "0.13", features = ["ecdsa", "pkcs8"], optional = true }
 # the FFI boundary into Python's `bytes`-managed memory during `dsm enroll`.
 # Soft attest backend only; production TPM/Keystore backends will use the
 # platform-native CSR API (PKCS#11 or Android KeyAttestation) and skip this dep.
-rcgen = { version = "0.13", default-features = false, features = ["pem", "crypto", "ring"] }
+rcgen = { version = "0.13", default-features = false, features = ["pem", "crypto", "ring"], optional = true }
 
 [profile.release]
 opt-level = 3

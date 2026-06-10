@@ -11,8 +11,8 @@ import asyncio
 import heapq
 import logging
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Awaitable, Callable
 
 from dsm.core.rand import csprng_float
 
@@ -125,18 +125,25 @@ class SendScheduler:
             self._event.clear()
             now = time.monotonic()
 
-            # Send any packets whose time has arrived. Only transport-level
-            # failures (network down, peer closed, socket closed under us)
-            # are swallowed; programming errors (ValueError/TypeError/etc.)
-            # bubble out so silent data loss can't hide a bug. (A broad
-            # `except Exception` here previously hid the TCP-fixed-size
-            # padding wire-mismatch ValueError from view.)
+            # Send any packets whose time has arrived. Transport-level failures
+            # (network down, peer closed, socket closed under us) are logged at
+            # WARNING and skipped. Any OTHER exception is logged at ERROR with a
+            # traceback and the loop CONTINUES (DSM-002): this detached task must
+            # stay alive so chaff and real egress keep flowing — a dead scheduler
+            # silently breaks the constant-traffic anonymity property with no
+            # shutdown signal. The ERROR+traceback keeps a genuine bug (e.g. the
+            # TCP-fixed-size padding wire-mismatch ValueError) visible in logs.
             while self._queue and self._queue[0].send_time <= now:
                 pkt = heapq.heappop(self._queue)
                 try:
                     await self._send_fn(pkt.data, pkt.target_size)
-                except (ConnectionError, OSError, asyncio.TimeoutError) as e:
+                except (TimeoutError, ConnectionError, OSError) as e:
                     log.warning("send failed: %s", type(e).__name__)
+                except Exception:
+                    log.error(
+                        "scheduler send_fn raised unexpectedly — keeping loop alive",
+                        exc_info=True,
+                    )
 
             # Inject chaff independently of queue state to avoid leaking
             # traffic activity via chaff-only / no-chaff timing patterns.
@@ -144,8 +151,13 @@ class SendScheduler:
                 try:
                     chaff_data, chaff_size = await self._chaff_fn()
                     self.enqueue(chaff_data, chaff_size)
-                except (ConnectionError, OSError, asyncio.TimeoutError) as e:
+                except (TimeoutError, ConnectionError, OSError) as e:
                     log.warning("chaff generation failed: %s", type(e).__name__)
+                except Exception:
+                    log.error(
+                        "scheduler chaff_fn raised unexpectedly — keeping loop alive",
+                        exc_info=True,
+                    )
 
             # Sleep until next packet or a jittered poll interval.
             # Jitter prevents a fixed 50ms cadence from fingerprinting the scheduler.
@@ -158,5 +170,5 @@ class SendScheduler:
 
             try:
                 await asyncio.wait_for(self._event.wait(), timeout=wait_time)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass

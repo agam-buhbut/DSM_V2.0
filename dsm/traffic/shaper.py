@@ -121,7 +121,9 @@ class SizeTracker:
         idx = self.class_index(size_class)
         w = self._weights
         decay = 1 - EMA_ALPHA
-        for i in range(len(w)):
+        for i in range(
+            len(w)
+        ):  # pylint: disable=consider-using-enumerate  # deliberate in-place index write
             w[i] = decay * w[i] + (EMA_ALPHA if i == idx else 0.0)
 
     def sample_with_idx(self) -> tuple[int, int]:

@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [ main ]
 
+# NOTE (supply chain): the Actions below are pinned to major version tags.
+# For full hardening they should be pinned to commit SHAs once looked up;
+# that is a deliberate follow-up (fabricating SHAs here would be unverifiable).
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -24,45 +28,64 @@ jobs:
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
 
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust/tuncore
 
-      - name: Install Python dependencies
+      - name: Install dev toolchain
         run: |
           python -m pip install --upgrade pip
-          pip install maturin pytest pyright mypy dnspython httpx types-dnspython
+          pip install maturin black isort ruff pylint pyright \
+                      pytest pytest-asyncio pip-audit dnspython types-dnspython
 
-      - name: Build Rust crypto core
+      # Build the release wheel from the repo root: bundles the dsm/ package
+      # AND the tuncore extension into one wheel (DSM-004), then install it so
+      # `import dsm` / `import tuncore` resolve from any cwd.
+      - name: Build + install (release wheel)
         env:
           PYO3_PYTHON: ${{ steps.setup-python.outputs.python-path }}
         run: |
-          cd rust/tuncore
-          cargo build --release
-          maturin develop --release
+          maturin build --release --out dist
+          pip install --no-index --find-links dist dsm
 
-      - name: Run Rust tests
-        env:
-          PYO3_PYTHON: ${{ steps.setup-python.outputs.python-path }}
-        run: |
-          cd rust/tuncore
-          cargo test --release
+      # ── Python gates (CLAUDE.md order: black → isort → ruff → pylint → pyright) ──
+      - name: black (format check)
+        run: black --check dsm tests
+      - name: isort (import-order check)
+        run: isort --check-only dsm tests
+      - name: ruff
+        run: ruff check dsm tests
+      - name: pylint
+        run: pylint dsm
+      - name: pyright
+        run: pyright
 
+      # ── Rust gates (rustfmt → clippy → audit) ──
+      - name: rustfmt (format check)
+        run: cargo fmt --manifest-path rust/tuncore/Cargo.toml --check
+      - name: clippy
+        run: >-
+          cargo clippy --manifest-path rust/tuncore/Cargo.toml --all-targets --
+          -D warnings -W clippy::pedantic -W clippy::unwrap_used
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
+      - name: cargo audit
+        run: cargo audit --file rust/tuncore/Cargo.lock
 
-      - name: Run cargo audit
-        run: |
-          cd rust/tuncore
-          cargo audit
+      # ── Supply chain: Python runtime deps ──
+      - name: pip-audit
+        run: pip-audit --progress-spinner off
 
-      - name: Run Python tests
+      # ── Tests ──
+      - name: Rust tests
+        run: cargo test --manifest-path rust/tuncore/Cargo.toml --release
+      - name: Python tests
         run: pytest tests/ -q
 
-      - name: Type check with pyright
-        run: pyright .
-
-      - name: Type check with mypy (advisory)
-        run: mypy dsm/ --ignore-missing-imports || true
+      # ── DSM-004 packaging smoke: the installed dsm must import from any cwd ──
+      - name: Packaging smoke
+        run: cd /tmp && python -c "import dsm, tuncore; print('packaging OK')"

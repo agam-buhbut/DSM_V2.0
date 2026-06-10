@@ -14,7 +14,11 @@ listen_port = 0                              # client: 0 = ephemeral; server: re
 # ─── Identity & device cert ────────────────────────────────────────────────
 key_file = "/opt/mtun/identity.key"          # Argon2id-wrapped X25519 Noise static
 cert_file = "/opt/mtun/device.crt"           # X.509 leaf cert (DER or PEM), signed by internal CA
-ca_root_file = "/opt/mtun/dsm_ca_root.pem"   # Pinned CA root cert (PEM); SHA-256 verified at install
+ca_root_file = "/opt/mtun/dsm_ca_root.pem"   # Pinned CA root cert (PEM)
+# REQUIRED: SHA-256 of ca_root_file (64 hex chars). The daemon refuses to
+# start without it — it pins the trust anchor so a swapped on-disk CA PEM is
+# rejected. Compute with: sha256sum /opt/mtun/dsm_ca_root.pem | cut -d' ' -f1
+ca_root_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
 attest_key_file = "/opt/mtun/attest.key"     # Argon2id-wrapped ECDSA P-256 attestation key
 # crl_file = "/opt/mtun/dsm_ca.crl"          # Optional but recommended; refresh monthly via walked-USB
 

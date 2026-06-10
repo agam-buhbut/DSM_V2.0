@@ -13,8 +13,10 @@ Wants=network-online.target
 # so notify would block systemd until TimeoutStartSec then assume failure.
 Type=simple
 
-# Run as root. The service needs CAP_NET_ADMIN+CAP_SYS_ADMIN+CAP_NET_BIND_SERVICE
-# (TUN, nftables, sysctl, /etc/resolv.conf write, bind 10.8.0.1:53), AND
+# Run as root. The service needs CAP_NET_ADMIN + CAP_NET_BIND_SERVICE + CAP_IPC_LOCK
+# (TUN, nftables, sysctl, /etc/resolv.conf write, bind 10.8.0.1:53, and mlock of
+# key material) — see the CapabilityBoundingSet= justification further down. It
+# does NOT need CAP_SYS_ADMIN; do not add it back. The service also needs
 # write access to /opt/mtun/ for keystore + cert + CRL refreshes. Hardening with
 # DynamicUser=yes / ProtectSystem=strict requires substantial path remapping
 # that is left to the operator. The dsm process itself runs harden_process()
@@ -29,6 +31,13 @@ LoadCredential=passphrase:/etc/dsm/passphrase
 # --mode server is the correct CLI form. The previous `dsm server --mode udp`
 # was wrong: `server` is not a subcommand and `--mode` only accepts
 # {client,server}. Transport (udp/tcp) lives in config.toml.
+#
+# `python3 -m dsm` resolves because the `dsm` package is INSTALLED into
+# /usr/bin/python3's site-packages by `pip install dsm-<ver>-*.whl` (the single
+# wheel built from the repo root — see deploy/GUIDE.txt §1, which bundles the
+# `dsm` package AND the `tuncore` extension). systemd runs with cwd=/, so there
+# is NO repo dir on sys.path; the import works purely off the installed package.
+# Hence no WorkingDirectory= / Environment=PYTHONPATH= is needed here.
 ExecStart=/usr/bin/python3 -m dsm --mode server \
           --passphrase-env-file=${CREDENTIALS_DIRECTORY}/passphrase
 

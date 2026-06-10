@@ -53,7 +53,7 @@ def _delete_tables(*table_names: str) -> None:
     """Best-effort delete of inet tables. Silently ignores missing tables."""
     for name in table_names:
         try:
-            subprocess.run(
+            subprocess.run(  # pylint: disable=subprocess-run-check  # FLAGGED: explicit check= (see report)
                 ["nft", "delete", "table", "inet", name],
                 capture_output=True,
                 timeout=5,
@@ -75,8 +75,12 @@ class TcpTimestampsDisabler:
 
     def apply(self) -> None:
         try:
-            self._original = TCP_TIMESTAMPS_PATH.read_text().strip()
-            TCP_TIMESTAMPS_PATH.write_text("0\n")
+            self._original = (
+                TCP_TIMESTAMPS_PATH.read_text().strip()
+            )  # pylint: disable=unspecified-encoding  # FLAGGED: explicit encoding= (see report)
+            TCP_TIMESTAMPS_PATH.write_text(
+                "0\n"
+            )  # pylint: disable=unspecified-encoding  # FLAGGED: explicit encoding= (see report)
             log.info("tcp_timestamps disabled (was %s)", self._original)
         except OSError as e:
             log.warning("could not disable tcp_timestamps: %s", e)
@@ -86,7 +90,9 @@ class TcpTimestampsDisabler:
         if self._original is None:
             return
         try:
-            TCP_TIMESTAMPS_PATH.write_text(f"{self._original}\n")
+            TCP_TIMESTAMPS_PATH.write_text(
+                f"{self._original}\n"
+            )  # pylint: disable=unspecified-encoding  # FLAGGED: explicit encoding= (see report)
             log.info("tcp_timestamps restored to %s", self._original)
         except OSError as e:
             log.warning("could not restore tcp_timestamps: %s", e)

@@ -116,9 +116,7 @@ class KeyStore:
         log.info("identity loaded")
         return pub
 
-    def load_or_generate_with_passphrase(
-        self, passphrase: bytes | bytearray
-    ) -> bytes:
+    def load_or_generate_with_passphrase(self, passphrase: bytes | bytearray) -> bytes:
         """Load or generate the identity (enroll-only).
 
         Used by ``dsm enroll --csr-out`` for first-time provisioning. The
