@@ -31,6 +31,7 @@ class TestConfigDirPrecedence(unittest.TestCase):
         self._tmpdir = tempfile.mkdtemp()
         self.config_path = Path(self._tmpdir) / "config.toml"
         self.config_path.write_bytes(_VALID_TOML)
+        os.chmod(self.config_path, 0o600)
         self._prev_env = os.environ.get("DSM_CONFIG_DIR")
         if "DSM_CONFIG_DIR" in os.environ:
             del os.environ["DSM_CONFIG_DIR"]
@@ -117,6 +118,7 @@ class TestShowPubkeyInsecurePerms(unittest.TestCase):
                 ]
             )
         )
+        os.chmod(self.config_path, 0o600)
 
     def tearDown(self) -> None:
         for p in (self.key_path, self.pass_path, self.config_path):

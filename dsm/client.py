@@ -48,17 +48,40 @@ VPN_DNS_SERVER = SERVER_TUN_IP
 log = logging.getLogger(__name__)
 
 
+def _emit_handshake_failure(err: Exception) -> None:
+    """Emit the failed-handshake audit event WITHOUT the exception
+    message.
+
+    The operator-facing ERROR log already carries the full detail (a
+    client owns its server and needs to debug its cert), but the netaudit
+    stream (a separate, machine-readable sink that may be shipped or
+    retained differently) is kept minimal and symmetric with the
+    server-side emit — only the exception class, never str(err)."""
+    netaudit.emit(
+        "handshake_end",
+        role="client",
+        outcome="failed",
+        error=type(err).__name__,
+    )
+
+
 async def run_client(
     config: Config,
     passphrase_fd: int | None = None,
     passphrase_env_file: str | None = None,
-) -> None:
+) -> int:
     """Run DSM in client mode using transactional resource management.
 
     Every resource that mutates host state (TUN, nftables, resolv.conf, etc.)
     is registered with an ``AsyncExitStack`` the moment it succeeds so that
     any failure downstream unwinds them in reverse order — never leaving
     the host in a half-configured state.
+
+    Returns:
+        0 on a clean shutdown (signal / SESSION_CLOSE / dead-peer), 1 on any
+        startup or handshake error path. ``main()`` ``sys.exit``s this so a
+        failed connection is a nonzero exit (so ``Restart=on-failure`` fires
+        and the kill switch is not left masking a silent outage).
     """
     import tuncore
 
@@ -71,6 +94,28 @@ async def run_client(
             e,
         )
 
+    # Independent ctypes backstop for the most security-critical bit, in
+    # case harden_process() above failed partway: a crash must not dump
+    # key material to a core file.
+    from dsm.core.hardening import ProcessHardeningError, set_process_nondumpable
+
+    try:
+        set_process_nondumpable()
+    except ProcessHardeningError as e:
+        log.warning("core-dump backstop (PR_SET_DUMPABLE) failed: %s", e)
+
+    from dsm.crypto.attest_gate import (
+        MalformedAttestBuildError,
+        SoftAttestNotAllowedError,
+        enforce_attest_backend_policy,
+    )
+
+    try:
+        enforce_attest_backend_policy(config)
+    except (SoftAttestNotAllowedError, MalformedAttestBuildError) as e:
+        log.error("%s", e)
+        return 1
+
     fsm = SessionFSM()
 
     # Cert auth materials must load BEFORE we touch any host state, so a
@@ -79,7 +124,7 @@ async def run_client(
         materials = load_cert_materials(config)
     except AuthMaterialsError as e:
         log.error("cert auth materials missing or invalid: %s", e)
-        return
+        return 1
 
     # Read the passphrase once and unlock both stores. Identity (X25519
     # Noise static) and attest key (ECDSA P-256) live behind the same
@@ -96,7 +141,7 @@ async def run_client(
         passphrase_fd=passphrase_fd,
         passphrase_env_file=passphrase_env_file,
     ):
-        return
+        return 1
 
     # With both stores unlocked, confirm the loaded cert was issued for
     # THIS device's keys. Catches the cert_file substitution failure mode
@@ -108,7 +153,7 @@ async def run_client(
         log.error("cert/identity consistency check failed: %s", e)
         attest_store.unload()
         keystore.unload()
-        return
+        return 1
 
     shaper = TrafficShaper(config.padding_min, config.padding_max)
 
@@ -118,6 +163,14 @@ async def run_client(
         # of the session.
         stack.callback(keystore.unload)
         stack.callback(attest_store.unload)
+
+        # Phase 1.8 (H10): create the shutdown event and install signal
+        # handlers BEFORE the pre-handshake kill switch, mirroring server.py.
+        # A SIGTERM during connect/handshake must trigger the AsyncExitStack
+        # unwind (removing the kill switch) rather than killing the process
+        # with the kill switch still applied and the host offline.
+        shutdown = asyncio.Event()
+        setup_signal_handlers(shutdown)
 
         # Pre-handshake kill switch: applied BEFORE any socket bind/connect
         # so a stuck or failed handshake never leaks user traffic during
@@ -204,15 +257,9 @@ async def run_client(
                 "handshake failed",
             )
             log.error("%s: %s", prefix, e)
-            netaudit.emit(
-                "handshake_end",
-                role="client",
-                outcome="failed",
-                error=type(e).__name__,
-                message=str(e),
-            )
+            _emit_handshake_failure(e)
             fsm.transition(State.TEARDOWN)
-            return  # AsyncExitStack unwinds transport + keystore
+            return 1  # AsyncExitStack unwinds transport + keystore
 
         fsm.transition(State.ESTABLISHED)
 
@@ -316,9 +363,9 @@ async def run_client(
         liveness = LivenessState()
         reassembly = ReassemblyBuffer()
 
-        shutdown = asyncio.Event()
-        setup_signal_handlers(shutdown)
-
+        # shutdown + signal handlers were installed at the top of the stack
+        # (Phase 1.8 H10), before the pre-handshake kill switch. Reuse that
+        # same event here so make_send_fn / DataPathContext observe signals.
         send_packet = make_send_fn(
             session_keys,
             transport,
@@ -377,3 +424,6 @@ async def run_client(
             shutdown_log="shutting down",
         )
         # AsyncExitStack unwinds remaining resources in reverse order.
+
+    # Clean shutdown (signal / SESSION_CLOSE / dead-peer): exit 0.
+    return 0

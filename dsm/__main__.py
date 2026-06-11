@@ -12,27 +12,55 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import sys
+import tomllib
 from dataclasses import replace
 from pathlib import Path
 
 from dsm.core import log as dsm_log
 from dsm.core import netaudit
-from dsm.core.config import load
+from dsm.core.config import Config, ConfigError, load
+
+
+def _load_config_or_exit(config_path: Path | None) -> Config:
+    """Load config, turning every load-time failure into a clean stderr
+    message + exit(2) instead of a raw traceback (Phase 1.8 / Phase-0 tail).
+    """
+    try:
+        return load(config_path)
+    except ConfigError as e:
+        print(f"config: {e}", file=sys.stderr)
+        sys.exit(2)
+    except tomllib.TOMLDecodeError as e:
+        print(f"config: malformed TOML: {e}", file=sys.stderr)
+        sys.exit(2)
+    except TypeError as e:
+        # Unknown / missing key surfaces as "unexpected keyword argument".
+        print(f"config: invalid or unknown key: {e}", file=sys.stderr)
+        sys.exit(2)
+    except ValueError as e:
+        print(f"config: {e}", file=sys.stderr)
+        sys.exit(2)
 
 
 def _add_passphrase_args(p: argparse.ArgumentParser) -> None:
-    """Non-interactive passphrase sources (stronger than DSM_PASSPHRASE env)."""
+    """Non-interactive passphrase sources (stronger than DSM_PASSPHRASE env).
+
+    Phase 1.11: default=SUPPRESS so a flag placed BEFORE the subcommand
+    (`dsm --passphrase-fd 3 enroll ...`) is not clobbered by the subparser's
+    own default — argparse only writes the attr when the flag is present.
+    """
     p.add_argument(
         "--passphrase-fd",
         type=int,
-        default=None,
+        default=argparse.SUPPRESS,
         help="Read passphrase from file descriptor N (e.g. systemd socket pipe)",
     )
     p.add_argument(
         "--passphrase-env-file",
         type=str,
-        default=None,
+        default=argparse.SUPPRESS,
         help="Read passphrase from file at PATH (must be 0600)",
     )
 
@@ -98,6 +126,13 @@ def main() -> None:
     )
     _add_passphrase_args(show_parser)
 
+    subparsers.add_parser(
+        "cleanup",
+        help="Remove all dsm host state (nft tables, table-100 route, ip "
+        "rule, resolv.conf, sysctls). Idempotent; for ExecStopPost / crash "
+        "recovery. Needs no config or passphrase.",
+    )
+
     args = parser.parse_args()
 
     if args.command == "enroll":
@@ -107,20 +142,28 @@ def main() -> None:
             import_cert=args.import_cert,
             cn=args.cn,
             role=args.role,
-            passphrase_fd=args.passphrase_fd,
-            passphrase_env_file=args.passphrase_env_file,
+            passphrase_fd=getattr(args, "passphrase_fd", None),
+            passphrase_env_file=getattr(args, "passphrase_env_file", None),
         )
         return
 
     if args.command == "show-pubkey":
         _run_show_pubkey(
             args.config,
-            passphrase_fd=args.passphrase_fd,
-            passphrase_env_file=args.passphrase_env_file,
+            passphrase_fd=getattr(args, "passphrase_fd", None),
+            passphrase_env_file=getattr(args, "passphrase_env_file", None),
         )
         return
 
-    config = load(args.config)
+    if args.command == "cleanup":
+        # Teardown utility: no config load, no store unlock, no passphrase.
+        from dsm.net.cleanup import cleanup_host_state
+
+        dsm_log.configure("info")
+        cleanup_host_state()
+        return
+
+    config = _load_config_or_exit(args.config)
     if args.mode:
         config = replace(config, mode=args.mode)
 
@@ -133,21 +176,25 @@ def main() -> None:
     if config.mode == "client":
         from dsm.client import run_client
 
-        asyncio.run(
-            run_client(
-                config,
-                passphrase_fd=args.passphrase_fd,
-                passphrase_env_file=args.passphrase_env_file,
+        sys.exit(
+            asyncio.run(
+                run_client(
+                    config,
+                    passphrase_fd=getattr(args, "passphrase_fd", None),
+                    passphrase_env_file=getattr(args, "passphrase_env_file", None),
+                )
             )
         )
     elif config.mode == "server":
         from dsm.server import run_server
 
-        asyncio.run(
-            run_server(
-                config,
-                passphrase_fd=args.passphrase_fd,
-                passphrase_env_file=args.passphrase_env_file,
+        sys.exit(
+            asyncio.run(
+                run_server(
+                    config,
+                    passphrase_fd=getattr(args, "passphrase_fd", None),
+                    passphrase_env_file=getattr(args, "passphrase_env_file", None),
+                )
             )
         )
     else:
@@ -170,7 +217,7 @@ def _run_enroll(
     from dsm.crypto.enroll import EnrollError, generate_enrollment, import_signed_cert
     from dsm.crypto.keystore import KeyStore
 
-    config = load(config_path)
+    config = _load_config_or_exit(config_path)
     keystore = KeyStore(config.key_file)
     attest_store = AttestStore(config.attest_key_file)
 
@@ -179,6 +226,26 @@ def _run_enroll(
         if effective_role not in ("client", "server"):
             print(
                 f"--role must be client or server (got {effective_role!r})",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+
+        # Phase 1.11: validate the CSR output path BEFORE we persist any keys.
+        # generate_enrollment writes identity + attest keys to disk; if the CSR
+        # write then fails the operator is stranded with keys on disk and no
+        # CSR, and re-running errors "identity key already exists".
+        csr_parent = csr_out.parent
+        if not csr_parent.is_dir():
+            print(
+                f"enroll: cannot write CSR to {csr_out}: directory "
+                f"{csr_parent} does not exist",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        if not os.access(csr_parent, os.W_OK):
+            print(
+                f"enroll: cannot write CSR to {csr_out}: directory "
+                f"{csr_parent} is not writable",
                 file=sys.stderr,
             )
             sys.exit(2)
@@ -203,7 +270,15 @@ def _run_enroll(
         finally:
             wipe_passphrase(passphrase)
 
-        csr_out.write_bytes(result.csr_der)
+        try:
+            csr_out.write_bytes(result.csr_der)
+        except OSError as e:
+            # Keys are already persisted by generate_enrollment; the precheck
+            # above caught the common cases, but a race (dir removed) or a
+            # transient FS error still lands here — report cleanly rather than
+            # surfacing a raw traceback.
+            print(f"enroll: cannot write CSR to {csr_out}: {e}", file=sys.stderr)
+            sys.exit(2)
         print(f"Wrote CSR to {csr_out}")
         print(f"  cn = {result.cn}")
         print(f"  noise_static_pub = {result.noise_static_pub.hex()}")
@@ -257,7 +332,7 @@ def _run_show_pubkey(
     from dsm.core.passphrase import read_passphrase, wipe_passphrase
     from dsm.crypto.keystore import KeyStore
 
-    config = load(config_path)
+    config = _load_config_or_exit(config_path)
     keystore = KeyStore(config.key_file)
     # show-pubkey is strictly read-only — if no identity has been provisioned,
     # silently auto-generating one would mislead the operator who's trying to

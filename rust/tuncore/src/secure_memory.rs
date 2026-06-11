@@ -1,4 +1,7 @@
 use libc::{mlock, munlock, rlimit, setrlimit, RLIMIT_CORE};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{LazyLock, Mutex};
 use zeroize::Zeroizing;
 
 /// Check a libc return code, mapping non-zero to a descriptive error.
@@ -14,6 +17,11 @@ fn syscall_check(ret: i32, name: &str) -> Result<(), String> {
 }
 
 /// Lock a byte slice into physical memory, preventing swap.
+///
+/// WARNING: bypasses [`PAGE_REFCOUNTS`]. `munlock_slice` on a region
+/// sharing a page with a live [`LockedKey32`] would re-enable swap for
+/// that key. Currently has no production callers — new key material must
+/// use `LockedKey32` (or route through `lock_key_pages`) instead.
 ///
 /// # Safety
 /// The slice must remain valid for the duration of the lock.
@@ -75,6 +83,118 @@ pub fn secure_zero(data: &mut [u8]) {
     data.zeroize();
 }
 
+/// Process-global page → live-key refcount. `mlock`/`munlock` are
+/// page-granular and not refcounted by the kernel; multiple
+/// `LockedKey32`s routinely share one allocator page, so dropping one key
+/// must not `munlock` a page that still holds another live key. This map
+/// makes `munlock` fire only when the last key on a page drops.
+static PAGE_REFCOUNTS: LazyLock<Mutex<HashMap<usize, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// `_SC_PAGESIZE` is constant for the process lifetime; query once.
+fn page_size() -> usize {
+    static PAGE: AtomicUsize = AtomicUsize::new(0);
+    let cached = PAGE.load(Ordering::Relaxed);
+    if cached != 0 {
+        return cached;
+    }
+    let raw = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    let sz = if raw <= 0 { 4096 } else { raw as usize };
+    PAGE.store(sz, Ordering::Relaxed);
+    sz
+}
+
+/// Page base addresses spanned by `[addr, addr+len)`.
+fn page_bases(addr: usize, len: usize) -> Vec<usize> {
+    let page = page_size();
+    let first = addr & !(page - 1);
+    let last = (addr + len - 1) & !(page - 1);
+    (first..=last).step_by(page).collect()
+}
+
+fn mlock_page(base: usize) -> Result<(), String> {
+    let page = page_size();
+    syscall_check(unsafe { mlock(base as *const libc::c_void, page) }, "mlock")
+}
+
+fn munlock_page(base: usize) {
+    // Teardown is unrecoverable and the kernel cleans the mapping on
+    // process exit; deliberately drop the error (matches prior behavior).
+    let page = page_size();
+    unsafe {
+        munlock(base as *const libc::c_void, page);
+    }
+}
+
+/// Reference-count the pages of a key region and `mlock` each page on its
+/// first resident key. On `mlock` failure, every increment made by THIS
+/// call is rolled back and the error is propagated, so key construction
+/// fails exactly as the old direct mlock did.
+fn lock_key_pages(addr: usize, len: usize) -> Result<(), String> {
+    // Guard the page math: `(addr + len - 1)` in `page_bases` would wrap
+    // for len == 0 and register a page that no unlock can ever balance.
+    debug_assert!(len > 0, "lock_key_pages: empty region");
+    if len == 0 {
+        return Ok(());
+    }
+    // `.expect` here is deliberate: a poisoned lock means a panic occurred
+    // mid-mlock-accounting, and continuing with corrupt accounting would
+    // silently void the swap-protection guarantee.
+    let mut map = PAGE_REFCOUNTS.lock().expect("page-refcount mutex poisoned");
+    let mut bumped: Vec<usize> = Vec::new();
+    let mut newly_locked: Vec<usize> = Vec::new();
+    for base in page_bases(addr, len) {
+        let count = map.get(&base).copied().unwrap_or(0);
+        if count == 0 {
+            if let Err(e) = mlock_page(base) {
+                for &b in &bumped {
+                    if let Some(c) = map.get_mut(&b) {
+                        *c -= 1;
+                        if *c == 0 {
+                            map.remove(&b);
+                        }
+                    }
+                }
+                for &b in &newly_locked {
+                    munlock_page(b);
+                }
+                return Err(e);
+            }
+            newly_locked.push(base);
+        }
+        map.insert(base, count + 1);
+        bumped.push(base);
+    }
+    Ok(())
+}
+
+/// Decrement the refcount of each page a key region spans; `munlock` only
+/// the pages whose count reaches zero.
+fn unlock_key_pages(addr: usize, len: usize) {
+    debug_assert!(len > 0, "unlock_key_pages: empty region");
+    if len == 0 {
+        return;
+    }
+    let mut map = PAGE_REFCOUNTS.lock().expect("page-refcount mutex poisoned");
+    for base in page_bases(addr, len) {
+        match map.get_mut(&base) {
+            Some(c) if *c > 1 => {
+                *c -= 1;
+            }
+            Some(_) => {
+                map.remove(&base);
+                munlock_page(base);
+            }
+            None => {
+                // Underflow: nothing locked here. Tolerated in release
+                // (worst case is a leaked lock, never a lost one); loud in
+                // debug/test builds so an accounting regression is caught.
+                debug_assert!(false, "munlock underflow at {base:#x}");
+            }
+        }
+    }
+}
+
 /// A 32-byte secret pinned to a stable heap address, mlock'd for its
 /// lifetime and zeroized before deallocation.
 ///
@@ -99,7 +219,7 @@ impl LockedKey32 {
     /// via `as_mut()` go straight to the locked heap address.
     pub fn zeroed() -> Result<Self, String> {
         let bytes = Box::new(Zeroizing::new([0u8; 32]));
-        mlock_slice(&**bytes)?;
+        lock_key_pages(bytes.as_ptr() as usize, 32)?;
         Ok(Self { bytes })
     }
 
@@ -117,7 +237,7 @@ impl LockedKey32 {
     /// so no transient stack copy of the key ever exists.
     pub fn from_array(src: [u8; 32]) -> Result<Self, String> {
         let bytes = Box::new(Zeroizing::new(src));
-        mlock_slice(&**bytes)?;
+        lock_key_pages(bytes.as_ptr() as usize, 32)?;
         Ok(Self { bytes })
     }
 
@@ -150,12 +270,15 @@ pub fn random_locked_key32() -> Result<LockedKey32, String> {
 
 impl Drop for LockedKey32 {
     fn drop(&mut self) {
-        // munlock before Box drops, so the kernel still has the mapping.
-        // Zeroize + deallocation are handled by Box<Zeroizing<..>>'s drop.
-        // munlock failure during teardown is unrecoverable; the kernel
-        // will clean the mapping on process exit anyway, so we
-        // deliberately drop the error.
-        munlock_slice(&**self.bytes).ok();
+        use zeroize::Zeroize;
+        let addr = self.bytes.as_ptr() as usize;
+        // Zeroize BEFORE releasing the page lock so the page is never
+        // swappable while it still holds the secret. The page is only
+        // actually munlock'd when the last live key on it drops (see
+        // PAGE_REFCOUNTS); Box<Zeroizing<..>>'s own drop then re-zeroizes
+        // (a no-op) and deallocates.
+        self.bytes.zeroize();
+        unlock_key_pages(addr, 32);
     }
 }
 
@@ -197,5 +320,51 @@ mod tests {
             dumpable, 0,
             "PR_GET_DUMPABLE should report 0 after harden_process"
         );
+    }
+
+    #[test]
+    fn page_refcount_keeps_lock_until_last_key_on_page_drops() {
+        let page = page_size();
+        // Real, mapped, mlockable memory spanning >1 page so we can place
+        // two synthetic 32-byte keys on the SAME page deterministically.
+        let buf = vec![0u8; page * 3];
+        let raw = buf.as_ptr() as usize;
+        let base = (raw + page - 1) & !(page - 1); // page-aligned addr in buf
+        let a = base; // page P
+        let b = base + 64; // same page P
+        lock_key_pages(a, 32).expect("lock a");
+        lock_key_pages(b, 32).expect("lock b");
+        {
+            let map = PAGE_REFCOUNTS.lock().expect("mutex");
+            assert_eq!(map.get(&base).copied(), Some(2), "both keys counted");
+        }
+        unlock_key_pages(a, 32);
+        {
+            let map = PAGE_REFCOUNTS.lock().expect("mutex");
+            assert_eq!(map.get(&base).copied(), Some(1), "page still held by b");
+        }
+        unlock_key_pages(b, 32);
+        {
+            let map = PAGE_REFCOUNTS.lock().expect("mutex");
+            assert_eq!(map.get(&base).copied(), None, "page released last drop");
+        }
+        drop(buf);
+    }
+
+    #[test]
+    fn locked_key32_registers_its_page_while_live() {
+        let mut k = LockedKey32::zeroed().expect("alloc");
+        k.as_mut().copy_from_slice(&[0xAB; 32]);
+        let page = page_size();
+        let base = (k.as_array().as_ptr() as usize) & !(page - 1);
+        {
+            let map = PAGE_REFCOUNTS.lock().expect("mutex");
+            assert!(
+                map.get(&base).copied().unwrap_or(0) >= 1,
+                "live key's page must be registered"
+            );
+        }
+        // Drop must not panic (zeroize-before-munlock + registry decrement).
+        drop(k);
     }
 }

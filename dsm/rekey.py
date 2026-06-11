@@ -300,6 +300,11 @@ async def handle_rekey_init(
         )
     except TimeoutError:
         log.warning("REKEY_ACK send timed out — peer may be wedged")
+        # Phase 1.2: this leaves pending_responder_rotation set in Rust with
+        # no apply. That is tolerated: the next REKEY_INIT's
+        # prepare_rotation_responder overwrites the stale pending (dropping
+        # and zeroizing its keys), so the responder self-heals on the next
+        # rekey instead of wedging permanently.
         fsm.transition(State.ESTABLISHED)
         return last_rekey_time, cached_ack_epoch, cached_ack_payload
 

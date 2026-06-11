@@ -3,6 +3,14 @@
 Extracted from client.py and server.py to eliminate duplication.
 """
 
+# This module concentrates the whole encrypt/send + decrypt/dispatch + TUN
+# forwarding + liveness + rekey + auto-MTU data path in one place by design
+# (the loops share a DataPathContext and tight ordering guarantees), so it
+# exceeds pylint's 1000-line module ceiling. Like the too-many-* metrics
+# disabled in pyproject.toml, this is a refactorer-territory size metric
+# inherent to the data path, not a bug.
+# pylint: disable=too-many-lines
+
 from __future__ import annotations
 
 import asyncio
@@ -352,7 +360,14 @@ def decrypt_packet(
 
     # Verify epoch_id matches the key epoch used for decryption.
     # Audit M3: epoch_id widened to 4 bits (0x0F mask).
-    if inner.ptype != PacketType.CHAFF:
+    #
+    # Phase 1.1: REKEY_ACK is ALSO exempt. A re-sent cached ACK is stamped
+    # with the responder's NEW epoch nibble, but a retransmitted INIT means
+    # the initiator is still at the OLD epoch, so the nibble check would drop
+    # the very ACK that completes recovery. REKEY_ACK self-validates via its
+    # own 4-byte epoch field (handle_rekey_ack checks it against
+    # pending_epoch) plus AEAD, so the outer nibble check is redundant for it.
+    if inner.ptype not in (PacketType.CHAFF, PacketType.REKEY_ACK):
         if decrypted_prev_epoch:
             expected_eid = (session_keys.epoch - 1) & 0x0F
         else:
@@ -624,6 +639,37 @@ async def liveness_loop(ctx: DataPathContext) -> None:
             ctx.liveness.last_real_send_time = now
 
 
+async def _tcp_recv_raced(
+    transport: TCPTransport, shutdown_wait: asyncio.Task[bool]
+) -> bytes | None:
+    """Await one framed TCP read, racing it against shutdown.
+
+    Returns the frame bytes, or ``None`` if shutdown won the race (the caller
+    must then stop the recv loop). Re-raises ``ConnectionError`` on peer close.
+
+    The framed ``transport.recv()`` has no internal timeout: a short
+    cancellable timeout would cancel-then-RETRY mid-frame (after the 4-byte
+    length prefix, before the payload) and desync the stream. But a bare,
+    untimed read on a silent peer blocks forever, and a local-initiated
+    shutdown (signal, dead-peer timeout, sibling-loop crash — all of which only
+    *set* the event) could then never interrupt it, hanging ``gather()`` and
+    deadlocking the AsyncExitStack kill-switch/TUN/resolv teardown. Racing the
+    read against a long-lived shutdown waiter fixes both: on shutdown we cancel
+    the in-flight read ENTIRELY (the session is tearing down, so abandoning the
+    partial frame is correct and never resumed — no desync).
+    """
+    recv_task = asyncio.ensure_future(transport.recv())
+    await asyncio.wait({recv_task, shutdown_wait}, return_when=asyncio.FIRST_COMPLETED)
+    if not recv_task.done():
+        recv_task.cancel()
+        try:
+            await recv_task
+        except (asyncio.CancelledError, ConnectionError):
+            pass
+        return None
+    return recv_task.result()  # may re-raise ConnectionError
+
+
 async def run_data_loops(
     ctx: DataPathContext,
     transport: UDPTransport | TCPTransport,
@@ -664,46 +710,77 @@ async def run_data_loops(
     """
 
     async def recv_loop() -> None:
-        while not ctx.shutdown.is_set():
-            recv_addr: tuple[str, int] | None = None
-            try:
-                if isinstance(transport, UDPTransport):
-                    data, recv_addr = await asyncio.wait_for(
-                        transport.recv(),
-                        timeout=0.1,
-                    )
-                    if udp_addr_filter is not None and not udp_addr_filter(recv_addr):
-                        log.debug(
-                            "packet from unexpected source %s, dropping",
-                            recv_addr,
+        # Phase 1.6: for TCP, race each framed read against shutdown via a
+        # single long-lived waiter (_tcp_recv_raced). See that helper for why.
+        is_tcp = not isinstance(transport, UDPTransport)
+        shutdown_wait: asyncio.Task[bool] | None = (
+            asyncio.ensure_future(ctx.shutdown.wait()) if is_tcp else None
+        )
+        try:
+            while not ctx.shutdown.is_set():
+                recv_addr: tuple[str, int] | None = None
+                try:
+                    if isinstance(transport, UDPTransport):
+                        data, recv_addr = await asyncio.wait_for(
+                            transport.recv(),
+                            timeout=0.1,
                         )
-                        continue
-                else:
-                    data = await asyncio.wait_for(
-                        transport.recv(),
-                        timeout=0.1,
-                    )
+                        if udp_addr_filter is not None and not udp_addr_filter(
+                            recv_addr
+                        ):
+                            log.debug(
+                                "packet from unexpected source %s, dropping",
+                                recv_addr,
+                            )
+                            continue
+                    else:
+                        assert shutdown_wait is not None
+                        framed = await _tcp_recv_raced(transport, shutdown_wait)
+                        if framed is None:
+                            return  # shutdown won the race
+                        data = framed
+                except TimeoutError:
+                    session_keys.tick()
+                    continue
+                except ConnectionError as e:
+                    log.info("transport closed by peer: %s", e)
+                    ctx.shutdown.set()
+                    return
+
+                result = decrypt_packet(data, session_keys, replay)
+                if result is None:
+                    continue
+
+                ctx.liveness.last_recv_time = time.monotonic()
+
+                # Server-side only: record the authenticated peer's UDP
+                # source address so subsequent sends can reach it.
+                if post_authenticate is not None and recv_addr is not None:
+                    post_authenticate(recv_addr)
+
+                inner, _prev_epoch = result
+                await dispatch_inner(ctx, inner)
+        finally:
+            if shutdown_wait is not None and not shutdown_wait.done():
+                shutdown_wait.cancel()
+                try:
+                    await shutdown_wait
+                except asyncio.CancelledError:
+                    pass
+
+    async def _tcp_idle_tick_loop() -> None:
+        # Phase 1.6: drive session_keys.tick() (grace-period cleanup) on a
+        # fixed cadence independent of the blocking framed recv. UDP gets its
+        # tick from the recv_loop's 0.1s timeout; TCP's recv blocks, so it
+        # needs its own ticker. Exits promptly on shutdown.
+        if isinstance(transport, UDPTransport):
+            return
+        while not ctx.shutdown.is_set():
+            try:
+                await asyncio.wait_for(ctx.shutdown.wait(), timeout=0.1)
+                return
             except TimeoutError:
                 session_keys.tick()
-                continue
-            except ConnectionError as e:
-                log.info("transport closed by peer: %s", e)
-                ctx.shutdown.set()
-                return
-
-            result = decrypt_packet(data, session_keys, replay)
-            if result is None:
-                continue
-
-            ctx.liveness.last_recv_time = time.monotonic()
-
-            # Server-side only: record the authenticated peer's UDP
-            # source address so subsequent sends can reach it.
-            if post_authenticate is not None and recv_addr is not None:
-                post_authenticate(recv_addr)
-
-            inner, _prev_epoch = result
-            await dispatch_inner(ctx, inner)
 
     async def _supervised(coro: Awaitable[None], name: str) -> None:
         # DSM-001: contain each loop so one loop's terminal exception cannot
@@ -733,6 +810,7 @@ async def run_data_loops(
             _supervised(recv_loop(), "recv"),
             _supervised(tun_send_loop(ctx), "tun_send"),
             _supervised(liveness_loop(ctx), "liveness"),
+            _supervised(_tcp_idle_tick_loop(), "tcp_tick"),
             *(_supervised(c, f"extra[{i}]") for i, c in enumerate(extra_loops)),
         )
     except asyncio.CancelledError:
@@ -795,6 +873,11 @@ async def auto_mtu_loop(
             except Exception as e:  # noqa: BLE001  # see linter report
                 log.warning("auto_mtu: set_mtu(%d) failed: %s", usable, e)
                 continue
+            # Phase 1.7: also clamp the shaper's size-class ceiling so padded
+            # / chaff outer packets fit the constrained path. The outer DSM
+            # packet rides inside IP(20)+UDP(8), so the size-class ceiling is
+            # path_mtu - 28.
+            ctx.shaper.set_size_class_ceiling(path_mtu - 28)
             log.info(
                 "auto_mtu: lowered tun mtu %d -> %d (kernel pmtu=%d)",
                 current,
@@ -819,6 +902,10 @@ async def auto_mtu_loop(
                     log.warning("auto_mtu: set_mtu(%d) failed: %s", usable, e)
                     rises_observed = 0
                     continue
+                # Phase 1.7: track the recovered path on the shaper too. The
+                # ceiling is bounded above by padding_max, so this restores the
+                # size-class set toward the full budget as the path heals.
+                ctx.shaper.set_size_class_ceiling(path_mtu - 28)
                 log.info(
                     "auto_mtu: raised tun mtu %d -> %d after %d stable "
                     "observations (kernel pmtu=%d)",

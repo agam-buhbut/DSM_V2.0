@@ -179,6 +179,10 @@ class TestSchemaLock(unittest.TestCase):
         # fresh ephemeral port on rekey completion (breaks src-port
         # session fingerprinting).
         "udp_rebound",
+        # Phase-0: emitted by attest_gate.enforce_attest_backend_policy when the
+        # soft-attest backend is refused (action=refused_start) or acknowledged
+        # (action=warned).
+        "soft_attest_acknowledged",
     }
 
     def test_call_sites_in_repo(self) -> None:

@@ -196,12 +196,13 @@ impl SoftAttestKey {
         Ok(csr.der().to_vec())
     }
 
-    /// Encrypt the signing key to a passphrase-protected blob.
-    /// Format: `salt(32) || nonce(24) || ciphertext+tag`. Plaintext is
-    /// the 32-byte ECDSA P-256 scalar.
+    /// Encrypt the signing key to a passphrase-protected blob. Plaintext
+    /// is the 32-byte ECDSA P-256 scalar.
     ///
-    /// Sealing is delegated to [`passphrase_store::seal`] so this blob
-    /// shape is byte-identical to the identity-store blob shape.
+    /// Format: the versioned sealed-blob format owned by
+    /// [`passphrase_store::seal`] (`DSMK` magic || version || Argon2id
+    /// params || salt || nonce || ciphertext+tag), byte-identical to the
+    /// identity-store blob shape.
     pub fn encrypt_to_store(&self, passphrase: &[u8]) -> Result<Vec<u8>, String> {
         // `to_bytes()` materializes the scalar; wrap in `Zeroizing` so
         // the temporary copy is scrubbed once `seal` has copied it into

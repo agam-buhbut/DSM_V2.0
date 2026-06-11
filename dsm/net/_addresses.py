@@ -15,3 +15,8 @@ from __future__ import annotations
 # The server's address inside the tunnel. Also the DNS-proxy bind IP.
 # Clients write this into /etc/resolv.conf as `nameserver SERVER_TUN_IP`.
 SERVER_TUN_IP: str = "10.8.0.1"
+
+# Prefix length for the in-tunnel /24 network.
+# Consumers: dns_proxy.LocalDNSProxy (source-filter net) and
+# tunnel.TunDevice.configure (netmask default).
+TUN_PREFIX_LEN: int = 24

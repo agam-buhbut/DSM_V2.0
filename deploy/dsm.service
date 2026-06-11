@@ -8,6 +8,13 @@ Documentation=file:///opt/dsm-repo/README.txt
 After=network-online.target
 Wants=network-online.target
 
+# Phase 1.9: StartLimitIntervalSec is only honored in [Unit] (systemd
+# ignores it in [Service], silently removing the crash-loop guard).
+# 5 restarts in 10 minutes is generous for legitimate transient failures
+# (network blip on boot) and tight enough that a config error fails fast.
+StartLimitIntervalSec=10min
+StartLimitBurst=5
+
 [Service]
 # Type=simple (NOT notify): the dsm process does not call sd_notify(),
 # so notify would block systemd until TimeoutStartSec then assume failure.
@@ -46,6 +53,13 @@ ExecStart=/usr/bin/python3 -m dsm --mode server \
 # stack to send SESSION_CLOSE and tear down nftables/TUN/resolv.conf.
 KillSignal=SIGTERM
 TimeoutStopSec=15
+
+# Phase 1.9: crash-safe cleanup. ExecStopPost runs on BOTH clean and crash
+# stops (SIGKILL/OOM that bypass the in-process AsyncExitStack unwind), so
+# the host never stays with the kill switch up, a dead resolv.conf, a stale
+# table-100 route / ip rule, or modified sysctls. Idempotent — safe to run
+# when there is nothing to clean.
+ExecStopPost=/usr/bin/python3 -m dsm cleanup
 
 Restart=on-failure
 RestartSec=10s
@@ -124,12 +138,24 @@ CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_IPC_LOCK
 # is correct here because the daemon controls its own allocations.
 LimitMEMLOCK=infinity
 
+# Core-dump backstop. harden_process() sets RLIMIT_CORE=0 and
+# PR_SET_DUMPABLE=0 in-process, and dsm.core.hardening re-asserts
+# PR_SET_DUMPABLE as a Python-side backstop — but both run only after the
+# process starts and their failure is non-fatal. These unit-level
+# directives clamp core dumps before the process exists, so a crash
+# during early startup (or after a partial in-process hardening failure)
+# cannot persist X25519 / ECDSA key material to a core file.
+# CoredumpFilter=0x00 additionally zeroes the per-process dump mask so no
+# memory class is ever written even if a core is somehow forced.
+# (CoredumpFilter= requires systemd >= 246; on older hosts it is ignored
+# and LimitCORE=0 alone still suppresses the dump.)
+LimitCORE=0
+CoredumpFilter=0x00
+
 # Bound automatic restart so a crash loop doesn't burn CPU and amplify a
-# fault into a denial of service for whatever else shares this host.
-# 5 restarts in 10 minutes is generous for legitimate transient failures
-# (network blip on boot) and tight enough that a config error fails fast.
-StartLimitIntervalSec=10min
-StartLimitBurst=5
+# fault into a denial of service for whatever else shares this host. The
+# StartLimit* directives that enforce this live in [Unit] above — systemd
+# silently ignores StartLimitIntervalSec when it is placed in [Service].
 
 # Tighten the file-creation default so any file dsm creates is mode 0600
 # regardless of where it's written. Already what we do for cert + key

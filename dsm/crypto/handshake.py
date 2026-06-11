@@ -36,7 +36,7 @@ import asyncio
 import logging
 import os
 from collections.abc import Awaitable, Callable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypeVar
 
 from cryptography.x509 import Certificate as X509Certificate
 from cryptography.x509 import ObjectIdentifier
@@ -118,6 +118,28 @@ def _unpad_from_frame(blob: bytes, expected_size: int) -> bytes:
     return bytes(blob[:expected_size])
 
 
+_NoiseT = TypeVar("_NoiseT")
+
+
+def _translate_noise_errors(what: str, call: Callable[[], _NoiseT]) -> _NoiseT:
+    """Run a tuncore Noise/transport call that parses peer-controlled
+    bytes, translating the PyO3 ``RuntimeError`` it raises on malformed
+    input into a typed :class:`HandshakeError` (finding C1).
+
+    Rust's Noise readers (``read_message_1/2/3``) and
+    ``NoiseTransport.decrypt`` surface every internal failure — wrong
+    frame size, low-order ephemeral, AEAD auth failure — as a bare
+    ``RuntimeError`` (PyO3 ``py_err``). ``run_server`` / ``run_client``
+    catch only ``HandshakeError`` / ``CertAuthError``, so an
+    unauthenticated malformed ``msg1`` would otherwise escape the retry
+    loop and terminate ``asyncio.run``.
+    """
+    try:
+        return call()
+    except RuntimeError as e:
+        raise HandshakeError(f"{what}: {e}") from e
+
+
 async def client_handshake(
     transport: UDPTransport | TCPTransport,
     identity: tuncore.IdentityKeyPair,
@@ -193,7 +215,9 @@ async def client_handshake(
     # Snapshot the handshake hash that signs msg2's binding *before*
     # read_message_2 advances the Noise state past it.
     binding_hash_for_msg2 = bytes(initiator.get_handshake_hash())
-    server_static_raw, server_attest_payload = initiator.read_message_2(msg2)
+    server_static_raw, server_attest_payload = _translate_noise_errors(
+        "read msg2", lambda: initiator.read_message_2(msg2)
+    )
     server_static = bytes(server_static_raw)
 
     # Verify server attestation: cert chain → CA, binding → server_static,
@@ -275,16 +299,21 @@ async def client_handshake(
     bootstrap_resp_ct = _unpad_from_frame(
         bootstrap_resp_frame, BOOTSTRAP_CIPHERTEXT_SIZE
     )
-    server_public = noise_transport.decrypt(bootstrap_resp_ct)
+    server_public = _translate_noise_errors(
+        "decrypt bootstrap response", lambda: noise_transport.decrypt(bootstrap_resp_ct)
+    )
     if len(server_public) != 32:
         raise HandshakeError("invalid bootstrap ephemeral from server")
 
-    session_keys = tuncore.complete_bootstrap(
-        client_ephemeral,
-        bytes(server_public),
-        is_initiator=True,
-        rotation_packets=rotation_packets,
-        rotation_seconds=rotation_seconds,
+    session_keys = _translate_noise_errors(
+        "bootstrap key derivation (client)",
+        lambda: tuncore.complete_bootstrap(
+            client_ephemeral,
+            bytes(server_public),
+            is_initiator=True,
+            rotation_packets=rotation_packets,
+            rotation_seconds=rotation_seconds,
+        ),
     )
 
     duration_s = asyncio.get_event_loop().time() - started_at
@@ -347,7 +376,7 @@ async def server_handshake(
     # msg1 cannot stall the loop.
     msg1, recv_addr = await _recv_initial(transport)
     started_at = asyncio.get_event_loop().time()
-    responder.read_message_1(msg1)
+    _translate_noise_errors("read msg1", lambda: responder.read_message_1(msg1))
     addr = recv_addr or client_addr
 
     # Message 2: <- e, ee, s, es [+ server attest payload]
@@ -373,7 +402,9 @@ async def server_handshake(
         )
 
     binding_hash_for_msg3 = bytes(responder.get_handshake_hash())
-    client_static_raw, client_attest_payload = responder.read_message_3(msg3)
+    client_static_raw, client_attest_payload = _translate_noise_errors(
+        "read msg3", lambda: responder.read_message_3(msg3)
+    )
     client_static = bytes(client_static_raw)
 
     try:
@@ -418,7 +449,9 @@ async def server_handshake(
     bootstrap_init_ct = _unpad_from_frame(
         bootstrap_init_frame, BOOTSTRAP_CIPHERTEXT_SIZE
     )
-    client_public = noise_transport.decrypt(bootstrap_init_ct)
+    client_public = _translate_noise_errors(
+        "decrypt bootstrap init", lambda: noise_transport.decrypt(bootstrap_init_ct)
+    )
     if len(client_public) != 32:
         raise HandshakeError("invalid bootstrap ephemeral from client")
 
@@ -429,12 +462,15 @@ async def server_handshake(
     bootstrap_resp_frame = _pad_to_frame(bootstrap_resp_ct, BOOTSTRAP_CIPHERTEXT_SIZE)
     await _send(transport, bootstrap_resp_frame, addr)
 
-    session_keys = tuncore.complete_bootstrap(
-        server_ephemeral,
-        bytes(client_public),
-        is_initiator=False,
-        rotation_packets=rotation_packets,
-        rotation_seconds=rotation_seconds,
+    session_keys = _translate_noise_errors(
+        "bootstrap key derivation (server)",
+        lambda: tuncore.complete_bootstrap(
+            server_ephemeral,
+            bytes(client_public),
+            is_initiator=False,
+            rotation_packets=rotation_packets,
+            rotation_seconds=rotation_seconds,
+        ),
     )
 
     duration_s = asyncio.get_event_loop().time() - started_at

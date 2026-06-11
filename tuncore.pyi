@@ -235,3 +235,8 @@ def complete_bootstrap(
 # bytes; receivers get exactly this many bytes back from
 # ``NoiseInitiator.read_message_2`` / ``NoiseResponder.read_message_3``.
 HANDSHAKE_ATTEST_PAYLOAD_SIZE: int
+
+# True when the compiled attestation backend is the extractable software
+# backend (dev-soft-attest). The daemon refuses to start on it unless
+# config.allow_soft_attest is set.
+ATTEST_BACKEND_IS_SOFTWARE: bool

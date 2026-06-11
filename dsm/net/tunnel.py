@@ -22,6 +22,7 @@ from pathlib import Path
 # for the strict TUN-naming counterpart used by config / forwarding.
 from dsm.core import netaudit
 from dsm.core._validators import LINUX_IFACE_NAME_RE as _IFACE_NAME_RE
+from dsm.net._addresses import TUN_PREFIX_LEN
 
 # VPN fwmark to prevent routing loops. Single source of truth lives in the
 # transport layer (_fwmark.SO_MARK_VALUE) so the SO_MARK set on the socket and
@@ -80,6 +81,10 @@ class TunDevice:
         # Guards deconfigure() from restoring IPv6 state that belongs to
         # a prior crashed run rather than this process.
         self._configured = False
+        # Phase 1.4: set True the moment configure() disables IPv6, BEFORE
+        # _configured. deconfigure() restores IPv6 whenever this is set, even
+        # if a later configure() command failed and _configured stayed False.
+        self._ipv6_mutated = False
 
     @property
     def name(self) -> str:
@@ -118,6 +123,18 @@ class TunDevice:
                     continue
         except OSError as e:
             log.warning("failed to capture IPv6 state: %s", e)
+        # Phase 1.4: configure() also writes net.ipv6.conf.all.disable_ipv6=1
+        # but the per-iface loop above never sees `all`/`default`. Capture them
+        # explicitly so _restore_ipv6_state can put them back. Both keys are
+        # alphanumeric and pass LINUX_IFACE_NAME_RE on restore.
+        for scope in ("all", "default"):
+            sysctl_path = Path(f"/proc/sys/net/ipv6/conf/{scope}/disable_ipv6")
+            try:
+                state[scope] = (
+                    sysctl_path.read_text().strip() == "1"
+                )  # pylint: disable=unspecified-encoding
+            except OSError:
+                continue
         return state
 
     def _save_ipv6_state(self, state: dict[str, bool]) -> None:
@@ -223,43 +240,69 @@ class TunDevice:
     def configure(
         self,
         local_ip: str = "10.8.0.2",
-        netmask: int = 24,
+        netmask: int = TUN_PREFIX_LEN,
         mtu: int = 1400,
+        *,
+        server_mode: bool = False,
     ) -> None:
-        """Configure IP address, bring up the interface, and set routing."""
+        """Configure IP address, bring up the interface, and set routing.
+
+        ``server_mode``: when True, SKIP the client full-tunnel policy route
+        (``default dev TUN table 100``) and the ``not fwmark`` ip rule. On
+        the server those would match forwarded client traffic and loop it
+        back into the TUN instead of out the WAN (Phase 1.3). The server
+        relies on the main routing table + MASQUERADE for egress.
+        """
         # Capture IPv6 state before disabling globally
         ipv6_state = self._capture_ipv6_state()
         self._save_ipv6_state(ipv6_state)
+        # Phase 1.4: from here on IPv6 may be disabled; mark mutated so
+        # deconfigure() restores even if a later command fails.
+        self._ipv6_mutated = True
 
         cmds = [
             ["ip", "addr", "replace", f"{local_ip}/{netmask}", "dev", self._name],
             ["ip", "link", "set", self._name, "mtu", str(mtu)],
             ["ip", "link", "set", self._name, "up"],
-            # Routing: use a separate table to route all traffic through TUN
-            # except VPN's own traffic (marked with FWMARK)
-            ["ip", "route", "replace", "default", "dev", self._name, "table", "100"],
             # Disable IPv6 on non-TUN interfaces to prevent dual-stack leaks.
             # The nftables rules also block IPv6, but disabling at sysctl level
             # prevents any IPv6 traffic from being generated in the first place.
             ["sysctl", "-w", "net.ipv6.conf.all.disable_ipv6=1"],
             ["sysctl", "-w", f"net.ipv6.conf.{self._name}.disable_ipv6=0"],
         ]
-        # ip rule has no 'replace' — delete first (ignore if absent), then add
-        rule_args = [
-            "not",
-            "fwmark",
-            str(FWMARK),
-            "table",
-            "100",
-            "priority",
-            "10",
-        ]
-        subprocess.run(  # pylint: disable=subprocess-run-check  # FLAGGED: explicit check= (see report)
-            ["ip", "rule", "del", *rule_args],
-            capture_output=True,
-            timeout=5,
-        )  # ignore errors — rule may not exist yet
-        cmds.append(["ip", "rule", "add", *rule_args])
+        if not server_mode:
+            # Client full-tunnel policy route: send all traffic through TUN
+            # except VPN's own marked traffic. The server skips this — see
+            # the server_mode docstring (Phase 1.3).
+            cmds.insert(
+                3,
+                [
+                    "ip",
+                    "route",
+                    "replace",
+                    "default",
+                    "dev",
+                    self._name,
+                    "table",
+                    "100",
+                ],
+            )
+            # ip rule has no 'replace' — delete first (ignore if absent), then add
+            rule_args = [
+                "not",
+                "fwmark",
+                str(FWMARK),
+                "table",
+                "100",
+                "priority",
+                "10",
+            ]
+            subprocess.run(  # pylint: disable=subprocess-run-check  # FLAGGED: explicit check= (see report)
+                ["ip", "rule", "del", *rule_args],
+                capture_output=True,
+                timeout=5,
+            )  # ignore errors — rule may not exist yet
+            cmds.append(["ip", "rule", "add", *rule_args])
 
         _run_commands(cmds)
         self._configured = True
@@ -308,12 +351,16 @@ class TunDevice:
             ],
             strict=False,
         )
-        # Only restore IPv6 state if we successfully configured in this process.
-        # Without this guard we might restore a state file left behind by a
-        # crashed earlier run that doesn't reflect the current host state.
-        if self._configured:
+        # Phase 1.4: restore IPv6 if EITHER configure fully succeeded OR it
+        # disabled IPv6 before failing partway. The state file still reflects
+        # the pre-disable host state in both cases. Without the _ipv6_mutated
+        # flag, a partial configure() (raised after disabling IPv6 but before
+        # _configured=True) would leave IPv6 globally disabled and the next
+        # run would capture that disabled baseline as the new "restore" target.
+        if self._configured or self._ipv6_mutated:
             self._restore_ipv6_state()
             self._configured = False
+            self._ipv6_mutated = False
             netaudit.emit("tun_deconfigure", iface=self._name)
 
     async def read(self, bufsize: int = 2048) -> bytes:

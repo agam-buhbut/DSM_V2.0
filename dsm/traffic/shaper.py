@@ -174,10 +174,13 @@ class TrafficShaper:
             sc for sc in SIZE_CLASSES if padding_min <= sc <= padding_max
         )
         if not self._active_classes:
-            # Fallback: use the smallest class >= padding_min
-            self._active_classes = (
-                min(sc for sc in SIZE_CLASSES if sc >= padding_min),
-            )
+            # Phase 1.11: padding_min may exceed the largest SIZE_CLASS (1400)
+            # while still passing Config's <=1500 range check. Clamp to the
+            # largest available class rather than crashing on an empty
+            # generator.
+            largest = SIZE_CLASSES[-1]
+            candidates = [sc for sc in SIZE_CLASSES if sc >= padding_min]
+            self._active_classes = (candidates[0],) if candidates else (largest,)
         self._size_tracker = SizeTracker(self._active_classes)
 
         # Wire-rate EMA state. ``_last_wire_time`` is the monotonic
@@ -194,6 +197,30 @@ class TrafficShaper:
         # "fire on the first poll" so a fresh shaper does not have a
         # cold-start dead zone.
         self._next_chaff_time: float = 0.0
+
+    def set_size_class_ceiling(self, max_outer: int) -> None:
+        """Phase 1.7: cap the size classes the shaper pads to at ``max_outer``
+        (the DSM outer-packet size budget = path_mtu - IP - UDP).
+
+        Filters the active classes to those <= max_outer and rebuilds the
+        size tracker so subsequent pad_packet / chaff sizes fit a constrained
+        path. Always keeps at least one class (the smallest), so an absurdly
+        low ceiling degrades gracefully rather than emptying the set. The
+        ceiling is bounded above by the configured ``padding_max`` (raising it
+        cannot exceed the operator's padding policy).
+        """
+        ceiling = min(max_outer, self._padding_max)
+        kept = tuple(sc for sc in SIZE_CLASSES if self._padding_min <= sc <= ceiling)
+        if not kept:
+            # Below the smallest configured class — keep one usable class.
+            # Mirror __init__'s guard: prefer the smallest class >= padding_min,
+            # else the largest available (padding_min may exceed every class —
+            # 1450 still passes Config's <=1500 check — so the generator can be
+            # empty; never crash on min() of an empty iterable).
+            candidates = [sc for sc in SIZE_CLASSES if sc >= self._padding_min]
+            kept = (candidates[0],) if candidates else (SIZE_CLASSES[-1],)
+        self._active_classes = kept
+        self._size_tracker = SizeTracker(self._active_classes)
 
     def pad_packet(self, inner: InnerPacket) -> tuple[bytes, int]:
         """Serialize and pad an inner packet to a size class.

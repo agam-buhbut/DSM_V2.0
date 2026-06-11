@@ -6,10 +6,20 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlparse
 
 from dsm.core._validators import DSM_TUN_NAME_RE as _TUN_NAME_PATTERN
+from dsm.core.path_security import (
+    InsecureFilePermissionsError,
+    check_user_file_permissions,
+)
 
 CONFIG_PATH = Path("/opt/mtun/config.toml")
+
+
+class ConfigError(Exception):
+    """Config file is missing, malformed, or has insecure permissions."""
+
 
 # Validation bounds
 MIN_PORT = 1
@@ -28,10 +38,15 @@ MIN_ROTATION_SECONDS = 60
 MAX_ROTATION_PACKETS = 1 << 31
 MAX_ROTATION_SECONDS = 365 * 24 * 3600
 # TUN MTU bounds. 576 is the IPv4 minimum path MTU (RFC 791). 1500 is
-# standard Ethernet; DSM's wire overhead (IP+UDP+outer header+GCM tag +
-# inner header ≈ 68 B) requires TUN MTU ≤ outer_link_MTU − 68 to avoid
-# path fragmentation. The default 1400 leaves slack for typical VPN-in-
-# VPN or PPPoE paths.
+# standard Ethernet. Two distinct overheads matter and must not be conflated:
+#   * Link overhead = IP(20) + UDP(8) = 28 B, charged against the LINK MTU
+#     (it rides OUTSIDE the DSM outer packet / size class).
+#   * Size-class overhead = outer header(20) + GCM tag(16) + inner header(4)
+#     = 40 B, charged against the 1400-byte top SIZE_CLASS.
+# So a full TUN packet of N bytes becomes an N+40 outer packet, which becomes
+# an N+40+28 wire datagram. DEFAULT_TUN_MTU 1400 leaves slack for VPN-in-VPN
+# / PPPoE paths; auto_mtu lowers it (and the shaper ceiling) on constrained
+# links (Phase 1.7).
 MIN_TUN_MTU = 576
 MAX_TUN_MTU = 1500
 DEFAULT_TUN_MTU = 1400
@@ -102,6 +117,11 @@ class Config:
     # capturing ground truth, and by Phase 4 pentest replays. May also
     # be enabled via the `--debug-net` CLI flag.
     debug_net: bool = False
+    # When False (the default) the daemon refuses to start on the extractable
+    # software attestation backend (dev-soft-attest), whose key is recoverable
+    # from process memory. Set True to acknowledge and run anyway (NOT for
+    # production) — startup then logs a prominent WARNING + netaudit event.
+    allow_soft_attest: bool = False
     # TUN device MTU in bytes. Must satisfy MIN_TUN_MTU <= mtu <= MAX_TUN_MTU.
     # The wire-level path MTU budget is checked against this at startup.
     mtu: int = DEFAULT_TUN_MTU
@@ -126,6 +146,43 @@ class Config:
         _validate(self)
 
 
+def _validate_types(c: Config) -> None:
+    """Phase 1.11: type-check numeric/bool fields before range validators so a
+    wrong-typed TOML value (e.g. server_port = "51820") raises a readable
+    ValueError instead of a cryptic TypeError from a `<=` comparison.
+    """
+    # The isinstance guards below look statically redundant (the dataclass
+    # annotates these as ``int``/``float``), so pyright flags them — but they
+    # are load-bearing: TOML supplies untyped data, so a wrong-typed value
+    # (e.g. server_port = "51820") reaches here despite the annotation. The
+    # ``reportUnnecessaryIsInstance`` suppression is the point of this pass.
+    int_fields = (
+        ("server_port", c.server_port),
+        ("listen_port", c.listen_port),
+        ("padding_min", c.padding_min),
+        ("padding_max", c.padding_max),
+        ("jitter_ms_min", c.jitter_ms_min),
+        ("jitter_ms_max", c.jitter_ms_max),
+        ("rotation_packets", c.rotation_packets),
+        ("rotation_seconds", c.rotation_seconds),
+        ("mtu", c.mtu),
+    )
+    for name, value in int_fields:
+        if isinstance(
+            value, bool
+        ) or not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
+            value, int
+        ):
+            raise ValueError(f"{name} must be an integer, got {type(value).__name__}")
+    if not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
+        c.pmtu_check_interval_s, (int, float)
+    ) or isinstance(c.pmtu_check_interval_s, bool):
+        raise ValueError(
+            "pmtu_check_interval_s must be a number, got "
+            f"{type(c.pmtu_check_interval_s).__name__}"
+        )
+
+
 def _validate_mode(c: Config) -> None:
     if c.mode not in ("client", "server"):
         raise ValueError(f"invalid mode: {c.mode!r}")
@@ -138,12 +195,20 @@ def _validate_server_ip(c: Config) -> None:
     # up at config-load time (and would happen before the kill switch is
     # installed, leaking the lookup), so we require an explicit IP.
     try:
-        ipaddress.ip_address(c.server_ip)
+        addr = ipaddress.ip_address(c.server_ip)
     except ValueError as e:
         raise ValueError(
             f"server_ip must be a literal IP, got {c.server_ip!r}. "
             f"Resolve your hostname first: `dig +short <host> | head -1`"
         ) from e
+    # Phase 1.11 / OWNER DECISION: reject IPv6 until a v6 data path exists.
+    # The transport binds AF_INET only, so an IPv6 endpoint passes this
+    # literal check but is unusable downstream — fail loudly at config load.
+    if addr.version == 6:
+        raise ValueError(
+            f"IPv6 server_ip {c.server_ip!r} is not supported (AF_INET-only "
+            "transport; configure disables IPv6). Use an IPv4 server endpoint."
+        )
 
 
 def _validate_ports(c: Config) -> None:
@@ -172,6 +237,8 @@ def _validate_ports(c: Config) -> None:
 def _validate_key_file(c: Config) -> None:
     if not c.key_file:
         raise ValueError("key_file must not be empty")
+    if not Path(c.key_file).is_absolute():
+        raise ValueError(f"key_file must be absolute, got {c.key_file!r}")
 
 
 def _validate_transport(c: Config) -> None:
@@ -200,6 +267,20 @@ def _validate_dns(c: Config) -> None:
                 "config to include the scheme so this provider is actually used.",
                 provider,
             )
+        # Phase 1.10: provider host MUST be an IP literal. A hostname-form
+        # provider triggers per-query getaddrinfo, whose unmarked UDP is
+        # routed into the server's own TUN (tunnel.py ip rule), dead-looping
+        # resolution. Mirror _validate_server_ip's IP-literal requirement.
+        parsed_host = urlparse(provider).hostname
+        if parsed_host is not None:
+            try:
+                ipaddress.ip_address(parsed_host)
+            except ValueError as e:
+                raise ValueError(
+                    f"dns_provider {provider!r} host must be an IP literal, "
+                    f"got {parsed_host!r}. Resolve it once offline and pin the "
+                    f"IP (a hostname provider dead-loops through the TUN)."
+                ) from e
         pins = c.dns_provider_pins.get(provider)
         if not pins:
             raise ValueError(
@@ -360,6 +441,7 @@ def _validate_pmtu_interval(c: Config) -> None:
 # encountered, so reordering changes which message a test sees. Keep
 # this sequence stable.
 _VALIDATORS = (
+    _validate_types,
     _validate_mode,
     _validate_server_ip,
     _validate_ports,
@@ -399,6 +481,18 @@ def load(path: Path | None = None) -> Config:
         3. Built-in default (/opt/mtun/)
     """
     p = path or CONFIG_PATH
+    # Probe existence first so a missing config produces a clear "not found"
+    # rather than the permission check's "cannot lstat ... chmod 600"
+    # message, which would send the operator chasing a permissions ghost.
+    if not p.exists():
+        raise ConfigError(f"config file not found: {p}")
+    try:
+        check_user_file_permissions(p)
+    except InsecureFilePermissionsError as e:
+        raise ConfigError(
+            f"refusing to load config with insecure permissions: {e}. "
+            f"config.toml pins the CA root + crl_strict; run: chmod 600 {p}"
+        ) from e
     if dsm_config_dir := os.getenv("DSM_CONFIG_DIR"):
         config_dir = Path(dsm_config_dir)
     else:

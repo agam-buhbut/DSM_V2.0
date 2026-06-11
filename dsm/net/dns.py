@@ -50,6 +50,27 @@ EDNS_PADDING_BLOCK = 128
 class _CacheEntry:
     addresses: list[str]
     expires: float
+    # Wire rcode of the cached authoritative answer (NOERROR for positive and
+    # NODATA, NXDOMAIN for a cached non-existent name) so a cache hit can be
+    # relayed with the right rcode (RFC 2308 negative caching).
+    rcode: int = 0
+
+
+@dataclass(slots=True)
+class _DnsResult:
+    """Outcome of parsing an upstream DNS response (Phase 1.10).
+
+    ``authoritative`` is True when the response was a well-formed DNS
+    message with a definitive rcode (NOERROR / NXDOMAIN), so callers can
+    stop provider fan-out and negative-cache instead of treating an empty
+    answer as a transport failure. ``rcode`` is the wire rcode (or -1 for
+    an unparseable / transport-level failure).
+    """
+
+    addresses: list[str]
+    ttl: int
+    rcode: int
+    authoritative: bool
 
 
 class DNSResolver:
@@ -154,23 +175,50 @@ class DNSResolver:
                 self._static_hosts[hostname.lower()] = ip
 
     async def resolve(self, hostname: str) -> list[str]:
-        """Resolve hostname to IP addresses.
+        """Resolve hostname to A-record IP addresses.
 
-        Checks: static hosts -> cache -> DoH -> DoT -> custom.
+        Backward-compatible ``list[str]`` contract (Phase 1.10): callers that
+        only need the addresses keep using this. The richer outcome
+        (NXDOMAIN/NODATA vs transport failure) is available via
+        :meth:`resolve_detailed`. An empty list still means "no addresses",
+        whether authoritative-empty or a failure — the proxy uses
+        :meth:`resolve_detailed` to tell them apart.
+        """
+        return (await self.resolve_detailed(hostname)).addresses
+
+    async def resolve_detailed(self, hostname: str) -> _DnsResult:
+        """Resolve ``hostname``, distinguishing authoritative-empty from failure.
+
+        Checks: static hosts -> cache -> DoH -> DoT -> custom. On an
+        authoritative answer (addresses, NXDOMAIN, or NODATA) provider
+        fan-out STOPS and the result is returned/negative-cached. Only a
+        transport-level failure across every provider yields a
+        non-authoritative empty result (rcode -1).
         """
         hostname = hostname.lower().rstrip(".")
 
         # 1. Static hosts
         static = self._static_hosts.get(hostname)
         if static:
-            return [static]
+            return _DnsResult(
+                addresses=[static],
+                ttl=MAX_TTL,
+                rcode=int(dns.rcode.NOERROR),
+                authoritative=True,
+            )
 
-        # 2. Cache
+        # 2. Cache (positive and negative entries; an empty address list is a
+        # cached authoritative-empty answer per RFC 2308).
         cached = self._cache.get(hostname)
         if cached and cached.expires > time.monotonic():
-            return cached.addresses
+            return _DnsResult(
+                addresses=list(cached.addresses),
+                ttl=MIN_TTL,
+                rcode=int(cached.rcode),
+                authoritative=True,
+            )
 
-        # 3. Query providers in order
+        # 3. Query providers in order; stop on the first authoritative answer.
         for provider in self._providers:
             try:
                 if provider.startswith("https://"):
@@ -181,7 +229,10 @@ class DNSResolver:
                     log.warning("unknown provider scheme: %s", provider)
                     continue
 
-                if result:
+                if result.authoritative:
+                    # Authoritative NXDOMAIN/NODATA/answer: stop fan-out. The
+                    # caching (positive or negative) already happened inside
+                    # the per-protocol resolver.
                     return result
             except Exception as e:  # noqa: BLE001  # see linter report
                 # SPKI pin failures surface as PinMismatchError and indicate
@@ -219,7 +270,9 @@ class DNSResolver:
             else f"qname-sha256={hashlib.sha256(hostname.encode('utf-8', 'replace')).hexdigest()[:16]}"  # noqa: E501  # single sha256(...).hexdigest()[:16] expr; splitting needs a temp var (logic change)
         )
         log.error("all DNS providers failed for %s", redacted)
-        return []
+        # Transport failure across every provider — non-authoritative so the
+        # proxy returns SERVFAIL, not NXDOMAIN.
+        return _DnsResult(addresses=[], ttl=MIN_TTL, rcode=-1, authoritative=False)
 
     async def _resolve_via_pinned_tls(
         self,
@@ -272,7 +325,7 @@ class DNSResolver:
             except (ConnectionError, OSError):
                 pass
 
-    async def _resolve_doh(self, url: str, hostname: str) -> list[str]:
+    async def _resolve_doh(self, url: str, hostname: str) -> _DnsResult:
         """DNS-over-HTTPS query with SPKI pin checked BEFORE the qname
         is sent.
 
@@ -331,12 +384,14 @@ class DNSResolver:
             _doh_send_recv,
             reverify_pin=True,
         )
-        addresses, ttl = _parse_dns_response(body)
-        if addresses:
-            self._cache_result(hostname, addresses, ttl)
-        return addresses
+        result = _parse_dns_response(body)
+        if result.authoritative:
+            # Cache positive (addresses) and negative (NXDOMAIN/NODATA,
+            # empty list) authoritative answers alike, per RFC 2308.
+            self._cache_result(hostname, result.addresses, result.ttl, result.rcode)
+        return result
 
-    async def _resolve_dot(self, provider: str, hostname: str) -> list[str]:
+    async def _resolve_dot(self, provider: str, hostname: str) -> _DnsResult:
         """DNS-over-TLS query with SPKI pin checked before the qname is
         sent. Underlying socket is SO_MARK'd so the connection bypasses
         the VPN's ip-rule routing (otherwise the lookup would loop
@@ -378,15 +433,48 @@ class DNSResolver:
             DOT_TIMEOUT,
             _dot_send_recv,
         )
-        addresses, ttl = _parse_dns_response(resp_data)
-        if addresses:
-            self._cache_result(hostname, addresses, ttl)
-        return addresses
+        result = _parse_dns_response(resp_data)
+        if result.authoritative:
+            # Cache positive (addresses) and negative (NXDOMAIN/NODATA,
+            # empty list) authoritative answers alike, per RFC 2308.
+            self._cache_result(hostname, result.addresses, result.ttl, result.rcode)
+        return result
 
     def _cache_result(
-        self, hostname: str, addresses: list[str], ttl: int = 300
+        self,
+        hostname: str,
+        addresses: list[str],
+        ttl: int = 300,
+        rcode: int = 0,
     ) -> None:
-        """Cache DNS results with TTL enforcement."""
+        """Cache a DNS result with TTL enforcement (positive or negative).
+
+        An empty ``addresses`` list with an authoritative ``rcode``
+        (NXDOMAIN or NOERROR/NODATA) is a negative-cache entry per RFC 2308.
+        """
+        now = time.monotonic()
+
+        # Phase 1.10: opportunistically drop expired heap heads on every cache
+        # write so the heap can't grow unboundedly when the live cache stays
+        # below MAX_CACHE_ENTRIES (a server resolving <2000 distinct names
+        # never entered the eviction loop, leaking a heap entry per
+        # re-resolution).
+        while self._cache_heap and self._cache_heap[0][0] < now:
+            exp, key = heapq.heappop(self._cache_heap)
+            entry = self._cache.get(key)
+            if entry is not None and entry.expires <= now and entry.expires == exp:
+                del self._cache[key]
+
+        # Re-caching the same (still-live) hostname leaves the old (expiry,
+        # key) tuple orphaned in the heap until it expires. Under a small,
+        # frequently-refreshed working set that never trips the eviction loop,
+        # those orphans accumulate. When the heap grows past 2x the live cache
+        # the head-reaping above can't catch up, so rebuild the heap from the
+        # live cache's current expiries (drops every orphan in one O(n) pass).
+        if len(self._cache_heap) > 2 * len(self._cache):
+            self._cache_heap = [(e.expires, k) for k, e in self._cache.items()]
+            heapq.heapify(self._cache_heap)
+
         # Evict expired or soonest-expiring entries via min-heap (O(log n)).
         while len(self._cache) >= MAX_CACHE_ENTRIES and self._cache_heap:
             exp, key = heapq.heappop(self._cache_heap)
@@ -398,10 +486,11 @@ class DNSResolver:
                 break
 
         clamped_ttl = max(MIN_TTL, min(MAX_TTL, ttl))
-        expires = time.monotonic() + clamped_ttl
+        expires = now + clamped_ttl
         self._cache[hostname] = _CacheEntry(
             addresses=addresses,
             expires=expires,
+            rcode=rcode,
         )
         heapq.heappush(self._cache_heap, (expires, hostname))
 
@@ -435,18 +524,39 @@ def _build_dns_query(hostname: str, qtype: int) -> bytes:
     return msg.to_wire()
 
 
-def _parse_dns_response(data: bytes) -> tuple[list[str], int]:
-    """Parse DNS response and extract A record addresses + minimum TTL."""
+def _parse_dns_response(data: bytes) -> _DnsResult:
+    """Parse a DNS response into a typed result (addresses + rcode).
+
+    Distinguishes an authoritative NXDOMAIN/NODATA answer (rcode set,
+    ``authoritative=True``, empty addresses) from a transport-level
+    failure or a retryable rcode (SERVFAIL/REFUSED, ``authoritative=False``)
+    so callers can stop provider fan-out and negative-cache instead of
+    treating every empty answer as a failure (Phase 1.10).
+    """
     try:
         msg = dns.message.from_wire(data)
     except dns.exception.DNSException:
-        return [], 300
+        # Not a parseable DNS message — a transport-level failure, NOT
+        # authoritative; the caller should keep trying other providers.
+        return _DnsResult(addresses=[], ttl=MIN_TTL, rcode=-1, authoritative=False)
 
-    if msg.rcode() != dns.rcode.NOERROR:
-        return [], 300
+    rcode = msg.rcode()
+    if rcode == dns.rcode.NXDOMAIN:
+        return _DnsResult(
+            addresses=[], ttl=MIN_TTL, rcode=int(rcode), authoritative=True
+        )
+    if rcode != dns.rcode.NOERROR:
+        # SERVFAIL / REFUSED etc. — treat as a (non-authoritative) failure so
+        # other providers are still tried.
+        return _DnsResult(
+            addresses=[], ttl=MIN_TTL, rcode=int(rcode), authoritative=False
+        )
 
     addresses: list[str] = []
-    min_ttl = 300
+    # Phase 1.10: seed with MAX_TTL (was 300) so the clamp in _cache_result
+    # can actually reach MAX_TTL — previously min(300, ttl) capped every
+    # answer at 300 s, making MAX_TTL dead.
+    min_ttl = MAX_TTL
     for rrset in msg.answer:
         if rrset.rdtype != dns.rdatatype.A:
             continue
@@ -457,7 +567,15 @@ def _parse_dns_response(data: bytes) -> tuple[list[str], int]:
             if isinstance(rdata, dns.rdtypes.IN.A.A):
                 addresses.append(rdata.address)
 
-    return addresses, min_ttl
+    if not addresses:
+        # NOERROR with no A records = NODATA, authoritative; negative-cache
+        # at MIN_TTL.
+        return _DnsResult(
+            addresses=[], ttl=MIN_TTL, rcode=int(rcode), authoritative=True
+        )
+    return _DnsResult(
+        addresses=addresses, ttl=min_ttl, rcode=int(rcode), authoritative=True
+    )
 
 
 # Hard caps on the manual HTTP/1.1 parser. DoH responses are tiny —

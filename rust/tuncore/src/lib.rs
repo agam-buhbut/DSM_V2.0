@@ -565,9 +565,16 @@ impl PySessionKeyManager {
         remote_ephemeral_pub: &[u8],
         new_epoch: u32,
     ) -> PyResult<(Vec<u8>, u32)> {
-        if self.pending_responder_rotation.is_some() {
-            return Err(py_err("responder rotation already prepared"));
-        }
+        // Phase 1.2: a prior responder rotation whose REKEY_ACK send timed
+        // out (dsm/rekey.py ACK-send-timeout path) leaves its pending here
+        // with no apply. That is the ONLY way a pending lingers — a
+        // successful rotation applies-and-clears within the same
+        // handle_rekey_init call, and apply_rotation_responder().take()s the
+        // pending even on its own error path. So any pending we find here is
+        // always stale: drop it (zeroizing its LockedKey32 send/recv keys via
+        // ResponderPending's Drop) and prepare fresh, rather than erroring
+        // and wedging the responder forever.
+        let _ = self.pending_responder_rotation.take();
         let pub_bytes = pub_key_from_slice(remote_ephemeral_pub)?;
         let pending = self
             .inner
@@ -830,5 +837,18 @@ fn tuncore(m: &Bound<'_, PyModule>) -> PyResult<()> {
         "HANDSHAKE_ATTEST_PAYLOAD_SIZE",
         noise_xx::HANDSHAKE_ATTEST_PAYLOAD_SIZE,
     )?;
+    m.add(
+        "ATTEST_BACKEND_IS_SOFTWARE",
+        device_attest::BACKEND_IS_SOFTWARE,
+    )?;
     Ok(())
 }
+
+// NOTE: the Phase-1.2 fix (prepare_rotation_responder overwrites a stale
+// pending instead of erroring) is covered by the FFI-level regression
+// tests/test_rekey_responder_abort.py. An inline #[cfg(test)] test here that
+// referenced the PyO3 wrapper type would pull libpython symbols into the
+// crate's single test binary, which fails to link under the
+// `extension-module` feature (pyo3 suppresses the libpython link directive),
+// breaking `cargo test` for the WHOLE crate. The Python end-to-end test runs
+// cleanly under pytest and verifies the same behavior through the FFI.

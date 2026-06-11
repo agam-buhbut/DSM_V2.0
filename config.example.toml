@@ -1,5 +1,6 @@
 # DSM VPN Configuration
-# Copy to /opt/mtun/config.toml and edit. All file paths must be absolute.
+# Copy to /opt/mtun/config.toml (mode 0600) and edit. All file paths must be
+# absolute.
 #
 # Trust model: every device runs `dsm enroll --csr-out` once, walks the CSR to
 # the offline CA laptop, gets a cert back, and runs `dsm enroll --import`.
@@ -7,32 +8,50 @@
 # (server) CN allowlist or (client) expected_server_cn. See deploy/GUIDE.txt.
 
 mode = "client"                              # "client" | "server"
-server_ip = "203.0.113.1"                    # Server public IP (literal IP, not hostname)
-server_port = 51820                          # Server's UDP service port
+server_ip = "203.0.113.1"                    # Server public IPv4 literal (not a hostname, not IPv6)
+server_port = 51820                          # Server's service port
 listen_port = 0                              # client: 0 = ephemeral; server: real bind port
 
 # ─── Identity & device cert ────────────────────────────────────────────────
-key_file = "/opt/mtun/identity.key"          # Argon2id-wrapped X25519 Noise static
+key_file = "/opt/mtun/identity.key"          # Argon2id-wrapped X25519 Noise static (absolute path)
 cert_file = "/opt/mtun/device.crt"           # X.509 leaf cert (DER or PEM), signed by internal CA
 ca_root_file = "/opt/mtun/dsm_ca_root.pem"   # Pinned CA root cert (PEM)
-# REQUIRED: SHA-256 of ca_root_file (64 hex chars). The daemon refuses to
-# start without it — it pins the trust anchor so a swapped on-disk CA PEM is
-# rejected. Compute with: sha256sum /opt/mtun/dsm_ca_root.pem | cut -d' ' -f1
+# REQUIRED — REPLACE the all-zeros placeholder BEFORE first start. SHA-256 of
+# ca_root_file (64 hex chars). The daemon refuses to start without a real value
+# (it pins the trust anchor so a swapped on-disk CA PEM is rejected). Compute:
+#   sha256sum /opt/mtun/dsm_ca_root.pem | cut -d' ' -f1
 ca_root_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
 attest_key_file = "/opt/mtun/attest.key"     # Argon2id-wrapped ECDSA P-256 attestation key
-# crl_file = "/opt/mtun/dsm_ca.crl"          # Optional but recommended; refresh monthly via walked-USB
+
+# Refuse to start on the extractable software attestation backend
+# (dev-soft-attest), whose key is recoverable from process memory and gives NO
+# hardware binding. Leave false in production; set true ONLY to acknowledge the
+# risk in dev/lab. Startup then logs a prominent WARNING + netaudit event.
+# allow_soft_attest = false
+
+# ─── Certificate revocation (CRL) ──────────────────────────────────────────
+# crl_strict is true BY DEFAULT and fail-closed: the daemon refuses to start
+# unless a crl_file is configured AND it is not past next_update. A fresh copy
+# of this example WITHOUT a crl_file will refuse to start. Either provide a CRL:
+# crl_file = "/opt/mtun/dsm_ca.crl"          # DER or PEM; refresh monthly via walked-USB
+# ...or, for dev/lab only, drop to a warning:
+# crl_strict = false
 
 # ─── Role-specific cert policy ─────────────────────────────────────────────
 # Client only: subject CN we accept on the server cert.
 expected_server_cn = "dsm-1234abcd-server"
 
-# Server only: file with one allowed client subject CN per line, mode 0o600 or 0o640.
+# Server only: file with one allowed client subject CN per line. Mode 0600
+# (or 0400) — any group/world bits are rejected at startup.
 # allowed_cns_file = "/opt/mtun/allowed_cns.txt"
 
-# Server only: DNS providers + pinned SPKI SHA-256 (server resolves on behalf of clients).
+# Server only: DNS providers + pinned SPKI SHA-256 (server resolves on behalf
+# of clients). Provider host MUST be an IP literal (a hostname dead-loops
+# through the TUN).
 # dns_providers = ["https://1.1.1.1/dns-query"]
 # [dns_provider_pins]
 # "https://1.1.1.1/dns-query" = ["<64-char hex SPKI SHA-256>"]
+# debug_dns = false                          # true logs plaintext qnames (privacy off)
 
 # ─── Network ───────────────────────────────────────────────────────────────
 transport = "udp"                            # "udp" | "tcp"
@@ -42,12 +61,21 @@ log_level = "warning"                        # "debug" | "info" | "warning" | "e
 # TUN MTU. Default 1400 leaves slack for VPN-in-VPN / PPPoE paths.
 mtu = 1400
 # pmtu_discover = false                      # Enable IP_MTU_DISCOVER (sets DF bit)
+# auto_mtu = false                           # Track kernel PMTU + adjust TUN MTU; recommend true for cellular/roaming
+# pmtu_check_interval_s = 30.0               # auto_mtu poll cadence (seconds)
+
+# Structured JSON audit stream on the dsm.netaudit logger. May also be enabled
+# with --debug-net. Note: enabling it on a shared log host re-exposes some
+# handshake-failure detail; see deploy/GUIDE.txt §9.
+# debug_net = false
 
 # ─── Traffic shaping ───────────────────────────────────────────────────────
 padding_min = 128
 padding_max = 1400
 jitter_ms_min = 1
-jitter_ms_max = 50
+# jitter_ms_max widens the packet-reorder window for anonymity. 100 is the
+# M-ANON-4 default; lower values trade anonymity for interactive latency.
+jitter_ms_max = 100
 
 # ─── Key rotation ──────────────────────────────────────────────────────────
 rotation_packets = 5000                      # Rotate after N packets

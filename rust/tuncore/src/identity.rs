@@ -122,9 +122,10 @@ impl IdentityKeyPair {
     /// Encrypt the keypair to a blob using a passphrase
     /// (Argon2id + XChaCha20-Poly1305).
     ///
-    /// Format: `salt(32) || nonce(24) || ciphertext+tag`. The actual
-    /// sealing is delegated to [`passphrase_store::seal`] so the wire
-    /// format is identical to the attest-store wire format.
+    /// Format: the versioned sealed-blob format owned by
+    /// [`passphrase_store::seal`] (`DSMK` magic || version || Argon2id
+    /// params || salt || nonce || ciphertext+tag), identical to the
+    /// attest-store wire format.
     pub fn encrypt_to_store(&self, passphrase: &[u8]) -> Result<Vec<u8>, String> {
         passphrase_store::seal(self.secret.as_array(), passphrase)
     }

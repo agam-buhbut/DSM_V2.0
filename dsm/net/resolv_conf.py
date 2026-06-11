@@ -23,6 +23,15 @@ log = logging.getLogger(__name__)
 
 RESOLV_CONF = Path("/etc/resolv.conf")
 
+# Persistent backup of the operator's REAL resolv.conf, written on the first
+# apply over a non-dsm file. Survives a crash so a restart that finds the
+# dsm-managed file (restore never ran) can still recover the true original.
+RESOLV_BACKUP = Path("/var/lib/dsm/resolv.conf.orig")
+
+# Marker that identifies a file WE wrote. If apply() reads this back as the
+# "current" file (after a crash), it must NOT treat that as the original.
+_DSM_MARKER = b"# Managed by dsm"
+
 
 class ResolvConfManager:
     """Own /etc/resolv.conf for the lifetime of the VPN session."""
@@ -32,6 +41,26 @@ class ResolvConfManager:
         self._original_contents: bytes | None = None
         self._original_symlink_target: str | None = None
         self._applied = False
+
+    @staticmethod
+    def _load_backup() -> bytes | None:
+        try:
+            if RESOLV_BACKUP.exists():
+                return RESOLV_BACKUP.read_bytes()
+        except OSError as e:
+            log.warning("could not read resolv.conf backup: %s", e)
+        return None
+
+    @staticmethod
+    def _save_backup(contents: bytes) -> None:
+        # Only write the backup once — never overwrite a good backup with a
+        # later (possibly dsm-managed) capture.
+        if RESOLV_BACKUP.exists():
+            return
+        try:
+            atomic_write(RESOLV_BACKUP, contents, mode=0o600, mkdir=True)
+        except OSError as e:
+            log.warning("could not persist resolv.conf backup: %s", e)
 
     def apply(self) -> None:
         """Replace resolv.conf with a single-nameserver file.
@@ -90,11 +119,28 @@ class ResolvConfManager:
                         self._original_contents = None
         elif RESOLV_CONF.exists():
             try:
-                self._original_contents = RESOLV_CONF.read_bytes()
+                current: bytes | None = RESOLV_CONF.read_bytes()
             except OSError:
-                # File disappeared between exists() and read; treat as
-                # "no original to restore" — same as the never-existed branch.
+                # File disappeared/errored between exists() and read; treat
+                # as "no original to restore" — same as the never-existed
+                # branch (remove() will unlink our override). MUST NOT fall
+                # into the capture/backup logic with b"": that would both
+                # write an empty resolv.conf on restore AND poison the
+                # write-once persistent backup with b"", permanently losing
+                # the real original on a later crash-restart.
+                current = None
+            if current is None:
                 self._original_contents = None
+            elif current.startswith(_DSM_MARKER):
+                # Phase 1.5: this is OUR file (a prior run crashed before
+                # restore). Do NOT capture it as the original — recover the
+                # real original from the persistent backup instead.
+                self._original_contents = self._load_backup()
+            else:
+                self._original_contents = current
+                # First apply over a genuine file: persist it so a later
+                # crash can still recover it.
+                self._save_backup(current)
         # If the file simply didn't exist, both fields stay None and we
         # remove our override on teardown instead of restoring anything.
 
@@ -126,6 +172,13 @@ class ResolvConfManager:
             return
 
         try:
+            if (
+                self._original_symlink_target is None
+                and self._original_contents is None
+            ):
+                # Phase 1.5: nothing captured in-memory — prefer the persistent
+                # backup (a crash-restart manager that found a dsm-managed file).
+                self._original_contents = self._load_backup()
             if self._original_symlink_target is not None:
                 # Symlink restore: create a sibling temp symlink, then
                 # rename it over RESOLV_CONF. rename(2) replaces
@@ -161,4 +214,10 @@ class ResolvConfManager:
             self._applied = False
             self._original_contents = None
             self._original_symlink_target = None
+            # Phase 1.5: the backup has served its purpose; drop it so the
+            # next apply over a genuine file captures a fresh original.
+            try:
+                RESOLV_BACKUP.unlink(missing_ok=True)
+            except OSError:
+                pass
             log.info("resolv.conf restored")

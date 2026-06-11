@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import ipaddress
 import logging
 import time
 from typing import Any
@@ -26,7 +27,14 @@ import dns.rdataclass
 import dns.rdatatype
 import dns.rrset
 
+import dsm.net.dns as _dns
+from dsm.net._addresses import TUN_PREFIX_LEN
 from dsm.net.dns import DNSResolver
+
+# _DnsResult is intentionally private in dsm.net.dns (Phase 1.10); the proxy is
+# a sibling that relays its rcode, so this cross-module use of an underscore
+# name is deliberate and the private-usage check is suppressed at the alias.
+_DnsResult = _dns._DnsResult  # pyright: ignore[reportPrivateUsage]  # noqa: E501
 
 log = logging.getLogger(__name__)
 
@@ -79,13 +87,28 @@ class LocalDNSProxy:
         self._transport: asyncio.DatagramTransport | None = None
         self._tasks: set[asyncio.Task[None]] = set()
         self._sem = asyncio.Semaphore(self._MAX_CONCURRENT_QUERIES)
-        # In-flight request deduplication: (qname, qtype) -> Future[addresses]
-        self._inflight: dict[tuple[str, int], asyncio.Future[list[str]]] = {}
+        # In-flight request deduplication: (qname, qtype) -> Future[_DnsResult]
+        self._inflight: dict[tuple[str, int], asyncio.Future[_DnsResult]] = {}
         # Counter of dropped queries due to task-set saturation. Sampled into
         # the audit log so an operator can see when the proxy is shedding
         # load (rate-limited via _shed_log_throttle to avoid log flooding).
         self._tasks_shed: int = 0
         self._tasks_shed_last_log: float = 0.0
+        # Restrict to the in-tunnel /24 derived from the bind address.
+        # The proxy binds on the server's TUN IP (10.8.0.1) and clients
+        # arrive from 10.8.0.0/24; any other source reaching this socket
+        # (Linux weak host model + rp_filter=2) is an off-tunnel
+        # open-resolver / reflection attempt and must be dropped before
+        # any task / inflight state is allocated.
+        self._allowed_source_net = ipaddress.ip_network(
+            f"{bind_ip}/{TUN_PREFIX_LEN}", strict=False
+        )
+        self._dropped_offnet: int = 0
+        self._dropped_offnet_last_log: float = 0.0
+        # Fires a one-time WARNING on the very first off-tunnel drop so an
+        # operator scanning logs at WARNING level always sees the guard is
+        # active. All subsequent drops use the rate-limited DEBUG path.
+        self._dropped_offnet_warned: bool = False
 
     async def start(self) -> None:
         loop = asyncio.get_running_loop()
@@ -149,6 +172,36 @@ class LocalDNSProxy:
         task.add_done_callback(self._tasks.discard)
         return True
 
+    def _source_allowed(self, addr: tuple[str, int]) -> bool:
+        """True iff ``addr`` is inside the in-tunnel source network."""
+        try:
+            src = ipaddress.ip_address(addr[0])
+        except ValueError:
+            return False
+        return src in self._allowed_source_net
+
+    def _note_dropped_source(self, addr: tuple[str, int]) -> None:
+        """Count an off-tunnel drop; log at WARNING once, then DEBUG-rate-limited."""
+        self._dropped_offnet += 1
+        if not self._dropped_offnet_warned:
+            self._dropped_offnet_warned = True
+            log.warning(
+                "off-tunnel DNS query dropped from %s (open-resolver guard); "
+                "further drops logged at DEBUG",
+                addr[0],
+            )
+            return
+        now = time.monotonic()
+        if now - self._dropped_offnet_last_log > 5.0:
+            log.debug(
+                "dropped %d off-tunnel DNS queries since last log "
+                "(most recent source %s)",
+                self._dropped_offnet,
+                addr[0],
+            )
+            self._dropped_offnet_last_log = now
+            self._dropped_offnet = 0
+
     def _parse_or_reject(
         self,
         data: bytes,
@@ -189,11 +242,31 @@ class LocalDNSProxy:
 
         return query, qname, qtype
 
+    async def _resolve_upstream(self, qname: str) -> _DnsResult:
+        """Call the resolver, preferring the rcode-bearing ``resolve_detailed``.
+
+        Resolvers that expose ``resolve_detailed`` (the real ``DNSResolver``)
+        let the proxy relay NXDOMAIN/NODATA. Test/stub resolvers that only
+        implement ``resolve() -> list[str]`` fall back to a non-authoritative
+        wrapper so an empty list still maps to SERVFAIL (the historic
+        fail-closed behavior).
+        """
+        detailed = getattr(self._resolver, "resolve_detailed", None)
+        if detailed is not None:
+            return await detailed(qname)
+        addresses = await self._resolver.resolve(qname)
+        return _DnsResult(
+            addresses=addresses,
+            ttl=DEFAULT_CACHED_TTL,
+            rcode=int(dns.rcode.NOERROR) if addresses else -1,
+            authoritative=bool(addresses),
+        )
+
     async def _resolve_with_dedup(
         self,
         qname: str,
         qtype: int,
-    ) -> list[str]:
+    ) -> _DnsResult:
         """Resolve ``qname`` for A records, coalescing concurrent duplicates.
 
         The first caller for a (qname, qtype) holds a semaphore slot while
@@ -201,8 +274,8 @@ class LocalDNSProxy:
         so the semaphore actually bounds upstream fan-out (not total
         duplicates waiting).
 
-        Returns ``[]`` on inflight-map saturation (signals SERVFAIL to
-        the caller) or on resolver failure.
+        Returns a non-authoritative empty ``_DnsResult`` (signals SERVFAIL to
+        the caller) on inflight-map saturation or on resolver failure.
         """
         query_key = (qname, qtype)
         inflight_future = self._inflight.get(query_key)
@@ -210,7 +283,7 @@ class LocalDNSProxy:
             try:
                 return await inflight_future
             except Exception:  # noqa: BLE001  # see linter report
-                return []
+                return _DnsResult(addresses=[], ttl=0, rcode=-1, authoritative=False)
 
         if len(self._inflight) >= self._MAX_INFLIGHT:
             log.debug(
@@ -218,16 +291,16 @@ class LocalDNSProxy:
                 len(self._inflight),
                 _redact_qname(qname),
             )
-            return []
+            return _DnsResult(addresses=[], ttl=0, rcode=-1, authoritative=False)
 
         inflight_future = asyncio.get_running_loop().create_future()
         self._inflight[query_key] = inflight_future
         try:
             async with self._sem:
                 try:
-                    addresses = await self._resolver.resolve(qname)
-                    inflight_future.set_result(addresses)
-                    return addresses
+                    result = await self._resolve_upstream(qname)
+                    inflight_future.set_result(result)
+                    return result
                 except Exception as e:  # noqa: BLE001  # see linter report
                     log_qname = (
                         qname
@@ -240,7 +313,9 @@ class LocalDNSProxy:
                         type(e).__name__,
                     )
                     inflight_future.set_exception(e)
-                    return []
+                    return _DnsResult(
+                        addresses=[], ttl=0, rcode=-1, authoritative=False
+                    )
         finally:
             del self._inflight[query_key]
 
@@ -285,13 +360,23 @@ class LocalDNSProxy:
             return
         query, qname, qtype = parsed
 
-        addresses = await self._resolve_with_dedup(qname, qtype)
+        result = await self._resolve_with_dedup(qname, qtype)
 
         try:
-            if not addresses:
+            if result.addresses:
+                send(self._build_response(query, result.addresses), addr)
+            elif result.authoritative and result.rcode == int(dns.rcode.NXDOMAIN):
+                # Relay the authoritative non-existent name as NXDOMAIN, not
+                # SERVFAIL (Phase 1.10).
+                send(_make_error(query, dns.rcode.NXDOMAIN), addr)
+            elif result.authoritative:
+                # NODATA: authoritative NOERROR with no A records.
+                resp = dns.message.make_response(query)
+                resp.flags |= dns.flags.RA
+                send(resp.to_wire(), addr)
+            else:
+                # Transport failure across all providers — SERVFAIL as before.
                 send(_make_error(query, dns.rcode.SERVFAIL), addr)
-                return
-            send(self._build_response(query, addresses), addr)
         except Exception as e:
             log.exception("failed to send DNS response to %s: %s", addr, e)
 
@@ -306,6 +391,9 @@ class _ProxyProtocol(asyncio.DatagramProtocol):
 
     def datagram_received(self, data: bytes, addr: tuple[str | Any, int]) -> None:
         if self._transport is None:
+            return
+        if not self._proxy._source_allowed(addr):  # pylint: disable=protected-access  # pyright: ignore[reportPrivateUsage]  # intentional sibling-internal access  # fmt: skip
+            self._proxy._note_dropped_source(addr)  # pylint: disable=protected-access  # pyright: ignore[reportPrivateUsage]  # intentional sibling-internal access  # fmt: skip
             return
         transport = self._transport
 

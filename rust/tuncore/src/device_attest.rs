@@ -11,6 +11,16 @@
 #[cfg(feature = "dev-soft-attest")]
 pub use crate::device_attest_soft::SoftAttestKey as AttestKey;
 
+/// True when the active (compile-time) attestation backend is the
+/// software backend, whose key is extractable from process memory.
+/// Exposed to Python as `tuncore.ATTEST_BACKEND_IS_SOFTWARE` so the
+/// daemon can gate startup on it (Phase 0). The future `tpm-attest`
+/// arm sets this to `false`.
+#[cfg(feature = "dev-soft-attest")]
+pub const BACKEND_IS_SOFTWARE: bool = true;
+#[cfg(feature = "tpm-attest")]
+pub const BACKEND_IS_SOFTWARE: bool = false;
+
 // Enforce EXACTLY ONE backend at compile time. `tpm-attest` is still
 // commented out in Cargo.toml (Phase 1 step 5), but the guard is written to
 // be correct the moment it is enabled — both arms must hold for any valid

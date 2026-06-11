@@ -36,7 +36,13 @@ def atomic_write(
     fd, tmp = tempfile.mkstemp(dir=path.parent)
     try:
         os.fchmod(fd, mode)
-        os.write(fd, data)
+        # Phase 1.11: os.write may write fewer bytes than requested (ENOSPC
+        # mid-write, >2GiB, interruption). Loop until all bytes are written so
+        # the atomically-renamed file is never silently truncated.
+        view = memoryview(data)
+        written = 0
+        while written < len(view):
+            written += os.write(fd, view[written:])
         os.fsync(fd)
         os.close(fd)
         fd = -1

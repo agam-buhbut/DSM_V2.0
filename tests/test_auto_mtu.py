@@ -15,7 +15,7 @@ from __future__ import annotations
 import asyncio
 import unittest
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -53,12 +53,15 @@ def _make_config(**overrides: Any) -> Config:
 class _StubCtx:
     """Minimal duck-typed DataPathContext for the auto-MTU loop.
 
-    The loop only touches ``tun`` and ``shutdown``; we don't need the
-    full session-state machinery.
+    The loop touches ``tun``, ``shutdown``, and (Phase 1.7) ``shaper``
+    (to clamp the size-class ceiling to the discovered PMTU); we don't
+    need the full session-state machinery. ``shaper`` is a MagicMock —
+    these tests assert on TUN-MTU decisions, not on shaper calls.
     """
 
     tun: Any
     shutdown: asyncio.Event
+    shaper: Any = field(default_factory=MagicMock)
 
 
 def _make_udp_transport_with_pmtus(pmtus: Iterator[int | None]) -> UDPTransport:
