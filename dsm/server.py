@@ -303,7 +303,16 @@ async def _run_one_session(
         # Fresh per-session protocol state. A re-accepted client gets a clean
         # SequenceCounter / ReplayWindow / epoch — never reuse the previous
         # session's instances.
-        shaper = TrafficShaper(config.padding_min, config.padding_max)
+        shaper = TrafficShaper(
+            config.padding_min,
+            config.padding_max,
+            envelope_idle_floor_min_pps=config.envelope_idle_floor_min_pps,
+            envelope_idle_floor_max_pps=config.envelope_idle_floor_max_pps,
+            envelope_ceiling_pps=config.envelope_ceiling_pps,
+            envelope_rise_per_s=config.envelope_rise_per_s,
+            envelope_fall_half_life_s=config.envelope_fall_half_life_s,
+            envelope_latency_budget_ms=config.envelope_latency_budget_ms,
+        )
         replay = tuncore.ReplayWindow()
         seq = SequenceCounter()
         rekey = RekeyState()
@@ -369,12 +378,13 @@ async def _run_one_session(
             shutdown=session_shutdown,
         )
 
-        # Guard chaff generation until client_addr is known — the scheduler
-        # starts immediately but chaff requires a destination for UDP. The
-        # monotonic-set-once invariant is enforced by _ClientAddr.set;
-        # _should_chaff just checks for the initial None state.
-        def _should_chaff() -> bool:
-            return client_addr.get() is not None and shaper.should_send_chaff()
+        # Phase 2: envelope-driven (mirrors the client). The shaper's paced
+        # wire budget decides how many packets leave per poll; should_chaff
+        # is now only a GATE that suppresses chaff-fill until client_addr is
+        # known — otherwise the direct chaff send would hit make_send_fn's
+        # "destination addr not yet known" path and trigger shutdown.
+        def _chaff_allowed() -> bool:
+            return client_addr.get() is not None
 
         # Scheduler+shaper params must mirror the client's — divergence here
         # reintroduces a direction-correlation fingerprint. See
@@ -382,9 +392,10 @@ async def _run_one_session(
         server_scheduler = SendScheduler(
             send_fn=send_packet,
             chaff_fn=lambda: make_chaff_packet(shaper, session_keys.epoch & 0x0F),
-            should_chaff_fn=_should_chaff,
+            should_chaff_fn=_chaff_allowed,
             jitter_ms_min=config.jitter_ms_min,
             jitter_ms_max=config.jitter_ms_max,
+            shaper=shaper,
         )
         await server_scheduler.start()
         session_stack.push_async_callback(server_scheduler.stop)

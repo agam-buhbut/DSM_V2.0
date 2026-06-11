@@ -77,6 +77,42 @@ jitter_ms_min = 1
 # M-ANON-4 default; lower values trade anonymity for interactive latency.
 jitter_ms_max = 100
 
+# ─── Adaptive-envelope shaping knobs (Phase 2 / Fork 8) ───────────────────
+# These are all optional; leaving them unset uses the defaults below.
+# The defaults form a coherent anonymity profile — operators who don't need
+# to tune leave them commented out.
+#
+# Idle overhead ≈ floor_pps × ~900 B/pkt; expect ~0.5–2 kB/s idle.
+# Burst-tail overhead: the envelope decays for ~fall_half_life_s seconds after
+# a burst ends, continuing to emit chaff at the elevated rate.
+#
+# Per-packet latency budget. A real packet is never delayed more than this
+# many milliseconds waiting for the envelope to rise. Lower = less hiding;
+# higher = more hiding but head-of-line latency under burst. The default
+# 1000ms (1s) gives the x2/s rise a full second to absorb a burst before
+# the budget override fires, hiding burst onset more strongly; lower it
+# toward ~250ms if interactive traffic feels laggy under load.
+# envelope_latency_budget_ms = 1000
+#
+# Multiplicative per-second rise cap (must be > 1.0). 2.0 means the envelope
+# can at most double per second during a burst — smears onset across ~2–4 s.
+# envelope_rise_per_s = 2.0
+#
+# Exponential-decay half-life (seconds) when idle. Sets how long the
+# post-burst chaff tail lasts before returning to the floor rate.
+# envelope_fall_half_life_s = 4.0
+#
+# Soft wire-rate ceiling (packets/sec). Normal chaff-fill never exceeds this;
+# only the latency-budget override may temporarily pierce it. 600 pps ×
+# ~1400 B ≈ 6.7 MB/s — this caps chaff overhead, not real throughput.
+# envelope_ceiling_pps = 600
+#
+# Per-session randomized idle floor bounds (packets/sec). The actual floor is
+# drawn uniformly from [min, max] at session start and held fixed for the
+# session lifetime, removing the exact-1-pps constant DSM baseline.
+# envelope_idle_floor_min_pps = 0.5
+# envelope_idle_floor_max_pps = 2.0
+
 # ─── Key rotation ──────────────────────────────────────────────────────────
 rotation_packets = 5000                      # Rotate after N packets
 rotation_seconds = 600                       # Rotate after N seconds (10 min)

@@ -594,6 +594,20 @@ class TestDataPathRoundtrip(unittest.IsolatedAsyncioTestCase):
             reassembly=ReassemblyBuffer(),
         )
 
+        # Phase 2.6: control-plane (REKEY_INIT retransmits) is now PACED
+        # through the scheduler, so each retry hands the packet to
+        # scheduler.enqueue rather than calling send_fn directly. Spy on
+        # enqueue to observe the retransmits (the scheduler is not started
+        # here, so paced packets stay queued and never reach send_fn).
+        enqueued: list[tuple[bytes, int]] = []
+        orig_enqueue = scheduler.enqueue
+
+        def _spy_enqueue(data: bytes, target_size: int) -> None:
+            enqueued.append((data, target_size))
+            orig_enqueue(data, target_size)
+
+        scheduler.enqueue = _spy_enqueue  # type: ignore[method-assign]
+
         # Let the loop run for a few iterations. The retry scheduler
         # should fire at least once per iteration until MAX_REKEY_RETRIES
         # is hit, then shutdown.set().
@@ -607,8 +621,9 @@ class TestDataPathRoundtrip(unittest.IsolatedAsyncioTestCase):
             shutdown.set()
             await asyncio.gather(task, return_exceptions=True)
 
-        # At least MAX_REKEY_RETRIES retransmits must have hit send_fn;
-        # after that the loop sets shutdown and exits.
+        # At least MAX_REKEY_RETRIES retransmits must have fired, and each
+        # must have been handed to the paced scheduler (enqueue); after
+        # that the loop sets shutdown and exits.
         from dsm.rekey import MAX_REKEY_RETRIES
 
         self.assertGreaterEqual(
@@ -617,9 +632,9 @@ class TestDataPathRoundtrip(unittest.IsolatedAsyncioTestCase):
             f"expected >= {MAX_REKEY_RETRIES} retries, got {rekey.retries_used}",
         )
         self.assertGreaterEqual(
-            len(wire_sends),
+            len(enqueued),
             MAX_REKEY_RETRIES,
-            "wire send_fn should have been called for each retry",
+            "each REKEY_INIT retransmit should have been enqueued (paced)",
         )
 
     async def test_session_close_triggers_peer_shutdown(self) -> None:

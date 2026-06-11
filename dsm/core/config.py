@@ -107,6 +107,27 @@ class Config:
     # who care about sub-50 ms RTT for VoIP/gaming can configure
     # lower; everyone else benefits from the larger reorder window.
     jitter_ms_max: int = 100
+    # ── Adaptive-envelope traffic-shaping knobs (Phase 2 / Fork 8) ────────
+    # All fields are optional (backward-compatible). The defaults form a
+    # coherent envelope profile; see config.example.toml for per-knob notes.
+    # Per-packet latency budget: a real packet is never delayed more than this
+    # many milliseconds waiting for the envelope to rise.
+    envelope_latency_budget_ms: int = 1000
+    # Multiplicative per-second rise cap. Must be > 1.0 (otherwise the
+    # envelope cannot rise at all). Value 2.0 means the envelope can at most
+    # double per second when draining a real-traffic burst.
+    envelope_rise_per_s: float = 2.0
+    # Exponential-decay half-life (seconds) when no real traffic is queued.
+    # Controls how long the post-burst chaff tail lasts.
+    envelope_fall_half_life_s: float = 4.0
+    # Soft ceiling on wire rate (packets/sec). Normal chaff-fill never
+    # exceeds this; only the latency-budget override may pierce it temporarily.
+    envelope_ceiling_pps: int = 600
+    # Per-session randomized idle floor bounds (packets/sec). The actual floor
+    # is drawn uniformly from [min, max] at shaper construction and fixed for
+    # the session lifetime, removing the exact-1-pps constant DSM baseline.
+    envelope_idle_floor_min_pps: float = 0.5
+    envelope_idle_floor_max_pps: float = 2.0
     rotation_packets: int = 5000
     rotation_seconds: int = 600
     debug_dns: bool = False
@@ -166,6 +187,8 @@ def _validate_types(c: Config) -> None:
         ("rotation_packets", c.rotation_packets),
         ("rotation_seconds", c.rotation_seconds),
         ("mtu", c.mtu),
+        ("envelope_latency_budget_ms", c.envelope_latency_budget_ms),
+        ("envelope_ceiling_pps", c.envelope_ceiling_pps),
     )
     for name, value in int_fields:
         if isinstance(
@@ -174,13 +197,18 @@ def _validate_types(c: Config) -> None:
             value, int
         ):
             raise ValueError(f"{name} must be an integer, got {type(value).__name__}")
-    if not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
-        c.pmtu_check_interval_s, (int, float)
-    ) or isinstance(c.pmtu_check_interval_s, bool):
-        raise ValueError(
-            "pmtu_check_interval_s must be a number, got "
-            f"{type(c.pmtu_check_interval_s).__name__}"
-        )
+    float_fields = (
+        ("pmtu_check_interval_s", c.pmtu_check_interval_s),
+        ("envelope_rise_per_s", c.envelope_rise_per_s),
+        ("envelope_fall_half_life_s", c.envelope_fall_half_life_s),
+        ("envelope_idle_floor_min_pps", c.envelope_idle_floor_min_pps),
+        ("envelope_idle_floor_max_pps", c.envelope_idle_floor_max_pps),
+    )
+    for name, value in float_fields:
+        if not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
+            value, (int, float)
+        ) or isinstance(value, bool):
+            raise ValueError(f"{name} must be a number, got {type(value).__name__}")
 
 
 def _validate_mode(c: Config) -> None:
@@ -369,6 +397,42 @@ def _validate_jitter(c: Config) -> None:
         )
 
 
+def _validate_envelope(c: Config) -> None:
+    # Bounds match the Task-2.8 spec: latency_budget_ms in [10, 5000];
+    # rise_per_s in (1.0, 100.0]; fall_half_life_s in (0, 60];
+    # ceiling_pps in [idle_floor_max, 100000];
+    # 0 < idle_floor_min <= idle_floor_max <= 1000.
+    if not (10 <= c.envelope_latency_budget_ms <= 5000):
+        raise ValueError(
+            f"envelope_latency_budget_ms must be 10–5000 ms, "
+            f"got {c.envelope_latency_budget_ms}"
+        )
+    if not (1.0 < c.envelope_rise_per_s <= 100.0):
+        raise ValueError(
+            f"envelope_rise_per_s must be > 1.0 and <= 100.0 "
+            f"(must be able to rise), got {c.envelope_rise_per_s}"
+        )
+    if not (0.0 < c.envelope_fall_half_life_s <= 60.0):
+        raise ValueError(
+            f"envelope_fall_half_life_s must be in (0, 60] s, "
+            f"got {c.envelope_fall_half_life_s}"
+        )
+    if not (
+        0.0 < c.envelope_idle_floor_min_pps <= c.envelope_idle_floor_max_pps <= 1000.0
+    ):
+        raise ValueError(
+            f"envelope_idle_floor_min_pps ({c.envelope_idle_floor_min_pps}) and "
+            f"envelope_idle_floor_max_pps ({c.envelope_idle_floor_max_pps}) must "
+            f"satisfy 0 < min <= max <= 1000"
+        )
+    if not (c.envelope_idle_floor_max_pps <= c.envelope_ceiling_pps <= 100000):
+        raise ValueError(
+            f"envelope_ceiling_pps must be >= envelope_idle_floor_max_pps "
+            f"({c.envelope_idle_floor_max_pps}) and <= 100000, "
+            f"got {c.envelope_ceiling_pps}"
+        )
+
+
 def _validate_rotation(c: Config) -> None:
     if c.rotation_packets < MIN_ROTATION_PACKETS:
         raise ValueError(f"rotation_packets too low: {c.rotation_packets}")
@@ -453,6 +517,7 @@ _VALIDATORS = (
     _validate_role_specific,
     _validate_padding,
     _validate_jitter,
+    _validate_envelope,
     _validate_rotation,
     _validate_log_level,
     _validate_tun_name,

@@ -495,6 +495,11 @@ async def _handle_rekey_init(ctx: DataPathContext, inner: InnerPacket) -> None:
         rekey_state=ctx.rekey,
         local_static_pub=ctx.local_static_pub,
         remote_static_pub=ctx.remote_static_pub,
+        # Task 2.6: route the (normal) REKEY_ACK through the paced envelope so
+        # its wire timing matches the steady stream. The duplicate-INIT
+        # cached-ACK replay inside handle_rekey_init keeps the bounded direct
+        # send_fn (lost-ACK recovery must stay observable within 5 s).
+        paced_send=ctx.scheduler.enqueue,
     )
 
 
@@ -957,6 +962,11 @@ async def tun_send_loop(ctx: DataPathContext) -> None:
                     ctx.shaper,
                     ctx.send_fn,
                     ctx.rekey.last_time,
+                    # Task 2.6: pace the REKEY_INIT onto the envelope. The
+                    # retransmit budget is gated on REKEY_ACK_TIMEOUT (ACK
+                    # receipt), not send completion, so fire-and-forget enqueue
+                    # is safe — a paced INIT leaves within one latency budget.
+                    paced_send=ctx.scheduler.enqueue,
                 )
             except Exception:
                 # An exception out of initiate_rekey must not leave the
@@ -1002,6 +1012,10 @@ async def tun_send_loop(ctx: DataPathContext) -> None:
                     ctx.session_keys,
                     ctx.shaper,
                     ctx.send_fn,
+                    # Task 2.6: pace the retransmitted INIT (same envelope path
+                    # as the original; the next ACK timeout is the recovery
+                    # mechanism, so fire-and-forget is correct).
+                    paced_send=ctx.scheduler.enqueue,
                 )
                 ctx.rekey.last_init_sent_at = time.monotonic()
 
@@ -1020,9 +1034,10 @@ async def tun_send_loop(ctx: DataPathContext) -> None:
             log.warning("dropping oversized TUN packet (%d bytes): %s", len(pkt), e)
             continue
 
-        smoothing_delay = ctx.shaper.burst_smoothing_delay()
-        if smoothing_delay is not None:
-            await asyncio.sleep(smoothing_delay)
+        # Phase 2: the adaptive envelope (TrafficShaper.update_envelope /
+        # release_budget, driven by the scheduler) smooths burst onset by
+        # PACING the queue — real packets enter the same paced queue and the
+        # envelope governs when they leave (within the latency budget).
         # H-ANON-1: spread out fragments across multiple jitter windows
         # so an oversized TUN packet doesn't produce a recognizable
         # "1 → N tightly-spaced packets" wire signature. Per-fragment

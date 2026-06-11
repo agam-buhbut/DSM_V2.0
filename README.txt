@@ -153,17 +153,58 @@ Padding:
   unauthenticated outer padding remains on the wire
 - TCP frames padded to max size class (1400) for constant wire size
 
-Chaff:
-- Adaptive chaff generation mirroring real traffic patterns
-- Active mode: rate tracks real traffic (0.5x-1.5x multiplier, resampled
-  every 1-3s)
-- Idle mode: burst patterns mimicking browsing (exponential inter-burst gaps)
-- Size distribution mirrors observed real traffic via exponential moving
-  average; chaff size occasionally perturbed ±1 class to decorrelate
+Chaff and adaptive-envelope shaping:
+- The wire packet rate (real + chaff) is paced to a slowly-varying
+  ENVELOPE — a target packets/sec that the scheduler emits exactly,
+  regardless of instantaneous real-traffic volume. Real packets are
+  queued and released at the envelope rate; chaff fills the gap when
+  real traffic is below the envelope.
+- Burst onset is SMEARED: when real traffic arrives the envelope rises
+  slowly (bounded ×2 per second), so a passive observer sees a gradual
+  rate increase over seconds rather than a step at the moment real
+  traffic starts. Short-term volume is hidden within the latency budget.
+- Per-packet latency budget (default 1000 ms): a real packet is never
+  delayed longer than the budget waiting for the envelope to rise.
+  Latency-sensitive deployments (VoIP, gaming) can lower
+  envelope_latency_budget_ms to trade onset-hiding for responsiveness.
+- Idle cover: a low, per-session-randomized chaff floor (default
+  0.5–2.0 pps, drawn once at session start) keeps cover traffic flowing
+  when idle. Idle overhead ≈ 0.5–2 kB/s.
+- Chaff sizes are drawn from a FIXED published size-class prior
+  (SIZE_CLASS_WEIGHTS), NOT the live real-traffic distribution. So the
+  aggregate (real + chaff) wire-size histogram trends toward a
+  fleet-wide constant rather than revealing the user's application
+  profile. A per-chaff-packet ±1-class perturbation further decorrelates.
+
+  DOCUMENTED RESIDUALS (what is NOT hidden — be explicit):
+  - SUSTAINED high-volume traffic (e.g. a bulk download) IS visible on
+    the wire: the budget override raises the envelope to match within
+    ~1 s, so a long steady-state flow at high rate is observable.
+    Only the onset (the transition from idle to active) is smeared;
+    steady-state volume is not hidden by this model.
+  - The idle floor is a detectable steady baseline: the PRESENCE of a
+    low-rate (~0.5–2 pps) chaff stream is visible even though the exact
+    rate is randomized per session.
+  - The envelope paces PACKETS, not bytes. Residual byte-rate signal is
+    bounded by the shared fixed-prior chaff sizes but not eliminated.
+  - BOOT / HANDSHAKE FINGERPRINT (accepted v1 risk): the Noise XX
+    handshake emits a fixed-size pre-key frame sequence before session
+    keys exist. This window is NOT covered by the envelope. A passive
+    observer can fingerprint DSM session establishment from this
+    recognizable fixed-1400-byte exchange. Masking pre-key traffic is
+    post-v1 research; it is documented here as an accepted v1 risk.
+  - TCP transport: see IMPORTANT note in NETWORKING above. TCP is
+    obfuscation-only against simple DPI; the SYN/FIN/RST connection
+    fingerprint remains visible regardless of inner padding or timing.
+    Use UDP for the strongest anonymity properties.
 
 Timing:
-- Configurable jitter (default 1-50ms) on all outgoing packets
+- Configurable jitter (default 1-100ms) on all outgoing packets
 - Send scheduler with priority queue and randomized delays
+- Envelope knobs (envelope_latency_budget_ms, envelope_rise_per_s,
+  envelope_fall_half_life_s, envelope_ceiling_pps,
+  envelope_idle_floor_min_pps, envelope_idle_floor_max_pps) are
+  documented with bandwidth/latency tradeoffs in config.example.toml
 
 Leak Prevention:
 - nftables kill switch blocks all non-VPN traffic
@@ -195,6 +236,30 @@ Out of Scope:
 - Physical access to client/server
 - Compromised dependencies or libraries
 - Anonymity from the server operator (server sees client IP)
+
+Accepted v1 Risks (documented, not fixed in this release):
+- BOOT / HANDSHAKE FINGERPRINT: the Noise XX establishment exchange
+  emits a recognizable fixed-1400-byte pre-key frame sequence before
+  any session keys exist. This window is outside the adaptive-envelope
+  shaper (the envelope governs post-key data traffic only). A passive
+  on-path observer can detect and fingerprint DSM session establishment
+  from this sequence. Masking pre-key traffic is post-v1 research.
+- SUSTAINED VOLUME: the envelope hides burst ONSET and short-term
+  volume within the configurable latency budget (default 1 s). A
+  sustained high-rate transfer that exceeds the budget for long enough
+  drives the envelope to match the real rate within ~1 s, making the
+  steady-state wire rate visible. Volume over many seconds is not
+  hidden; only the transition is smeared.
+- TCP TRANSPORT: see IMPORTANT note in NETWORKING above. TCP is
+  obfuscation-only against simple DPI; connection establishment and
+  teardown patterns are visible. Use UDP for the strongest anonymity
+  properties.
+- PACKET-RATE (not byte-rate) ENVELOPE: the shaper paces packets/sec.
+  Residual byte-rate signal is bounded by the fixed-prior chaff sizes
+  but not eliminated; a bytes/sec envelope is post-v1 work.
+- SOFTWARE ATTEST KEY: the default soft-attest backend stores the
+  ECDSA attest key on disk and it is extractable from process memory
+  (see CRYPTOGRAPHY above). Hardware binding (TPM) is Phase 1 step 5.
 
 IMPLEMENTATION
 

@@ -23,6 +23,19 @@ PADDING_MIN = 128
 PADDING_MAX = 1400
 
 
+class _Clock:
+    """Injectable monotonic clock for deterministic pacing-symmetry tests."""
+
+    def __init__(self, start: float = 1000.0) -> None:
+        self.t = start
+
+    def __call__(self) -> float:
+        return self.t
+
+    def advance(self, dt: float) -> None:
+        self.t += dt
+
+
 def _sizes_from_many_packets(shaper: TrafficShaper, trials: int) -> set[int]:
     """Call pad_packet many times and collect the target outer sizes."""
     sizes: set[int] = set()
@@ -70,28 +83,58 @@ class TestSymmetricShaping(unittest.TestCase):
 
         asyncio.run(_run())
 
-    def test_both_ends_report_chaff_under_poisson_model(self) -> None:
-        """Both client and server shapers must schedule chaff under the
-        same Poisson model. Tested in a single-shot manner: ``should_send_chaff``
-        fires at most once per ``_next_chaff_time`` crossing, so polling
-        a fresh shaper exactly once (with ``_next_chaff_time`` pre-armed
-        in the past) must return True on both sides.
+    def test_both_ends_pace_identically_under_same_envelope_config(self) -> None:
+        """Client and server shapers driven by the same envelope config must
+        release the SAME per-tick wire budget given the same queue input.
 
-        We deliberately avoid a "fires at least N times in 1000 polls"
-        assertion: under the Poisson model that depends on real wall-clock
-        time advancing between polls, which is racy in CI."""
-        client = TrafficShaper(PADDING_MIN, PADDING_MAX)
-        server = TrafficShaper(PADDING_MIN, PADDING_MAX)
+        The wire rate is paced by the envelope (update_envelope /
+        release_budget), so direction symmetry now means: identical config +
+        identical queue history => identical release schedule. A divergence
+        here would let a passive observer tell client→server from
+        server→client by the chaff/real cadence rather than by size.
 
-        # Both shapers start with _next_chaff_time = 0.0 (in the past).
-        self.assertTrue(client.should_send_chaff())
-        self.assertTrue(server.should_send_chaff())
+        Driven by an injected deterministic clock and a fixed idle floor
+        (min == max) so the only per-session randomness is removed and the
+        pacing math is fully reproducible across both ends.
+        """
 
-        # After firing, both must reschedule into the future with the
-        # same Poisson process (same parameters → same support).
-        now = client._next_chaff_time
-        self.assertGreater(now, 0.0)
-        self.assertGreater(server._next_chaff_time, 0.0)
+        def _make(clock: _Clock) -> TrafficShaper:
+            return TrafficShaper(
+                PADDING_MIN,
+                PADDING_MAX,
+                clock=clock,
+                envelope_idle_floor_min_pps=1.0,
+                envelope_idle_floor_max_pps=1.0,
+                envelope_ceiling_pps=100.0,
+                envelope_rise_per_s=2.0,
+                envelope_fall_half_life_s=4.0,
+                envelope_latency_budget_ms=1000,
+            )
+
+        client_clk, server_clk = _Clock(), _Clock()
+        client, server = _make(client_clk), _make(server_clk)
+
+        # Same queue history on both ends over ~3s: idle, then a sustained
+        # backlog whose oldest packet breaches the 1s budget (forcing the
+        # override on both ends), then idle again. The window is long enough
+        # that the 1pps floor alone releases several packets, so the schedule
+        # is non-trivial. Record each end's per-tick release budget.
+        depths = [0] * 50 + [200] * 150 + [0] * 100
+        ages = [0.0] * 50 + [1.5] * 150 + [0.0] * 100
+        client_budget: list[int] = []
+        server_budget: list[int] = []
+        for depth, age in zip(depths, ages):
+            client_clk.advance(0.01)
+            server_clk.advance(0.01)
+            client.update_envelope(client_clk(), depth, age)
+            server.update_envelope(server_clk(), depth, age)
+            client_budget.append(client.release_budget(client_clk()))
+            server_budget.append(server.release_budget(server_clk()))
+
+        self.assertEqual(client_budget, server_budget)
+        # Sanity: the run actually drove releases (not a trivially-equal
+        # all-zero schedule).
+        self.assertGreater(sum(client_budget), 0)
 
 
 if __name__ == "__main__":

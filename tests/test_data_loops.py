@@ -59,17 +59,11 @@ class _FakeSessionKeys:
 
 
 class _FakeShaper:
-    def burst_smoothing_delay(self) -> float | None:
-        return None
-
     def pad_packet(self, inner: object) -> tuple[bytes, int]:
         return (b"\x00" * 16, 128)
 
     def observe_real_packet(self, size: int) -> None:
         pass
-
-    def should_send_chaff(self) -> bool:
-        return False
 
 
 class _RecordingScheduler:

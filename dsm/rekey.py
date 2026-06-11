@@ -41,6 +41,17 @@ MAX_REKEY_RETRIES = 9
 
 SendFn = Callable[[bytes, int], Awaitable[None]]
 
+# Task 2.6 (Fork 7 = YES): a synchronous, fire-and-forget paced-enqueue
+# callable — the same ``SendScheduler.enqueue`` real data/chaff packets use.
+# When supplied, control-plane REKEY_INIT/REKEY_ACK are released at the
+# envelope rate (≤ one latency budget late) instead of leaving immediately
+# via ``send_fn``, so their wire timing is indistinguishable from the steady
+# stream. ``enqueue`` only *queues*; the retransmit logic is gated on
+# ACK-receipt timeout (REKEY_ACK_TIMEOUT), not on send completion, so
+# fire-and-forget is safe (see the module docstring of session.py and the
+# retry scheduler in tun_send_loop).
+PacedSend = Callable[[bytes, int], None]
+
 
 async def _send_rekey_packet(
     ptype: PacketType,
@@ -48,13 +59,23 @@ async def _send_rekey_packet(
     session_keys: tuncore.SessionKeyManager,
     shaper: TrafficShaper,
     send_fn: SendFn,
+    paced_send: PacedSend | None = None,
 ) -> None:
     """Build a rekey-family inner packet, pad, and send it.
 
     All four REKEY_INIT/REKEY_ACK construction sites share the same
     shape — same epoch_id derivation, same shaper.pad_packet call,
-    same send_fn invocation. Centralised here so future protocol
+    same send invocation. Centralised here so future protocol
     fields (e.g. an explicit rekey reason) land in one place.
+
+    Task 2.6: when ``paced_send`` is supplied the padded packet is handed
+    to the paced scheduler queue (fire-and-forget) instead of the bounded
+    direct ``send_fn``, so it leaves at the envelope rate. The padding is
+    identical either way — the wire packet is the same size class / AEAD
+    shape as a real data packet, only its release timing differs. When
+    ``paced_send`` is None the legacy direct-await path is used (kept so
+    pre-existing call sites / tests that pass only ``send_fn`` are
+    unchanged, and so the duplicate-ACK retransmit can stay bounded).
     """
     inner = InnerPacket(
         ptype=ptype,
@@ -62,7 +83,10 @@ async def _send_rekey_packet(
         payload=payload,
     )
     padded, target_size = shaper.pad_packet(inner)
-    await send_fn(padded, target_size)
+    if paced_send is not None:
+        paced_send(padded, target_size)
+    else:
+        await send_fn(padded, target_size)
 
 
 def _is_rate_limited(last_rekey_time: float | None) -> bool:
@@ -82,6 +106,8 @@ async def initiate_rekey(
     shaper: TrafficShaper,
     send_fn: SendFn,
     last_rekey_time: float | None = None,
+    *,
+    paced_send: PacedSend | None = None,
 ) -> tuple[float | None, int | None, bytes | None]:
     """Start a key rotation: generate ephemeral keypair, send REKEY_INIT.
 
@@ -90,6 +116,12 @@ async def initiate_rekey(
     into the REKEY_INIT; callers should stash it in ``RekeyState`` so
     ``resend_rekey_init`` can retransmit the same INIT on ACK timeout.
     Returns ``(last_rekey_time, None, None)`` if the rekey was skipped.
+
+    Task 2.6: when ``paced_send`` is supplied the REKEY_INIT rides the
+    paced envelope (fire-and-forget enqueue) instead of the bounded direct
+    ``send_fn``. This is safe because the retransmit budget is driven by
+    REKEY_ACK_TIMEOUT (ACK *receipt*), not by send completion — a paced
+    INIT leaves within ~one latency budget, far inside the 8 s window.
     """
     if fsm.state != State.ESTABLISHED:
         log.warning("cannot initiate rekey in state %s", fsm.state.name)
@@ -107,6 +139,7 @@ async def initiate_rekey(
         session_keys,
         shaper,
         send_fn,
+        paced_send=paced_send,
     )
     log.info("rekey initiated, new epoch=%d", new_epoch)
     return time.monotonic(), new_epoch, payload
@@ -117,6 +150,8 @@ async def resend_rekey_init(
     session_keys: tuncore.SessionKeyManager,
     shaper: TrafficShaper,
     send_fn: SendFn,
+    *,
+    paced_send: PacedSend | None = None,
 ) -> None:
     """Retransmit a REKEY_INIT with the same rotation payload.
 
@@ -125,6 +160,10 @@ async def resend_rekey_init(
     ACK and retransmit it without re-deriving keys. Padding is
     re-randomized per call via ``shaper.pad_packet``; an observer
     cannot see a byte-identical retransmit.
+
+    Task 2.6: when ``paced_send`` is supplied the retransmit also rides
+    the paced envelope (same justification as ``initiate_rekey`` — the
+    next ACK-timeout retry is the recovery mechanism, not send completion).
     """
     await _send_rekey_packet(
         PacketType.REKEY_INIT,
@@ -132,6 +171,7 @@ async def resend_rekey_init(
         session_keys,
         shaper,
         send_fn,
+        paced_send=paced_send,
     )
 
 
@@ -150,6 +190,7 @@ async def handle_rekey_init(
     rekey_state: RekeyState | None = None,
     local_static_pub: bytes | None = None,
     remote_static_pub: bytes | None = None,
+    paced_send: PacedSend | None = None,
 ) -> tuple[float | None, int | None, bytes | None]:
     """Process a REKEY_INIT: complete rotation as responder, send REKEY_ACK.
 
@@ -284,29 +325,52 @@ async def handle_rekey_init(
         return last_rekey_time, cached_ack_epoch, cached_ack_payload
 
     # Send ACK under old keys (session_keys epoch not yet rotated).
-    # M-BUG-12: bound the send so TCP backpressure doesn't stall the
-    # recv loop indefinitely.
     ack_payload = struct.pack("!I", prepared_epoch) + bytes(our_ephemeral_pub)
-    try:
-        await asyncio.wait_for(
-            _send_rekey_packet(
-                PacketType.REKEY_ACK,
-                ack_payload,
-                session_keys,
-                shaper,
-                send_fn,
-            ),
-            timeout=5.0,
+    if paced_send is not None:
+        # Task 2.6: pace the ACK so its wire timing matches the steady stream.
+        # The packet is BUILT now (old-epoch nibble) but LEAVES later at the
+        # envelope rate. Two safety properties keep this correct across the
+        # immediately-following apply_rotation_responder():
+        #   * the receiver EXEMPTS REKEY_ACK from the epoch-nibble check
+        #     (decrypt_packet, Phase 1.1), so a NEW nibble restamped at send
+        #     time by make_send_fn does not drop it; and
+        #   * the responder DEFERS its send-key swap for the grace window
+        #     (session_keys.rs H-BUG-2/3), so the paced ACK still encrypts
+        #     under the OLD send key the pre-rotation initiator can decrypt.
+        # enqueue is fire-and-forget: no TimeoutError self-heal is needed
+        # because the scheduler — not this recv-loop frame — owns delivery
+        # and cannot pin the recv loop on a wedged transport (it drops oldest).
+        await _send_rekey_packet(
+            PacketType.REKEY_ACK,
+            ack_payload,
+            session_keys,
+            shaper,
+            send_fn,
+            paced_send=paced_send,
         )
-    except TimeoutError:
-        log.warning("REKEY_ACK send timed out — peer may be wedged")
-        # Phase 1.2: this leaves pending_responder_rotation set in Rust with
-        # no apply. That is tolerated: the next REKEY_INIT's
-        # prepare_rotation_responder overwrites the stale pending (dropping
-        # and zeroizing its keys), so the responder self-heals on the next
-        # rekey instead of wedging permanently.
-        fsm.transition(State.ESTABLISHED)
-        return last_rekey_time, cached_ack_epoch, cached_ack_payload
+    else:
+        # Legacy direct path. M-BUG-12: bound the send so TCP backpressure
+        # doesn't stall the recv loop indefinitely.
+        try:
+            await asyncio.wait_for(
+                _send_rekey_packet(
+                    PacketType.REKEY_ACK,
+                    ack_payload,
+                    session_keys,
+                    shaper,
+                    send_fn,
+                ),
+                timeout=5.0,
+            )
+        except TimeoutError:
+            log.warning("REKEY_ACK send timed out — peer may be wedged")
+            # Phase 1.2: this leaves pending_responder_rotation set in Rust with
+            # no apply. That is tolerated: the next REKEY_INIT's
+            # prepare_rotation_responder overwrites the stale pending (dropping
+            # and zeroizing its keys), so the responder self-heals on the next
+            # rekey instead of wedging permanently.
+            fsm.transition(State.ESTABLISHED)
+            return last_rekey_time, cached_ack_epoch, cached_ack_payload
 
     # Now apply the rotation.
     try:
