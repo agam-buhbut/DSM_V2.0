@@ -1,10 +1,16 @@
 """Encrypted on-disk store for the device's hardware-bound attest key.
 
-Soft attest backend only: the key is wrapped with Argon2id +
-XChaCha20-Poly1305, identical to the identity store. TPM and Android
-Keystore backends seal the key natively (TPM persistent handle, Keystore
-alias) and do not produce a passphrase blob — those backends will live in
-a sibling module.
+The operator passphrase protects the attest key on BOTH backends (Task 3.12):
+
+  * Soft backend: the signing scalar is wrapped with Argon2id +
+    XChaCha20-Poly1305, identical to the identity store.
+  * TPM backend: the key is TPM-resident and never leaves the chip, so the
+    passphrase is bound as the key's TPM authorization value (via
+    ``TPM2_ObjectChangeAuth`` at store time, re-installed via
+    ``tr_set_auth`` at sign time). TPM residency AND the passphrase are then
+    both required to sign — an attacker holding the on-disk ``DSMT`` blob and
+    TPM access still cannot sign without the passphrase, and the TPM's
+    dictionary-attack lockout rate-limits guessing.
 
 Mirrors ``dsm.crypto.keystore.KeyStore`` so both stores can share the
 same passphrase: caller reads the passphrase once via
@@ -26,8 +32,32 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
+def _store_passphrase(passphrase: bytes | bytearray) -> bytes:
+    """Operator passphrase for the Rust store shim — load-bearing on BOTH
+    backends (Task 3.12).
+
+    The real passphrase is passed through unchanged regardless of backend:
+
+      * Soft backend seals the signing scalar under it (Argon2id +
+        XChaCha20-Poly1305).
+      * TPM backend binds it as the key's TPM authorization value
+        (``encrypt_to_store`` runs ``TPM2_ObjectChangeAuth``;
+        ``decrypt_from_store`` caches the derived auth for ``sign``).
+
+    The TCTI that selects which TPM to talk to is threaded via the ``TCTI``
+    env var by the enroll/daemon entry points (the Rust backend reads it),
+    not by this store.
+    """
+    return bytes(passphrase)
+
+
 class AttestStore:
-    """Manages the device attest key's on-disk persistence (soft backend)."""
+    """Manages the device attest key's on-disk persistence.
+
+    Backend-agnostic: the operator passphrase protects the key on both the
+    soft (Argon2id seal) and TPM (key TPM-auth) backends — see the module
+    docstring. The active backend is selected at wheel build time.
+    """
 
     def __init__(self, attest_key_file: str) -> None:
         self._path = Path(attest_key_file)
@@ -58,7 +88,7 @@ class AttestStore:
         import tuncore
 
         ak = tuncore.AttestKey.generate()
-        blob = bytes(ak.encrypt_to_store(bytes(passphrase)))
+        blob = bytes(ak.encrypt_to_store(_store_passphrase(passphrase)))
         atomic_write(self._path, blob)
         self._key = ak
         return bytes(ak.public_spki_der())
@@ -74,7 +104,7 @@ class AttestStore:
         import tuncore
 
         blob = self._path.read_bytes()
-        ak = tuncore.AttestKey.decrypt_from_store(blob, bytes(passphrase))
+        ak = tuncore.AttestKey.decrypt_from_store(blob, _store_passphrase(passphrase))
         self._key = ak
         return bytes(ak.public_spki_der())
 

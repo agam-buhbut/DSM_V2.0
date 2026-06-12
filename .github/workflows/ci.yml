@@ -10,6 +10,16 @@ on:
 # For full hardening they should be pinned to commit SHAs once looked up;
 # that is a deliberate follow-up (fabricating SHAs here would be unverifiable).
 
+# Two attest lanes (Phase-3 Task 3.11): the soft and tpm backends are
+# mutually exclusive at compile time, so each backend needs its own wheel and
+# its own job.
+#   * soft lane (`test`)        — builds the dev-soft-attest wheel and runs the
+#                                 FULL Python suite + the soft Rust tests. This
+#                                 is the broad gate (black/isort/ruff/pylint/
+#                                 pyright/audit live here, unchanged).
+#   * tpm  lane (`tpm-attest`)  — installs swtpm + the TSS2 stack, builds the
+#                                 tpm-attest wheel, and runs the swtpm-driven
+#                                 Rust tests + the TPM-only Python tests.
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -42,14 +52,17 @@ jobs:
           pip install maturin black isort ruff pylint pyright \
                       pytest pytest-asyncio pip-audit dnspython types-dnspython
 
-      # Build the release wheel from the repo root: bundles the dsm/ package
-      # AND the tuncore extension into one wheel (DSM-004), then install it so
-      # `import dsm` / `import tuncore` resolve from any cwd.
-      - name: Build + install (release wheel)
+      # Build the SOFT release wheel from the repo root: bundles the dsm/
+      # package AND the tuncore extension into one wheel (DSM-004), then install
+      # it so `import dsm` / `import tuncore` resolve from any cwd. The default
+      # Cargo feature is now `tpm-attest` (Task 3.11), so this lane must force
+      # `--no-default-features --features dev-soft-attest` to get the soft
+      # backend the full Python suite expects (ATTEST_BACKEND_IS_SOFTWARE=True).
+      - name: Build + install (soft wheel)
         env:
           PYO3_PYTHON: ${{ steps.setup-python.outputs.python-path }}
         run: |
-          maturin build --release --out dist
+          maturin build --release --no-default-features --features dev-soft-attest --out dist
           pip install --no-index --find-links dist dsm
 
       # ── Python gates (CLAUDE.md order: black → isort → ruff → pylint → pyright) ──
@@ -65,27 +78,117 @@ jobs:
         run: pyright
 
       # ── Rust gates (rustfmt → clippy → audit) ──
+      # clippy runs on the soft feature here (this runner has no TSS2 headers);
+      # the tpm-attest clippy gate lives in the tpm-attest job below.
       - name: rustfmt (format check)
         run: cargo fmt --manifest-path rust/tuncore/Cargo.toml --check
-      - name: clippy
+      - name: clippy (soft)
         run: >-
-          cargo clippy --manifest-path rust/tuncore/Cargo.toml --all-targets --
+          cargo clippy --manifest-path rust/tuncore/Cargo.toml --all-targets
+          --no-default-features --features dev-soft-attest --
           -D warnings -W clippy::pedantic -W clippy::unwrap_used
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
       - name: cargo audit
-        run: cargo audit --file rust/tuncore/Cargo.lock
+        # RUSTSEC-2026-0176 (OOB read in PyList/PyTuple `nth`/`nth_back`) and
+        # RUSTSEC-2026-0177 (missing Sync bound on `PyCFunction::new_closure`)
+        # both require pyo3 >= 0.29 (a breaking 0.24 -> 0.29 jump for the FFI
+        # crypto core). DSM uses NEITHER affected API: the FFI passes PyBytes,
+        # never PyList/PyTuple nth-iteration nor raw closures. Ignored here with
+        # this justification; the pyo3 0.24 -> 0.29 upgrade is tracked as a
+        # dedicated dependency-maintenance pass (with full FFI re-test).
+        run: >
+          cargo audit --file rust/tuncore/Cargo.lock
+          --ignore RUSTSEC-2026-0176
+          --ignore RUSTSEC-2026-0177
 
       # ── Supply chain: Python runtime deps ──
       - name: pip-audit
         run: pip-audit --progress-spinner off
 
-      # ── Tests ──
-      - name: Rust tests
-        run: cargo test --manifest-path rust/tuncore/Cargo.toml --release
-      - name: Python tests
+      # ── Tests (soft lane) ──
+      - name: Rust tests (soft)
+        run: >-
+          cargo test --manifest-path rust/tuncore/Cargo.toml --release
+          --no-default-features --features dev-soft-attest
+      - name: Python tests (soft)
+        env:
+          DSM_REQUIRE_TUNCORE: "1"
         run: pytest tests/ -q
 
       # ── DSM-004 packaging smoke: the installed dsm must import from any cwd ──
       - name: Packaging smoke
         run: cd /tmp && python -c "import dsm, tuncore; print('packaging OK')"
+
+  # ── TPM lane: the real tpm-attest backend, exercised against swtpm ──────────
+  # ubuntu-latest runners do NOT ship the TSS2 stack or swtpm by default, so
+  # this job installs them. Verified package names on a current Debian/Ubuntu:
+  #   swtpm                       — the /usr/bin/swtpm emulator binary
+  #   swtpm-tools                 — swtpm_setup et al.
+  #   libtss2-dev                 — tss2-esys headers + pkg-config (build/link)
+  #                                 AND the swtpm TCTI (libtss2-tcti-swtpm.so)
+  #   libtss2-tcti-swtpm0         — the runtime swtpm TCTI shared object the
+  #                                 esys loader dlopen()s at test time
+  # (tss-esapi-sys 0.6.0 ships pregenerated x86_64-linux bindings, so no
+  # libclang/bindgen is needed — only the tss2-esys pkg-config + lib.)
+  tpm-attest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        id: setup-python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust/tuncore
+
+      - name: Install swtpm + TSS2 stack
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            swtpm swtpm-tools libtss2-dev libtss2-tcti-swtpm0
+
+      - name: Install build deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install maturin pytest pytest-asyncio
+
+      # Build the TPM wheel explicitly (the default would also be tpm now, but
+      # spell it out so the lane is unambiguous and survives a future default
+      # change). Installs into this job's venv ONLY — never the soft lane.
+      - name: Build + install (tpm wheel)
+        env:
+          PYO3_PYTHON: ${{ steps.setup-python.outputs.python-path }}
+        run: |
+          maturin build --release --no-default-features --features tpm-attest --out dist-tpm
+          pip install --no-index --find-links dist-tpm dsm
+
+      # clippy on the real backend (this runner has the TSS2 headers).
+      - name: clippy (tpm)
+        run: >-
+          cargo clippy --manifest-path rust/tuncore/Cargo.toml --all-targets
+          --no-default-features --features tpm-attest --
+          -D warnings -W clippy::pedantic -W clippy::unwrap_used
+
+      # swtpm spins up per test; serialize so the per-test TCP port pairs and
+      # transient TPM slots don't collide.
+      - name: Rust TPM tests (swtpm)
+        run: >-
+          cargo test --manifest-path rust/tuncore/Cargo.toml --release
+          --no-default-features --features tpm-attest
+          --test tpm_swtpm --test dsmt_format -- --test-threads=1
+
+      # The TPM-only Python tests self-skip under a soft wheel (they key on
+      # ATTEST_BACKEND_IS_SOFTWARE), so they run meaningfully only here.
+      - name: Python TPM tests (swtpm)
+        run: pytest tests/test_tpm_attest_store.py tests/test_tpm_enroll_csr.py -v

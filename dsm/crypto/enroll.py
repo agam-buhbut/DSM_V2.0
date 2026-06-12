@@ -17,10 +17,13 @@ The CSR is signed with the attest key (proof-of-possession of the
 device's hardware-bound private key). The CA verifies that signature
 before issuing.
 
-Soft-backend only for now: the CSR signature is produced by exporting
-the attest key's PKCS#8 DER and re-importing into ``cryptography`` —
-TPM / Keystore backends will sign the CSR via platform APIs in their
-own enroll path.
+The CSR build is backend-aware (see ``build_csr``): the soft backend
+builds and signs the CSR entirely inside Rust (``rcgen``), while the TPM
+backend — whose private scalar cannot leave the chip — assembles the CSR
+here and delegates the signature to the TPM. Both paths emit a
+structurally identical PKCS#10 (same subject + same critical
+``id-dsm-noiseStaticBinding`` extension), so the offline-CA workflow is
+unchanged.
 """
 
 from __future__ import annotations
@@ -87,17 +90,135 @@ def build_csr(
 ) -> bytes:
     """Build and DER-encode a CSR for this device.
 
-    The CSR is built and signed entirely inside the Rust attest backend —
-    the PKCS#8 export of the signing scalar never crosses the FFI boundary
-    (audit M4). The CSR carries the ``id-dsm-noiseStaticBinding`` critical
-    extension with the X25519 Noise static pub wrapped per the conventional
-    OCTET STRING form (see ``dsm.crypto.cert``).
+    Soft backend: the CSR is built and signed entirely inside the Rust
+    attest backend (``rcgen``) — the PKCS#8 export of the signing scalar
+    never crosses the FFI boundary (audit M4). TPM backend: the key cannot
+    export a private scalar, so the ``CertificationRequestInfo`` (TBS) is
+    built here with ``cryptography`` and the signature is delegated to the
+    TPM via ``attest_key.sign``. Both paths produce a structurally identical
+    CSR (same SPKI algorithm, same critical ``id-dsm-noiseStaticBinding``
+    extension wrapped per the conventional OCTET STRING form — see
+    ``dsm.crypto.cert``), so the offline-CA workflow is unchanged.
     """
     if len(noise_static_pub) != 32:
         raise EnrollError(
             f"noise_static_pub must be 32 bytes, got {len(noise_static_pub)}"
         )
-    return bytes(attest_key.build_csr(cn, bytes(noise_static_pub)))
+    import tuncore
+
+    if getattr(tuncore, "ATTEST_BACKEND_IS_SOFTWARE", True):
+        return bytes(attest_key.build_csr(cn, bytes(noise_static_pub)))
+    return _build_csr_tpm(
+        attest_key=attest_key,
+        noise_static_pub=bytes(noise_static_pub),
+        cn=cn,
+    )
+
+
+def _build_csr_tpm(
+    *,
+    attest_key: tuncore.AttestKey,
+    noise_static_pub: bytes,
+    cn: str,
+) -> bytes:
+    """Assemble a PKCS#10 CSR whose signature is produced by the TPM.
+
+    No private key is exported. ``cryptography`` shapes the TBS
+    (``CertificationRequestInfo``) using a throwaway P-256 signer that
+    yields the right subject + the same critical
+    ``id-dsm-noiseStaticBinding`` extension the soft path emits. A P-256
+    ``SubjectPublicKeyInfo`` is a fixed 91 bytes; the throwaway's SPKI is
+    byte-substituted for the TPM key's exported SPKI, the TPM signs the
+    substituted TBS, and the final ``CertificationRequest`` SEQUENCE is
+    assembled with minimal hand-rolled DER. The result is re-parsed and its
+    signature verified before it is handed to the caller (fail closed).
+    """
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    from dsm.crypto.cert import (
+        DSM_NOISE_STATIC_BINDING_OID,
+        encode_noise_static_binding_value,
+    )
+
+    # ``serialization`` is imported at module scope (used by import_signed_cert).
+
+    tpm_spki = bytes(attest_key.public_spki_der())
+    if len(tpm_spki) != 91:
+        raise EnrollError(
+            "TPM attest SPKI is not the expected 91-byte P-256 SPKI "
+            f"(got {len(tpm_spki)}); cannot assemble CSR"
+        )
+
+    ext_value = encode_noise_static_binding_value(noise_static_pub)
+    throwaway = ec.generate_private_key(ec.SECP256R1())
+    throwaway_spki = throwaway.public_key().public_bytes(
+        serialization.Encoding.DER,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    # A P-256 SPKI is always 91 bytes (fixed AlgorithmIdentifier + 0x04 ||
+    # X(32) || Y(32) uncompressed point). The throwaway SPKI is freshly
+    # generated, so a coincidental 91-byte collision elsewhere in the TBS
+    # (e.g. inside the subject CN or the extension's 32-byte payload) is
+    # astronomically unlikely — but we still require EXACTLY ONE occurrence
+    # before substituting, so we can never silently overwrite the wrong span.
+    csr0 = (
+        x509.CertificateSigningRequestBuilder()
+        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)]))
+        .add_extension(
+            x509.UnrecognizedExtension(DSM_NOISE_STATIC_BINDING_OID, ext_value),
+            critical=True,
+        )
+        .sign(throwaway, hashes.SHA256())
+    )
+    tbs = csr0.tbs_certrequest_bytes
+    occurrences = tbs.count(throwaway_spki)
+    if occurrences != 1:
+        raise EnrollError(
+            "internal: throwaway SPKI not uniquely locatable in CSR TBS "
+            f"(found {occurrences}); refusing to substitute the TPM key"
+        )
+    tbs = tbs.replace(throwaway_spki, tpm_spki)
+
+    # The TPM signs the substituted TBS: SHA-256 + in-TPM ECDSA, returning a
+    # standard ASN.1 DER ECDSA signature (the same contract the soft backend
+    # and cryptography's verifier expect).
+    sig = bytes(attest_key.sign(tbs))
+
+    # AlgorithmIdentifier { algorithm ecdsa-with-SHA256 (1.2.840.10045.4.3.2) }
+    # — a fixed 12-byte DER SEQUENCE with no parameters, identical to what
+    # cryptography emits for an ECDSA-SHA256-signed P-256 CSR.
+    sig_alg = bytes.fromhex("300a06082a8648ce3d040302")
+    # signatureValue is a BIT STRING with 0 unused bits wrapping the DER sig.
+    bitstring = b"\x03" + _der_len(len(sig) + 1) + b"\x00" + sig
+    # CertificationRequest ::= SEQUENCE { TBS, sigAlg, signatureValue }.
+    body = tbs + sig_alg + bitstring
+    csr_der = b"\x30" + _der_len(len(body)) + body
+
+    # Fail closed: re-parse and verify the signature against the TPM SPKI
+    # before this CSR ever reaches the operator / CA.
+    parsed = x509.load_der_x509_csr(csr_der)
+    if not parsed.is_signature_valid:
+        raise EnrollError("assembled TPM CSR failed signature self-verification")
+    parsed_spki = parsed.public_key().public_bytes(
+        serialization.Encoding.DER,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    if parsed_spki != tpm_spki:
+        raise EnrollError(
+            "assembled TPM CSR public key does not match the TPM attest SPKI"
+        )
+    return csr_der
+
+
+def _der_len(n: int) -> bytes:
+    """DER definite-length encoding of a non-negative length ``n``."""
+    if n < 0x80:
+        return bytes([n])
+    body = n.to_bytes((n.bit_length() + 7) // 8, "big")
+    return bytes([0x80 | len(body)]) + body
 
 
 @dataclass(frozen=True)

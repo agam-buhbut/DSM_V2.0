@@ -3,8 +3,8 @@ Description=DSM VPN Tunnel
 # Documentation= points at the repo-shipped operator guide. The README
 # is not copied to /opt/mtun/ — only config + keys + cert live there.
 # Adjust the path if you keep the repo at a different location.
-Documentation=file:///opt/dsm-repo/deploy/GUIDE.txt
-Documentation=file:///opt/dsm-repo/README.txt
+Documentation=file:///opt/dsm-repo/deploy/GUIDE.md
+Documentation=file:///opt/dsm-repo/README.md
 After=network-online.target
 Wants=network-online.target
 
@@ -30,6 +30,21 @@ Type=simple
 # (no_new_privs, dumpable=0, core dumps disabled) once started.
 User=root
 
+# TPM access (default tpm-attest backend). The in-kernel resource manager
+# node /dev/tpmrm0 is owned tss:tss mode 0660, so the daemon must be in the
+# `tss` group to open it (the attest key is TPM-resident — generated, stored,
+# and signed inside the TPM; see deploy/GUIDE.md §0e). Running as root already
+# satisfies DAC here, but granting the group makes a future de-rooted unit
+# work unchanged and documents the dependency.
+#
+# Do NOT enable PrivateDevices=yes: it remounts /dev to a minimal set that
+# EXCLUDES /dev/tpmrm0, which would make the daemon (and `dsm enroll`) fail to
+# reach the TPM. If device isolation is ever added, it MUST be paired with an
+# explicit allow:  DeviceAllow=/dev/tpmrm0 rw  (and DeviceAllow=/dev/tpm0 rw
+# only if a direct-TCTI fallback is configured). For the dev-soft-attest build
+# the TPM is unused and this group membership is harmless.
+SupplementaryGroups=tss
+
 # Pass passphrase via systemd credential. The source file /etc/dsm/passphrase
 # must be mode 0600, owned by root. systemd materializes a per-process copy
 # at $CREDENTIALS_DIRECTORY/passphrase (mode 0400, root-owned, in tmpfs).
@@ -39,13 +54,12 @@ LoadCredential=passphrase:/etc/dsm/passphrase
 # was wrong: `server` is not a subcommand and `--mode` only accepts
 # {client,server}. Transport (udp/tcp) lives in config.toml.
 #
-# `python3 -m dsm` resolves because the `dsm` package is INSTALLED into
-# /usr/bin/python3's site-packages by `pip install dsm-<ver>-*.whl` (the single
-# wheel built from the repo root — see deploy/GUIDE.txt §1, which bundles the
-# `dsm` package AND the `tuncore` extension). systemd runs with cwd=/, so there
-# is NO repo dir on sys.path; the import works purely off the installed package.
-# Hence no WorkingDirectory= / Environment=PYTHONPATH= is needed here.
-ExecStart=/usr/bin/python3 -m dsm --mode server \
+# install.sh creates a dedicated venv at /opt/dsm/venv and installs the wheel
+# into it, producing the `dsm` console-script at /opt/dsm/venv/bin/dsm (its
+# shebang pins the venv interpreter). systemd runs with cwd=/, so this
+# absolute path is what guarantees the right interpreter + the installed
+# `dsm` + `tuncore` packages — no system-Python pollution.
+ExecStart=/opt/dsm/venv/bin/dsm --mode server \
           --passphrase-env-file=${CREDENTIALS_DIRECTORY}/passphrase
 
 # Graceful shutdown: dsm.session.setup_signal_handlers wires SIGINT, SIGTERM,
@@ -59,7 +73,7 @@ TimeoutStopSec=15
 # the host never stays with the kill switch up, a dead resolv.conf, a stale
 # table-100 route / ip rule, or modified sysctls. Idempotent — safe to run
 # when there is nothing to clean.
-ExecStopPost=/usr/bin/python3 -m dsm cleanup
+ExecStopPost=/opt/dsm/venv/bin/dsm cleanup
 
 Restart=on-failure
 RestartSec=10s
@@ -193,7 +207,7 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET
 # conservative — it bans @clock (settime), @cpu-emulation, @debug
 # (ptrace/process_vm_*), @module (init_module), @mount, @obsolete,
 # @raw-io (iopl), @reboot, @swap, and @privileged (capset etc.). Audit
-# work in deploy/GUIDE.txt §9f may tighten further once strace data is
+# work in deploy/GUIDE.md §9f may tighten further once strace data is
 # collected on the cellular demo. This filter is known-safe for the
 # CPython interpreter + tun ioctl + ip/nft subprocess + DNS resolution.
 SystemCallFilter=@system-service
@@ -203,7 +217,7 @@ SystemCallErrorNumber=EPERM
 # ─── Sandboxing TODOs (gated on the strace audit step) ────────────────────
 # The two flags below are likely safe but can break TUN ioctl / netlink in
 # subtle ways depending on kernel build. Enable empirically after walking
-# deploy/GUIDE.txt §9f (strace audit on the cellular client).
+# deploy/GUIDE.md §9f (strace audit on the cellular client).
 #
 # RestrictNamespaces=true
 #     Should not break dsm in the common case — we don't enter any namespaces

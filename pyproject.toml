@@ -6,6 +6,11 @@ build-backend = "maturin"
 name = "dsm"
 version = "0.1.0"
 requires-python = ">=3.11"
+# PEP 639: SPDX expression + explicit license file. With the SPDX `license`
+# string, the legacy `License :: OSI Approved :: MIT License` trove classifier
+# is deprecated/rejected by PEP 639-compliant backends, so it is omitted.
+license = "MIT"
+license-files = ["LICENSE"]
 dependencies = [
     "cryptography>=46.0.7,<49",
     "dnspython>=2.6,<3.0",

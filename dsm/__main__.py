@@ -133,6 +133,14 @@ def main() -> None:
         "recovery. Needs no config or passphrase.",
     )
 
+    init_parser = subparsers.add_parser(
+        "init",
+        help="Quickstart wizard: orchestrate config + CA-pin + enroll + TPM "
+        "+ unit install. Use `dsm init server` or `dsm init client`.",
+        add_help=False,
+    )
+    init_parser.add_argument("init_args", nargs=argparse.REMAINDER)
+
     args = parser.parse_args()
 
     if args.command == "enroll":
@@ -162,6 +170,11 @@ def main() -> None:
         dsm_log.configure("info")
         cleanup_host_state()
         return
+
+    if args.command == "init":
+        from dsm import init as dsm_init
+
+        sys.exit(dsm_init.main(args.init_args))
 
     config = _load_config_or_exit(args.config)
     if args.mode:
@@ -221,6 +234,14 @@ def _run_enroll(
     keystore = KeyStore(config.key_file)
     attest_store = AttestStore(config.attest_key_file)
 
+    # Thread the configured TCTI to the Rust attest backend, which reads it
+    # from the environment. setdefault so an explicit TCTI already in the
+    # environment (e.g. a test harness pointing at swtpm) still wins. No-op on
+    # the soft backend, which ignores the TCTI entirely.
+    tcti = getattr(config, "attest_tpm_tcti", None)
+    if tcti:
+        os.environ.setdefault("TCTI", tcti)
+
     if csr_out is not None:
         effective_role = role or config.mode
         if effective_role not in ("client", "server"):
@@ -250,11 +271,39 @@ def _run_enroll(
             )
             sys.exit(2)
 
-        passphrase = read_passphrase(
-            passphrase_fd=passphrase_fd,
-            passphrase_env_file=passphrase_env_file,
-            prompt="New passphrase (will protect identity + attest key): ",
+        # Backend-aware enroll: on the TPM build the attest key is generated
+        # inside the TPM (no passphrase protects it), so verify the TPM is
+        # reachable before provisioning and word the prompt accurately.
+        import tuncore
+        from dsm.crypto.tpm_preflight import TpmPreflightError, preflight_tpm
+
+        is_soft = bool(getattr(tuncore, "ATTEST_BACKEND_IS_SOFTWARE", True))
+        if not is_soft:
+            try:
+                preflight_tpm(getattr(config, "attest_tpm_tcti", None))
+            except TpmPreflightError as e:
+                print(f"enroll: {e}", file=sys.stderr)
+                sys.exit(2)
+
+        prompt = (
+            "New passphrase (will protect identity + attest key): "
+            if is_soft
+            else "New passphrase (protects the identity key; attest key is "
+            "TPM-resident): "
         )
+        try:
+            passphrase = read_passphrase(
+                passphrase_fd=passphrase_fd,
+                passphrase_env_file=passphrase_env_file,
+                prompt=prompt,
+            )
+        except ValueError as e:
+            # read_passphrase fails closed on an empty passphrase (would
+            # otherwise enroll an unprotected empty-auth TPM key). Surface
+            # cleanly rather than as a raw traceback, mirroring the
+            # EnrollError / TpmPreflightError handlers above.
+            print(f"enroll: {e}", file=sys.stderr)
+            sys.exit(2)
         try:
             try:
                 result = generate_enrollment(

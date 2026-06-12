@@ -37,6 +37,8 @@ pub mod aes_gcm;
 pub mod device_attest;
 #[cfg(feature = "dev-soft-attest")]
 pub mod device_attest_soft;
+#[cfg(feature = "tpm-attest")]
+pub mod device_attest_tpm;
 pub mod identity;
 pub mod noise_xx;
 pub mod nonce;
@@ -45,6 +47,7 @@ pub mod replay_window;
 pub mod secure_memory;
 pub mod secure_noise;
 pub mod session_keys;
+pub mod tpm_blob;
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
@@ -675,14 +678,26 @@ impl PyAttestKey {
         self.inner.sign(msg).map_err(py_err)
     }
 
-    /// Encrypt the attest key to a passphrase-protected blob (Argon2id +
-    /// XChaCha20-Poly1305). Soft backend only — TPM/Keystore backends use
-    /// platform-native sealing and reject this call.
+    /// Encrypt/seal the attest key to disk, binding the operator passphrase.
+    ///
+    /// The passphrase is LOAD-BEARING on BOTH backends:
+    /// - Soft backend: the signing scalar is wrapped under the passphrase
+    ///   (Argon2id + XChaCha20-Poly1305).
+    /// - TPM backend: the key is TPM-resident (non-extractable), so the
+    ///   passphrase is bound as the key's TPM authorization value via
+    ///   `TPM2_ObjectChangeAuth` (defense-in-depth — TPM residency AND the
+    ///   passphrase are then both required to sign). An empty passphrase keeps
+    ///   the key empty-auth (back-compat).
     fn encrypt_to_store(&self, passphrase: &[u8]) -> PyResult<Vec<u8>> {
         self.inner.encrypt_to_store(passphrase).map_err(py_err)
     }
 
-    /// Restore an attest key from a stored blob. Soft backend only.
+    /// Restore an attest key from a stored blob, applying the passphrase.
+    ///
+    /// Soft backend: unwraps the scalar. TPM backend: caches the
+    /// passphrase-derived TPM auth so the next `sign` authorizes with it; a
+    /// WRONG passphrase parses fine here but fails the next `sign` (TPM
+    /// authorization rejection).
     #[staticmethod]
     fn decrypt_from_store(blob: &[u8], passphrase: &[u8]) -> PyResult<Self> {
         let inner =

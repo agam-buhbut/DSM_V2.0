@@ -1,0 +1,165 @@
+name: Release
+
+# Tag-triggered Release pipeline (distinct from ci.yml). On a `v*` tag this
+# REUSES the ci.yml gate suite as a hard precondition, builds the three
+# supported-distro artifacts (tpm-attest wheel, +soft eval wheel, sdist),
+# checksums them, signs the checksum file with the owner's minisign key, and
+# publishes a GitHub Release with the signed artifacts attached.
+#
+# SUPPLY-CHAIN PINNING: every third-party action is pinned to a full 40-hex
+# commit SHA (not a floating tag), with a trailing comment naming the version
+# that SHA corresponds to. The SHAs were resolved against the GitHub API at
+# authoring time. NOTE: ci.yml currently pins its actions to floating MAJOR
+# tags (actions/checkout@v4 etc.) with an in-file note acknowledging that as a
+# deliberate follow-up; this release.yml does NOT follow that convention —
+# release artifacts are signed and published, so the stricter SHA pinning is
+# applied here. (Inconsistency with ci.yml is intentional and flagged.)
+
+on:
+  push:
+    tags: [ 'v*' ]
+
+# Minimal permissions: only what is needed to create the Release and upload
+# its assets. Nothing else (no packages:, id-token:, pull-requests:, etc.).
+permissions:
+  contents: write          # create the Release + upload assets
+
+jobs:
+  # Reuse the per-PR gate suite as a hard precondition: a tag can never publish
+  # artifacts that did not pass black/isort/ruff/pylint/pyright/pytest +
+  # clippy/cargo-test/cargo-audit (with the documented RUSTSEC ignores) +
+  # pip-audit + the swtpm TPM lane. This is a local reusable-workflow call, so
+  # it is exempt from the third-party SHA-pin rule (it is this repo's own file).
+  gate:
+    uses: ./.github/workflows/ci.yml
+
+  build-tpm-wheel:
+    needs: gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b  # v5.3.0
+        with:
+          python-version: "3.12"
+      # dtolnay/rust-toolchain@stable is a moving alias by design; pinned to the
+      # commit SHA the `stable` branch pointed at, per supply-chain policy.
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable branch
+        with:
+          components: rustfmt, clippy
+      # TPM lane build deps mirror ci.yml's tpm-attest job: the tss2-esys headers
+      # (libtss2-dev) for the build/link, plus the device TCTI runtime object.
+      - name: Install TSS2 build stack
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libtss2-dev libtss2-tcti-device0
+      - name: Build TPM (production) wheel
+        run: |
+          python -m pip install --upgrade pip
+          pip install maturin
+          # NB: the production wheel links the host libtss2-esys on purpose, so
+          # do NOT auditwheel-repair/vendor it; tag plain linux_x86_64.
+          maturin build --release --no-default-features --features tpm-attest --out dist
+      - uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08  # v4.6.0
+        with:
+          name: tpm-wheel
+          path: dist/*.whl
+
+  build-soft-wheel:
+    needs: gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b  # v5.3.0
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable branch
+        with:
+          components: rustfmt, clippy
+      - name: Build +soft (evaluation) wheel
+        run: |
+          python -m pip install --upgrade pip
+          pip install maturin
+          # The +soft EVALUATION wheel: software attest backend, extractable key,
+          # NO hardware binding. The +soft local-version segment comes from the
+          # crate metadata; it must never be deployed in production.
+          maturin build --release --no-default-features --features dev-soft-attest --out dist
+      - uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08  # v4.6.0
+        with:
+          name: soft-wheel
+          path: dist/*.whl
+
+  build-sdist:
+    needs: gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b  # v5.3.0
+        with:
+          python-version: "3.12"
+      - name: Build sdist (build-from-source fallback)
+        run: |
+          python -m pip install --upgrade pip
+          pip install maturin
+          maturin sdist --out dist
+      - uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08  # v4.6.0
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+
+  sign-and-publish:
+    needs: [ build-tpm-wheel, build-soft-wheel, build-sdist ]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16  # v4.1.8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Stage install.sh alongside artifacts
+        run: cp install.sh dist/install.sh
+      - name: Generate SHA256SUMS over all artifacts
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS
+      - name: Sign SHA256SUMS with minisign
+        env:
+          # TODO(owner): add these two REPO SECRETS before the first release.
+          #   MINISIGN_SECRET_KEY  — the OWNER-ONLY minisign signing PRIVATE key
+          #                          (the full .key file contents, base64 block).
+          #   MINISIGN_KEY_PASSWORD — the password protecting that private key.
+          # The matching PUBLIC key is embedded in install.sh for verify-before-
+          # execute. Do NOT commit the private key or password — secrets only.
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          MINISIGN_KEY_PASSWORD: ${{ secrets.MINISIGN_KEY_PASSWORD }}
+        run: |
+          sudo apt-get update && sudo apt-get install -y minisign
+          umask 077
+          KEYFILE="$(mktemp)"
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > "$KEYFILE"
+          # minisign reads the key password from stdin in non-interactive use;
+          # feed the owner secret so no prompt blocks the runner.
+          printf '%s\n' "$MINISIGN_KEY_PASSWORD" | \
+            minisign -S -s "$KEYFILE" -m dist/SHA256SUMS
+          shred -u "$KEYFILE"
+      - name: Determine pre-release flag (0.x tags are pre-releases)
+        id: prerelease
+        run: |
+          # A 0.x.y tag (v0.*) carries no SemVer-stability promise → pre-release.
+          if printf '%s' "${GITHUB_REF_NAME}" | grep -Eq '^v0\.'; then
+            echo "value=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@c95fe1489396fe8a9eb87c0abf8aa5b2ef267fda  # v2.2.1
+        with:
+          # <OWNER/REPO> is implicit via ${{ github.repository }} — softprops
+          # publishes to the repo the workflow runs in; no slug to fill in here.
+          prerelease: ${{ steps.prerelease.outputs.value }}
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.whl
+            dist/*.tar.gz
+            dist/install.sh
+            dist/SHA256SUMS
+            dist/SHA256SUMS.minisig

@@ -21,13 +21,32 @@ ca_root_file = "/opt/mtun/dsm_ca_root.pem"   # Pinned CA root cert (PEM)
 # (it pins the trust anchor so a swapped on-disk CA PEM is rejected). Compute:
 #   sha256sum /opt/mtun/dsm_ca_root.pem | cut -d' ' -f1
 ca_root_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
-attest_key_file = "/opt/mtun/attest.key"     # Argon2id-wrapped ECDSA P-256 attestation key
+# Attest-key artifact path. On the DEFAULT tpm-attest build this is a
+# TPM-bound DSMT context blob (the ECDSA P-256 key is generated, stored, and
+# signs INSIDE the TPM and never appears here — the blob is useless on any
+# other TPM); the blob's key requires the operator enroll passphrase as its
+# TPM authorization value, so TPM residency AND the passphrase are both needed
+# to sign. On the dev-soft-attest build it is instead an Argon2id-wrapped
+# software key. Either way the passphrase is load-bearing — `dsm enroll`
+# writes it.
+attest_key_file = "/opt/mtun/attest.key"
 
-# Refuse to start on the extractable software attestation backend
-# (dev-soft-attest), whose key is recoverable from process memory and gives NO
-# hardware binding. Leave false in production; set true ONLY to acknowledge the
-# risk in dev/lab. Startup then logs a prominent WARNING + netaudit event.
+# allow_soft_attest applies ONLY to the dev-soft-attest build. On the default
+# tpm-attest build the attest key is TPM-resident and non-extractable, so this
+# knob is inert. On the soft build it refuses to start on the extractable
+# software backend (whose key is recoverable from process memory and gives NO
+# hardware binding); leave false in production and set true ONLY to acknowledge
+# the risk in dev/lab — startup then logs a prominent WARNING + netaudit event.
 # allow_soft_attest = false
+
+# TPM attest backend only: the tss-esapi TCTI string that selects which TPM
+# the hardware-resident attest key lives on. Leave unset (the default) to
+# auto-resolve via the TCTI / TPM2TOOLS_TCTI env vars and finally the
+# in-kernel resource manager at /dev/tpmrm0. Override only for a non-default
+# device or a test TPM. The soft-attest backend ignores this field.
+#   attest_tpm_tcti = "device:/dev/tpmrm0"     # explicit hardware TPM
+#   attest_tpm_tcti = "swtpm:host=127.0.0.1,port=2321"  # hermetic test TPM
+# attest_tpm_tcti =
 
 # ─── Certificate revocation (CRL) ──────────────────────────────────────────
 # crl_strict is true BY DEFAULT and fail-closed: the daemon refuses to start

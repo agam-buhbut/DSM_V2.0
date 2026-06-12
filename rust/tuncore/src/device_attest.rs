@@ -11,6 +11,9 @@
 #[cfg(feature = "dev-soft-attest")]
 pub use crate::device_attest_soft::SoftAttestKey as AttestKey;
 
+#[cfg(feature = "tpm-attest")]
+pub use crate::device_attest_tpm::TpmAttestKey as AttestKey;
+
 /// True when the active (compile-time) attestation backend is the
 /// software backend, whose key is extractable from process memory.
 /// Exposed to Python as `tuncore.ATTEST_BACKEND_IS_SOFTWARE` so the

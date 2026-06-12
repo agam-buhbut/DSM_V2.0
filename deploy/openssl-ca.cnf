@@ -79,18 +79,20 @@ CN = DSM Root CA
 basicConstraints       = critical, CA:TRUE, pathlen:0
 keyUsage               = critical, keyCertSign, cRLSign
 subjectKeyIdentifier   = hash
-# Name constraints: leaf certs MUST have a CN of the form
-# "dsm-<hex>-{client,server}". The permitted DirName pattern bounds the
-# CA's signing authority — even if the CA key were misused (lost USB,
-# coerced operator), it could not produce a cert for an arbitrary CN
-# accepted by some other system that trusts this root. Excluded DNS /
-# IP / URI / RFC822 ranges block the same key from issuing any
-# non-DSM-style certificate. cryptography &gt;=42 enforces nameConstraints
-# end-to-end on the leaf during chain validation.
-nameConstraints        = critical, permitted;DirName:dsm_permitted_dn, excluded;DNS:., excluded;IP:0.0.0.0/0, excluded;IP:::/0, excluded;URI:., excluded;email:.
-
-[ dsm_permitted_dn ]
-CN                     = dsm
+# Name constraints are a THIRD-PARTY-TRUST bound only: they constrain what a
+# *foreign* validator that trusts this root would accept. DSM's own runtime
+# does NOT evaluate nameConstraints, so they are not relied upon for any DSM
+# security property.
+#
+# The previous `permitted;dirName:CN=dsm` subtree was dropped: a permitted
+# dirName of CN=dsm would reject every real DSM leaf (whose CN is
+# "dsm-<hex>-{client,server}", not exactly "dsm"), and it also failed to
+# parse (OpenSSL wants lowercase `dirName:` and mask-form IP ranges, not the
+# `DirName:`/CIDR syntax that was here).
+#
+# We keep only EXCLUDED constraints, in OpenSSL's required mask form, so the
+# CA key cannot be misused to issue an IP-SAN certificate for any address.
+nameConstraints        = critical, excluded;DNS:., excluded;IP:0.0.0.0/0.0.0.0, excluded;IP:::/::, excluded;URI:., excluded;email:.
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -114,11 +116,4 @@ basicConstraints       = critical, CA:FALSE
 keyUsage               = critical, digitalSignature
 extendedKeyUsage       = critical, serverAuth
 subjectKeyIdentifier   = hash
-authorityKeyIdentifier = keyid:always
-
-
-# ═════════════════════════════════════════════════════════════════════════
-# CRL extensions
-# ═════════════════════════════════════════════════════════════════════════
-[ crl_ext ]
 authorityKeyIdentifier = keyid:always

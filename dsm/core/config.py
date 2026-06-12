@@ -143,6 +143,13 @@ class Config:
     # from process memory. Set True to acknowledge and run anyway (NOT for
     # production) — startup then logs a prominent WARNING + netaudit event.
     allow_soft_attest: bool = False
+    # TPM-backend TCTI (the tss-esapi transport string) for the hardware
+    # attest key, e.g. "device:/dev/tpmrm0". None (the default) lets the Rust
+    # backend auto-resolve via the TCTI/TPM2TOOLS_TCTI env vars and finally
+    # "device:/dev/tpmrm0". Only consulted on the tpm-attest build; the
+    # soft-attest backend ignores it. The Rust side does the real parse — this
+    # validator only catches an obviously-wrong family prefix.
+    attest_tpm_tcti: str | None = None
     # TUN device MTU in bytes. Must satisfy MIN_TUN_MTU <= mtu <= MAX_TUN_MTU.
     # The wire-level path MTU budget is checked against this at startup.
     mtu: int = DEFAULT_TUN_MTU
@@ -368,6 +375,28 @@ def _validate_ca_root_sha256(c: Config) -> None:
         raise ValueError("ca_root_sha256 is not valid hex") from e
 
 
+def _validate_attest_tpm_tcti(c: Config) -> None:
+    # Format only, and only on the lenient side: the Rust tss-esapi layer is
+    # the authoritative parser. We reject an empty string (an unset TCTI must
+    # be None, not "") and an obviously-wrong family prefix, so a typo surfaces
+    # here instead of as an opaque tss-esapi error at enroll/start time.
+    if c.attest_tpm_tcti is None:
+        return
+    if (
+        not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
+            c.attest_tpm_tcti, str
+        )
+        or not c.attest_tpm_tcti
+    ):
+        raise ValueError("attest_tpm_tcti must be a non-empty string or unset")
+    allowed = ("device:", "swtpm:", "mssim:", "tabrmd:")
+    if not c.attest_tpm_tcti.startswith(allowed):
+        raise ValueError(
+            f"attest_tpm_tcti must start with one of {allowed}, "
+            f"got {c.attest_tpm_tcti!r}"
+        )
+
+
 def _validate_role_specific(c: Config) -> None:
     if c.mode == "client":
         if not c.expected_server_cn:
@@ -514,6 +543,7 @@ _VALIDATORS = (
     _validate_dns,
     _validate_cert_paths,
     _validate_ca_root_sha256,
+    _validate_attest_tpm_tcti,
     _validate_role_specific,
     _validate_padding,
     _validate_jitter,

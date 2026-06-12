@@ -215,6 +215,16 @@ def read_passphrase(
     and MUST call ``wipe_passphrase`` on it after use.
     """
     p = _read_noninteractive(passphrase_fd, passphrase_env_file)
-    if p is not None:
-        return p
-    return _read_from_tty(prompt)
+    if p is None:
+        p = _read_from_tty(prompt)
+    # Fail closed on an empty passphrase from ANY source (empty fd, empty
+    # file, or a bare Enter at the tty). The soft backend's
+    # seal/open already reject empty (passphrase_store.rs), but the TPM
+    # attest backend would otherwise enroll an UNPROTECTED empty-auth key
+    # — so enforce the same non-empty contract here, at the single
+    # operator entry point, before any backend sees it. Wipe the (empty)
+    # buffer first to keep the wipeable-bytearray discipline intact.
+    if len(p) == 0:
+        wipe_passphrase(p)
+        raise ValueError("passphrase must not be empty") from None
+    return p

@@ -145,7 +145,18 @@ IPv6/resolv.conf survive partial-configure and SIGKILL, TCP survives
 segmented paths, rekey survives a dropped ACK, server survives client blips,
 daemon exit codes drive systemd restart correctly.
 
-## Phase 2 — Anonymity: adaptive envelope
+## Phase 2 — Anonymity: adaptive envelope ✅ COMPLETE (2026-06-12, uncommitted)
+
+Detailed plan: `2026-06-11-phase2-adaptive-shaping.md`. All 7 tasks (2.1–2.6,
+2.8) done TDD-first with traffic-anonymity/security review. Owner raised the
+latency budget to 1s; old additive-Poisson model removed; README rewritten to
+claim exactly what holds (documented residuals: sustained volume visible, boot
+fingerprint accepted, TCP caveat). Exit gate met: Python 478 passed / 0 failed;
+Rust 114 / 0; lints/types clean; pylint 10.00. Awaiting owner commit.
+**Phase-3 env note:** this host has BOTH `swtpm` + a real `/dev/tpm0`/`tpmrm0`,
+`libtss2-esys.so`, and `tss-esapi` 7.7.0 in the cargo cache — TPM work is fully
+testable here.
+
 
 | # | Item |
 |---|---|
