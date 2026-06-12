@@ -54,6 +54,16 @@ rcgen = { version = "0.13", default-features = false, features = ["pem", "crypto
 # pkg-config — no bindgen/libclang at build time.
 tss-esapi = { version = "7.7.0", optional = true }
 
+[dev-dependencies]
+# Phase-5 perf baseline: criterion drives the AEAD floor benchmark
+# (benches/aead.rs). Standard Rust micro-benchmark harness; dev-only,
+# never shipped in the wheel.
+criterion = "0.5"
+
+[[bench]]
+name = "aead"
+harness = false
+
 [profile.release]
 opt-level = 3
 lto = true

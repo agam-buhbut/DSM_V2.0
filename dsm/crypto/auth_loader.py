@@ -87,7 +87,7 @@ def load_cert_materials(config: Config) -> CertAuthMaterials:
     if not ca_root_file.is_file():
         raise AuthMaterialsError(
             f"ca_root_file missing at {ca_root_file}; copy the pinned "
-            "CA root cert into place per deploy/GUIDE.txt §2e"
+            "CA root cert into place per deploy/GUIDE.md §2e"
         )
 
     cert_der = _load_cert_der(cert_file)
@@ -103,7 +103,7 @@ def load_cert_materials(config: Config) -> CertAuthMaterials:
             "ca_root_sha256 is required but not set in config; refusing to "
             "start. Compute it with `sha256sum <ca_root_file> | cut -d' ' -f1` "
             'and set ca_root_sha256 = "<hex>" in config.toml '
-            "(see deploy/GUIDE.txt)."
+            "(see deploy/GUIDE.md)."
         )
     try:
         expected_ca_sha256 = bytes.fromhex(config.ca_root_sha256)
@@ -130,13 +130,13 @@ def load_cert_materials(config: Config) -> CertAuthMaterials:
             raise AuthMaterialsError(
                 "no crl_file configured and crl_strict=true; refusing to "
                 "start. Either provision a CRL via the CA workflow per "
-                "deploy/GUIDE.txt §7e, or set crl_strict=false in config "
+                "deploy/GUIDE.md §7e, or set crl_strict=false in config "
                 "to accept revoked certs (NOT recommended for production)."
             )
         log.warning(
             "no crl_file configured and crl_strict=false; revoked "
             "client/server certs will be accepted. Wire a CRL via "
-            "deploy/GUIDE.txt §7e for revocation enforcement."
+            "deploy/GUIDE.md §7e for revocation enforcement."
         )
         netaudit.emit("crl_missing", action="warned")
     if config.crl_file:

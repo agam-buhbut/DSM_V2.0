@@ -11,7 +11,7 @@ This module:
   * checks freshness (``next_update``) and surfaces stale CRLs
   * answers ``is_revoked(serial)`` for a leaf cert's serial number
 
-CRL distribution and rotation are operational concerns (deploy/GUIDE.txt §7e).
+CRL distribution and rotation are operational concerns (deploy/GUIDE.md §7e).
 This module is the runtime check.
 """
 

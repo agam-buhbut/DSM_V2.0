@@ -1,0 +1,40 @@
+# Cargo build configuration for the dsm-tuncore extension.
+#
+# WHY THIS FILE EXISTS — AES-NI hardware acceleration (Phase-5 perf).
+#
+# The `aes` 0.8 crate (pulled in by `aes-gcm`) does NOT emit a
+# runtime-detected AES-NI path on stable Rust. Unlike `ghash`/`polyval`
+# (which use `cpufeatures` to dispatch PCLMULQDQ at runtime), the `aes`
+# block cipher only compiles its hardware (AES-NI) backend when the
+# `aes` target-feature is enabled at COMPILE time. Without the flags
+# below, the data path runs the constant-time *software* AES backend on
+# every packet.
+#
+# MEASURED (criterion benches/aead.rs, 1400-byte packets, Celeron N4120):
+#   software (no flags):   ~459 MiB/s,  2.91 us/op
+#   AES-NI (these flags):  ~577 MiB/s,  2.31 us/op   (~+25%, ~0.6 us/op saved)
+# Verified with objdump: the `aes` rlib goes from 0 `aesenc` instructions
+# (no flags) to hardware AES-NI codegen with these flags. The gain is
+# modest only because Goldmont-Plus AES-NI is intrinsically slow; on a
+# mainstream server core the same flags yield multi-GB/s.
+#
+# FEATURE SET — minimal, intentionally NOT `target-cpu=native`.
+# `+aes,+pclmulqdq,+sse2,+ssse3,+sse4.1` are present on EVERY AES-NI-capable
+# x86_64 CPU shipped since ~2010 (Westmere onward). We avoid `target-cpu=native`
+# / AVX-512 so the produced wheel stays portable across the supported
+# x86_64 server fleet (no risk of an illegal-instruction trap on a host
+# without a newer feature).
+#
+# PORTABILITY CONTRACT: the shipped x86_64 wheel now REQUIRES an AES-NI
+# x86_64 CPU. This is universal on modern servers and matches the
+# supported-target list. A non-AES-NI x86_64 host (pre-2010) would fault;
+# such hosts are out of the supported set.
+#
+# CI/RELEASE FOLLOW-UP (not changed here): the maturin invocations in
+# .github/workflows/{ci,release}.yml run from the repo root, so Cargo
+# discovers THIS root-level config automatically (Cargo walks up from the
+# build cwd) — no workflow edit is required for the gain to ship. If a
+# future build is invoked from a directory ABOVE the repo root, pass the
+# same flags via the RUSTFLAGS env in that step.
+[build]
+rustflags = ["-C", "target-feature=+aes,+pclmulqdq,+sse2,+ssse3,+sse4.1"]

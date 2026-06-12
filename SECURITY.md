@@ -1,9 +1,16 @@
 # Security Policy
 
 DSM is security-sensitive software: it is a VPN / network-anonymity tool, and
-people may rely on it to protect traffic from a passive observer, an active
-on-path adversary, and even a compromised server. We take vulnerability reports
-seriously and appreciate responsible disclosure.
+people rely on it to protect traffic from a passive observer and an active
+on-path adversary. The server is the tunnel terminator and is assumed to be
+operator-owned and trusted: it necessarily sees the client's source IP and the
+decrypted tunneled traffic, so DSM does NOT promise confidentiality of that
+traffic against the server operator. What the device attestation and CA-signed
+certificate binding DO guarantee even against a misbehaving server is that the
+server cannot forge a client's device identity, swap the bound Noise static, or
+escalate to other enrolled devices (see the threat-model section of the README
+for the full split of protected vs. residual properties). We take vulnerability
+reports seriously and appreciate responsible disclosure.
 
 ## Supported Versions
 

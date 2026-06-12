@@ -10,22 +10,30 @@ Open-source, security and anonymity focused VPN for Linux. Single client-server 
 
 ```sh
 # 1. Install (downloads + minisign-verifies the wheel, apt-installs the TPM
-#    runtime libs, creates /opt/dsm/venv, symlinks `dsm`, installs the unit).
+#    runtime libs, creates /opt/dsm/venv, symlinks `dsm`). Add `--systemd`
+#    to also install the dsm.service unit.
 #    TODO(owner): replace <OWNER/REPO> with the real repo before release.
-curl -fsSL https://github.com/<OWNER/REPO>/releases/download/v0.1.0/install.sh | sudo sh
+curl -fsSL https://github.com/<OWNER/REPO>/releases/download/v0.1.0/install.sh | sudo sh -s -- --systemd
 
-# 2. Go from zero to running (orchestrates config + CA-pin + enroll + TPM + unit).
-sudo dsm init server      # or, on the client box:  sudo dsm init client
-#   ...prompts for IP/port/paths/CA-root/passphrase; pauses for the offline-CA
-#   signing step; resume with:  sudo dsm init server --resume
+# 2. Provision config + CA-pin + enroll (orchestrates config + TPM preflight +
+#    CSR emit). Pass the required flags up front; only the key passphrase is
+#    prompted. Server example (client: use `client` + --expected-server-cn and
+#    drop --dns-provider/--dns-pin):
+sudo dsm init server \
+    --server-ip <IP> --server-port <PORT> --ca-root <ca-root.pem> \
+    --dns-provider <DoH-URL> --dns-pin <SPKI-SHA256>
+#   ...this writes a CSR and pauses for the offline-CA signing step. Walk the
+#   CSR to the CA, sign it, then resume with the returned cert:
+sudo dsm init server --resume --signed-cert <signed.crt>
 
 # 3. Start it.
 sudo systemctl enable --now dsm
 ```
 
 **Evaluation without a TPM:** a clearly-named `+soft` evaluation wheel is also
-published. Install it with `install.sh --eval`. It provides **no hardware
-binding** — it is for evaluation only and must never be deployed in production.
+published. Install it with `install.sh --eval` (combine flags in any order,
+e.g. `-s -- --eval --systemd`). It provides **no hardware binding** — it is for
+evaluation only and must never be deployed in production.
 
 ## Goal
 
@@ -94,9 +102,12 @@ Client -> Client-Owned Server -> Destination
 - Bootstrap ephemeral-DH retransmit on lost response (retransmits msg3 +
   bootstrap_init as a pair until timeout)
 - Rekey ACK retransmit on loss: if REKEY_ACK does not arrive within
-  REKEY_ACK_TIMEOUT=5s, the initiator retransmits the same REKEY_INIT up
-  to MAX_REKEY_RETRIES=3 times before giving up. Responder caches the
-  last ACK payload so duplicate INITs replay the ACK without re-rotating.
+  REKEY_ACK_TIMEOUT=8s, the initiator retransmits the same REKEY_INIT up
+  to MAX_REKEY_RETRIES=9 times before giving up. The total retry window
+  (8s × 9 = 72s) deliberately exceeds the 60s rekey rate-limit so a
+  responder still inside its own rate-limit window has time to accept a
+  later retransmit. Responder caches the last ACK payload so duplicate
+  INITs replay the ACK without re-rotating.
 - No application-level retransmission for data packets (relies on inner protocol or TCP)
 
 **Fragmentation:**
@@ -189,8 +200,15 @@ Client -> Client-Owned Server -> Destination
   on-disk attest_key_file is a versioned, TPM-bound DSMT context blob
   (marshalled TPMT_PUBLIC + the TPM-encrypted TPM2B_PRIVATE) that loads
   ONLY on the TPM that created it — there is no extractable private
-  scalar and no attest-key passphrase. The dev/test soft backend instead
-  Argon2id-wraps a software attest key on disk (extractable).
+  scalar. The operator passphrase ALSO protects the attest key on this
+  backend: it is bound as the in-TPM key's authorization value (set via
+  TPM2_ObjectChangeAuth at store time, re-installed via tr_set_auth before
+  each sign), so a wrong passphrase fails the sign with TPM_RC_AUTH_FAIL.
+  This is defense-in-depth on top of hardware residency — signing then
+  requires BOTH this TPM and the passphrase. A forgotten passphrase makes
+  the key unusable and forces a re-enroll. The dev/test soft backend
+  instead Argon2id-seals a software attest key file under the same
+  passphrase (extractable from memory).
 - Argon2id parameters: 512 MiB memory, 4 iterations, 2 parallelism
 - Memory locked (mlock) during use
 - Single-pass zeroization via Rust zeroize crate on drop
@@ -224,11 +242,18 @@ Client -> Client-Owned Server -> Destination
 - Idle cover: a low, per-session-randomized chaff floor (default
   0.5–2.0 pps, drawn once at session start) keeps cover traffic flowing
   when idle. Idle overhead ≈ 0.5–2 kB/s.
-- Chaff sizes are drawn from a FIXED published size-class prior
-  (SIZE_CLASS_WEIGHTS), NOT the live real-traffic distribution. So the
+- BOTH chaff AND real packet sizes are drawn from a FIXED published
+  size-class prior (SIZE_CLASS_WEIGHTS), NOT a live real-traffic
+  distribution. Real-packet sizing is stateless: a real packet's class
+  is a fresh fixed-prior draw bumped up to fit its actual payload, and
+  the chosen class is never fed back into any distribution. So the
   aggregate (real + chaff) wire-size histogram trends toward a
   fleet-wide constant rather than revealing the user's application
-  profile. A per-chaff-packet ±1-class perturbation further decorrelates.
+  profile. A per-chaff-packet ±1-class perturbation further decorrelates
+  chaff. (Earlier builds sized real packets from a self-reinforcing EMA
+  that collapsed the real-traffic size distribution onto one dominant
+  class within tens of packets, re-spiking the histogram at the user's
+  modal size; that feedback loop has been removed.)
 
   DOCUMENTED RESIDUALS (what is NOT hidden — be explicit):
   - SUSTAINED high-volume traffic (e.g. a bulk download) IS visible on
@@ -236,6 +261,16 @@ Client -> Client-Owned Server -> Destination
     ~1 s, so a long steady-state flow at high rate is observable.
     Only the onset (the transition from idle to active) is smeared;
     steady-state volume is not hidden by this model.
+  - SIZE "CAN'T-PAD-DOWN" FLOOR: a real payload of P bytes MUST pad to a
+    size class >= P — padding can only grow a packet, never shrink it.
+    So while the size histogram trends to the fixed prior, real packets
+    are never sized BELOW their own payload: large/near-MTU payloads
+    (bulk transfers) unavoidably use the large class, leaving the
+    large-class bin over-represented during high-payload activity. This
+    is a bounded residual that folds into the sustained-volume point
+    above — DSM does not claim perfect size-decoupling for large
+    payloads. Small/mixed-size traffic, by contrast, follows the prior
+    closely because the bump-to-fit almost never raises the drawn class.
   - The idle floor is a detectable steady baseline: the PRESENCE of a
     low-rate (~0.5–2 pps) chaff stream is visible even though the exact
     rate is randomized per session.
@@ -265,7 +300,11 @@ Client -> Client-Owned Server -> Destination
 
 - nftables kill switch blocks all non-VPN traffic
 - mDNS (5353) and LLMNR (5355) blocked to prevent LAN enumeration
-- DNS (53, 853) on non-TUN interfaces blocked except to server IP
+- DNS (53/udp+tcp) and DoT/DoQ (853) on non-TUN interfaces blocked
+  UNCONDITIONALLY — there is no server-IP exception for cleartext DNS or
+  DoT. The "except to the server IP" carve-out applies only to HTTPS/DoH
+  and DoH3 (443/tcp+udp), so the encrypted tunnel itself can reach the
+  server while every other DoH destination is dropped.
 - VPN sockets marked with SO_MARK=0x1 so the ip-rule skips the TUN table
   and avoids routing loops
 
@@ -288,7 +327,14 @@ Client -> Client-Owned Server -> Destination
 **Assumptions:**
 
 - Network is hostile
-- Server is trusted (operator-owned)
+- Server is trusted (operator-owned). The server is the tunnel terminator:
+  it sees the client's source IP and the decrypted tunneled traffic, so
+  confidentiality of that traffic against the server operator is NOT a
+  promised property. What the CA-signed device cert + attestation binding
+  still hold against a misbehaving server: it cannot forge a client's
+  device identity, substitute the bound Noise static, or pivot to other
+  enrolled devices — peer authentication and the E2E-negotiated session
+  keys remain sound. SECURITY.md states the same split.
 - Client device is physically secure
 
 **Out of Scope:**
@@ -392,8 +438,10 @@ Client -> Client-Owned Server -> Destination
   `sha256sum <ca_root_file> | cut -d' ' -f1`
 - attest_key_file: path to the attest-key artifact. On the default
   tpm-attest build this is a TPM-bound DSMT context blob (no extractable
-  key, no passphrase); on the dev-soft-attest build it is an
-  Argon2id-wrapped ECDSA P-256 software key.
+  key; the operator passphrase is bound as the in-TPM key's authorization
+  value, so a sign needs both this TPM and the passphrase); on the
+  dev-soft-attest build it is an Argon2id-sealed ECDSA P-256 software key
+  under the same passphrase.
 - attest_tpm_tcti: tpm-attest only; optional TSS2 TCTI string selecting
   the TPM (e.g. "device:/dev/tpmrm0"). Unset = auto-resolve via the
   TCTI / TPM2TOOLS_TCTI env vars, then /dev/tpmrm0. Ignored by the soft

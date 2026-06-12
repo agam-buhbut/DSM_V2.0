@@ -191,12 +191,42 @@ def _require_server_args(role: str, args: argparse.Namespace) -> None:
         _fail(f"missing required argument(s): {', '.join(missing)}")
 
 
+def _ensure_secret_dir(install_dir: Path) -> None:
+    """Create/harden the install dir to 0o700 (it holds the identity + attest
+    keys, the device cert, and the resume-state file).
+
+    ``mkdir(exist_ok=True)`` does not re-chmod an already-existing dir, so we
+    follow up with an explicit ``chmod`` — mirroring the secret-dir handling in
+    ``dsm.net.tunnel``. To avoid silently weakening a dir owned by someone else
+    (e.g. a pre-provisioned ``/opt/mtun`` owned by a service account), we fail
+    closed when the dir already exists and is not owner-owned.
+    """
+    if install_dir.exists():
+        try:
+            st = install_dir.stat()
+        except OSError as e:
+            _fail(f"cannot stat install dir {install_dir}: {e}")
+            return  # unreachable; _fail exits
+        if st.st_uid != os.geteuid():
+            _fail(
+                f"install dir {install_dir} is owned by uid {st.st_uid}, not "
+                f"the current uid {os.geteuid()}; refusing to chmod a dir owned "
+                "by another user (provision it yourself at mode 0700)"
+            )
+            return  # unreachable; _fail exits
+    install_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        install_dir.chmod(0o700)
+    except OSError as e:
+        _fail(f"cannot set 0o700 on install dir {install_dir}: {e}")
+
+
 def _phase_a(role: str, args: argparse.Namespace) -> int:
     _require_server_args(role, args)
     _validate_ip_literal(args.server_ip)
     _check_preconditions(getattr(args, "tcti", None))
     install_dir = Path(args.install_dir)
-    install_dir.mkdir(parents=True, exist_ok=True)
+    _ensure_secret_dir(install_dir)
 
     state_path = install_dir / _STATE_NAME
     if state_path.exists() and not args.force:
@@ -246,6 +276,9 @@ def _phase_a(role: str, args: argparse.Namespace) -> int:
 
     csr_path = install_dir / f"{role}.csr"
     csr_path.write_bytes(result.csr_der)
+    # A CSR is not secret, but write it 0o600 for consistency with the rest of
+    # the install dir (config, state, keys) and to avoid an umask-dependent mode.
+    csr_path.chmod(0o600)
     _write_state(install_dir, role, args, csr_path, result.cn)
     print(f"Wrote CSR to {csr_path} (cn={result.cn})")
     print(

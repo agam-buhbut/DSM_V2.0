@@ -1429,7 +1429,7 @@ or prctl(PR_SET_DUMPABLE) didn't stick. Usually one of:
 - Chaff + jitter adds latency by design. For a faster-but-less-
   anonymized smoke test, lower padding_max and jitter_ms_max to 5.
 
-### "rekey giving up after 3 retries — tearing down"
+### "rekey giving up after 9 retries — tearing down"
 
 REKEY_ACK never reached the initiator. Check the peer log for
 "rekey completed as responder" — if missing, the server never

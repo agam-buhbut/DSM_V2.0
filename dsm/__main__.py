@@ -83,7 +83,7 @@ def main() -> None:
         action="store_true",
         help="Emit structured JSON events on the dsm.netaudit logger "
         "(handshake/nft/tun/rekey/liveness/shutdown). Overrides "
-        "config.debug_net. See deploy/GUIDE.txt §9 for capture flow.",
+        "config.debug_net. See deploy/GUIDE.md §9 for capture flow.",
     )
     _add_passphrase_args(parser)
 
@@ -321,6 +321,10 @@ def _run_enroll(
 
         try:
             csr_out.write_bytes(result.csr_der)
+            # A CSR is not secret, but write it 0o600 for consistency with the
+            # 0o600/0o700 convention used for the cert/key/state files and to
+            # avoid an umask-dependent mode.
+            csr_out.chmod(0o600)
         except OSError as e:
             # Keys are already persisted by generate_enrollment; the precheck
             # above caught the common cases, but a race (dir removed) or a
@@ -333,7 +337,7 @@ def _run_enroll(
         print(f"  noise_static_pub = {result.noise_static_pub.hex()}")
         print(
             "Walk the CSR via USB to the offline CA per "
-            "deploy/GUIDE.txt §3c, then run "
+            "deploy/GUIDE.md §3c, then run "
             "`dsm enroll --import <signed.crt>`."
         )
         return
@@ -411,4 +415,12 @@ def _run_show_pubkey(
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        # Ctrl-C at an interactive prompt (e.g. the passphrase tty read in
+        # dsm.core.passphrase raises a bare KeyboardInterrupt) or during a
+        # running session. Exit cleanly with the conventional 128+SIGINT code
+        # instead of dumping a raw traceback.
+        print("aborted", file=sys.stderr)
+        sys.exit(130)

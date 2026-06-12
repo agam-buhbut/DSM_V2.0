@@ -13,7 +13,7 @@ from cryptography.x509.oid import ExtendedKeyUsageOID
 from dsm.core import netaudit
 from dsm.core.config import Config
 from dsm.core.fsm import SessionFSM, State
-from dsm.core.protocol import ReassemblyBuffer
+from dsm.core.protocol import PacketType, ReassemblyBuffer
 from dsm.crypto.attest_store import AttestStore
 from dsm.crypto.auth_loader import (
     AuthMaterialsError,
@@ -33,8 +33,10 @@ from dsm.net.tunnel import TunDevice
 from dsm.session import (
     DataPathContext,
     LivenessState,
+    PathValidationState,
     RekeyState,
     SequenceCounter,
+    make_addr_send_fn,
     make_send_fn,
     setup_signal_handlers,
 )
@@ -416,14 +418,67 @@ async def _run_one_session(
             remote_static_pub=client_pub_bytes,
         )
 
-        # Hand off the steady-state recv/send/liveness loops to the shared
-        # driver. Server-specific bit: post_authenticate records the source
-        # addr of the first authenticated packet into the mutable cell that
-        # send_fn dereferences. No udp_addr_filter — the server has no single
-        # expected peer addr until that first authenticated packet lands. No
-        # extra_loops — auto_mtu_loop is client-only.
-        def _record_client_addr(addr: tuple[str, int]) -> None:
-            client_addr.set(addr)
+        # Return-routability state for egress roaming. The first authenticated
+        # addr commits normally; a later authenticated packet from a DIFFERENT
+        # source is treated as an unvalidated candidate and probed with a
+        # PATH_CHALLENGE — egress does NOT roam there until the candidate echoes
+        # the token in a PATH_RESPONSE. This blocks the on-path attack where a
+        # genuine client packet is suppressed and reinjected with a SPOOFED
+        # victim source: it is AEAD-valid (so it delivers to TUN) but the victim
+        # never returns a valid PATH_RESPONSE, so egress stays on the real
+        # client. Uses the SAME SequenceCounter as the data path so seq numbers
+        # stay monotonic (replay window + nonce uniqueness).
+        path_validation = PathValidationState()
+        path_send = make_addr_send_fn(session_keys, transport, seq)
+
+        async def _send_challenge(candidate: tuple[str, int], token: bytes) -> None:
+            # The challenge goes DIRECTLY to the pending candidate — NOT through
+            # the scheduler (which always targets the committed egress) and
+            # WITHOUT touching the committed egress. Bounded so a wedged/unroutable
+            # candidate (e.g. the spoofed victim) cannot pin the recv loop.
+            from dsm.session import _build_control_packet  # local: avoid cycle churn
+
+            padded, target_size = _build_control_packet(
+                ctx, PacketType.PATH_CHALLENGE, payload=token
+            )
+            try:
+                await asyncio.wait_for(
+                    path_send(padded, target_size, candidate), timeout=5.0
+                )
+            except (TimeoutError, OSError) as e:
+                log.debug("PATH_CHALLENGE send to %s failed: %s", candidate, e)
+
+        async def _post_authenticate(addr: tuple[str, int], inner: object) -> None:
+            from dsm.core.protocol import InnerPacket
+
+            assert isinstance(inner, InnerPacket)
+            committed = client_addr.get()
+
+            # First authenticated addr: commit (no challenge for the first one).
+            if committed is None:
+                client_addr.set(addr)
+                return
+
+            # A PATH_RESPONSE from the pending candidate with a matching token
+            # COMMITS the roam. Validate BEFORE the same-addr fast path so a
+            # response from the new candidate addr (which differs from the
+            # committed addr) is acted on here.
+            if inner.ptype == PacketType.PATH_RESPONSE:
+                if path_validation.validate(addr, inner.payload):
+                    client_addr.set(addr)
+                    path_validation.clear()
+                    log.info("egress roam validated, committed to new peer addr")
+                return
+
+            # Same committed addr: nothing to do (steady state).
+            if addr == committed:
+                return
+
+            # A different authenticated source: hold as the pending candidate and
+            # (rate-limited) probe it. Egress stays on the committed real client.
+            token = path_validation.should_challenge(addr)
+            if token is not None:
+                await _send_challenge(addr, token)
 
         from dsm.session import run_data_loops
 
@@ -433,7 +488,7 @@ async def _run_one_session(
             session_keys,
             replay,
             fsm,
-            post_authenticate=_record_client_addr,
+            post_authenticate=_post_authenticate,
             shutdown_log="server shutting down",
         )
         # session_stack unwinds here (resolver → dns_proxy → masquerade →

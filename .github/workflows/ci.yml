@@ -6,9 +6,11 @@ on:
   pull_request:
     branches: [ main ]
 
-# NOTE (supply chain): the Actions below are pinned to major version tags.
-# For full hardening they should be pinned to commit SHAs once looked up;
-# that is a deliberate follow-up (fabricating SHAs here would be unverifiable).
+# NOTE (supply chain): every third-party Action below is pinned to a full
+# 40-hex commit SHA (not a floating tag), with a trailing comment naming the
+# version that SHA corresponds to. Shared actions reuse the exact SHAs pinned
+# in release.yml so the gate and the signed-release pipeline stay consistent.
+# The SHAs were resolved against the GitHub API (tag/branch -> commit).
 
 # Two attest lanes (Phase-3 Task 3.11): the soft and tpm backends are
 # mutually exclusive at compile time, so each backend needs its own wheel and
@@ -20,6 +22,12 @@ on:
 #   * tpm  lane (`tpm-attest`)  — installs swtpm + the TSS2 stack, builds the
 #                                 tpm-attest wheel, and runs the swtpm-driven
 #                                 Rust tests + the TPM-only Python tests.
+
+# Least-privilege default for every job: this is a test/lint gate that only
+# needs to read the repository. No job writes contents, packages, or tokens.
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -28,21 +36,21 @@ jobs:
         python-version: [ "3.11", "3.12" ]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
 
       - name: Set up Python
         id: setup-python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b  # v5.3.0
         with:
           python-version: ${{ matrix.python-version }}
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable branch
         with:
           components: rustfmt, clippy
 
       - name: Cache Rust
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc  # v2.9.1
         with:
           workspaces: rust/tuncore
 
@@ -134,21 +142,21 @@ jobs:
   tpm-attest:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
 
       - name: Set up Python
         id: setup-python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b  # v5.3.0
         with:
           python-version: "3.12"
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable branch
         with:
           components: rustfmt, clippy
 
       - name: Cache Rust
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc  # v2.9.1
         with:
           workspaces: rust/tuncore
 

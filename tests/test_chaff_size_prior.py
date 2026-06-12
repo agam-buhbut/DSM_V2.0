@@ -19,7 +19,12 @@ import asyncio
 import collections
 import unittest
 
-from dsm.core.protocol import SIZE_CLASS_WEIGHTS, SIZE_CLASSES
+from dsm.core.protocol import (
+    SIZE_CLASS_WEIGHTS,
+    SIZE_CLASSES,
+    InnerPacket,
+    PacketType,
+)
 from dsm.traffic.shaper import (
     _CHAFF_SIZE_PERTURB_DOWN_P,
     _CHAFF_SIZE_PERTURB_UP_P,
@@ -68,16 +73,21 @@ def _expected_perturbed_prior() -> dict[int, float]:
 
 class TestChaffSizeFixedPrior(unittest.TestCase):
     def test_chaff_size_does_not_track_skewed_real_traffic(self) -> None:
-        """CORE discriminator: hammer the real-size EMA toward the largest
-        class only, then assert chaff still follows the fixed prior (the
-        smallest class — prior weight 20/100 — stays well represented).
+        """CORE discriminator: drive a large stream of real (large) packets,
+        then assert chaff still follows the fixed prior (the smallest class —
+        prior weight 20/100 — stays well represented).
 
-        Before the fix, chaff tracked the EMA so the smallest class would be
-        ~never produced after 2000 large observations.
+        Before Task 2.3, chaff tracked a live real-size EMA so the smallest
+        class would be ~never produced after a stream of large real packets.
+        After the H-ANON fix the EMA is gone entirely — chaff sizing is a
+        stateless fixed-prior draw, so no real-traffic pattern can skew it.
         """
         shaper = TrafficShaper(128, 1400)
+        # Drive real (large-payload) packets through the real sizing path:
+        # this is what *would* have skewed the old EMA.
+        big = InnerPacket(ptype=PacketType.DATA, epoch_id=0, payload=b"x" * 1300)
         for _ in range(2000):
-            shaper.observe_real_packet(1400)
+            shaper.pad_packet(big)
         hist = _chaff_size_hist(shaper, 4000)
         smallest = SIZE_CLASSES[0]
         self.assertGreater(
@@ -117,11 +127,13 @@ class TestChaffSizeFixedPrior(unittest.TestCase):
             )
 
     def test_chaff_size_matches_prior_even_with_skewed_real_traffic(self) -> None:
-        """The fixed-prior distribution holds even after the real EMA is
-        skewed — chaff sizing is fully decoupled from real-traffic sizing."""
+        """The fixed-prior distribution holds even after a heavy stream of
+        small real packets — chaff sizing is fully decoupled from real-traffic
+        sizing (the former EMA that this could have skewed is removed)."""
         shaper = TrafficShaper(128, 1400)
+        small = InnerPacket(ptype=PacketType.DATA, epoch_id=0, payload=b"x" * 4)
         for _ in range(2000):
-            shaper.observe_real_packet(128)
+            shaper.pad_packet(small)
         n = 50_000
         hist = _chaff_size_hist(shaper, n)
         expected = _expected_perturbed_prior()

@@ -5,7 +5,7 @@
 # Trust model: every device runs `dsm enroll --csr-out` once, walks the CSR to
 # the offline CA laptop, gets a cert back, and runs `dsm enroll --import`.
 # At runtime the daemon authenticates peers against the pinned CA root +
-# (server) CN allowlist or (client) expected_server_cn. See deploy/GUIDE.txt.
+# (server) CN allowlist or (client) expected_server_cn. See deploy/GUIDE.md.
 
 mode = "client"                              # "client" | "server"
 server_ip = "203.0.113.1"                    # Server public IPv4 literal (not a hostname, not IPv6)
@@ -85,7 +85,7 @@ mtu = 1400
 
 # Structured JSON audit stream on the dsm.netaudit logger. May also be enabled
 # with --debug-net. Note: enabling it on a shared log host re-exposes some
-# handshake-failure detail; see deploy/GUIDE.txt §9.
+# handshake-failure detail; see deploy/GUIDE.md §9.
 # debug_net = false
 
 # ─── Traffic shaping ───────────────────────────────────────────────────────

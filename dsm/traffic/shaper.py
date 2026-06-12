@@ -28,13 +28,27 @@ Residual: the envelope hides burst *onset* within the latency budget, but a
 visible at) the elevated wire rate — concealing sustained volume is out of
 scope for this model and is a documented residual.
 
-Size distribution: REAL packets pad to the size class that fits their actual
-size (the live ``SizeTracker`` EMA informs padding). CHAFF packet sizes are
-drawn from a FIXED published prior (``SIZE_CLASS_WEIGHTS``, renormalized over
-the active classes) — decoupled from the real-traffic EMA (Task 2.3, fix for
-shaper.py:292) — with a per-chaff-packet ±1 class perturbation on top. So the
-aggregate (real + chaff) size histogram trends toward the published
-fleet-wide prior rather than amplifying the user's actual application profile.
+Size distribution: BOTH real and chaff packets pad to a size class drawn from
+the SAME FIXED published prior (``SIZE_CLASS_WEIGHTS``, renormalized over the
+active classes). A real packet's class is the fixed-prior draw bumped UP to the
+smallest class that fits its actual payload (you cannot pad a packet below its
+own size); chaff adds a per-chaff-packet ±1-class perturbation on top of the
+draw. Real-packet sizing carries NO state — there is no EMA feeding the next
+draw — so the aggregate (real + chaff) wire-size histogram trends toward the
+published fleet-wide prior rather than amplifying the user's application
+profile.
+
+H-ANON (size-feedback fix): real packets formerly padded to a class sampled
+from a live ``SizeTracker`` EMA that was then re-fed the padded output size
+(``observe_real_packet``). That positive-feedback loop collapsed the
+real-traffic size distribution onto one dominant class within tens of packets,
+re-spiking the aggregate histogram at the user's modal size — the dual of the
+Task-2.3 chaff finding, but for real packets. The EMA and its feedback are
+removed: real packets now draw from the fixed prior exactly like chaff. The
+one UNAVOIDABLE residual is the "can't pad down" floor — a P-byte payload must
+use a class >= P — so large/near-MTU payloads (bulk transfers) still
+over-represent the large class. That is bounded and folds into the already
+documented "sustained volume is visible" residual.
 """
 
 from __future__ import annotations
@@ -55,10 +69,6 @@ from dsm.core.protocol import (
     PacketType,
 )
 from dsm.core.rand import csprng_float
-
-# EMA decay for the size-class distribution. Kept at the historical 0.15
-# so chaff sizes track real-traffic size mix on the order of ~10 packets.
-EMA_ALPHA = 0.15
 
 # Adaptive-envelope defaults (Phase 2 / Fork 8). These mirror the Config
 # defaults so a TrafficShaper built without explicit envelope kwargs still
@@ -82,78 +92,6 @@ _ENVELOPE_LATENCY_BUDGET_MS = 1000
 # the EMA-tracked real distribution.
 _CHAFF_SIZE_PERTURB_UP_P = 0.15
 _CHAFF_SIZE_PERTURB_DOWN_P = 0.30
-
-
-class SizeTracker:
-    """Track real traffic size class distribution via EMA."""
-
-    def __init__(self, classes: tuple[int, ...] | None = None) -> None:
-        self._classes = classes or SIZE_CLASSES
-        # M-ANON-1: initialize from the published web-traffic prior
-        # (SIZE_CLASS_WEIGHTS) rather than uniform. With α=0.15 the EMA
-        # takes ~30 observations to forget the prior; uniform-init
-        # means chaff sizes for the first ~30 real packets are drawn
-        # from an unrealistic distribution that a passive observer can
-        # tell apart from steady-state. Seeding from the long-run
-        # prior makes cold-start chaff statistically indistinguishable
-        # from steady-state chaff.
-        if classes is None or classes == SIZE_CLASSES:
-            total = float(sum(SIZE_CLASS_WEIGHTS))
-            self._weights: list[float] = [w / total for w in SIZE_CLASS_WEIGHTS]
-        else:
-            # Custom classes (e.g., filtered by padding_min/max) —
-            # fall back to uniform since we don't have a matching prior.
-            n = len(self._classes)
-            self._weights = [1.0 / n] * n
-
-    def observe(self, size_class: int) -> None:
-        """Update the distribution based on an observed real packet size class.
-
-        M-PERF-3: the previous implementation ran a second normalization
-        loop after every observation. The math proves it's a no-op when
-        the EMA invariant holds: ``sum(w_new) = decay * sum(w_old) +
-        EMA_ALPHA = decay * 1 + EMA_ALPHA = 1``. So as long as the
-        weights start summing to 1 (they do, ``[1/n] * n``), they stay
-        summing to 1 modulo float-rounding (which is bounded by IEEE 754
-        relative error * n iterations — never observable for n=11 and
-        any realistic session length). The renormalization loop is
-        removed; correctness preserved by the EMA invariant.
-        """
-        idx = self.class_index(size_class)
-        w = self._weights
-        decay = 1 - EMA_ALPHA
-        for i in range(
-            len(w)
-        ):  # pylint: disable=consider-using-enumerate  # deliberate in-place index write
-            w[i] = decay * w[i] + (EMA_ALPHA if i == idx else 0.0)
-
-    def sample_with_idx(self) -> tuple[int, int]:
-        """Sample a size class AND return its index in one scan.
-
-        M-PERF-4: callers that immediately need the index for chaff
-        perturbation (``pad_packet`` / ``make_chaff_packet``) save a
-        redundant linear scan via ``class_index`` after ``sample``.
-        """
-        r = csprng_float()
-        cumulative = 0.0
-        for i, w in enumerate(self._weights):
-            cumulative += w
-            if r < cumulative:
-                return self._classes[i], i
-        last = len(self._classes) - 1
-        return self._classes[last], last
-
-    def sample(self) -> int:
-        """Sample a size class from the current distribution."""
-        sc, _ = self.sample_with_idx()
-        return sc
-
-    def class_index(self, size: int) -> int:
-        """Find the index of the matching or next-larger class."""
-        for i, sc in enumerate(self._classes):
-            if sc >= size:
-                return i
-        return len(self._classes) - 1
 
 
 class TrafficShaper:
@@ -196,11 +134,11 @@ class TrafficShaper:
             largest = SIZE_CLASSES[-1]
             candidates = [sc for sc in SIZE_CLASSES if sc >= padding_min]
             self._active_classes = (candidates[0],) if candidates else (largest,)
-        self._size_tracker = SizeTracker(self._active_classes)
-        # Task 2.3: chaff sizes are drawn from a FIXED published prior, NOT
-        # the live real-traffic EMA above. Precomputed once so each draw is
-        # allocation-free (a single cumulative scan in _sample_chaff_size).
-        self._chaff_prior_cumulative = self._build_chaff_prior_cumulative()
+        # H-ANON: BOTH real and chaff packets size from this FIXED published
+        # prior (no live real-traffic EMA — see module docstring). Precomputed
+        # once so each draw is allocation-free (a single cumulative scan in
+        # _sample_size_class).
+        self._size_prior_cumulative = self._build_size_prior_cumulative()
 
         # ── Adaptive envelope (Phase 2) ──────────────────────────────────
         # The envelope is a paced target wire rate (real+chaff) that the
@@ -235,11 +173,11 @@ class TrafficShaper:
         (the DSM outer-packet size budget = path_mtu - IP - UDP).
 
         Filters the active classes to those <= max_outer and rebuilds the
-        size tracker so subsequent pad_packet / chaff sizes fit a constrained
-        path. Always keeps at least one class (the smallest), so an absurdly
-        low ceiling degrades gracefully rather than emptying the set. The
-        ceiling is bounded above by the configured ``padding_max`` (raising it
-        cannot exceed the operator's padding policy).
+        fixed size prior so subsequent pad_packet / chaff sizes fit a
+        constrained path. Always keeps at least one class (the smallest), so an
+        absurdly low ceiling degrades gracefully rather than emptying the set.
+        The ceiling is bounded above by the configured ``padding_max`` (raising
+        it cannot exceed the operator's padding policy).
         """
         ceiling = min(max_outer, self._padding_max)
         kept = tuple(sc for sc in SIZE_CLASSES if self._padding_min <= sc <= ceiling)
@@ -252,13 +190,13 @@ class TrafficShaper:
             candidates = [sc for sc in SIZE_CLASSES if sc >= self._padding_min]
             kept = (candidates[0],) if candidates else (SIZE_CLASSES[-1],)
         self._active_classes = kept
-        self._size_tracker = SizeTracker(self._active_classes)
-        # Task 2.3: rebuild the fixed chaff-size prior over the narrowed active
-        # set so chaff never samples a class the shaper can no longer emit.
-        self._chaff_prior_cumulative = self._build_chaff_prior_cumulative()
+        # Rebuild the fixed size prior over the narrowed active set so neither
+        # real nor chaff sizing ever samples a class the shaper can no longer
+        # emit.
+        self._size_prior_cumulative = self._build_size_prior_cumulative()
 
-    def _build_chaff_prior_cumulative(self) -> tuple[float, ...]:
-        """Precompute cumulative weights for the fixed chaff-size prior.
+    def _build_size_prior_cumulative(self) -> tuple[float, ...]:
+        """Precompute cumulative weights for the fixed size prior.
 
         The prior is the published ``SIZE_CLASS_WEIGHTS`` restricted to the
         current ``_active_classes`` (so padding_min/padding_max and any
@@ -266,7 +204,8 @@ class TrafficShaper:
         A class outside the published set (none exist today, but the active
         filter could in principle hold one) falls back to weight 1. Returns
         ascending cumulative weights summing to 1.0 for a single-scan sample
-        in ``_sample_chaff_size``.
+        in ``_sample_size_class``. Shared by BOTH real-packet sizing
+        (``pad_packet``) and chaff sizing (``_sample_chaff_wire_class``).
         """
         weight_by_class: dict[int, int] = dict(zip(SIZE_CLASSES, SIZE_CLASS_WEIGHTS))
         weights = [float(weight_by_class.get(sc, 1)) for sc in self._active_classes]
@@ -283,16 +222,18 @@ class TrafficShaper:
             cumulative.append(running)
         return tuple(cumulative)
 
-    def _sample_chaff_size(self) -> tuple[int, int]:
-        """Sample a chaff size class from the FIXED published prior.
+    def _sample_size_class(self) -> tuple[int, int]:
+        """Sample a size class from the FIXED published prior.
 
-        Mirrors ``SizeTracker.sample_with_idx`` (one CSPRNG draw + a cumulative
-        scan, allocation-free) but reads the frozen ``_chaff_prior_cumulative``
-        weights instead of the live EMA — so chaff sizing is independent of the
-        real-traffic size distribution. Returns ``(size_class, index)``.
+        One CSPRNG draw + a cumulative scan (allocation-free) over the frozen
+        ``_size_prior_cumulative`` weights. There is NO live EMA — sizing is
+        stateless and independent of the real-traffic size distribution. Shared
+        by ``pad_packet`` (real packets, no perturbation) and
+        ``_sample_chaff_wire_class`` (chaff, ±1 perturbation on top). Returns
+        ``(size_class, index)``.
         """
         r = csprng_float()
-        for i, cum in enumerate(self._chaff_prior_cumulative):
+        for i, cum in enumerate(self._size_prior_cumulative):
             if r < cum:
                 return self._active_classes[i], i
         last = len(self._active_classes) - 1
@@ -301,16 +242,18 @@ class TrafficShaper:
     def _sample_chaff_wire_class(self) -> int:
         """Final chaff size class = FIXED prior draw + ±1-class perturbation.
 
-        The perturbation (Fork 6) is applied ON TOP of the fixed prior, not the
-        live EMA: with probability ``_CHAFF_SIZE_PERTURB_UP_P`` bump one class
-        up, with the next slice down, else leave it (clamped at the active-set
-        boundaries). Used for BOTH the chaff payload budget (``make_chaff``) and
-        the chaff wire size (``pad_chaff``) so the two agree distributionally.
+        The perturbation (Fork 6) is applied ON TOP of the fixed prior: with
+        probability ``_CHAFF_SIZE_PERTURB_UP_P`` bump one class up, with the
+        next slice down, else leave it (clamped at the active-set boundaries).
+        Used for BOTH the chaff payload budget (``make_chaff``) and the chaff
+        wire size (``pad_chaff``) so the two agree distributionally. Real
+        packets (``pad_packet``) draw from the SAME prior but WITHOUT this
+        perturbation — they bump up to fit their payload instead.
 
         Allocation-free: two CSPRNG draws (prior + perturbation), no per-call
         list construction.
         """
-        size_class, idx = self._sample_chaff_size()
+        size_class, idx = self._sample_size_class()
         r = csprng_float()
         classes = self._active_classes
         if r < _CHAFF_SIZE_PERTURB_UP_P:
@@ -326,12 +269,18 @@ class TrafficShaper:
 
         Returns (inner_plaintext_with_padding, target_outer_size).
 
-        The target class is sampled from the live ``SizeTracker`` EMA, which
-        tracks real-traffic sizes — so a real packet pads to a class near the
-        real-traffic size mix. (Chaff uses ``pad_chaff`` / the fixed prior
-        instead, Task 2.3.)
+        H-ANON (size-feedback fix): the target class is drawn from the FIXED
+        published prior (``_sample_size_class`` — the SAME prior chaff uses,
+        WITHOUT chaff's ±1 perturbation), then ``_serialize_padded`` bumps it UP
+        to the smallest class that fits the actual payload. This is stateless:
+        unlike the removed ``SizeTracker`` EMA, the chosen class is NOT fed back
+        into any distribution, so the real-traffic size histogram can no longer
+        collapse onto a single dominant class. Real and chaff sizing both trend
+        to the fixed prior; the only residual is the unavoidable "can't pad
+        down" floor (a P-byte payload must use a class >= P), so large payloads
+        still over-represent the large class.
         """
-        target_outer, idx = self._size_tracker.sample_with_idx()
+        target_outer, idx = self._sample_size_class()
         return self._serialize_padded(inner, target_outer, idx)
 
     def pad_chaff(self, inner: InnerPacket) -> tuple[bytes, int]:
@@ -341,11 +290,11 @@ class TrafficShaper:
 
         Task 2.3 (fix for shaper.py:292): the chaff WIRE size is drawn from the
         fixed published prior + ±1-class perturbation
-        (``_sample_chaff_wire_class``) instead of the live real-traffic EMA used
-        by ``pad_packet``. So the chaff size histogram — the quantity a passive
-        observer measures — is independent of the user's application profile;
-        the aggregate (real + chaff) histogram trends toward the fleet-wide
-        published prior.
+        (``_sample_chaff_wire_class``). Real packets (``pad_packet``) draw from
+        the same fixed prior (H-ANON fix), so the chaff size histogram — the
+        quantity a passive observer measures — is independent of the user's
+        application profile and the aggregate (real + chaff) histogram trends
+        toward the fleet-wide published prior.
 
         Standalone draw: this picks its OWN wire class. The internal hot path
         (``make_chaff_packet``) instead draws the class ONCE and sizes the
@@ -368,11 +317,12 @@ class TrafficShaper:
     ) -> tuple[bytes, int]:
         """Build the padded inner plaintext for a pre-chosen target class.
 
-        Shared by ``pad_packet`` (EMA target) and ``pad_chaff`` (fixed-prior
-        target). Bumps ``target_outer`` up to the next class that fits the
-        payload (or to the exact minimum if no class is large enough), then
-        builds the header + payload + random padding into a single pre-sized
-        bytearray to avoid an intermediate ``serialized`` copy.
+        Shared by ``pad_packet`` and ``pad_chaff`` — both now draw the target
+        from the same fixed prior. Bumps ``target_outer`` up to the next class
+        that fits the payload (or to the exact minimum if no class is large
+        enough — the "can't pad down" floor), then builds the header + payload +
+        random padding into a single pre-sized bytearray to avoid an
+        intermediate ``serialized`` copy.
         """
         payload_len = len(inner.payload)
         if payload_len > MAX_INNER_PAYLOAD:
@@ -399,18 +349,6 @@ class TrafficShaper:
         if inner_pad_len > 0:
             buf[INNER_HEADER_SIZE + payload_len :] = os.urandom(inner_pad_len)
         return bytes(buf), target_outer
-
-    def observe_real_packet(self, size_class: int) -> None:
-        """Track a real outgoing packet's size class for REAL-packet padding.
-
-        Feeds the live ``SizeTracker`` EMA that ``pad_packet`` samples when
-        padding real packets. Task 2.3: this no longer affects CHAFF sizing —
-        chaff is drawn from the fixed published prior (``_sample_chaff_size``),
-        decoupled from the real-traffic size distribution. The wire *rate* is
-        governed entirely by the envelope (``update_envelope`` /
-        ``release_budget``).
-        """
-        self._size_tracker.observe(size_class)
 
     def update_envelope(
         self, now: float, real_queue_depth: int, oldest_real_age_s: float
@@ -506,13 +444,13 @@ class TrafficShaper:
     def make_chaff(self, epoch_id: int = 0) -> InnerPacket:
         """Generate a chaff packet with perturbed size to break correlation.
 
-        Task 2.3: the chaff size class is drawn from the FIXED published prior
-        + ±1-class perturbation (``_sample_chaff_wire_class``), NOT the live
-        real-traffic ``SizeTracker`` EMA. So chaff no longer mirrors the user's
-        app profile and the aggregate (real + chaff) size histogram trends
-        toward the fleet-wide published prior rather than amplifying the user's
-        actual traffic. ``pad_chaff`` draws the wire size from the same
-        distribution, so the payload sized here fits without distortion.
+        Task 2.3 / H-ANON: the chaff size class is drawn from the FIXED
+        published prior + ±1-class perturbation (``_sample_chaff_wire_class``).
+        Real packets draw from the same fixed prior (no perturbation), so the
+        aggregate (real + chaff) size histogram trends toward the fleet-wide
+        published prior rather than amplifying the user's actual traffic.
+        ``pad_chaff`` draws the wire size from the same distribution, so the
+        payload sized here fits without distortion.
 
         M-ANON-8: pick payload_len uniformly within the chosen size
         class's plaintext budget so that — post-AEAD — the chaff's

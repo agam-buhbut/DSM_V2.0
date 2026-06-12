@@ -78,15 +78,19 @@ pub fn serialize(blob: &DsmtBlob) -> Vec<u8> {
     out.push(HIERARCHY_OWNER);
     out.push(KEY_KIND_CONTEXT_BLOB);
     out.push(CURVE_NIST_P256);
-    // Lengths are bounded by TPM2B max (<= 0xFFFF); cast is lossless. A
-    // debug_assert documents the invariant for any future larger structure.
-    debug_assert!(u16::try_from(blob.public_tpmt.len()).is_ok());
-    debug_assert!(u16::try_from(blob.private_buf.len()).is_ok());
-    #[allow(clippy::cast_possible_truncation)]
-    out.extend_from_slice(&(blob.public_tpmt.len() as u16).to_be_bytes());
+    // Lengths are bounded by TPM2B max (<= 0xFFFF) for every blob this crate
+    // produces (the inputs are a marshalled TPMT_PUBLIC and the TPM's own
+    // TPM2B_PRIVATE area — never attacker-supplied wire bytes). The checked
+    // conversion makes that invariant release-safe: a future >u16::MAX
+    // structure trips a clear panic here instead of silently truncating the
+    // length prefix and emitting a corrupt blob.
+    let pub_len = u16::try_from(blob.public_tpmt.len())
+        .expect("DSMT serialize: public_tpmt length exceeds u16::MAX");
+    let priv_len = u16::try_from(blob.private_buf.len())
+        .expect("DSMT serialize: private_buf length exceeds u16::MAX");
+    out.extend_from_slice(&pub_len.to_be_bytes());
     out.extend_from_slice(&blob.public_tpmt);
-    #[allow(clippy::cast_possible_truncation)]
-    out.extend_from_slice(&(blob.private_buf.len() as u16).to_be_bytes());
+    out.extend_from_slice(&priv_len.to_be_bytes());
     out.extend_from_slice(&blob.private_buf);
     out
 }

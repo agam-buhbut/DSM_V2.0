@@ -27,6 +27,7 @@ from dsm.core.fsm import SessionFSM, State
 from dsm.core.protocol import (
     GCM_TAG_SIZE,
     OUTER_HEADER_SIZE,
+    PATH_TOKEN_SIZE,
     SEQ_STRUCT,
     SIZE_CLASSES,
     Fragment,
@@ -214,12 +215,24 @@ def make_send_fn(
         # reserved/zero — audit M3 widening) with the live
         # session_keys.epoch right before encryption. CHAFF packets are
         # exempt from the receiver's check, but patching them is
-        # harmless. Patch in a fresh bytearray so we never mutate the
-        # buffer the scheduler queue still holds a reference to.
-        buf = bytearray(data)
-        if len(buf) >= 2:
-            buf[1] = (buf[1] & 0x0F) | ((session_keys.epoch & 0x0F) << 4)
-        data = bytes(buf)
+        # harmless.
+        #
+        # M-PERF: the shaper already stamped the queue-time epoch nibble
+        # into byte 1 (shaper._serialize_padded). When NO rekey happened
+        # between queue and send — the overwhelmingly common case — that
+        # nibble already equals the live epoch, so we can hand the
+        # immutable `data` straight to AEAD with ZERO copies. Only when a
+        # rekey actually changed the live epoch do we allocate a fresh
+        # bytearray to patch it (measured: 2 allocs / ~2890 B per packet
+        # eliminated on the common path). We still never mutate the
+        # scheduler's buffer: the patch path allocates a NEW bytearray
+        # (bytearray(data) copies), exactly as before.
+        if len(data) >= 2:
+            want_byte1 = (data[1] & 0x0F) | ((session_keys.epoch & 0x0F) << 4)
+            if data[1] != want_byte1:
+                buf = bytearray(data)
+                buf[1] = want_byte1
+                data = bytes(buf)
         if tcp_fixed_size and len(data) < tcp_inner_target:
             # Fixed-size TCP framing: extend the inner plaintext to
             # tcp_inner_target so that after AEAD (+GCM_TAG_SIZE) and
@@ -265,6 +278,167 @@ def make_send_fn(
             liveness.last_send_time = time.monotonic()
 
     return send_packet
+
+
+def make_addr_send_fn(
+    session_keys: tuncore.SessionKeyManager,
+    transport: UDPTransport | TCPTransport,
+    seq: SequenceCounter,
+) -> Callable[[bytes, int, tuple[str, int]], Awaitable[None]]:
+    """Build an encrypt-and-send closure that targets an EXPLICIT addr.
+
+    Unlike ``make_send_fn`` — whose destination is whatever the committed
+    egress closure returns — this resolves the destination from the
+    ``addr`` argument passed at call time. It exists solely for the
+    return-routability PATH_CHALLENGE: that probe must go to the UNCOMMITTED
+    pending candidate WITHOUT routing through the scheduler (which always
+    targets the committed egress) and WITHOUT mutating the committed egress.
+
+    The AEAD/seq/nonce framing is byte-identical to ``make_send_fn`` — only
+    the destination resolution differs — so the probe is indistinguishable on
+    the wire from any other size-128 control packet. TCP has a single
+    connection (no per-packet addr), so the ``addr`` argument is ignored and
+    ``transport.send`` is used directly; in practice path validation is a
+    UDP-roaming concern.
+    """
+
+    async def send_to(data: bytes, target_size: int, addr: tuple[str, int]) -> None:
+        n = seq.next()
+        if len(data) >= 2:
+            want_byte1 = (data[1] & 0x0F) | ((session_keys.epoch & 0x0F) << 4)
+            if data[1] != want_byte1:
+                buf = bytearray(data)
+                buf[1] = want_byte1
+                data = bytes(buf)
+        aad = SEQ_STRUCT.pack(n)
+        nonce, ct, _epoch = session_keys.encrypt(data, aad)
+        outer = OuterPacket(seq=n, nonce=nonce, ciphertext=ct)
+        wire = outer.serialize(target_size)
+        if isinstance(transport, UDPTransport):
+            await transport.send(wire, addr)
+        else:
+            await transport.send(wire)
+
+    return send_to
+
+
+# Minimum interval between PATH_CHALLENGE emissions (seconds). A single
+# pending slot bounds memory; this bounds the challenge SEND rate so the
+# return-routability probe cannot be abused as a reflection/amplification
+# vector (each AEAD-valid packet from a new source would otherwise emit a
+# challenge). Replies are size-class-padded control packets, so even a
+# saturated challenge cadence emits at most one small packet per interval to
+# any given candidate.
+PATH_CHALLENGE_MIN_INTERVAL = 1.0
+
+# How long a pending candidate may sit unvalidated before it is discarded.
+# A stale pending must never wedge a future legitimate roam: once it times
+# out the slot is free for the next candidate. Must comfortably exceed a
+# real RTT plus the challenge cadence so a genuine NAT-rebind round-trip
+# completes; 5s mirrors other recovery windows in the data path.
+PATH_PENDING_TIMEOUT = 5.0
+
+
+@dataclass
+class PathValidationState:
+    """Single-slot return-routability state for server egress roaming.
+
+    The server commits its egress address only to a peer that PROVES it can
+    receive at that address (it echoes a fresh 16-byte token in a
+    PATH_RESPONSE). Until then a candidate from a new source addr is held
+    here as ``pending_addr`` and probed with a PATH_CHALLENGE.
+
+    One slot only: a newer candidate REPLACES any existing pending (with a
+    fresh token), so an attacker cannot exhaust memory and cannot pin the
+    slot against a genuine later roam. ``clock`` is injectable so timeout /
+    rate-limit behaviour is deterministic in tests (default time.monotonic).
+
+    Fields:
+      * ``pending_addr``: the unvalidated candidate egress, or None.
+      * ``token``: the 16-byte token the candidate must echo. None iff no
+        pending.
+      * ``challenge_sent_at``: monotonic time the current pending's first
+        challenge went out — drives the pending timeout.
+      * ``last_challenge_at``: monotonic time of the most recent challenge
+        emission (any candidate) — drives the send rate limit.
+    """
+
+    clock: Callable[[], float] = time.monotonic
+    pending_addr: tuple[str, int] | None = None
+    token: bytes | None = None
+    challenge_sent_at: float | None = None
+    last_challenge_at: float | None = None
+
+    def _expired(self, now: float) -> bool:
+        return (
+            self.challenge_sent_at is not None
+            and now - self.challenge_sent_at > PATH_PENDING_TIMEOUT
+        )
+
+    def clear(self) -> None:
+        self.pending_addr = None
+        self.token = None
+        self.challenge_sent_at = None
+
+    def should_challenge(self, candidate: tuple[str, int]) -> bytes | None:
+        """Decide whether to (re)challenge ``candidate``; return a fresh token
+        to send, or None to stay silent.
+
+        Issues a token when there is no live pending, when the pending has
+        timed out, or when the candidate differs from the current pending —
+        each case (re)arms the slot with a fresh token bound to ``candidate``.
+        A repeat of the SAME live, un-timed-out pending is suppressed (no new
+        token) UNLESS the rate-limit interval has elapsed, in which case the
+        existing token is re-sent (a retransmit, not a new probe).
+
+        All emissions are gated by ``PATH_CHALLENGE_MIN_INTERVAL`` so the
+        probe cannot be abused as an amplifier.
+        """
+        now = self.clock()
+        if self.last_challenge_at is not None and (
+            now - self.last_challenge_at < PATH_CHALLENGE_MIN_INTERVAL
+        ):
+            return None
+
+        same_live_pending = (
+            self.pending_addr == candidate
+            and self.token is not None
+            and not self._expired(now)
+        )
+        if same_live_pending:
+            # Rate-limit interval has elapsed (checked above): retransmit the
+            # existing token rather than minting a new one, so an in-flight
+            # legitimate response still matches.
+            assert self.token is not None
+            token = self.token
+        else:
+            # New candidate, or the slot is empty/expired: arm a fresh token.
+            token = os.urandom(PATH_TOKEN_SIZE)
+            self.pending_addr = candidate
+            self.token = token
+            self.challenge_sent_at = now
+        self.last_challenge_at = now
+        return token
+
+    def validate(self, recv_addr: tuple[str, int], token: bytes) -> bool:
+        """Return True iff ``token`` matches the live pending for ``recv_addr``.
+
+        On success the caller commits egress to ``recv_addr`` and calls
+        ``clear()``. A mismatched token, a response from a non-pending addr,
+        or a response after the pending timed out all return False — egress
+        stays on the committed real client.
+        """
+        if self.pending_addr is None or self.token is None:
+            return False
+        if recv_addr != self.pending_addr:
+            return False
+        if self._expired(self.clock()):
+            return False
+        # Constant-time compare: the token is a secret the attacker is trying
+        # to guess; a timing oracle on the echo path would leak it.
+        import hmac
+
+        return hmac.compare_digest(token, self.token)
 
 
 def _decrypt_with_fallback(
@@ -367,7 +541,17 @@ def decrypt_packet(
     # the very ACK that completes recovery. REKEY_ACK self-validates via its
     # own 4-byte epoch field (handle_rekey_ack checks it against
     # pending_epoch) plus AEAD, so the outer nibble check is redundant for it.
-    if inner.ptype not in (PacketType.CHAFF, PacketType.REKEY_ACK):
+    # PATH_CHALLENGE / PATH_RESPONSE are control packets (like CHAFF /
+    # REKEY_ACK). They can be built under one epoch and re-stamped by
+    # make_send_fn at send time, or arrive during a rekey grace window, so
+    # exempt them from the outer epoch-nibble check. They self-authenticate
+    # via AEAD plus the 16-byte token echo; the nibble adds nothing.
+    if inner.ptype not in (
+        PacketType.CHAFF,
+        PacketType.REKEY_ACK,
+        PacketType.PATH_CHALLENGE,
+        PacketType.PATH_RESPONSE,
+    ):
         if decrypted_prev_epoch:
             expected_eid = (session_keys.epoch - 1) & 0x0F
         else:
@@ -540,19 +724,49 @@ async def _handle_session_close(ctx: DataPathContext, inner: InnerPacket) -> Non
     ctx.shutdown.set()
 
 
-def _build_control_packet(ctx: DataPathContext, ptype: PacketType) -> tuple[bytes, int]:
-    """Build a zero-payload control packet (KEEPALIVE / SESSION_CLOSE).
+def _build_control_packet(
+    ctx: DataPathContext, ptype: PacketType, payload: bytes = b""
+) -> tuple[bytes, int]:
+    """Build a control packet (KEEPALIVE / SESSION_CLOSE / PATH_*).
 
-    Both use the same shape: empty payload, current epoch_id, run
-    through the shaper for padding. Centralised so future control-packet
-    types pick up the right epoch/padding wiring automatically.
+    They share the same shape: a small payload (empty for KEEPALIVE /
+    SESSION_CLOSE, the 16-byte token for PATH_CHALLENGE / PATH_RESPONSE),
+    current epoch_id, run through the shaper for size-class padding.
+    Centralised so future control-packet types pick up the right
+    epoch/padding wiring automatically.
     """
     inner = InnerPacket(
         ptype=ptype,
         epoch_id=ctx.session_keys.epoch & 0x0F,
-        payload=b"",
+        payload=payload,
     )
     return ctx.shaper.pad_packet(inner)
+
+
+async def _handle_path_challenge(ctx: DataPathContext, inner: InnerPacket) -> None:
+    """Client side: answer a PATH_CHALLENGE with a PATH_RESPONSE.
+
+    The server emits a PATH_CHALLENGE to a candidate egress addr to confirm
+    return-routability before it roams its egress there. A legitimate client
+    that has just moved (NAT rebind / network change) IS at that new addr,
+    receives the challenge, and echoes the 16-byte token straight back via
+    the normal paced send path — so the legitimate roam completes. The
+    response rides the scheduler (same envelope as any control packet); the
+    server matches the echoed token against its pending slot.
+
+    An off-path attacker who spoofed a victim's source addr never receives
+    the challenge (it is sent to the victim, who cannot decrypt or
+    meaningfully answer it), so it never produces a valid response — the
+    server's egress stays on the real client.
+    """
+    token = inner.payload
+    if len(token) != PATH_TOKEN_SIZE:
+        log.debug("PATH_CHALLENGE with bad token length %d, dropping", len(token))
+        return
+    padded, target_size = _build_control_packet(
+        ctx, PacketType.PATH_RESPONSE, payload=token
+    )
+    ctx.scheduler.enqueue(padded, target_size)
 
 
 async def send_session_close(ctx: DataPathContext) -> None:
@@ -592,6 +806,11 @@ _DISPATCH: dict[
     PacketType.REKEY_INIT: _handle_rekey_init,
     PacketType.REKEY_ACK: _handle_rekey_ack,
     PacketType.SESSION_CLOSE: _handle_session_close,
+    # Client answers a server's PATH_CHALLENGE with a PATH_RESPONSE.
+    PacketType.PATH_CHALLENGE: _handle_path_challenge,
+    # PATH_RESPONSE: the server validates+commits in post_authenticate (it has
+    # recv_addr there); reaching dispatch it is a no-op (client never gets one).
+    PacketType.PATH_RESPONSE: _handle_noop,
 }
 
 
@@ -684,7 +903,9 @@ async def run_data_loops(
     *,
     extra_loops: tuple[Awaitable[None], ...] = (),
     udp_addr_filter: Callable[[tuple[str, int]], bool] | None = None,
-    post_authenticate: Callable[[tuple[str, int]], None] | None = None,
+    post_authenticate: (
+        Callable[[tuple[str, int], InnerPacket], Awaitable[None]] | None
+    ) = None,
     shutdown_log: str = "shutting down",
 ) -> None:
     """Drive the steady-state recv/tun_send/liveness loops to completion.
@@ -699,9 +920,13 @@ async def run_data_loops(
     * ``udp_addr_filter`` (client): drop UDP datagrams whose source addr
       is not the expected server. ``None`` on the server, which has no
       single expected peer addr until the first authenticated packet.
-    * ``post_authenticate`` (server): record the source addr of an
-      authenticated packet (the server has to learn the peer's UDP
-      ephemeral port from the first valid frame).
+    * ``post_authenticate`` (server): handle the source addr of an
+      authenticated packet (the server learns the peer's UDP ephemeral port
+      from the first valid frame, and gates any later egress roam behind a
+      return-routability PATH_CHALLENGE/PATH_RESPONSE check). Receives the
+      decrypted ``inner`` too so it can act on a PATH_RESPONSE; called BEFORE
+      ``dispatch_inner`` so the egress decision is made before the payload is
+      delivered.
     * ``extra_loops``: client passes ``auto_mtu_loop(...)`` here; server
       passes nothing.
     * ``shutdown_log``: caller-supplied label so the log line still
@@ -758,12 +983,18 @@ async def run_data_loops(
 
                 ctx.liveness.last_recv_time = time.monotonic()
 
-                # Server-side only: record the authenticated peer's UDP
-                # source address so subsequent sends can reach it.
-                if post_authenticate is not None and recv_addr is not None:
-                    post_authenticate(recv_addr)
-
                 inner, _prev_epoch = result
+
+                # Server-side only: gate the egress-address roam. The first
+                # addr commits; a DIFFERENT authenticated source is held as a
+                # pending candidate and probed with a PATH_CHALLENGE (it does
+                # NOT switch egress until it echoes the token in a
+                # PATH_RESPONSE — return-routability). Runs BEFORE dispatch so
+                # a PATH_RESPONSE is validated against recv_addr here; the
+                # packet's payload still delivers to TUN via dispatch_inner.
+                if post_authenticate is not None and recv_addr is not None:
+                    await post_authenticate(recv_addr, inner)
+
                 await dispatch_inner(ctx, inner)
         finally:
             if shutdown_wait is not None and not shutdown_wait.done():
@@ -1056,7 +1287,12 @@ async def tun_send_loop(ctx: DataPathContext) -> None:
         ctx.liveness.last_real_send_time = time.monotonic()
         for i, inner in enumerate(inners):
             padded, target_size = ctx.shaper.pad_packet(inner)
-            ctx.shaper.observe_real_packet(target_size)
+            # H-ANON (size-feedback fix): real-packet sizes are no longer fed
+            # back into any distribution. pad_packet draws the target class
+            # from the FIXED published prior (the same one chaff uses) and
+            # bumps up to fit the payload, so the real-traffic size histogram
+            # cannot collapse onto one dominant class. The former
+            # observe_real_packet feedback (the Polya-urn loop) is removed.
             # i=0 gets no extra delay; later fragments shuffle within
             # the per-position window.
             extra = (i + csprng_float()) * 0.05 if i > 0 else 0.0

@@ -9,7 +9,7 @@ Two-step flow used by the offline-CA model:
      extension carrying the X25519 static pubkey.
 
   2. The operator walks the CSR over USB to the offline CA laptop, signs
-     it (per ``deploy/GUIDE.txt`` §3c), walks the cert back, and runs
+     it (per ``deploy/GUIDE.md`` §3c), walks the cert back, and runs
      ``import_signed_cert(...)`` to verify the cert matches the local
      identity + attest material and persist it.
 

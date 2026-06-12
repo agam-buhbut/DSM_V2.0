@@ -6,7 +6,7 @@
 #   * emit the periodic CRL
 #
 # Walk this file to the offline laptop alongside the CA private key (which
-# never leaves the laptop's encrypted USB). See deploy/GUIDE.txt §2.
+# never leaves the laptop's encrypted USB). See deploy/GUIDE.md §2.
 #
 # Custom OID:
 #   id-dsm-noiseStaticBinding 1.3.6.1.4.1.99999.1.1
@@ -63,7 +63,7 @@ commonName       = supplied
 [ req ]
 # default_bits is RSA-only and IGNORED for EC keys. The CA actually uses
 # P-384 via the `openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-384`
-# step in deploy/GUIDE.txt §2. Kept here only because some openssl
+# step in deploy/GUIDE.md §2. Kept here only because some openssl
 # versions warn if the [req] section omits default_bits entirely.
 default_bits        = 384
 default_md          = sha384
@@ -101,7 +101,7 @@ nameConstraints        = critical, excluded;DNS:., excluded;IP:0.0.0.0/0.0.0.0, 
 # Both profiles enforce the same critical extensions; only EKU differs.
 # `copy_extensions = copy` carries the binding extension from the CSR
 # unmodified — operator MUST verify it is critical and 34 bytes
-# (0x04 0x20 || <32 bytes>) before signing. See deploy/GUIDE.txt §3c.
+# (0x04 0x20 || <32 bytes>) before signing. See deploy/GUIDE.md §3c.
 
 [ dsm_client_leaf ]
 basicConstraints       = critical, CA:FALSE

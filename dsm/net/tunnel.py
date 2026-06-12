@@ -228,7 +228,7 @@ class TunDevice:
             fcntl.ioctl(tun_fd, TUNSETIFF, ifr)
         except OSError as e:
             os.close(tun_fd)
-            raise RuntimeError(f"failed to create TUN device {self._name}: {e}")
+            raise RuntimeError(f"failed to create TUN device {self._name}: {e}") from e
 
         # Set non-blocking for asyncio
         flags = fcntl.fcntl(tun_fd, fcntl.F_GETFL)

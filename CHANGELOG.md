@@ -42,8 +42,11 @@ toward a public, MIT-licensed release. High-level summary:
   traffic-analysis caveat).
 
 ### Hardware attestation
-- TPM 2.0 key-residency attestation in progress (key generated and resident in
-  the TPM, signing in-TPM).
+- TPM 2.0 key-residency attestation implemented and shipped as the production
+  DEFAULT backend (the `tpm-attest` Cargo feature): the ECDSA P-256 attest key
+  is generated in, never leaves, and signs inside the TPM, and the operator
+  passphrase is bound as the in-TPM key's authorization value. The extractable
+  software backend (`dev-soft-attest`) is retained for dev/CI/eval only.
 
 ### Tooling / release engineering
 - Fixed the `deploy/openssl-ca.cnf` CA bootstrap so the offline CA config parses

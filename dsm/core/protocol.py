@@ -59,6 +59,16 @@ class PacketType(IntEnum):
     KEEPALIVE = 0x05
     SESSION_CLOSE = 0x06
     FRAGMENT = 0x07
+    # QUIC-style return-routability check for server egress roaming.
+    # Both authenticated (inside AEAD); each carries a 16-byte token.
+    PATH_CHALLENGE = 0x08
+    PATH_RESPONSE = 0x09
+
+
+# Return-routability token: 128 bits of CSPRNG entropy is unguessable by an
+# on-path attacker who must echo it back from a spoofed (and unreachable to
+# them) source address. The token rides inside the AEAD envelope.
+PATH_TOKEN_SIZE = 16
 
 
 @dataclass(slots=True)
