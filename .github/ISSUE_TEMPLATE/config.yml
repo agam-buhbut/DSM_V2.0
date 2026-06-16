@@ -1,7 +1,7 @@
 blank_issues_enabled: false
 contact_links:
   - name: Security vulnerability (DO NOT open a public issue)
-    url: https://github.com/<OWNER/REPO>/security/policy
+    url: https://github.com/agam-buhbut/DSM_V2.0/security/policy
     about: >
       Report security vulnerabilities privately. Do NOT open a public issue
       and do NOT paste keys, secrets, configs, certificates, or attest blobs.

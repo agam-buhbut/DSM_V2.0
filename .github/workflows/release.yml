@@ -111,15 +111,54 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b  # v5.3.0
+        with:
+          # The installer's pinned wheel is cp311/abi3 (see install.sh $WHEEL),
+          # and the supported runtime floor is requires-python>=3.11. Resolve the
+          # dependency wheelhouse against 3.11 so abi3/manylinux wheels picked
+          # here are exactly those a fresh 3.11 venv on the target will load.
+          python-version: "3.11"
       - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16  # v4.1.8
         with:
           path: dist
           merge-multiple: true
       - name: Stage install.sh alongside artifacts
         run: cp install.sh dist/install.sh
+      # Vendor the RUNTIME dependency wheels into the SAME dir as the DSM wheel
+      # so they land in the SAME minisign-signed SHA256SUMS and are uploaded as
+      # release assets next to it. DSM's model is "no PyPI at install time —
+      # signed GitHub Releases": PyPI is used HERE (a build step) only to STAGE
+      # the wheelhouse; install.sh later fetches these from the Release and
+      # verifies every one against this signed SHA256SUMS (same trust anchor).
+      #
+      # --only-binary=:all: forbids any sdist (the installer is --no-index, so a
+      # source dist could not build on the target anyway). The platform/abi/
+      # python triple is pinned to the supported target (Debian 12+/Ubuntu
+      # 22.04+ x86_64, cp311 + manylinux) so the resolved set matches install.sh
+      # $WHEEL. The two top-level runtime deps mirror pyproject.toml; pip pulls
+      # their transitive runtime deps automatically (cryptography -> cffi ->
+      # pycparser; dnspython is pure-Python).
+      - name: Vendor runtime dependency wheels into the wheelhouse
+        run: |
+          python -m pip install --upgrade pip
+          pip download \
+            --only-binary=:all: \
+            --python-version 311 \
+            --implementation cp \
+            --abi cp311 --abi abi3 --abi none \
+            --platform manylinux2014_x86_64 \
+            --platform manylinux_2_17_x86_64 \
+            --platform manylinux_2_28_x86_64 \
+            --dest dist \
+            "cryptography>=46.0.7,<49" "dnspython>=2.6,<3.0"
+          echo "Wheelhouse contents (DSM wheels + vendored runtime deps):"
+          ls -1 dist/*.whl
       - name: Generate SHA256SUMS over all artifacts
         run: |
           cd dist
+          # Covers every wheel (DSM tpm + DSM +soft + all vendored dep wheels),
+          # the sdist, and install.sh — the signed list is the single trust
+          # anchor the installer verifies the entire local wheelhouse against.
           sha256sum * > SHA256SUMS
       - name: Sign SHA256SUMS with minisign
         env:
@@ -157,6 +196,11 @@ jobs:
           # publishes to the repo the workflow runs in; no slug to fill in here.
           prerelease: ${{ steps.prerelease.outputs.value }}
           fail_on_unmatched_files: true
+          # `files` is a block scalar consumed line-by-line by the action as
+          # glob patterns — comments cannot live INSIDE it, so this note stays
+          # here: `dist/*.whl` uploads BOTH DSM wheels AND every vendored
+          # runtime-dep wheel (cryptography/cffi/pycparser/dnspython), so
+          # install.sh can fetch the whole verified wheelhouse from the Release.
           files: |
             dist/*.whl
             dist/*.tar.gz

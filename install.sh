@@ -29,8 +29,7 @@ set -eu
 # Pinned release this script installs. The wheel name and its signed
 # SHA256SUMS entry both embed this; a mismatch aborts (see anti-rollback note).
 DSM_VERSION="0.1.0"
-# TODO(owner): replace <OWNER/REPO> with the real GitHub org/repo before release.
-BASE="${DSM_RELEASE_BASE_URL:-https://github.com/<OWNER/REPO>/releases/download/v${DSM_VERSION}}"
+BASE="${DSM_RELEASE_BASE_URL:-https://github.com/agam-buhbut/DSM_V2.0/releases/download/v${DSM_VERSION}}"
 
 # TODO(owner): paste the real minisign PUBLIC key (one base64 line) before
 # release. The matching PRIVATE key is OWNER-ONLY and lives in a CI secret.
@@ -157,6 +156,40 @@ printf '%s\n' "$EXPECTED_LINE" > "$WORK/expected.sha256" \
 ( cd "$WORK" && sha256sum -c "$WORK/expected.sha256" ) \
   || die "wheel checksum mismatch — refusing to install"
 
+# --- 4b. Dependency wheelhouse: fetch + verify the RUNTIME-dep wheels ---------
+#        The venv install below is --no-index, so a fresh venv cannot reach
+#        PyPI for cryptography/dnspython (+ cffi/pycparser). The release bundles
+#        those dep wheels next to the DSM wheel and lists EVERY one in this
+#        already-minisign-VERIFIED SHA256SUMS — the SAME single trust anchor. We
+#        download each dependency wheel into $WORK and verify it against that
+#        signed list, reusing the exact-field selection + `sha256sum -c` pattern
+#        from step 4 (fail closed on a missing/duplicated entry or a hash
+#        mismatch). No new/unsigned dep source is introduced.
+#
+#        Selection: every SHA256SUMS entry whose name ends in `.whl` and does
+#        NOT start with `dsm-`. That is the third-party dependency set; it
+#        excludes BOTH DSM variant wheels — the one we want is already fetched
+#        and verified above ($WHEEL), and the OTHER DSM variant (e.g. the +soft
+#        wheel during a production install) is a different DSM build, not a
+#        dependency, so the installer must not pull it. The non-.whl entries
+#        (sdist, install.sh, SHA256SUMS*) are likewise skipped. The match is an
+#        exact awk FIELD test (not a regex), so a `+` in a local-version
+#        segment is never a metacharacter.
+DEP_WHEELS="$(awk '$2 ~ /\.whl$/ && $2 !~ /^dsm-/ {print $2}' "$WORK/SHA256SUMS")"
+for dep in $DEP_WHEELS; do
+  # Re-select THIS dep's canonical signed line by exact field match; require
+  # exactly one (a missing/duplicated entry fails closed, as in step 3).
+  dep_line="$(awk -v w="$dep" '$2 == w {n++; line=$1"  "$2} END {if (n==1) print line}' "$WORK/SHA256SUMS")"
+  [ -n "$dep_line" ] \
+    || die "signed SHA256SUMS has no single entry for dependency wheel ${dep} — refusing"
+  curl -fsSL --proto '=https' --tlsv1.2 "$BASE/$dep" \
+    -o "$WORK/$dep" || die "cannot fetch dependency wheel $dep"
+  printf '%s\n' "$dep_line" > "$WORK/expected.sha256" \
+    || die "could not stage the expected checksum for $dep"
+  ( cd "$WORK" && sha256sum -c "$WORK/expected.sha256" ) \
+    || die "dependency wheel checksum mismatch for $dep — refusing to install"
+done
+
 # ============================================================================
 #  VERIFIED-ARTIFACT GATE PASSED. Only past this line may we run apt/pip/venv.
 # ============================================================================
@@ -179,8 +212,10 @@ fi
 # --- 6. Dedicated venv + wheel install (no system-Python pollution) ---------
 python3 -m venv "$VENV" || die "could not create the venv at $VENV"
 "$VENV/bin/pip" install --upgrade pip || die "could not upgrade pip in the venv"
-# --no-index + --find-links restricts the install to the verified local wheel
-# (and its transitive deps from the same dir); pip never reaches the network.
+# --no-index + --find-links restricts the install to the local wheelhouse: the
+# verified DSM wheel PLUS the dependency wheels downloaded and checksum-verified
+# in step 4b (cryptography/dnspython + cffi/pycparser). pip resolves every
+# runtime dep from $WORK and never reaches the network.
 "$VENV/bin/pip" install --no-index --find-links "$WORK" "$WORK/$WHEEL" \
   || die "wheel install failed"
 ln -sf "$VENV/bin/dsm" /usr/local/bin/dsm || die "could not symlink dsm into /usr/local/bin"

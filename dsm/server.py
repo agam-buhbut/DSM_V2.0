@@ -436,7 +436,10 @@ async def _run_one_session(
             # the scheduler (which always targets the committed egress) and
             # WITHOUT touching the committed egress. Bounded so a wedged/unroutable
             # candidate (e.g. the spoofed victim) cannot pin the recv loop.
-            from dsm.session import _build_control_packet  # local: avoid cycle churn
+            # local import (avoids cycle churn):
+            from dsm.session import (
+                _build_control_packet,  # pyright: ignore[reportPrivateUsage]
+            )
 
             padded, target_size = _build_control_packet(
                 ctx, PacketType.PATH_CHALLENGE, payload=token
@@ -610,7 +613,17 @@ async def run_server(
         stack.callback(attest_store.unload)
 
         rate_limiter = ServerRateLimitManager(config.listen_port)
-        rate_limiter.apply()
+        try:
+            rate_limiter.apply()
+        except RuntimeError as e:
+            # Fail closed: refuse to serve without handshake-flood protection.
+            log.error(
+                "server handshake rate-limit could not be installed: %s — "
+                "refusing to start (fail-closed). Ensure nftables is present "
+                "and the daemon has CAP_NET_ADMIN.",
+                e,
+            )
+            return 1
         stack.callback(rate_limiter.remove)
 
         tcp_ts = TcpTimestampsDisabler()

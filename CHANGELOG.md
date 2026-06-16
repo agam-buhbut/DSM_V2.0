@@ -54,6 +54,5 @@ toward a public, MIT-licensed release. High-level summary:
 - CI and packaging work toward a reproducible install path and GitHub Releases
   distribution.
 
-<!-- TODO(owner): replace <OWNER/REPO> with the real GitHub org/repo before release. -->
-[Unreleased]: https://github.com/<OWNER/REPO>/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/<OWNER/REPO>/releases/tag/v0.1.0
+[Unreleased]: https://github.com/agam-buhbut/DSM_V2.0/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/agam-buhbut/DSM_V2.0/releases/tag/v0.1.0

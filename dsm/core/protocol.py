@@ -360,6 +360,14 @@ class ReassemblyBuffer:
         if frag.index in entry.received:
             return None
 
+        # Defensive: an out-of-range index would later KeyError the
+        # range(total) reassembly join below (a {0,1,5}-for-total-3 set can
+        # reach len == total). Unreachable from the wire (deserialize bounds
+        # index < total), but guard explicitly so a malformed in-process
+        # fragment fails closed (drop) rather than raising.
+        if not 0 <= frag.index < entry.total:
+            return None
+
         entry.received[frag.index] = frag.data
 
         # Check if complete

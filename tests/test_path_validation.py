@@ -182,9 +182,7 @@ def _frame(
     return OuterPacket(seq=n, nonce=nonce, ciphertext=ct).serialize()
 
 
-def _extract_token(
-    wire: bytes, client_keys: tuncore.SessionKeyManager
-) -> bytes:
+def _extract_token(wire: bytes, client_keys: tuncore.SessionKeyManager) -> bytes:
     """Decrypt a server-emitted PATH_CHALLENGE wire packet and return its
     16-byte token.
 
@@ -282,7 +280,9 @@ class PathValidationDriver(unittest.IsolatedAsyncioTestCase):
 
         async def _send_challenge(candidate: tuple[str, int], token: bytes) -> None:
             padded, target_size = _build_control_packet(
-                ctx, PacketType.PATH_CHALLENGE, payload=token
+                ctx,
+                PacketType.PATH_CHALLENGE,
+                payload=token,  # pyright: ignore[reportCallIssue]
             )
             try:
                 await asyncio.wait_for(
@@ -375,7 +375,11 @@ class PathValidationDriver(unittest.IsolatedAsyncioTestCase):
         )
         # Everything else is addressed to the committed real client.
         self.assertTrue(
-            all(d == _COMMITTED_ADDR for w, d in transport.sent if d != _SPOOFED_VICTIM_ADDR),
+            all(
+                d == _COMMITTED_ADDR
+                for w, d in transport.sent
+                if d != _SPOOFED_VICTIM_ADDR
+            ),
             "non-challenge egress must stay on the committed real client",
         )
         # The probe was a real PATH_CHALLENGE (decryptable by the client's
@@ -474,7 +478,9 @@ class PathValidationDriver(unittest.IsolatedAsyncioTestCase):
 
         async def _send_challenge(candidate: tuple[str, int], token: bytes) -> None:
             padded, target_size = _build_control_packet(
-                ctx, PacketType.PATH_CHALLENGE, payload=token
+                ctx,
+                PacketType.PATH_CHALLENGE,
+                payload=token,  # pyright: ignore[reportCallIssue]
             )
             await path_send(padded, target_size, candidate)
 

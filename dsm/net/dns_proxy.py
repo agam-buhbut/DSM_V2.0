@@ -312,10 +312,17 @@ class LocalDNSProxy:
                         log_qname,
                         type(e).__name__,
                     )
-                    inflight_future.set_exception(e)
-                    return _DnsResult(
+                    # Publish a SERVFAIL RESULT (not set_exception): the owner
+                    # returns directly below without awaiting this future, so a
+                    # set_exception with zero coalesced waiters would be left
+                    # unretrieved ("Future exception was never retrieved" loop
+                    # diagnostics). Coalesced waiters receive the same SERVFAIL
+                    # via the result instead of catching an exception.
+                    servfail = _DnsResult(
                         addresses=[], ttl=0, rcode=-1, authoritative=False
                     )
+                    inflight_future.set_result(servfail)
+                    return servfail
         finally:
             del self._inflight[query_key]
 

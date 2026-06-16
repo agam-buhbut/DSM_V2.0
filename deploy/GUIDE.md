@@ -677,8 +677,11 @@ Pick ONE source:
 (i) Plain file (0600, read once at startup):
 
 ```sh
-$ echo 'my-strong-passphrase' \
-      | sudo install -m 0600 /dev/stdin /etc/dsm/passphrase
+# Type the passphrase at the prompt; do NOT pass it as a literal on the
+# command line (it would be saved in your shell history). read -s hides it.
+$ read -rs DSM_PP
+$ printf '%s' "$DSM_PP" | sudo install -m 0600 /dev/stdin /etc/dsm/passphrase
+$ unset DSM_PP
 ```
 
 Then start with:
@@ -703,8 +706,10 @@ $CREDENTIALS_DIRECTORY/passphrase (mode 0400, root-owned, in
 tmpfs). Install the source file:
 
 ```sh
-$ echo 'my-strong-passphrase' | \
-    sudo install -m 0600 /dev/stdin /etc/dsm/passphrase
+# Same rule: never echo a literal passphrase (it lands in shell history).
+$ read -rs DSM_PP
+$ printf '%s' "$DSM_PP" | sudo install -m 0600 /dev/stdin /etc/dsm/passphrase
+$ unset DSM_PP
 $ sudo cp deploy/dsm.service /etc/systemd/system/dsm.service
 $ sudo systemctl daemon-reload
 $ sudo systemctl enable --now dsm

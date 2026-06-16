@@ -126,70 +126,71 @@ async def run_client(
         log.error("cert auth materials missing or invalid: %s", e)
         return 1
 
-    # Read the passphrase once and unlock both stores. Identity (X25519
-    # Noise static) and attest key (ECDSA P-256) live behind the same
-    # passphrase by design — they're both provisioned together by
-    # `dsm enroll`. Daemon variant returns (not exits) on failure so the
-    # surrounding AsyncExitStack still unwinds cleanly.
-    from dsm.crypto._stores import load_daemon_stores
-
-    keystore = KeyStore(config.key_file)
-    attest_store = AttestStore(config.attest_key_file)
-    if not load_daemon_stores(
-        keystore,
-        attest_store,
-        passphrase_fd=passphrase_fd,
-        passphrase_env_file=passphrase_env_file,
-    ):
-        return 1
-
-    # With both stores unlocked, confirm the loaded cert was issued for
-    # THIS device's keys. Catches the cert_file substitution failure mode
-    # at startup with a clear error, rather than at server's
-    # AttestBindingMismatchError much later in the handshake.
-    try:
-        verify_cert_matches_identity(materials.cert_der, keystore, attest_store)
-    except AuthMaterialsError as e:
-        log.error("cert/identity consistency check failed: %s", e)
-        attest_store.unload()
-        keystore.unload()
-        return 1
-
-    shaper = TrafficShaper(
-        config.padding_min,
-        config.padding_max,
-        envelope_idle_floor_min_pps=config.envelope_idle_floor_min_pps,
-        envelope_idle_floor_max_pps=config.envelope_idle_floor_max_pps,
-        envelope_ceiling_pps=config.envelope_ceiling_pps,
-        envelope_rise_per_s=config.envelope_rise_per_s,
-        envelope_fall_half_life_s=config.envelope_fall_half_life_s,
-        envelope_latency_budget_ms=config.envelope_latency_budget_ms,
-    )
-
     async with AsyncExitStack() as stack:
-        # Keystore unload happens last (first registered, unwound last) so
-        # the encrypted identity material is kept in memory for the lifetime
-        # of the session.
-        stack.callback(keystore.unload)
-        stack.callback(attest_store.unload)
-
         # Phase 1.8 (H10): create the shutdown event and install signal
-        # handlers BEFORE the pre-handshake kill switch, mirroring server.py.
-        # A SIGTERM during connect/handshake must trigger the AsyncExitStack
-        # unwind (removing the kill switch) rather than killing the process
-        # with the kill switch still applied and the host offline.
+        # handlers BEFORE the pre-handshake kill switch. A SIGTERM during
+        # connect/handshake must trigger the AsyncExitStack unwind (removing
+        # the kill switch) rather than killing the process with the kill
+        # switch still applied and the host offline.
         shutdown = asyncio.Event()
         setup_signal_handlers(shutdown)
 
-        # Pre-handshake kill switch: applied BEFORE any socket bind/connect
-        # so a stuck or failed handshake never leaks user traffic during
-        # the connection window. Allows only loopback, DHCP renewal, and
-        # the configured server endpoint. Upgraded atomically to the full
-        # kill switch (which also covers the TUN interface and DNS leaks)
-        # by NFTablesManager.apply() below, once the TUN is up.
+        # Pre-handshake kill switch: applied BEFORE the (possibly interactive)
+        # passphrase read + key unlock below, so the host is fail-closed for
+        # the ENTIRE startup window — not just from socket bind onward. A slow
+        # passphrase prompt or key load must never leave user traffic
+        # unprotected. Allows only loopback, DHCP renewal, and the configured
+        # server endpoint; upgraded atomically to the full kill switch (which
+        # also covers the TUN interface and DNS leaks) by NFTablesManager
+        # .apply() below, once the TUN is up.
         pre_killswitch = PreHandshakeKillSwitch(config.server_ip, config.server_port)
         pre_killswitch.apply()
         stack.callback(pre_killswitch.remove)
+
+        # Read the passphrase once and unlock both stores, now BEHIND the kill
+        # switch. Identity (X25519 Noise static) and attest key (ECDSA P-256)
+        # live behind the same passphrase by design — both are provisioned
+        # together by `dsm enroll`. On failure the AsyncExitStack unwinds,
+        # removing the kill switch and restoring the host.
+        from dsm.crypto._stores import load_daemon_stores
+
+        keystore = KeyStore(config.key_file)
+        attest_store = AttestStore(config.attest_key_file)
+        if not load_daemon_stores(
+            keystore,
+            attest_store,
+            passphrase_fd=passphrase_fd,
+            passphrase_env_file=passphrase_env_file,
+        ):
+            return 1
+
+        # Register the unloads now that the stores are loaded. They unwind
+        # before the kill switch is removed (the nft teardown does not need
+        # the keys); the identity stays resident for the whole session.
+        stack.callback(keystore.unload)
+        stack.callback(attest_store.unload)
+
+        # With both stores unlocked, confirm the loaded cert was issued for
+        # THIS device's keys. Catches the cert_file substitution failure mode
+        # at startup with a clear error, rather than at the server's
+        # AttestBindingMismatchError much later in the handshake. On failure
+        # the stack unwinds (unloading the stores, removing the kill switch).
+        try:
+            verify_cert_matches_identity(materials.cert_der, keystore, attest_store)
+        except AuthMaterialsError as e:
+            log.error("cert/identity consistency check failed: %s", e)
+            return 1
+
+        shaper = TrafficShaper(
+            config.padding_min,
+            config.padding_max,
+            envelope_idle_floor_min_pps=config.envelope_idle_floor_min_pps,
+            envelope_idle_floor_max_pps=config.envelope_idle_floor_max_pps,
+            envelope_ceiling_pps=config.envelope_ceiling_pps,
+            envelope_rise_per_s=config.envelope_rise_per_s,
+            envelope_fall_half_life_s=config.envelope_fall_half_life_s,
+            envelope_latency_budget_ms=config.envelope_latency_budget_ms,
+        )
 
         # Transport
         if config.transport == "udp":

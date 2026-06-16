@@ -171,8 +171,16 @@ def _read_noninteractive(
         )
         if result is not None:
             return result
-        # Note: fall through to DSM_PASSPHRASE (matches the original
-        # behavior — DSM_PASSPHRASE_FILE failure did NOT stop the chain).
+        # Fail closed: the operator EXPLICITLY selected a file source, so an
+        # unreadable/broken DSM_PASSPHRASE_FILE must NOT silently downgrade to
+        # the weaker, process-visible DSM_PASSPHRASE env var (readable via
+        # /proc/PID/environ for the process lifetime). Abort startup with a
+        # clear error rather than fingerprinting a weaker secret source.
+        raise ValueError(
+            f"DSM_PASSPHRASE_FILE is set ({env_file}) but could not be read; "
+            "refusing to fall back to the process-visible DSM_PASSPHRASE "
+            "environment variable"
+        ) from None
 
     # os.environb returns bytes (one fewer immutable str copy than
     # os.environ.get + .encode). The fundamental limitation remains: the

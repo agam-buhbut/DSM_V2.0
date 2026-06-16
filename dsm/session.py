@@ -303,7 +303,16 @@ def make_addr_send_fn(
     """
 
     async def send_to(data: bytes, target_size: int, addr: tuple[str, int]) -> None:
-        n = seq.next()
+        try:
+            n = seq.next()
+        except RuntimeError as e:
+            # Parity with make_send_fn: seq.next() overflows at 2**64. Same
+            # graceful-drop rationale as the encrypt() guard below — this
+            # closure has no shutdown handle, but the shared data-path send
+            # hits the same exhaustion and drives teardown; drop the probe
+            # rather than letting the traceback escape the recv loop.
+            log.error("sequence counter exhausted on path-challenge send: %s", e)
+            return
         if len(data) >= 2:
             want_byte1 = (data[1] & 0x0F) | ((session_keys.epoch & 0x0F) << 4)
             if data[1] != want_byte1:
@@ -311,7 +320,16 @@ def make_addr_send_fn(
                 buf[1] = want_byte1
                 data = bytes(buf)
         aad = SEQ_STRUCT.pack(n)
-        nonce, ct, _epoch = session_keys.encrypt(data, aad)
+        try:
+            nonce, ct, _epoch = session_keys.encrypt(data, aad)
+        except RuntimeError as e:
+            # Parity with make_send_fn's nonce-exhaustion handling. This
+            # closure has no shutdown handle, but it shares session_keys and
+            # the seq counter with the data-path send, so that path hits the
+            # same exhaustion and drives teardown; here we just log and drop
+            # the probe rather than letting the traceback escape the recv loop.
+            log.error("AEAD nonce exhausted on path-challenge send: %s", e)
+            return
         outer = OuterPacket(seq=n, nonce=nonce, ciphertext=ct)
         wire = outer.serialize(target_size)
         if isinstance(transport, UDPTransport):
@@ -326,9 +344,12 @@ def make_addr_send_fn(
 # pending slot bounds memory; this bounds the challenge SEND rate so the
 # return-routability probe cannot be abused as a reflection/amplification
 # vector (each AEAD-valid packet from a new source would otherwise emit a
-# challenge). Replies are size-class-padded control packets, so even a
-# saturated challenge cadence emits at most one small packet per interval to
-# any given candidate.
+# challenge). Replies are size-class-padded control packets and a challenge
+# is the SAME size class as its response, so the amplification ratio is <= 1.
+# The single global rate gate in should_challenge (checked before any slot
+# logic) bounds emissions to at most ONE per interval IN TOTAL -- across all
+# candidates, not per candidate -- so cycling source addresses cannot defeat
+# it (a fresh fake candidate every window still yields <= 1 emission/interval).
 PATH_CHALLENGE_MIN_INTERVAL = 1.0
 
 # How long a pending candidate may sit unvalidated before it is discarded.

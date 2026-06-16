@@ -282,6 +282,15 @@ def _validate_transport(c: Config) -> None:
 
 
 def _validate_dns(c: Config) -> None:
+    if c.debug_dns:
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "debug_dns is ENABLED: plaintext DNS query names will be written "
+            "to logs, defeating DNS-metadata privacy. Use ONLY for local "
+            "debugging and disable it in production."
+        )
+
     if c.mode == "server" and not c.dns_providers:
         raise ValueError("server mode requires at least one dns_providers entry")
 

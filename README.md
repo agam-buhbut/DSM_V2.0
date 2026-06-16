@@ -12,8 +12,7 @@ Open-source, security and anonymity focused VPN for Linux. Single client-server 
 # 1. Install (downloads + minisign-verifies the wheel, apt-installs the TPM
 #    runtime libs, creates /opt/dsm/venv, symlinks `dsm`). Add `--systemd`
 #    to also install the dsm.service unit.
-#    TODO(owner): replace <OWNER/REPO> with the real repo before release.
-curl -fsSL https://github.com/<OWNER/REPO>/releases/download/v0.1.0/install.sh | sudo sh -s -- --systemd
+curl -fsSL https://github.com/agam-buhbut/DSM_V2.0/releases/download/v0.1.0/install.sh | sudo sh -s -- --systemd
 
 # 2. Provision config + CA-pin + enroll (orchestrates config + TPM preflight +
 #    CSR emit). Pass the required flags up front; only the key passphrase is

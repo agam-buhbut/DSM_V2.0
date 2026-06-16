@@ -31,16 +31,9 @@ Because there is no stable release yet, all users should track the latest
 
 Report privately through one of the following channels:
 
-<!-- TODO(maintainer): set a real security contact before public release.
-     Recommended: enable GitHub Security Advisories ("Report a vulnerability"
-     under the repository Security tab) AND publish a dedicated contact address
-     such as security@<project-domain>. Replace the placeholder below with the
-     real address and remove this comment. -->
-
 - Preferred: GitHub Security Advisories — use the repository's **Security →
   Report a vulnerability** workflow (private to maintainers).
-- Email: `SECURITY-CONTACT-PLACEHOLDER` (maintainer must configure a real
-  address before public release).
+- Email: `252506444+agam-buhbut@users.noreply.github.com`
 
 Please include:
 

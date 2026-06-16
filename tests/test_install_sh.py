@@ -370,7 +370,10 @@ class TestPlaceholdersAndHygiene(unittest.TestCase):
         self.text = _INSTALL_SH.read_text(encoding="utf-8")
 
     def test_owner_placeholders_present(self) -> None:
-        for token in ("<OWNER/REPO>", "TODO(owner)"):
+        # The repo-URL placeholder has been filled with the real release URL
+        # (github.com/agam-buhbut/DSM_V2.0); only the minisign-pubkey
+        # TODO(owner) legitimately remains a placeholder until release.
+        for token in ("TODO(owner)",):
             self.assertIn(
                 token,
                 self.text,
@@ -410,6 +413,170 @@ class TestPlaceholdersAndHygiene(unittest.TestCase):
                     r"(?i)private[_-]?key|passphrase|secret[_-]?key",
                     f"must not print secret material: {code!r}",
                 )
+
+
+class TestDependencyWheelhouse(unittest.TestCase):
+    """The installer ships a SIGNED wheelhouse: after verifying the DSM wheel
+    against the minisign-signed SHA256SUMS it must ALSO download every
+    dependency wheel listed there and verify each one's SHA256 against the SAME
+    signed list (no separate/unsigned dep source). The final ``pip install``
+    stays ``--no-index`` so deps resolve only from that verified local dir.
+
+    These assertions are ADD-ON coverage for the dep-wheelhouse flow; they do
+    not relax any existing verify-before-execute / fail-closed assertion above.
+    """
+
+    def setUp(self) -> None:
+        self.assertTrue(_INSTALL_SH.is_file(), f"missing {_INSTALL_SH}")
+        self.code = "\n".join(c for _, c in _code_lines())
+
+        # Anchors. The minisign signature check; the dep selection/loop; the
+        # dep download; the dep checksum check; and the FINAL wheel install
+        # (anchored on the unambiguous `--no-index --find-links` line rather
+        # than the first `pip install`, which is `pip install --upgrade pip`).
+        self.minisign_verify_ln = _first_lineno(r"\bminisign\s+-V\b")
+        # awk selecting `.whl` entries that are NOT the dsm wheel(s).
+        self.dep_select_ln = _first_lineno(
+            r"awk\b.*\$2\s*~.*\\\.whl\$.*\$2\s*!~.*\^dsm-"
+        )
+        # The first `curl ... "$BASE/$dep"` (the per-dependency download).
+        self.dep_dl_ln = _first_lineno(r'curl\b.*"\$BASE/\$dep"')
+        # The wheel-install line (verified local wheelhouse, no network).
+        self.wheel_install_ln = _first_lineno(
+            r"pip['\"]?\s+install\b.*--no-index\b.*--find-links\b"
+        )
+
+    def test_dependency_wheels_selected_from_signed_sums(self) -> None:
+        """Dep wheels are chosen by an awk FIELD filter over the verified
+        SHA256SUMS: name ends in ``.whl`` and does NOT start with ``dsm-``."""
+        self.assertIsNotNone(
+            self.dep_select_ln,
+            "no awk selection of non-dsm `*.whl` entries from SHA256SUMS — "
+            "the dependency wheelhouse is not assembled from the signed list",
+        )
+        # Iterated in a shell `for` loop over the selected names.
+        self.assertRegex(
+            self.code,
+            r"for\s+dep\s+in\s+\$DEP_WHEELS\b",
+            "selected dependency wheels must be iterated in a `for dep in "
+            "$DEP_WHEELS` loop",
+        )
+
+    def test_each_dependency_wheel_is_downloaded(self) -> None:
+        self.assertIsNotNone(
+            self.dep_dl_ln,
+            "no `curl ... $BASE/$dep` — dependency wheels are never downloaded",
+        )
+        # The dep download must use the same fail-fast HTTPS curl as the rest.
+        for _, code in _code_lines():
+            if re.search(r'curl\b.*"\$BASE/\$dep"', code):
+                self.assertRegex(
+                    code,
+                    r"\|\|\s*die\b",
+                    "dependency-wheel download must `|| die` on fetch failure",
+                )
+                return
+        self.fail("no `curl ... $BASE/$dep` download line found")
+
+    def test_dependency_wheel_checksum_verified_and_fails_closed(self) -> None:
+        """Inside the dep loop, each wheel is checksum-checked against the
+        signed line via `sha256sum -c`, aborting (`|| die`) on a mismatch."""
+        # There must be MORE than one `sha256sum -c` now: the original DSM-wheel
+        # check PLUS the per-dependency check.
+        sha_check_lines = [
+            code for _, code in _code_lines() if re.search(r"\bsha256sum\s+-c\b", code)
+        ]
+        self.assertGreaterEqual(
+            len(sha_check_lines),
+            2,
+            "expected a second `sha256sum -c` for the dependency wheels in "
+            "addition to the DSM-wheel check",
+        )
+        # Every `sha256sum -c` (DSM and dep) must fail closed.
+        for code in sha_check_lines:
+            self.assertRegex(
+                code,
+                r"\|\|\s*die\b",
+                f"checksum check must `|| die` on failure: {code!r}",
+            )
+        # The dep-specific abort message must exist (distinct from the DSM one),
+        # proving the per-dependency verification is wired to its own die.
+        self.assertRegex(
+            self.code,
+            r"die\s+\"dependency wheel checksum mismatch",
+            "a dependency-wheel checksum mismatch must `die` (fail closed)",
+        )
+
+    def test_missing_dependency_entry_fails_closed(self) -> None:
+        """A dep wheel with no single signed SHA256SUMS entry must abort
+        (anti-rollback / fail-closed), mirroring the DSM-wheel guard."""
+        # Exact single-match selection of the dep's signed line ...
+        self.assertRegex(
+            self.code,
+            r"awk\b.*-v\s+w=\"\$dep\".*\$2\s*==\s*w",
+            "each dependency wheel's signed line must be selected by an exact "
+            "field match (so a `+` local-version is not a regex metachar)",
+        )
+        # ... then a non-empty guard that dies when absent/duplicated.
+        self.assertRegex(
+            self.code,
+            r'\[\s+-n\s+"\$dep_line"\s+\]',
+            "must require a (single) signed entry for each dependency wheel",
+        )
+        self.assertRegex(
+            self.code,
+            r"die\s+\"signed SHA256SUMS has no single entry for dependency",
+            "a missing/duplicated dependency entry must `die` (fail closed)",
+        )
+
+    def test_dep_download_and_verify_precede_wheel_install(self) -> None:
+        """Verify-before-execute extends to the dependencies: they are
+        downloaded AND checksum-verified before the venv `pip install`."""
+        assert self.dep_select_ln is not None, "dep selection line missing"
+        assert self.dep_dl_ln is not None, "dep download line missing"
+        assert self.wheel_install_ln is not None, "wheel install line missing"
+        assert self.minisign_verify_ln is not None, "minisign verify missing"
+
+        # Deps are selected from the list only AFTER the signature is verified.
+        self.assertLess(
+            self.minisign_verify_ln,
+            self.dep_select_ln,
+            "dependency wheels must be selected from SHA256SUMS only AFTER the "
+            "minisign signature over it is verified",
+        )
+        # Dep download happens before the wheel install (and thus before deps
+        # are needed by pip).
+        self.assertLess(
+            self.dep_dl_ln,
+            self.wheel_install_ln,
+            "dependency wheels must be downloaded before the venv `pip install`",
+        )
+        # The LAST dep `sha256sum -c` must still precede the wheel install.
+        last_dep_sha_ln = None
+        for lineno, code in _code_lines():
+            if re.search(r"\bsha256sum\s+-c\b", code):
+                last_dep_sha_ln = lineno
+        assert last_dep_sha_ln is not None
+        self.assertLess(
+            last_dep_sha_ln,
+            self.wheel_install_ln,
+            "every wheel (DSM + deps) must be checksum-verified before the "
+            "`pip install` — verify-before-execute violated for dependencies",
+        )
+
+    def test_final_install_is_no_index_against_local_wheelhouse(self) -> None:
+        """The DSM install stays offline: `--no-index --find-links "$WORK"`,
+        so deps resolve from the verified local wheelhouse, never PyPI."""
+        self.assertIsNotNone(
+            self.wheel_install_ln,
+            "no `pip install --no-index --find-links` wheel install found",
+        )
+        self.assertRegex(
+            self.code,
+            r'pip[\'"]?\s+install\b.*--no-index\b.*--find-links\b.*"\$WORK"',
+            'the wheel install must be `--no-index --find-links "$WORK"` '
+            "(verified local wheelhouse), never reaching the network",
+        )
 
 
 if __name__ == "__main__":

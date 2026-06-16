@@ -249,9 +249,13 @@ class ServerRateLimitManager:
         self._applied = False
 
     def apply(self) -> None:
+        # Fail closed: handshake rate-limiting is the server's first line of
+        # defense against unauthenticated flood/DoS. If the ruleset cannot be
+        # installed (no nft, permission failure), _apply_ruleset raises so the
+        # caller aborts startup rather than serving unprotected.
         self._applied = _apply_ruleset(
             self._render(),
-            fatal=False,
+            fatal=True,
             log_label=f"server rate-limit (port {self._listen_port})",
         )
         if self._applied:

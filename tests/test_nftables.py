@@ -235,13 +235,15 @@ class ManagerFatalnessTest(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 NFTablesManager(V4_IP, PORT).apply()
 
-    def test_rate_limit_apply_does_not_raise_on_nft_failure(self) -> None:
-        # Best-effort: a failure is swallowed (logged) and applied stays False.
+    def test_rate_limit_apply_raises_on_nft_failure(self) -> None:
+        # Fail closed: handshake rate-limiting is mandatory, so a failed
+        # install raises (the server aborts startup) rather than serving
+        # without flood protection. Mirrors the kill-switch fatal path above.
         fake = _FakeRun([_called_process_error(b"meh")])
         mgr = ServerRateLimitManager(PORT)
         with patch.object(nftables.subprocess, "run", fake):
-            with self.assertLogs(nftables.log, level="WARNING"):
-                mgr.apply()  # must not raise
+            with self.assertRaises(RuntimeError):
+                mgr.apply()
         self.assertFalse(mgr._applied)
 
 
