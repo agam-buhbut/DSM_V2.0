@@ -539,6 +539,21 @@ def _validate_pmtu_interval(c: Config) -> None:
         )
 
 
+def _validate_auto_mtu(c: Config) -> None:
+    # auto_mtu adapts the TUN MTU from kernel PMTU readings, which are only
+    # available when pmtu_discover sets IP_PMTUDISC_DO — get_path_mtu() returns
+    # None otherwise. auto_mtu without pmtu_discover is silently inert, so warn
+    # loudly rather than let an operator believe the path is adapting.
+    if c.auto_mtu and not c.pmtu_discover:
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "auto_mtu=true has no effect unless pmtu_discover=true is also set "
+            "(kernel PMTU is unavailable without it); the TUN MTU will not "
+            "adapt. Set pmtu_discover=true to enable PMTU adaptation."
+        )
+
+
 # Section order is observable — Config(...) reports the FIRST error
 # encountered, so reordering changes which message a test sees. Keep
 # this sequence stable.
@@ -562,6 +577,7 @@ _VALIDATORS = (
     _validate_tun_name,
     _validate_mtu,
     _validate_pmtu_interval,
+    _validate_auto_mtu,
 )
 
 

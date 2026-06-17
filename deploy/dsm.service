@@ -20,6 +20,13 @@ StartLimitBurst=5
 # so notify would block systemd until TimeoutStartSec then assume failure.
 Type=simple
 
+# Pin a complete PATH. The daemon shells out to nft / ip / sysctl, which live
+# in /usr/sbin and /sbin. systemd's compiled default PATH can omit /sbin (and
+# /bin) on non-merged-usr hosts, turning an installed nft/ip into "command not
+# found" — and the kill switch / rate-limiter fail closed on that, refusing to
+# start. An explicit PATH makes privileged-tool resolution deterministic.
+Environment="PATH=/usr/sbin:/usr/bin:/sbin:/bin"
+
 # Run as root. The service needs CAP_NET_ADMIN + CAP_NET_BIND_SERVICE + CAP_IPC_LOCK
 # (TUN, nftables, sysctl, /etc/resolv.conf write, bind 10.8.0.1:53, and mlock of
 # key material) — see the CapabilityBoundingSet= justification further down. It

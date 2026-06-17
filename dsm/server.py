@@ -12,7 +12,7 @@ from cryptography.x509.oid import ExtendedKeyUsageOID
 
 from dsm.core import netaudit
 from dsm.core.config import Config
-from dsm.core.fsm import SessionFSM, State
+from dsm.core.fsm import ProtocolError, SessionFSM, State
 from dsm.core.protocol import PacketType, ReassemblyBuffer
 from dsm.crypto.attest_store import AttestStore
 from dsm.crypto.auth_loader import (
@@ -213,6 +213,22 @@ async def _accept_one_session(
                 break  # shutdown arrived during backoff
 
     return None, None, transport_obj
+
+
+def _drive_fsm_to_idle(fsm: SessionFSM) -> None:
+    """Return the FSM to IDLE from wherever a failed session left it so the
+    re-accept loop can start the next session. Any active state can reach
+    TEARDOWN, and TEARDOWN -> IDLE; best-effort, never raises."""
+    try:
+        if fsm.state not in (State.IDLE, State.TEARDOWN):
+            fsm.transition(State.TEARDOWN)
+        if fsm.state is State.TEARDOWN:
+            fsm.transition(State.IDLE)
+    except ProtocolError:
+        log.error(
+            "could not drive FSM to IDLE from %s after a failed session",
+            fsm.state.name,
+        )
 
 
 async def _run_one_session(
@@ -615,8 +631,10 @@ async def run_server(
         rate_limiter = ServerRateLimitManager(config.listen_port)
         try:
             rate_limiter.apply()
-        except RuntimeError as e:
+        except (RuntimeError, OSError) as e:
             # Fail closed: refuse to serve without handshake-flood protection.
+            # OSError covers a missing/unresolvable nft (FileNotFoundError), so
+            # an absent nftables yields this clean exit, not a raw traceback.
             log.error(
                 "server handshake rate-limit could not be installed: %s — "
                 "refusing to start (fail-closed). Ensure nftables is present "
@@ -681,15 +699,29 @@ async def run_server(
                     await transport_obj.aclose()
                 break  # clean process shutdown during accept
 
-            await _run_one_session(
-                config,
-                fsm,
-                keystore,
-                session_keys,
-                client_pub,
-                transport_obj,
-                process_shutdown,
-            )
+            try:
+                await _run_one_session(
+                    config,
+                    fsm,
+                    keystore,
+                    session_keys,
+                    client_pub,
+                    transport_obj,
+                    process_shutdown,
+                )
+            except Exception:
+                # A per-session host-setup failure (TUN open/configure, DNS-proxy
+                # bind, forwarding sysctls) previously propagated out of this
+                # loop and crashed the whole server, denying service to ALL
+                # future clients. _run_one_session's per-session AsyncExitStack
+                # has already unwound any partial state; reset the FSM and keep
+                # the daemon up. The loop tail re-arms CONNECTING for the next
+                # client.
+                log.exception(
+                    "session failed; recovering — daemon stays up for the "
+                    "next client"
+                )
+                _drive_fsm_to_idle(fsm)
 
             # The session ended. If it was a process shutdown, the loop
             # condition breaks below. Otherwise (dead-peer / SESSION_CLOSE /

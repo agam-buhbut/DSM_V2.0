@@ -2,6 +2,15 @@
 # Copy to /opt/mtun/config.toml (mode 0600) and edit. All file paths must be
 # absolute.
 #
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │ BEFORE FIRST START — this example will NOT boot as-shipped. You must:     │
+# │   1. Replace ca_root_sha256 with the real 64-hex SHA-256 of the CA root   │
+# │      (the all-zeros placeholder below is rejected at CA-load time).       │
+# │   2. Resolve the CRL: this example sets crl_strict = false so it boots in  │
+# │      a lab, but PRODUCTION must instead provision a crl_file and leave     │
+# │      crl_strict at its fail-closed default of true (see the CRL section).  │
+# └──────────────────────────────────────────────────────────────────────────┘
+#
 # Trust model: every device runs `dsm enroll --csr-out` once, walks the CSR to
 # the offline CA laptop, gets a cert back, and runs `dsm enroll --import`.
 # At runtime the daemon authenticates peers against the pinned CA root +
@@ -16,9 +25,12 @@ listen_port = 0                              # client: 0 = ephemeral; server: re
 key_file = "/opt/mtun/identity.key"          # Argon2id-wrapped X25519 Noise static (absolute path)
 cert_file = "/opt/mtun/device.crt"           # X.509 leaf cert (DER or PEM), signed by internal CA
 ca_root_file = "/opt/mtun/dsm_ca_root.pem"   # Pinned CA root cert (PEM)
-# REQUIRED — REPLACE the all-zeros placeholder BEFORE first start. SHA-256 of
-# ca_root_file (64 hex chars). The daemon refuses to start without a real value
-# (it pins the trust anchor so a swapped on-disk CA PEM is rejected). Compute:
+# REQUIRED — REPLACE the placeholder BEFORE first start. SHA-256 of
+# ca_root_file (64 hex chars). The daemon refuses to start without the correct
+# value (it pins the trust anchor so a swapped on-disk CA PEM is rejected). The
+# all-zeros placeholder below is format-valid but is rejected at CA-load time
+# when the daemon hashes the real ca_root_file and the digests do not match.
+# Compute the real value with:
 #   sha256sum /opt/mtun/dsm_ca_root.pem | cut -d' ' -f1
 ca_root_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
 # Attest-key artifact path. On the DEFAULT tpm-attest build this is a
@@ -51,10 +63,16 @@ attest_key_file = "/opt/mtun/attest.key"
 # ─── Certificate revocation (CRL) ──────────────────────────────────────────
 # crl_strict is true BY DEFAULT and fail-closed: the daemon refuses to start
 # unless a crl_file is configured AND it is not past next_update. A fresh copy
-# of this example WITHOUT a crl_file will refuse to start. Either provide a CRL:
+# of this example WITHOUT a crl_file would refuse to start, so this example
+# ships with crl_strict = false to be bootable out of the box.
+#
+# !! SECURITY: crl_strict = false means revoked certs are accepted SILENTLY —
+# !! it disables revocation enforcement entirely. This is acceptable ONLY for a
+# !! dev/lab box that has no CA CRL workflow. FOR PRODUCTION: comment out the
+# !! crl_strict line below (restoring the true default), uncomment crl_file, and
+# !! provision the CRL per deploy/GUIDE.md §2c/§2f. Enforcement then fails closed.
+crl_strict = false
 # crl_file = "/opt/mtun/dsm_ca.crl"          # DER or PEM; refresh monthly via walked-USB
-# ...or, for dev/lab only, drop to a warning:
-# crl_strict = false
 
 # ─── Role-specific cert policy ─────────────────────────────────────────────
 # Client only: subject CN we accept on the server cert.

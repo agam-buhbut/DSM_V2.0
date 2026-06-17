@@ -41,8 +41,9 @@ from cryptography.x509.oid import NameOID
 # Signature-hash algorithms accepted on the leaf cert and CRL. SHA-1 and MD5
 # are explicitly excluded — both have practical collisions that allow forging
 # a TBS that hashes to the same value as a legitimately signed object. The
-# CA is configured to sign with SHA-256 (rcgen default + offline CA runbook),
-# so this allowlist is consistent with the issuance path. Re-used by
+# offline CA (deploy/openssl-ca.cnf) signs with SHA-384 (default_md=sha384) and
+# the dev-soft-attest CSR path with SHA-256; both are in this allowlist, so it
+# is consistent with every issuance path. Re-used by
 # ``crypto.crl`` via ``check_strong_signature_hash`` below.
 _STRONG_HASH_NAMES: frozenset[str] = frozenset({"sha256", "sha384", "sha512"})
 
@@ -171,7 +172,7 @@ class DeviceCert:
 
     @classmethod
     def from_pem_or_der(cls, raw: bytes) -> DeviceCert:
-        """Sniff PEM (``-----BEGIN`` prefix) vs DER and parse accordingly.
+        """Sniff PEM (a ``-----BEGIN`` marker anywhere) vs DER and parse.
 
         Raises :class:`CertError` on a parse failure or empty input.
         Callers that need a module-specific exception type should catch
@@ -179,7 +180,13 @@ class DeviceCert:
         """
         if not raw:
             raise CertError("cert input is empty")
-        if raw.lstrip().startswith(b"-----BEGIN"):
+        # Sniff on the presence of a PEM boundary ANYWHERE, not just at the
+        # very start: `openssl ca` / `openssl x509` without -notext prepend a
+        # human-readable text dump before the -----BEGIN CERTIFICATE----- block,
+        # and cryptography's PEM loader tolerates that preamble. A strict
+        # startswith() check mis-routed such certs to the DER parser and failed
+        # `dsm enroll --import` with a cryptic ASN.1 error on a clean deploy.
+        if b"-----BEGIN" in raw:
             return cls.from_pem(raw)
         return cls.from_der(raw)
 

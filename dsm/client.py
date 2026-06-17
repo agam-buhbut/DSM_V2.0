@@ -144,7 +144,18 @@ async def run_client(
         # also covers the TUN interface and DNS leaks) by NFTablesManager
         # .apply() below, once the TUN is up.
         pre_killswitch = PreHandshakeKillSwitch(config.server_ip, config.server_port)
-        pre_killswitch.apply()
+        try:
+            pre_killswitch.apply()
+        except OSError as e:
+            # Fail closed: never proceed to connect without the egress lock.
+            # OSError covers a missing/unresolvable nft (FileNotFoundError).
+            log.error(
+                "pre-handshake kill switch could not be installed: %s — "
+                "refusing to start (fail-closed). Ensure nftables is present "
+                "and the daemon has CAP_NET_ADMIN.",
+                e,
+            )
+            return 1
         stack.callback(pre_killswitch.remove)
 
         # Read the passphrase once and unlock both stores, now BEHIND the kill

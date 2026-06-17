@@ -421,7 +421,23 @@ $ openssl req -config openssl-ca.cnf \
       -out dsm_ca_root.pem
 ```
 
-### 2c. Record the root cert fingerprint in your physical safe
+### 2c. Generate the initial (empty) CRL
+
+The daemon ships fail-closed: `crl_strict` defaults to true, so every dsm
+host REFUSES to start unless a `crl_file` is present and current (see §3a,
+§7e). You must therefore produce a CRL now — even on a fresh CA with an
+empty `index.txt`, before any cert has been revoked — and distribute it
+alongside the root cert in §2f.
+
+```sh
+$ openssl ca -config openssl-ca.cnf -gencrl -out crl/dsm_ca.crl
+```
+
+This writes an empty but valid CRL whose `next_update` is `default_crl_days`
+(31) out. Re-run this command (and re-walk the CRL) before it expires, and
+whenever you revoke a cert (§7e).
+
+### 2d. Record the root cert fingerprint in your physical safe
 
 ```sh
 $ openssl x509 -in dsm_ca_root.pem -noout -fingerprint -sha256
@@ -431,7 +447,7 @@ $ sha256sum dsm_ca_root.pem
 Print BOTH outputs and store the printout in the safe.
 
 The bare 64-hex SHA-256 of the FILE (second command) is also the
-REQUIRED `ca_root_sha256` config value (see §2e and §3a). The daemon
+REQUIRED `ca_root_sha256` config value (see §2f and §3a). The daemon
 refuses to start unless config.toml sets `ca_root_sha256` and it
 matches the on-disk dsm_ca_root.pem — this pins the trust anchor so a
 swapped CA PEM is rejected. Capture it in config-ready form now:
@@ -441,7 +457,7 @@ $ sha256sum dsm_ca_root.pem | cut -d' ' -f1
 # -> 64 hex chars; this goes verbatim into ca_root_sha256 = "<hex>"
 ```
 
-### 2d. Snapshot the CA directory onto your encrypted USB sticks
+### 2e. Snapshot the CA directory onto your encrypted USB sticks
 
 Make AT LEAST two redundant copies on separate USB sticks. Store at
 least one off-site (safe deposit box). Wipe and re-snapshot whenever
@@ -451,16 +467,18 @@ ca/serial files must stay in sync with what was issued.
 The CA private key NEVER leaves these USBs. To sign a CSR, mount the
 USB RW, sign, unmount, return to safe.
 
-### 2e. Distribute the root cert to every dsm host (via Stick B)
+### 2f. Distribute the root cert + CRL to every dsm host (via Stick B)
 
-On Stick B, place a copy of dsm_ca_root.pem (public, safe to walk).
-On each dsm host:
+On Stick B, place a copy of BOTH dsm_ca_root.pem and the initial CRL
+crl/dsm_ca.crl from §2c (both public, safe to walk). On each dsm host:
 
 ```sh
 $ sudo install -m 0600 -o root -g root /mnt/transport/dsm_ca_root.pem \
       /opt/mtun/dsm_ca_root.pem
+$ sudo install -m 0600 -o root -g root /mnt/transport/dsm_ca.crl \
+      /opt/mtun/dsm_ca.crl
 $ sha256sum /opt/mtun/dsm_ca_root.pem | cut -d' ' -f1
-      # cross-check this 64-hex value vs the safe printout (§2c),
+      # cross-check this 64-hex value vs the safe printout (§2d),
       # then paste it into config.toml as ca_root_sha256 (§3a).
 ```
 
@@ -470,6 +488,10 @@ install it 0o600. Substitution of dsm_ca_root.pem changes the trust
 anchor — defense-in-depth is appropriate, and the REQUIRED
 `ca_root_sha256` config pin makes the swap fatal at startup rather
 than silently trusting the new anchor.
+
+The CRL goes to /opt/mtun/dsm_ca.crl (the `crl_file` path in §3a). Because
+`crl_strict` defaults true, the daemon will not start without it. Refresh
+it on the CRL cadence (§7e).
 
 Re-wipe Stick B (`shred -v`) before reusing it.
 
@@ -485,7 +507,11 @@ the DoH provider's SPKI pin (see 3a.1 below).
 
 ```sh
 $ sudo mkdir -p /opt/mtun
-$ sudo tee /opt/mtun/config.toml >/dev/null <<'EOF'
+# install -m 0600 writes the file mode 0600 directly. A plain `sudo tee`
+# would create it mode 0644 under root's umask, and the daemon's
+# path-security check REFUSES to load a config with any group/world bits
+# ("refusing to load config with insecure permissions ... chmod 600").
+$ sudo install -m 0600 /dev/stdin /opt/mtun/config.toml <<'EOF'
 mode               = "server"
 server_ip          = "10.0.0.5"         # THIS host's public IP (literal)
 server_port        = 51820
@@ -494,12 +520,17 @@ listen_port        = 51820
 key_file           = "/opt/mtun/identity.key"
 cert_file          = "/opt/mtun/device.crt"
 ca_root_file       = "/opt/mtun/dsm_ca_root.pem"
-# REQUIRED: 64-hex SHA-256 of ca_root_file (§2c / §2e). The daemon refuses
+# REQUIRED: 64-hex SHA-256 of ca_root_file (§2d / §2f). The daemon refuses
 # to start without it and rejects a swapped CA PEM. Compute with:
 #   sha256sum /opt/mtun/dsm_ca_root.pem | cut -d' ' -f1
 ca_root_sha256     = "REPLACE_WITH_64_HEX_SHA256_OF_dsm_ca_root.pem"
 attest_key_file    = "/opt/mtun/attest.key"
-crl_file           = "/opt/mtun/dsm_ca.crl"   # required by default (crl_strict=true)
+crl_file           = "/opt/mtun/dsm_ca.crl"   # required by default (crl_strict=true);
+                                              # provision the initial CRL per §2c
+                                              # and distribute it per §2f BEFORE
+                                              # first start, else the daemon refuses
+                                              # to boot ("crl_file configured but
+                                              # missing").
 # crl_strict       = true                     # default. Set false ONLY for
                                               # lab/dev with no CA workflow.
 
@@ -640,21 +671,29 @@ $ openssl req -in /mnt/transport/dsm-csr-server.der \
 #   * Subject Public Key is prime256v1 (256-bit ECDSA)
 # If ANY check fails, REJECT. Wipe Stick B. Investigate.
 
-# 2. Sign with the server profile
-$ openssl ca -config openssl-ca.cnf -extensions dsm_server_leaf \
+# 2. Sign with the server profile. -notext keeps the emitted file pure PEM
+#    (without it openssl prepends a human-readable text dump before the
+#    -----BEGIN CERTIFICATE----- block). The output name matches the import
+#    path used in §3d so the two steps line up.
+$ openssl ca -config openssl-ca.cnf -extensions dsm_server_leaf -notext \
       -in /mnt/transport/dsm-csr-server.der -inform DER \
-      -out certs/<hostname>.pem -batch
+      -out certs/dsm-cert-server.pem -batch
 
 # 3. Copy the signed cert back to Stick B (the cert ONLY — never
 #    walk the CA private key or index.txt anywhere)
-$ cp certs/<hostname>.pem /mnt/transport/
+$ cp certs/dsm-cert-server.pem /mnt/transport/
 
 # 4. Eject Stick B, eject Stick A, return both to the safe.
 ```
 
 ### 3d. Server: import the signed cert
 
+Walk Stick B back to the server and copy the signed cert off it to the
+import path BEFORE importing (this is the cross-machine bridge — §3c wrote
+the cert on the CA laptop's Stick B, not on the server):
+
 ```sh
+$ sudo cp /mnt/transport/dsm-cert-server.pem /tmp/dsm-cert-server.pem
 $ sudo python3 -m dsm --config /opt/mtun/config.toml \
       enroll --import /tmp/dsm-cert-server.pem
 ```
@@ -743,10 +782,12 @@ $ sudo python3 -m dsm --config /opt/mtun/config.toml \
       enroll --csr-out /tmp/dsm-csr-client.der --role client
 ```
 
-Walk to CA, sign with `-extensions dsm_client_leaf` (NOT
-dsm_server_leaf), walk back, then:
+Walk to CA, sign exactly as in §3c but with `-extensions dsm_client_leaf`
+(NOT dsm_server_leaf) and `-out certs/dsm-cert-client.pem` (keep `-notext`),
+copy it to Stick B, walk back, then bridge it off the stick and import:
 
 ```sh
+$ sudo cp /mnt/transport/dsm-cert-client.pem /tmp/dsm-cert-client.pem
 $ sudo python3 -m dsm --config /opt/mtun/config.toml \
       enroll --import /tmp/dsm-cert-client.pem
 ```
@@ -969,7 +1010,7 @@ revoked certs silently), set `crl_strict = false` in config.toml.
 ### 7f. Disaster recovery — CA private key lost
 
 1. Bootstrap a new CA per §2.
-2. Walk the new root cert to every dsm host (§2e).
+2. Walk the new root cert + CRL to every dsm host (§2f).
 3. Re-enroll every device per §3.
 
 ### 7g. Disaster recovery — device identity / attest key compromise, or a lost/cleared TPM
@@ -1005,7 +1046,9 @@ namespace; the test still works).
 
 ```sh
 $ sudo mkdir -p /opt/mtun
-$ sudo tee /opt/mtun/config.toml <<'EOF'
+# install -m 0600 (NOT `tee`) so the config is mode 0600 — a 0644 config is
+# rejected at startup ("refusing to load config with insecure permissions").
+$ sudo install -m 0600 /dev/stdin /opt/mtun/config.toml <<'EOF'
 mode = "server"
 server_ip = "127.0.0.1"
 server_port = 51820
@@ -1013,17 +1056,21 @@ listen_port = 51820
 key_file = "/opt/mtun/identity.key"
 cert_file = "/opt/mtun/device.crt"
 ca_root_file = "/opt/mtun/dsm_ca_root.pem"
-ca_root_sha256 = "REPLACE_WITH_64_HEX_SHA256_OF_dsm_ca_root.pem"  # REQUIRED (§2c)
+ca_root_sha256 = "REPLACE_WITH_64_HEX_SHA256_OF_dsm_ca_root.pem"  # REQUIRED (§2d)
 attest_key_file = "/opt/mtun/attest.key"
 allowed_cns_file = "/opt/mtun/allowed_cns.txt"
 transport = "udp"
+# crl_strict = false ONLY for this local sanity check, which has no CA CRL
+# workflow. PRODUCTION MUST provision a CRL (§2c) and leave crl_strict at its
+# fail-closed default of true (§3a, §7e).
+crl_strict = false
 dns_providers = ["https://1.1.1.1/dns-query"]
 [dns_provider_pins]
 "https://1.1.1.1/dns-query" = ["<64-hex SPKI SHA-256>"]
 EOF
 ```
 
-Place /opt/mtun/dsm_ca_root.pem per §2e. Cross-check its SHA-256
+Place /opt/mtun/dsm_ca_root.pem per §2f. Cross-check its SHA-256
 against the safe printout, and set ca_root_sha256 to that 64-hex
 value (`sha256sum /opt/mtun/dsm_ca_root.pem | cut -d' ' -f1`) — the
 daemon refuses to start without it.
@@ -1407,7 +1454,7 @@ if the CN changed unexpectedly (implies unauthorized re-enrollment).
 - "chain ..." → the pinned ca_root_file does not match the CA that
   issued this side's cert. Cross-check
   `sha256sum /opt/mtun/dsm_ca_root.pem` against the value recorded in
-  your safe (§2c).
+  your safe (§2d).
 - "binding ..." → the cert's noiseStaticBinding extension does not
   match the local Noise static. The cert was issued for a different
   identity. Re-enroll.
