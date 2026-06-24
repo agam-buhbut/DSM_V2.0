@@ -9,7 +9,7 @@ build/
 .venv/
 venv/
 misc
-
+docs/superpowers/
 # Rust
 rust/tuncore/target/
 target/
@@ -26,3 +26,6 @@ target/
 
 # Archived documentation (superseded by deploy/GUIDE.txt)
 backup/
+
+# isolated worktrees (Claude hardening/UX tracks)
+.worktrees/
