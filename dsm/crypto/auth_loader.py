@@ -29,7 +29,7 @@ from dsm.core.path_security import (
 )
 from dsm.crypto.attest_store import AttestStore
 from dsm.crypto.cert import CertError, DeviceCert, load_ca_root
-from dsm.crypto.crl import CRL, CRLError
+from dsm.crypto.crl import CRL, CRLError, CRLRollbackError
 from dsm.crypto.keystore import KeyStore
 
 log = logging.getLogger(__name__)
@@ -152,6 +152,15 @@ def load_cert_materials(config: Config) -> CertAuthMaterials:
         except CRLError as e:
             raise AuthMaterialsError(f"CRL at {crl_path} failed validation: {e}") from e
         log.info("loaded CRL crl_number=%s", crl.crl_number)
+        # DSM-B1: reject a genuinely-signed but older CRL replayed to
+        # un-revoke a cert. The last-accepted crl_number is persisted under
+        # the config dir and must never regress.
+        crl_number_store = config.config_dir / "crl_number.seen"
+        try:
+            crl.reject_if_rolled_back(crl_number_store)
+        except CRLRollbackError as e:
+            netaudit.emit("crl_rollback", path=str(crl_path), action="refused_start")
+            raise AuthMaterialsError(f"CRL at {crl_path} rejected: {e}") from e
         _now = datetime.datetime.now(datetime.UTC)
         # DSM-030: a CRL with no nextUpdate is never reported "stale"
         # (is_stale returns False without the field), so it would slip past

@@ -132,25 +132,22 @@ jobs:
       # verifies every one against this signed SHA256SUMS (same trust anchor).
       #
       # --only-binary=:all: forbids any sdist (the installer is --no-index, so a
-      # source dist could not build on the target anyway). The platform/abi/
-      # python triple is pinned to the supported target (Debian 12+/Ubuntu
-      # 22.04+ x86_64, cp311 + manylinux) so the resolved set matches install.sh
-      # $WHEEL. The two top-level runtime deps mirror pyproject.toml; pip pulls
-      # their transitive runtime deps automatically (cryptography -> cffi ->
-      # pycparser; dnspython is pure-Python).
+      # source dist could not build on the target anyway). --require-hashes pins
+      # the resolved set to the committed requirements.lock (137 hashed pins,
+      # generated with --generate-hashes): the vendored wheelhouse is EXACTLY the
+      # locked runtime closure (cryptography -> cffi -> pycparser; dnspython is
+      # pure-Python), so a compromised index cannot substitute an unpinned dep.
+      # --python-version 311 keeps the abi3/manylinux wheels aligned with the
+      # cp311-abi3 DSM wheel install.sh $WHEEL loads on the target.
       - name: Vendor runtime dependency wheels into the wheelhouse
         run: |
           python -m pip install --upgrade pip
           pip download \
+            --require-hashes \
+            -r requirements.lock \
             --only-binary=:all: \
             --python-version 311 \
-            --implementation cp \
-            --abi cp311 --abi abi3 --abi none \
-            --platform manylinux2014_x86_64 \
-            --platform manylinux_2_17_x86_64 \
-            --platform manylinux_2_28_x86_64 \
-            --dest dist \
-            "cryptography>=46.0.7,<49" "dnspython>=2.6,<3.0"
+            --dest dist
           echo "Wheelhouse contents (DSM wheels + vendored runtime deps):"
           ls -1 dist/*.whl
       - name: Generate SHA256SUMS over all artifacts

@@ -251,6 +251,11 @@ async def handle_rekey_init(
             rekey_state.in_progress = False
             rekey_state.reset_retry()
             rekey_state.pending_epoch = None
+            # B4: our own initiate_rekey just stamped last_rekey_time, which
+            # would rate-limit-drop the peer's winning INIT below. Clear the
+            # anchor here — and ONLY on this genuine-yield path — so the peer's
+            # INIT is processed rather than silently dropped.
+            last_rekey_time = None
             fsm.transition(State.ESTABLISHED)
         else:
             log.warning("rekey init received in state %s, ignoring", fsm.state.name)

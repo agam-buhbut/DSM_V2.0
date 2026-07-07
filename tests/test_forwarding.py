@@ -73,8 +73,6 @@ class IPForwardingApplyRemoveTest(unittest.TestCase):
         self.assertEqual(self._read("net.ipv4.conf.all.accept_redirects"), "0")
         self.assertEqual(self._read("net.ipv4.conf.default.accept_redirects"), "0")
         self.assertEqual(self._read("net.ipv4.conf.all.secure_redirects"), "0")
-        # Loose reverse-path filtering for asymmetric tunnel paths.
-        self.assertEqual(self._read("net.ipv4.conf.all.rp_filter"), "2")
 
     def test_remove_restores_every_touched_value(self) -> None:
         ip_forward = self._seed("net.ipv4.ip_forward", "0")

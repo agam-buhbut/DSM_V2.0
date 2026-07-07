@@ -85,15 +85,11 @@ class TestInnerPacket(unittest.TestCase):
 
 
 class TestOuterPacket(unittest.TestCase):
-    def test_roundtrip(self) -> None:
+    def test_serialize_roundtrip_length(self) -> None:
         ct = os.urandom(48)
         pkt = OuterPacket(seq=42, nonce=os.urandom(12), ciphertext=ct)
         wire = pkt.serialize()
         self.assertEqual(len(wire), OUTER_HEADER_SIZE + len(ct))
-        got = OuterPacket.deserialize(wire, ciphertext_len=len(ct))
-        self.assertEqual(got.seq, 42)
-        self.assertEqual(got.nonce, pkt.nonce)
-        self.assertEqual(got.ciphertext, ct)
 
     def test_serialize_matches_explicit_target(self) -> None:
         ct = os.urandom(48)
@@ -110,17 +106,6 @@ class TestOuterPacket(unittest.TestCase):
             pkt.serialize(target_size=10)
         with self.assertRaises(ValueError):
             pkt.serialize(target_size=OUTER_HEADER_SIZE + len(ct) + 32)
-
-    def test_too_short_deserialize(self) -> None:
-        with self.assertRaises(ValueError):
-            OuterPacket.deserialize(b"\x00" * 10, ciphertext_len=5)
-
-    def test_aad_format(self) -> None:
-        pkt = OuterPacket(seq=123, nonce=b"\x00" * 12, ciphertext=b"")
-        aad = pkt.aad()
-        self.assertEqual(len(aad), 8)  # AAD = seq only (nonce bound as GCM IV)
-        seq_from_aad = struct.unpack("!Q", aad)[0]
-        self.assertEqual(seq_from_aad, 123)
 
 
 class TestFragment(unittest.TestCase):

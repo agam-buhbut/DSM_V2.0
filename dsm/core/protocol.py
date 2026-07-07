@@ -164,37 +164,6 @@ class OuterPacket:
         buf[OUTER_HEADER_SIZE:] = self.ciphertext
         return bytes(buf)
 
-    @classmethod
-    def deserialize(cls, data: bytes, ciphertext_len: int) -> OuterPacket:
-        """Deserialize from wire format.
-
-        ciphertext_len is needed because outer padding is unauthenticated
-        and we need to know where ciphertext ends.
-        The ciphertext length = inner_plaintext_size + GCM_TAG_SIZE.
-        In practice, this is total_packet_size - OUTER_HEADER_SIZE - outer_padding.
-        The receiver computes this from the encrypted inner_length field after
-        decryption, or uses the full remaining bytes and lets GCM reject if wrong.
-        """
-        if len(data) < OUTER_HEADER_SIZE:
-            raise ValueError("outer packet too short")
-        seq = SEQ_STRUCT.unpack_from(data)[0]
-        nonce = data[8:20]
-        ct_end = OUTER_HEADER_SIZE + ciphertext_len
-        if ct_end > len(data):
-            raise ValueError("ciphertext_len exceeds packet")
-        ciphertext = data[OUTER_HEADER_SIZE:ct_end]
-        return cls(seq=seq, nonce=nonce, ciphertext=ciphertext)
-
-    def aad(self) -> bytes:
-        """Return the Additional Authenticated Data for this packet.
-
-        AAD = sequence number (8 bytes).  The nonce is NOT included
-        because it is inherently bound as the GCM IV — including it
-        in AAD would be redundant.  This matches the actual AAD
-        construction in session.py encrypt/decrypt paths.
-        """
-        return SEQ_STRUCT.pack(self.seq)
-
 
 def pick_random_size_class() -> int:
     """Pick a random size class weighted toward smaller packets."""

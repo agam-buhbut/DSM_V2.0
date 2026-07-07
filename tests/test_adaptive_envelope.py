@@ -83,6 +83,30 @@ class TestEnvelopeRelease(unittest.TestCase):
         self.assertLess(released_first_100ms, 50)
         self.assertGreater(depth, 100)
 
+    def test_stall_does_not_burst_release(self) -> None:
+        # B5: a scheduler/send stall balloons the release dt. Credit accrual
+        # must clamp dt to the envelope interval so one post-stall tick cannot
+        # dump range(credit) packets (a timing side-channel leaking the stall).
+        clk = _Clock()
+        # Pin the envelope at the 100pps ceiling (floor==ceiling) so the only
+        # variable under test is the dt clamp.
+        s = TrafficShaper(
+            clock=clk,
+            envelope_idle_floor_min_pps=100.0,
+            envelope_idle_floor_max_pps=100.0,
+            envelope_ceiling_pps=100.0,
+            envelope_rise_per_s=2.0,
+            envelope_fall_half_life_s=4.0,
+            envelope_latency_budget_ms=250,
+        )
+        clk.advance(0.01)
+        s.release_budget(clk())  # prime _last_release_time
+        clk.advance(10.0)  # 10s stall (scheduler/send hang)
+        n = s.release_budget(clk())
+        # Unclamped this would be ~100pps * 10s = ~1000 packets. Clamped to the
+        # 250ms budget it is at most ~100pps * 0.25s = 25 (+1 fractional carry).
+        self.assertLessEqual(n, 26)
+
     def test_latency_budget_overrides_rise_cap(self) -> None:
         # A single real packet that has waited past the 250ms budget must be
         # releasable even though the rise cap alone would still be low.

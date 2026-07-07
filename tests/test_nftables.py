@@ -20,7 +20,6 @@ from dsm.net.nftables import (
     NFTablesManager,
     PreHandshakeKillSwitch,
     ServerRateLimitManager,
-    _apply_ruleset,
 )
 
 V4_IP = "203.0.113.7"
@@ -174,45 +173,6 @@ class InputValidationTest(unittest.TestCase):
             with self.subTest(port=bad_port):
                 with self.assertRaises(ValueError):
                     ServerRateLimitManager(bad_port)
-
-
-# --------------------------------------------------------------------------- #
-# _apply_ruleset fatal / non-fatal contract (no real nft)
-# --------------------------------------------------------------------------- #
-class ApplyRulesetContractTest(unittest.TestCase):
-    def test_called_process_error_fatal_raises_with_stderr(self) -> None:
-        fake = _FakeRun([_called_process_error(b"syntax error near line 3")])
-        with patch.object(nftables.subprocess, "run", fake):
-            with self.assertRaises(RuntimeError) as ctx:
-                _apply_ruleset("ruleset", fatal=True, log_label="ks")
-        self.assertIn("syntax error near line 3", str(ctx.exception))
-
-    def test_called_process_error_nonfatal_returns_false_and_logs(self) -> None:
-        fake = _FakeRun([_called_process_error(b"boom")])
-        with patch.object(nftables.subprocess, "run", fake):
-            with self.assertLogs(nftables.log, level="WARNING") as cm:
-                result = _apply_ruleset("ruleset", fatal=False, log_label="ks")
-        self.assertFalse(result)
-        self.assertTrue(any("boom" in m for m in cm.output))
-
-    def test_file_not_found_fatal_reraises(self) -> None:
-        fake = _FakeRun([FileNotFoundError("nft")])
-        with patch.object(nftables.subprocess, "run", fake):
-            with self.assertRaises(FileNotFoundError):
-                _apply_ruleset("ruleset", fatal=True, log_label="ks")
-
-    def test_file_not_found_nonfatal_returns_false(self) -> None:
-        fake = _FakeRun([FileNotFoundError("nft")])
-        with patch.object(nftables.subprocess, "run", fake):
-            with self.assertLogs(nftables.log, level="WARNING"):
-                result = _apply_ruleset("ruleset", fatal=False, log_label="ks")
-        self.assertFalse(result)
-
-    def test_success_returns_true(self) -> None:
-        fake = _FakeRun()  # default success
-        with patch.object(nftables.subprocess, "run", fake):
-            self.assertTrue(_apply_ruleset("ruleset", fatal=True, log_label="ks"))
-        self.assertEqual(len(fake.calls), 1)
 
 
 # --------------------------------------------------------------------------- #

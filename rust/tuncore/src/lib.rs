@@ -174,39 +174,6 @@ impl PyReplayWindow {
     }
 }
 
-/// Python-visible nonce generator.
-#[pyclass(name = "NonceGenerator")]
-struct PyNonceGenerator {
-    inner: nonce::NonceGenerator,
-}
-
-#[pymethods]
-impl PyNonceGenerator {
-    #[new]
-    fn new(epoch: u32) -> Self {
-        Self {
-            inner: nonce::NonceGenerator::new(epoch),
-        }
-    }
-
-    fn next(&self) -> PyResult<Vec<u8>> {
-        self.inner
-            .next()
-            .map(|n| n.to_vec())
-            .ok_or_else(|| py_err("nonce counter exhausted"))
-    }
-
-    #[getter]
-    fn count(&self) -> u32 {
-        self.inner.count()
-    }
-
-    #[getter]
-    fn epoch(&self) -> u32 {
-        self.inner.epoch()
-    }
-}
-
 /// Python-visible Noise XX initiator.
 #[pyclass(name = "NoiseInitiator")]
 struct PyNoiseInitiator {
@@ -615,6 +582,11 @@ impl PySessionKeyManager {
     }
 
     #[getter]
+    fn send_epoch(&self) -> u32 {
+        self.inner.send_epoch()
+    }
+
+    #[getter]
     fn packets_sent(&self) -> u64 {
         self.inner.packets_sent()
     }
@@ -622,28 +594,6 @@ impl PySessionKeyManager {
     #[getter]
     fn has_grace_period(&self) -> bool {
         self.inner.has_grace_period()
-    }
-}
-
-/// Python-visible AES-256-GCM key handle.
-#[pyclass(name = "AesKey")]
-struct PyAesKey {
-    inner: aes_gcm::AesKey,
-}
-
-#[pymethods]
-impl PyAesKey {
-    // No #[new] — keys must not be created from Python with raw bytes.
-    // PyAesKey instances are only produced by Rust-side key derivation.
-
-    fn encrypt(&self, nonce: &[u8], plaintext: &[u8], aad: &[u8]) -> PyResult<Vec<u8>> {
-        let n = nonce_from_slice(nonce)?;
-        self.inner.encrypt(&n, plaintext, aad).map_err(py_err)
-    }
-
-    fn decrypt(&self, nonce: &[u8], ciphertext: &[u8], aad: &[u8]) -> PyResult<Vec<u8>> {
-        let n = nonce_from_slice(nonce)?;
-        self.inner.decrypt(&n, ciphertext, aad).map_err(py_err)
     }
 }
 
@@ -837,12 +787,10 @@ fn complete_bootstrap(
 fn tuncore(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyIdentityKeyPair>()?;
     m.add_class::<PyReplayWindow>()?;
-    m.add_class::<PyNonceGenerator>()?;
     m.add_class::<PyNoiseInitiator>()?;
     m.add_class::<PyNoiseResponder>()?;
     m.add_class::<PyNoiseTransport>()?;
     m.add_class::<PySessionKeyManager>()?;
-    m.add_class::<PyAesKey>()?;
     m.add_class::<PyAttestKey>()?;
     m.add_class::<PyBootstrapEphemeral>()?;
     m.add_function(wrap_pyfunction!(disable_core_dumps, m)?)?;

@@ -433,6 +433,12 @@ class TrafficShaper:
         if dt <= 0:
             return 1 if deadline else 0
         self._last_release_time = now
+        # B5: clamp dt to the envelope interval before accruing credit. A
+        # scheduler/send stall balloons dt and would otherwise let one tick
+        # emit a burst of range(credit) packets — leaking the stall as a
+        # timing side-channel. Capping at the latency budget bounds the
+        # per-tick credit to the pacing the envelope is allowed to sustain.
+        dt = min(dt, self._latency_budget_s)
         self._release_credit += self._envelope_pps * dt
         n = int(self._release_credit)
         self._release_credit -= n

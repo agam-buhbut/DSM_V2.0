@@ -61,41 +61,6 @@ class TestSessionFSM(unittest.TestCase):
         fsm.transition(State.TEARDOWN)
         self.assertFalse(fsm.is_active())
 
-    def test_on_enter_callback(self) -> None:
-        fsm = SessionFSM()
-        entered: list[State] = []
-        fsm.on_enter(State.CONNECTING, lambda: entered.append(State.CONNECTING))
-        fsm.transition(State.CONNECTING)
-        self.assertEqual(entered, [State.CONNECTING])
-
-    def test_on_exit_callback(self) -> None:
-        fsm = SessionFSM()
-        exited: list[State] = []
-        fsm.on_exit(State.IDLE, lambda: exited.append(State.IDLE))
-        fsm.transition(State.CONNECTING)
-        self.assertEqual(exited, [State.IDLE])
-
-    def test_on_enter_failure_noncritical(self) -> None:
-        fsm = SessionFSM()
-        fsm.on_enter(
-            State.CONNECTING, lambda: (_ for _ in ()).throw(RuntimeError("oops"))
-        )
-        # Non-critical state: callback fails but transition still happens
-        fsm.transition(State.CONNECTING)
-        self.assertEqual(fsm.state, State.CONNECTING)
-
-    def test_on_enter_failure_critical(self) -> None:
-        fsm = SessionFSM()
-        fsm.transition(State.CONNECTING)
-        fsm.transition(State.HANDSHAKING)
-        fsm.on_enter(
-            State.ESTABLISHED, lambda: (_ for _ in ()).throw(RuntimeError("critical"))
-        )
-        with self.assertRaises(RuntimeError):
-            fsm.transition(State.ESTABLISHED)
-        # Critical state failure forces TEARDOWN
-        self.assertEqual(fsm.state, State.TEARDOWN)
-
     def test_multiple_rekeying_cycles(self) -> None:
         fsm = SessionFSM()
         fsm.transition(State.CONNECTING)

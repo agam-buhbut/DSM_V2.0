@@ -29,7 +29,7 @@ use hkdf::Hkdf;
 use sha2::{Digest as _, Sha256};
 use tss_esapi::attributes::ObjectAttributes;
 use tss_esapi::constants::tss::{TPM2_RH_NULL, TPM2_ST_HASHCHECK};
-use tss_esapi::constants::StartupType;
+use tss_esapi::constants::{StartupType, Tss2ResponseCodeKind};
 use tss_esapi::interface_types::algorithm::{HashingAlgorithm, PublicAlgorithm};
 use tss_esapi::interface_types::ecc::EccCurve;
 use tss_esapi::interface_types::resource_handles::Hierarchy;
@@ -822,9 +822,15 @@ fn map_tpm_err(op: &str, e: tss_esapi::Error) -> String {
 }
 
 /// True for the benign "TPM already started" (`TPM2_RC_INITIALIZE`) condition
-/// a redundant `TPM2_Startup` returns on an already-running TPM.
+/// a redundant `TPM2_Startup` returns on an already-running TPM. Matches the
+/// typed tss-esapi return code rather than a stringified message, which is
+/// fragile across libtss2 versions and locales on real hardware.
 fn is_already_initialized(e: tss_esapi::Error) -> bool {
-    format!("{e}").contains("INITIALIZE")
+    matches!(
+        e,
+        tss_esapi::Error::Tss2Error(rc)
+            if rc.kind() == Some(Tss2ResponseCodeKind::Initialize)
+    )
 }
 
 /// Build the `TPM_RC_NULL` hashcheck ticket required by `TPM2_Sign`. The digest
@@ -860,4 +866,25 @@ fn ecdsa_signature_to_der(sig: &Signature) -> Result<Vec<u8>, String> {
     let signature = p256::ecdsa::Signature::from_slice(&scalars)
         .map_err(|e| format!("invalid ECDSA (r,s) from TPM: {e}"))?;
     Ok(signature.to_der().as_bytes().to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tss_esapi::constants::tss::{TPM2_RC_FAILURE, TPM2_RC_INITIALIZE};
+    use tss_esapi::constants::Tss2ResponseCode;
+
+    fn tss_err(rc: u32) -> tss_esapi::Error {
+        tss_esapi::Error::Tss2Error(Tss2ResponseCode::from(rc))
+    }
+
+    #[test]
+    fn initialize_rc_is_benign() {
+        assert!(is_already_initialized(tss_err(TPM2_RC_INITIALIZE)));
+    }
+
+    #[test]
+    fn other_rc_is_not_benign() {
+        assert!(!is_already_initialized(tss_err(TPM2_RC_FAILURE)));
+    }
 }

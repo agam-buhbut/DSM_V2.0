@@ -23,10 +23,11 @@ have, and the precise restore still happens whenever the clean teardown runs.
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 
 from dsm.core.atomic_io import atomic_write
-from dsm.net.resolv_conf import RESOLV_BACKUP, RESOLV_CONF
+from dsm.net.resolv_conf import RESOLV_BACKUP, RESOLV_CONF, parse_symlink_backup
 from dsm.net.transport._fwmark import SO_MARK_VALUE as FWMARK
 
 log = logging.getLogger(__name__)
@@ -106,7 +107,20 @@ def _restore_resolv_conf() -> None:
     try:
         if RESOLV_BACKUP.exists():
             data = RESOLV_BACKUP.read_bytes()
-            atomic_write(RESOLV_CONF, data, mode=0o644, mkdir=False)
+            target = parse_symlink_backup(data)
+            if target is not None:
+                # Original was a symlink (systemd-resolved / NetworkManager):
+                # recreate it atomically (temp symlink -> rename) rather than
+                # writing its target text as file contents (B2).
+                tmp = RESOLV_CONF.with_suffix(RESOLV_CONF.suffix + ".dsm-restore")
+                try:
+                    tmp.unlink()
+                except FileNotFoundError:
+                    pass
+                os.symlink(target, tmp)
+                os.rename(tmp, RESOLV_CONF)
+            else:
+                atomic_write(RESOLV_CONF, data, mode=0o644, mkdir=False)
             RESOLV_BACKUP.unlink(missing_ok=True)
             log.info("restored resolv.conf from backup")
         elif RESOLV_CONF.exists():

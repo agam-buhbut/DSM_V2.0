@@ -6,16 +6,9 @@ forwarding + send_redirects + rp_filter) and
 ``/proc/sys/...`` keys for the lifetime of a tunnel session: capture
 prior value, write new value, restore on teardown.
 
-The two callers differ in two small respects which this module
-parameterises:
-
-* ``only_log_on_change`` — IPForwardingManager only emits the
-  ``sysctl K: old -> new`` log line when ``old != new``;
-  TcpTimestampsDisabler always logs the capture/write (and emits a
-  caller-specific message).
-* whether failures during the write tracking are silent or visible —
-  both swallow OSError into a WARNING; the caller picks the log
-  prefix via the ``label`` argument.
+Both callers only override a key when its current value differs from
+the requested one, emitting a ``sysctl K: old -> new`` log line on
+change. Failures during the write are swallowed into a WARNING.
 """
 
 from __future__ import annotations
@@ -44,9 +37,8 @@ class SysctlOverride:
     independent.
     """
 
-    def __init__(self, only_log_on_change: bool = True) -> None:
+    def __init__(self) -> None:
         self._original: dict[str, str] = {}
-        self._only_log_on_change = only_log_on_change
 
     def set(self, key: str, value: str) -> str | None:
         """Override ``key`` to ``value``; return prior value (or None on failure).
@@ -72,8 +64,7 @@ class SysctlOverride:
         # the same key twice in the lifetime of one manager must restore
         # back to the *first* observed value, not the second-most-recent.
         self._original.setdefault(key, current)
-        if self._only_log_on_change:
-            log.info("sysctl %s: %s -> %s", key, current, value)
+        log.info("sysctl %s: %s -> %s", key, current, value)
         return current
 
     def restore_all(self) -> None:

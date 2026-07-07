@@ -20,11 +20,11 @@ PRE_HANDSHAKE_TEMPLATE_PATH = (
 TCP_TIMESTAMPS_PATH = Path("/proc/sys/net/ipv4/tcp_timestamps")
 
 
-def _apply_ruleset(rules: str, *, fatal: bool, log_label: str) -> bool:
+def _apply_ruleset(rules: str, *, log_label: str) -> None:
     """Load a rendered nftables ruleset via ``nft -f -``.
 
-    When ``fatal`` is true, a failure raises ``RuntimeError``; otherwise it
-    logs at WARNING and returns False. Returns True on success.
+    Raises ``RuntimeError`` on ``nft`` failure and re-raises
+    ``FileNotFoundError`` when ``nft`` is not installed.
     """
     try:
         subprocess.run(
@@ -35,18 +35,9 @@ def _apply_ruleset(rules: str, *, fatal: bool, log_label: str) -> bool:
             timeout=5,
         )
         log.info("%s applied", log_label)
-        return True
-    except FileNotFoundError:
-        if fatal:
-            raise
-        log.warning("nft not installed; skipping %s", log_label)
-        return False
     except subprocess.CalledProcessError as e:
         stderr = e.stderr.decode(errors="replace").strip()
-        if fatal:
-            raise RuntimeError(f"{log_label} apply failed: {stderr}")
-        log.warning("%s apply failed: %s", log_label, stderr)
-        return False
+        raise RuntimeError(f"{log_label} apply failed: {stderr}")
 
 
 def _delete_tables(*table_names: str) -> None:
@@ -128,7 +119,6 @@ class PreHandshakeKillSwitch:
     def apply(self) -> None:
         _apply_ruleset(
             self._render(),
-            fatal=True,
             log_label="pre-handshake kill switch",
         )
         self._applied = True
@@ -188,14 +178,13 @@ class NFTablesManager:
             f"delete table inet {PreHandshakeKillSwitch.TABLE_NAME}\n" + self._render()
         )
         try:
-            _apply_ruleset(rules, fatal=True, log_label="nftables kill switch")
+            _apply_ruleset(rules, log_label="nftables kill switch")
         except RuntimeError:
             # The pre-handshake table may not exist (e.g. operator wired
             # apply() manually without the pre-handshake step). Retry
             # without the delete.
             _apply_ruleset(
                 self._render(),
-                fatal=True,
                 log_label="nftables kill switch",
             )
         netaudit.emit(
@@ -253,17 +242,16 @@ class ServerRateLimitManager:
         # defense against unauthenticated flood/DoS. If the ruleset cannot be
         # installed (no nft, permission failure), _apply_ruleset raises so the
         # caller aborts startup rather than serving unprotected.
-        self._applied = _apply_ruleset(
+        _apply_ruleset(
             self._render(),
-            fatal=True,
             log_label=f"server rate-limit (port {self._listen_port})",
         )
-        if self._applied:
-            netaudit.emit(
-                "nft_apply",
-                tables=["dsm_server_ratelimit"],
-                listen_port=self._listen_port,
-            )
+        self._applied = True
+        netaudit.emit(
+            "nft_apply",
+            tables=["dsm_server_ratelimit"],
+            listen_port=self._listen_port,
+        )
 
     def remove(self) -> None:
         if not self._applied:

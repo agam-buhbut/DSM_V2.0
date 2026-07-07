@@ -24,7 +24,6 @@ from dsm.crypto.enroll import EnrollError, EnrollmentResult
 def _server_flags(cfg_dir: Path) -> list[str]:
     return [
         "server",
-        "--non-interactive",
         "--server-ip",
         "203.0.113.1",
         "--server-port",
@@ -157,7 +156,6 @@ def test_existing_key_without_force_exits_2(cfg_dir: Path) -> None:
 def test_client_uses_expected_server_cn(cfg_dir: Path) -> None:
     flags = [
         "client",
-        "--non-interactive",
         "--server-ip",
         "203.0.113.1",
         "--server-port",
@@ -224,3 +222,85 @@ def test_render_config_escapes_toml_injection(cfg_dir: Path) -> None:
     parsed = tomllib.loads(text)
     assert "allow_soft_attest" not in parsed
     assert parsed["dns_providers"] == [payload]
+
+
+def test_render_config_is_fail_closed_crl(cfg_dir: Path) -> None:
+    # The wizard must emit crl_strict=true AND a concrete crl_file, so the
+    # generated config is self-consistent (fail-closed on a missing CRL with a
+    # clear message) instead of silently skipping revocation.
+    import argparse
+    import tomllib
+
+    ca = cfg_dir / "dsm_ca_root.pem"
+    ca.write_bytes(b"-----BEGIN CERTIFICATE-----\nx\n-----END CERTIFICATE-----\n")
+    args = argparse.Namespace(
+        server_ip="10.0.0.1",
+        server_port=51820,
+        ca_root=str(ca),
+        dns_provider="https://1.1.1.1/dns-query",
+        dns_pin="ab" * 32,
+        expected_server_cn="cn",
+    )
+    parsed = tomllib.loads(
+        dsm_init._render_config("server", args, cfg_dir)  # noqa: SLF001
+    )
+    assert parsed["crl_strict"] is True
+    assert parsed["crl_file"] == str(cfg_dir / "dsm_ca.crl")
+
+
+def test_force_restart_removes_keys_then_reenrolls(cfg_dir: Path) -> None:
+    # First run lays down state + (mocked) enrollment. Stale key files stand in
+    # for the residue generate_enrollment would refuse to clobber.
+    with (
+        mock.patch.object(dsm_init, "preflight_tpm"),
+        mock.patch.object(
+            dsm_init, "generate_enrollment", return_value=_fake_enrollment()
+        ),
+    ):
+        assert dsm_init.main(_server_flags(cfg_dir)) == 0
+    (cfg_dir / "identity.key").write_bytes(b"stale")
+    (cfg_dir / "attest.key").write_bytes(b"stale")
+    assert (cfg_dir / ".dsm-init-state.json").exists()
+
+    # Without --force the state guard blocks re-init.
+    with pytest.raises(SystemExit) as ei:
+        dsm_init.main(_server_flags(cfg_dir))
+    assert ei.value.code == 2
+
+    # --force clears the key files + state so generate_enrollment runs again.
+    with (
+        mock.patch.object(dsm_init, "preflight_tpm"),
+        mock.patch.object(
+            dsm_init, "generate_enrollment", return_value=_fake_enrollment()
+        ) as gen,
+    ):
+        rc = dsm_init.main(_server_flags(cfg_dir) + ["--force"])
+    assert rc == 0
+    # generate_enrollment re-ran (it is mocked, so it does not recreate the
+    # key files) — the point is the stale keys it would have refused to clobber
+    # are gone, unblocking the restart.
+    assert gen.call_count == 1
+    assert not (cfg_dir / "identity.key").exists()
+    assert not (cfg_dir / "attest.key").exists()
+
+
+def test_force_unlink_failure_is_nonfatal(cfg_dir: Path) -> None:
+    # A failed unlink of a TPM-related key must be reported, not crash --force.
+    with (
+        mock.patch.object(dsm_init, "preflight_tpm"),
+        mock.patch.object(
+            dsm_init, "generate_enrollment", return_value=_fake_enrollment()
+        ),
+    ):
+        assert dsm_init.main(_server_flags(cfg_dir)) == 0
+
+    with (
+        mock.patch.object(dsm_init, "preflight_tpm"),
+        mock.patch.object(
+            dsm_init, "generate_enrollment", return_value=_fake_enrollment()
+        ) as gen,
+        mock.patch.object(dsm_init.Path, "unlink", side_effect=OSError("EPERM")),
+    ):
+        rc = dsm_init.main(_server_flags(cfg_dir) + ["--force"])
+    assert rc == 0
+    assert gen.call_count == 1

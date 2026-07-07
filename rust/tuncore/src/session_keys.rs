@@ -366,7 +366,12 @@ impl SessionKeyManager {
             .ok_or("nonce counter exhausted — rotation overdue")?;
         let ciphertext = self.send.key.encrypt(&nonce, plaintext, aad)?;
         self.packets_sent += 1;
-        Ok((nonce, ciphertext, self.epoch))
+        // H-CRYPT: return the SEND direction's epoch, not self.epoch.
+        // On a responder deferred send-swap self.epoch is already the
+        // NEW epoch while self.send still holds the OLD key; returning
+        // self.epoch would stamp a NEW nibble on an OLD-key packet and
+        // the peer would drop it at the epoch_id check.
+        Ok((nonce, ciphertext, self.send.nonce_gen.epoch()))
     }
 
     /// Decrypt a packet. Tries current epoch first, then previous if in grace period.
@@ -680,6 +685,13 @@ impl SessionKeyManager {
         self.epoch
     }
 
+    /// Epoch of the SEND direction key. Differs from `epoch()` only during
+    /// a responder deferred send-swap, where `self.epoch` has advanced to
+    /// the new epoch but `self.send` still holds the old key.
+    pub fn send_epoch(&self) -> u32 {
+        self.send.nonce_gen.epoch()
+    }
+
     pub fn packets_sent(&self) -> u64 {
         self.packets_sent
     }
@@ -807,6 +819,31 @@ mod tests {
         let (nonce, ct, _) = server.encrypt(b"mid-rotation data", aad).unwrap();
         let pt = client.decrypt(&nonce, &ct, aad, 1, false).unwrap();
         assert_eq!(pt, b"mid-rotation data");
+    }
+
+    /// Regression for A1: while a deferred send-swap is pending, the epoch
+    /// returned by `encrypt()` MUST be the OLD (send-direction) epoch, not
+    /// the already-advanced `self.epoch`. Otherwise Python stamps the NEW
+    /// nibble onto an OLD-key packet and the peer drops it.
+    #[test]
+    fn encrypt_returns_old_epoch_while_send_swap_pending() {
+        let (client, mut server) = make_paired_managers();
+        let aad = &1u64.to_be_bytes();
+
+        let old_epoch = server.epoch();
+        let init_keypair = client.initiate_rotation().unwrap();
+        let pending = server
+            .prepare_rotation_responder(&init_keypair.ephemeral_pub, init_keypair.new_epoch)
+            .unwrap();
+        server.apply_rotation_responder(pending).unwrap();
+
+        assert!(server.has_pending_send_swap());
+        // self.epoch has advanced, but the send key (and thus the stamped
+        // epoch) must still be the old one.
+        assert_eq!(server.epoch(), old_epoch + 1);
+        let (_nonce, _ct, epoch) = server.encrypt(b"data", aad).unwrap();
+        assert_eq!(epoch, old_epoch, "encrypt must return the OLD send epoch");
+        assert_eq!(server.send_epoch(), old_epoch);
     }
 
     /// Regression for H-CRYPT-2: `derive_rotation_keys` MUST NOT depend

@@ -252,6 +252,47 @@ class MutualInitTieBreakTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(loser.fsm.state, State.REKEYING)
         self.assertIs(_inner_type(loser.sent[0]), PacketType.REKEY_INIT)
 
+    async def test_yield_clears_rate_limit_anchor(self) -> None:
+        # B4: the yielding side's own initiate_rekey just stamped
+        # last_rekey_time to "now", so the rate-limit check below would
+        # silently drop the peer's WINNING INIT unless the yield branch
+        # clears the anchor. Pass a fresh (recent) last_rekey_time — as the
+        # real caller would after initiate_rekey — and assert the loser still
+        # yields AND processes the peer's INIT (rotates + ACKs) instead of
+        # rate-limit-dropping it.
+        import time
+
+        winner, loser, shaper = await self._both_initiate()
+        winner_init = winner.last_init_payload
+
+        await handle_rekey_init(
+            winner_init,
+            loser.keys,
+            loser.fsm,
+            shaper,
+            loser.send,
+            last_rekey_time=time.monotonic(),  # loser just initiated → recent
+            rekey_state=loser.rekey,
+            local_static_pub=loser.static_pub,
+            remote_static_pub=winner.static_pub,
+        )
+        # Not rate-limit-dropped: the loser yielded, rotated as responder, and
+        # emitted a REKEY_ACK (2nd captured packet).
+        self.assertFalse(loser.rekey.in_progress)
+        self.assertEqual(loser.fsm.state, State.ESTABLISHED)
+        self.assertEqual(len(loser.sent), 2)
+        self.assertIs(_inner_type(loser.sent[1]), PacketType.REKEY_ACK)
+        # And the winner can complete against that ACK: keys converge.
+        ack_payload = _inner_payload(loser.sent[1])
+        result = handle_rekey_ack(
+            ack_payload,
+            winner.keys,
+            winner.fsm,
+            expected_epoch=winner.rekey.pending_epoch,
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(winner.keys.epoch, loser.keys.epoch)
+
     async def test_tiebreak_skipped_without_static_pubs(self) -> None:
         # Older call sites omit the static pubs -> tie-break is disabled and
         # behavior matches pre-fix: a REKEY_INIT arriving in REKEYING is

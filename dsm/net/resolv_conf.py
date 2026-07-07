@@ -32,6 +32,24 @@ RESOLV_BACKUP = Path("/var/lib/dsm/resolv.conf.orig")
 # "current" file (after a crash), it must NOT treat that as the original.
 _DSM_MARKER = b"# Managed by dsm"
 
+# A backup file may hold either the original resolv.conf CONTENTS (a regular
+# file was replaced) or — when the original was a symlink (systemd-resolved /
+# NetworkManager hosts) — this sentinel line recording the link target so a
+# crash-restart or teardown can RECREATE the symlink instead of losing it.
+_SYMLINK_SENTINEL = b"# dsm-resolv-symlink -> "
+
+
+def parse_symlink_backup(data: bytes) -> str | None:
+    """Return the symlink target if ``data`` is a symlink-sentinel backup.
+
+    Returns ``None`` when ``data`` is ordinary backed-up file contents.
+    """
+    if data.startswith(_SYMLINK_SENTINEL):
+        return (
+            data[len(_SYMLINK_SENTINEL) :].split(b"\n", 1)[0].decode(errors="replace")
+        )
+    return None
+
 
 class ResolvConfManager:
     """Own /etc/resolv.conf for the lifetime of the VPN session."""
@@ -61,6 +79,37 @@ class ResolvConfManager:
             atomic_write(RESOLV_BACKUP, contents, mode=0o600, mkdir=True)
         except OSError as e:
             log.warning("could not persist resolv.conf backup: %s", e)
+
+    @staticmethod
+    def _save_backup_symlink(target: str) -> None:
+        # Durably record that the original was a symlink pointing at ``target``
+        # so restore can recreate it. Write-once, like _save_backup.
+        if RESOLV_BACKUP.exists():
+            return
+        try:
+            atomic_write(
+                RESOLV_BACKUP,
+                _SYMLINK_SENTINEL + target.encode() + b"\n",
+                mode=0o600,
+                mkdir=True,
+            )
+        except OSError as e:
+            log.warning("could not persist resolv.conf symlink backup: %s", e)
+
+    def _recover_from_backup(self) -> None:
+        """Load the persistent backup into the right in-memory field.
+
+        A backup can hold either a symlink target (sentinel) or ordinary file
+        contents; route each to the field remove() acts on.
+        """
+        data = self._load_backup()
+        if data is None:
+            return
+        target = parse_symlink_backup(data)
+        if target is not None:
+            self._original_symlink_target = target
+        else:
+            self._original_contents = data
 
     def apply(self) -> None:
         """Replace resolv.conf with a single-nameserver file.
@@ -106,6 +155,9 @@ class ResolvConfManager:
         if RESOLV_CONF.is_symlink():
             try:
                 self._original_symlink_target = os.readlink(RESOLV_CONF)
+                # Persist the target durably: a crash before remove() must be
+                # able to recreate the symlink, not lose it (B2).
+                self._save_backup_symlink(self._original_symlink_target)
             except OSError:
                 # Race: symlink was replaced between is_symlink() and
                 # readlink. Fall through to the regular-file branch so
@@ -134,8 +186,8 @@ class ResolvConfManager:
             elif current.startswith(_DSM_MARKER):
                 # Phase 1.5: this is OUR file (a prior run crashed before
                 # restore). Do NOT capture it as the original — recover the
-                # real original from the persistent backup instead.
-                self._original_contents = self._load_backup()
+                # real original (contents OR symlink target) from the backup.
+                self._recover_from_backup()
             else:
                 self._original_contents = current
                 # First apply over a genuine file: persist it so a later
@@ -171,6 +223,7 @@ class ResolvConfManager:
         if not self._applied:
             return
 
+        restored = False
         try:
             if (
                 self._original_symlink_target is None
@@ -178,7 +231,7 @@ class ResolvConfManager:
             ):
                 # Phase 1.5: nothing captured in-memory — prefer the persistent
                 # backup (a crash-restart manager that found a dsm-managed file).
-                self._original_contents = self._load_backup()
+                self._recover_from_backup()
             if self._original_symlink_target is not None:
                 # Symlink restore: create a sibling temp symlink, then
                 # rename it over RESOLV_CONF. rename(2) replaces
@@ -191,6 +244,7 @@ class ResolvConfManager:
                     pass
                 os.symlink(self._original_symlink_target, tmp)
                 os.rename(tmp, RESOLV_CONF)
+                restored = True
             elif self._original_contents is not None:
                 # atomic_write uses tmpfile → fchmod → fsync → rename;
                 # already atomic over both files AND symlinks.
@@ -200,6 +254,7 @@ class ResolvConfManager:
                     mode=0o644,
                     mkdir=False,
                 )
+                restored = True
             else:
                 # No original to restore — explicitly remove our file.
                 # Brief absence here matches the pre-apply state by
@@ -208,16 +263,27 @@ class ResolvConfManager:
                     RESOLV_CONF.unlink()
                 except FileNotFoundError:
                     pass
+                restored = True
         except OSError as e:
             log.error("failed to restore resolv.conf: %s", e)
         finally:
             self._applied = False
-            self._original_contents = None
-            self._original_symlink_target = None
-            # Phase 1.5: the backup has served its purpose; drop it so the
-            # next apply over a genuine file captures a fresh original.
-            try:
-                RESOLV_BACKUP.unlink(missing_ok=True)
-            except OSError:
-                pass
-            log.info("resolv.conf restored")
+            # B2: only drop the persistent backup and clear the captured
+            # original AFTER a restore actually succeeded. If the restore
+            # write raised, keep both so the crash-path cleanup (or a retry)
+            # can still recover the true original instead of losing it.
+            if restored:
+                self._original_contents = None
+                self._original_symlink_target = None
+                # Phase 1.5: the backup has served its purpose; drop it so the
+                # next apply over a genuine file captures a fresh original.
+                try:
+                    RESOLV_BACKUP.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                log.info("resolv.conf restored")
+            else:
+                log.error(
+                    "resolv.conf restore failed — preserving backup %s",
+                    RESOLV_BACKUP,
+                )

@@ -85,6 +85,10 @@ class TunDevice:
         # _configured. deconfigure() restores IPv6 whenever this is set, even
         # if a later configure() command failed and _configured stayed False.
         self._ipv6_mutated = False
+        # Count of outbound packets dropped because the TUN write buffer was
+        # full (EAGAIN). A dropped packet is recoverable (peer/kernel will
+        # retransmit); tearing down the session is not.
+        self._tx_drops = 0
 
     @property
     def name(self) -> str:
@@ -401,17 +405,23 @@ class TunDevice:
         """Write a packet to the TUN device (async, avoids blocking event loop).
 
         TUN has a kernel-side buffer; a non-blocking write almost always
-        succeeds immediately. Try the sync write first to skip the thread
-        hop on the common path; only on ``EAGAIN`` do we fall back to
-        the executor. This cuts per-packet latency meaningfully on the
-        send-from-recv-loop hot path and avoids needless thread-pool
-        churn on low-RAM targets.
+        succeeds immediately, so we issue the sync write directly and skip
+        the thread hop entirely. On ``EAGAIN`` (buffer full) we DROP the
+        packet and return normally: the fd is ``O_NONBLOCK`` so an executor
+        write cannot block either and would just re-raise, tearing down the
+        session. A dropped outbound packet is recoverable (peer/kernel will
+        retransmit); a torn-down session is not.
         """
         try:
             return os.write(self.fd, data)
         except BlockingIOError:
-            loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(None, os.write, self.fd, data)
+            self._tx_drops += 1
+            log.warning(
+                "TUN %s write buffer full, dropped outbound packet (total drops=%d)",
+                self._name,
+                self._tx_drops,
+            )
+            return 0
 
     def close(self) -> None:
         """Close the TUN device."""

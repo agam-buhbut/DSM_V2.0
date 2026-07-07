@@ -213,7 +213,10 @@ def make_send_fn(
         # packet at the `inner.epoch_id != expected_eid` check. Patch
         # byte 1 of the header (top 4 bits = epoch_id, bottom 4
         # reserved/zero — audit M3 widening) with the live
-        # session_keys.epoch right before encryption. CHAFF packets are
+        # session_keys.send_epoch right before encryption. During a
+        # responder deferred send-swap the SEND key still lags self.epoch,
+        # so we stamp the send-direction epoch to match the key actually
+        # used by encrypt(). CHAFF packets are
         # exempt from the receiver's check, but patching them is
         # harmless.
         #
@@ -228,7 +231,7 @@ def make_send_fn(
         # scheduler's buffer: the patch path allocates a NEW bytearray
         # (bytearray(data) copies), exactly as before.
         if len(data) >= 2:
-            want_byte1 = (data[1] & 0x0F) | ((session_keys.epoch & 0x0F) << 4)
+            want_byte1 = (data[1] & 0x0F) | ((session_keys.send_epoch & 0x0F) << 4)
             if data[1] != want_byte1:
                 buf = bytearray(data)
                 buf[1] = want_byte1
@@ -314,7 +317,7 @@ def make_addr_send_fn(
             log.error("sequence counter exhausted on path-challenge send: %s", e)
             return
         if len(data) >= 2:
-            want_byte1 = (data[1] & 0x0F) | ((session_keys.epoch & 0x0F) << 4)
+            want_byte1 = (data[1] & 0x0F) | ((session_keys.send_epoch & 0x0F) << 4)
             if data[1] != want_byte1:
                 buf = bytearray(data)
                 buf[1] = want_byte1

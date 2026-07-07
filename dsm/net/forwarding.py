@@ -71,8 +71,6 @@ class IPForwardingManager:
         self._sysctl.set("net.ipv4.conf.all.accept_redirects", "0")
         self._sysctl.set("net.ipv4.conf.default.accept_redirects", "0")
         self._sysctl.set("net.ipv4.conf.all.secure_redirects", "0")
-        # Loose reverse-path filtering for asymmetric tunnel paths.
-        self._sysctl.set("net.ipv4.conf.all.rp_filter", "2")
         if self._tun_name:
             self._sysctl.set(f"net.ipv4.conf.{self._tun_name}.send_redirects", "0")
             self._sysctl.set(f"net.ipv4.conf.{self._tun_name}.accept_redirects", "0")

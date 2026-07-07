@@ -17,6 +17,7 @@ from dsm.crypto.crl import (
     CRL,
     CRLIssuerMismatchError,
     CRLLoadError,
+    CRLRollbackError,
     CRLSignatureError,
     CRLStaleError,
 )
@@ -61,6 +62,29 @@ def _build_crl(
         )
         builder = builder.add_revoked_certificate(entry)
     crl = builder.sign(private_key=signing_key, algorithm=hashes.SHA384())
+    return crl.public_bytes(Encoding.DER)
+
+
+def _build_crl_no_number(ca, *, revoked_serials: list[int] | None = None) -> bytes:
+    """Build a DER CRL with NO crl_number extension (for rollback tests)."""
+    if revoked_serials is None:
+        revoked_serials = []
+    now = datetime.datetime.now(datetime.UTC)
+    builder = (
+        x509.CertificateRevocationListBuilder()
+        .issuer_name(ca.certificate.subject)
+        .last_update(now)
+        .next_update(now + datetime.timedelta(days=30))
+    )
+    for s in revoked_serials:
+        entry = (
+            x509.RevokedCertificateBuilder()
+            .serial_number(s)
+            .revocation_date(now)
+            .build()
+        )
+        builder = builder.add_revoked_certificate(entry)
+    crl = builder.sign(private_key=ca.private_key, algorithm=hashes.SHA384())
     return crl.public_bytes(Encoding.DER)
 
 
@@ -177,6 +201,62 @@ class TestCRLRejections(unittest.TestCase):
             self.assertFalse(crl.is_revoked(0xAA00))
         finally:
             path.unlink()
+
+
+class TestCRLRollback(unittest.TestCase):
+    def setUp(self) -> None:
+        self.ca = make_test_ca()
+        self.dir = Path(
+            os.path.join(
+                os.environ.get("TMPDIR", "/tmp"),
+                f"dsm-crl-rb-{os.getpid()}-{secrets.token_hex(4)}",
+            )
+        )
+        self.dir.mkdir(parents=True)
+        self.store = self.dir / "crl_number.seen"
+
+    def tearDown(self) -> None:
+        for p in self.dir.glob("*"):
+            p.unlink()
+        self.dir.rmdir()
+
+    def _load(self, crl_number: int | None) -> CRL:
+        if crl_number is None:
+            der = _build_crl_no_number(self.ca)
+        else:
+            der = _build_crl(self.ca, crl_number=crl_number)
+        path = _write_tmp(der)
+        try:
+            return CRL.load(path, self.ca.certificate)
+        finally:
+            path.unlink()
+
+    def test_accept_then_reject_older(self) -> None:
+        # Accept #5, then an older but genuinely-signed #3 must be rejected.
+        self._load(5).reject_if_rolled_back(self.store)
+        self.assertEqual(self.store.read_text().strip(), "5")
+        with self.assertRaises(CRLRollbackError):
+            self._load(3).reject_if_rolled_back(self.store)
+        # Floor is unchanged after the rejection.
+        self.assertEqual(self.store.read_text().strip(), "5")
+
+    def test_equal_and_newer_accepted(self) -> None:
+        self._load(5).reject_if_rolled_back(self.store)
+        # Same number is fine (idempotent re-load).
+        self._load(5).reject_if_rolled_back(self.store)
+        # Newer advances the floor.
+        self._load(6).reject_if_rolled_back(self.store)
+        self.assertEqual(self.store.read_text().strip(), "6")
+
+    def test_downgrade_to_unnumbered_rejected(self) -> None:
+        self._load(5).reject_if_rolled_back(self.store)
+        with self.assertRaises(CRLRollbackError):
+            self._load(None).reject_if_rolled_back(self.store)
+
+    def test_corrupt_store_fails_closed(self) -> None:
+        self.store.write_text("not-an-int")
+        with self.assertRaises(CRLRollbackError):
+            self._load(5).reject_if_rolled_back(self.store)
 
 
 if __name__ == "__main__":

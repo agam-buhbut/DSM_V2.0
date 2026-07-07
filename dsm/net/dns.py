@@ -362,7 +362,9 @@ class DNSResolver:
             request = (
                 f"POST {path} HTTP/1.1\r\n"
                 f"Host: {host}\r\n"
-                f"User-Agent: dsm/1.0\r\n"
+                f"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                f"AppleWebKit/537.36 (KHTML, like Gecko) "
+                f"Chrome/120.0.0.0 Safari/537.36\r\n"
                 f"Content-Type: application/dns-message\r\n"
                 f"Accept: application/dns-message\r\n"
                 f"Content-Length: {len(query)}\r\n"

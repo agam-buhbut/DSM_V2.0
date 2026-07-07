@@ -117,6 +117,12 @@ def _render_config(role: str, args: argparse.Namespace, install_dir: Path) -> st
         _fail(f"ca-root not found: {ca_root}")
     ca_sha = hashlib.sha256(ca_root.read_bytes()).hexdigest()
     print(f"ca_root_sha256 = {ca_sha}", file=sys.stderr)
+    crl_file = install_dir / "dsm_ca.crl"
+    print(
+        f"dsm init: crl_strict is on (fail-closed); the daemon will NOT start "
+        f"until you place a current CRL at {crl_file} — see deploy/GUIDE.md §7e.",
+        file=sys.stderr,
+    )
     # Every dynamic/operator-supplied value is rendered with json.dumps so it
     # cannot break out of the TOML string and inject config keys (e.g. a
     # --dns-provider or --expected-server-cn containing a quote/newline that
@@ -132,8 +138,12 @@ def _render_config(role: str, args: argparse.Namespace, install_dir: Path) -> st
         f"ca_root_file = {json.dumps(str(ca_root))}",
         f"ca_root_sha256 = {json.dumps(ca_sha)}",
         f"attest_key_file = {json.dumps(str(install_dir / 'attest.key'))}",
-        # init writes a working dev default; GUIDE.md §7e adds a real CRL.
-        "crl_strict = false",
+        # Fail-closed by default: crl_strict=true with a configured crl_file
+        # makes the daemon refuse to start on a MISSING/stale CRL with a clear
+        # message, rather than silently skipping revocation. The operator must
+        # place a current CRL at crl_file before starting (deploy/GUIDE.md §7e).
+        "crl_strict = true",
+        f"crl_file = {json.dumps(str(crl_file))}",
         'transport = "udp"',
     ]
     if role == "client":
@@ -221,6 +231,34 @@ def _ensure_secret_dir(install_dir: Path) -> None:
         _fail(f"cannot set 0o700 on install dir {install_dir}: {e}")
 
 
+def _force_remove_enrollment(install_dir: Path, state_path: Path) -> None:
+    """--force restart: clear the prior enrollment so generate_enrollment can
+    re-run.
+
+    generate_enrollment refuses to clobber an existing identity/attest key, so
+    --force alone (which only bypasses the state guard) can never restart an
+    enrollment. Remove those keys and the resume-state file here. Fail-safe:
+    these are TPM-related, so a failed unlink is reported and skipped rather
+    than crashing mid-teardown.
+    """
+    print(
+        "dsm init: --force: removing existing enrollment keys",
+        file=sys.stderr,
+    )
+    for path in (
+        install_dir / "identity.key",
+        install_dir / "attest.key",
+        state_path,
+    ):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as e:
+            print(
+                f"dsm init: --force: could not remove {path}: {e}",
+                file=sys.stderr,
+            )
+
+
 def _phase_a(role: str, args: argparse.Namespace) -> int:
     _require_server_args(role, args)
     _validate_ip_literal(args.server_ip)
@@ -234,6 +272,8 @@ def _phase_a(role: str, args: argparse.Namespace) -> int:
             f"init already in progress ({state_path} exists); resume with "
             "`--resume` or re-run with `--force` to restart"
         )
+    if args.force:
+        _force_remove_enrollment(install_dir, state_path)
 
     config_path = install_dir / "config.toml"
     config_path.write_text(_render_config(role, args, install_dir), encoding="utf-8")
@@ -365,7 +405,6 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("role", choices=["server", "client"])
     p.add_argument("--resume", action="store_true")
     p.add_argument("--force", action="store_true")
-    p.add_argument("--non-interactive", action="store_true")
     p.add_argument("--install-dir", default="/opt/mtun")
     p.add_argument("--server-ip")
     p.add_argument("--server-port", type=int)

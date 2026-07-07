@@ -28,6 +28,7 @@ from cryptography.hazmat.primitives.asymmetric.ec import (
     EllipticCurvePublicKey,
 )
 
+from dsm.core.atomic_io import atomic_write
 from dsm.crypto.cert import check_strong_signature_hash
 
 
@@ -49,6 +50,15 @@ class CRLStaleError(CRLError):
 
 class CRLIssuerMismatchError(CRLError):
     """The CRL's issuer does not match the CA root's subject."""
+
+
+class CRLRollbackError(CRLError):
+    """The CRL's ``crl_number`` regresses below the last-accepted value.
+
+    Signals a rollback/replay: an older but still genuinely-signed and
+    still-fresh CRL was presented to un-revoke a cert that a newer CRL
+    had already revoked.
+    """
 
 
 @dataclass(frozen=True)
@@ -160,6 +170,46 @@ class CRL:
             return None
         return ext.crl_number
 
+    def reject_if_rolled_back(self, store_path: Path) -> None:
+        """Refuse this CRL if its ``crl_number`` is older than the last seen.
+
+        ``load`` verifies the CA signature and freshness but nothing stops a
+        co-resident attacker (or a MITM on the distribution channel) from
+        replaying an older, still-genuinely-signed, still-fresh CRL to drop a
+        revocation. This persists the highest ``crl_number`` ever accepted in
+        ``store_path`` and rejects any CRL that regresses below it. A CRL with
+        no ``crl_number`` after a numbered one was already accepted is treated
+        as suspect (cannot prove it is newer) and rejected too. On accept, the
+        store is advanced when this CRL's number exceeds the stored one.
+
+        Call this *after* ``load``/``_from_bytes`` has validated signature and
+        issuer — it is an additive, optional follow-up, not part of ``load``.
+
+        Args:
+            store_path: File under the config/state dir holding the last-seen
+                ``crl_number`` as a decimal integer.
+
+        Raises:
+            CRLRollbackError: The CRL regresses (or drops) ``crl_number``
+                relative to the last-accepted value, or the store is corrupt.
+        """
+        last_seen = _read_last_crl_number(store_path)
+        current = self.crl_number
+        if last_seen is not None:
+            if current is None:
+                raise CRLRollbackError(
+                    "CRL has no crl_number but a numbered CRL "
+                    f"(#{last_seen}) was previously accepted; refusing to "
+                    "downgrade to an unnumbered CRL (possible rollback)"
+                )
+            if current < last_seen:
+                raise CRLRollbackError(
+                    f"CRL crl_number {current} is older than the last-accepted "
+                    f"{last_seen}; refusing (possible rollback/replay)"
+                )
+        if current is not None and (last_seen is None or current > last_seen):
+            _write_last_crl_number(store_path, current)
+
     def is_stale(self, now: datetime.datetime) -> bool:
         try:
             return now > self.next_update
@@ -170,6 +220,37 @@ class CRL:
 
     def __len__(self) -> int:
         return len(self._revoked_serials)
+
+
+def _read_last_crl_number(store_path: Path) -> int | None:
+    """Return the last-accepted crl_number, or None if no store exists yet.
+
+    A corrupt/unreadable store is treated as fail-closed (raises) rather than
+    silently reset: a co-resident attacker who could clear the rollback floor
+    would otherwise re-enable exactly the replay this store defends against.
+    """
+    try:
+        raw = store_path.read_text(encoding="ascii").strip()
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        raise CRLRollbackError(
+            f"failed to read CRL rollback store {store_path}: {e}"
+        ) from e
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError as e:
+        raise CRLRollbackError(
+            f"CRL rollback store {store_path} is corrupt (not an integer): "
+            f"{raw!r}; refusing to proceed. Remove the file to reset the "
+            "rollback floor only if you are certain this is not tampering."
+        ) from e
+
+
+def _write_last_crl_number(store_path: Path, number: int) -> None:
+    atomic_write(store_path, f"{number}\n".encode("ascii"))
 
 
 def _parse_crl(raw: bytes, source: str) -> x509.CertificateRevocationList:
