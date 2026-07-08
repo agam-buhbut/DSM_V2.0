@@ -1,7 +1,7 @@
 use crate::aes_gcm::AesKey;
 use crate::nonce::NonceGenerator;
 use crate::replay_window::ReplayWindow;
-use crate::secure_memory::LockedKey32;
+use crate::secure_memory::{public_from_locked, LockedKey32};
 use hkdf::Hkdf;
 use rand::rngs::OsRng;
 use rand::RngCore;
@@ -420,25 +420,16 @@ impl SessionKeyManager {
             let Some(prev_replay) = self.prev_replay.as_mut() else {
                 return Err(AUTH_FAILED.into());
             };
-            let replay_ok = prev_replay.check(seq);
-            let aead_result = prev.key.decrypt(nonce, ciphertext, aad);
-            match (replay_ok, aead_result) {
-                (true, Ok(pt)) => {
-                    prev_replay.update(seq);
-                    Ok(pt)
-                }
-                _ => Err(AUTH_FAILED.into()),
-            }
+            try_decrypt_dir(&prev.key, prev_replay, nonce, ciphertext, aad, seq)
         } else {
-            let replay_ok = self.replay.check(seq);
-            let aead_result = self.recv.key.decrypt(nonce, ciphertext, aad);
-            match (replay_ok, aead_result) {
-                (true, Ok(pt)) => {
-                    self.replay.update(seq);
-                    Ok(pt)
-                }
-                _ => Err(AUTH_FAILED.into()),
-            }
+            try_decrypt_dir(
+                &self.recv.key,
+                &mut self.replay,
+                nonce,
+                ciphertext,
+                aad,
+                seq,
+            )
         }
     }
 
@@ -451,15 +442,11 @@ impl SessionKeyManager {
     /// Initiate key rotation: generate an ephemeral keypair for the new epoch.
     pub fn initiate_rotation(&self) -> Result<RotationInit, String> {
         let secret = gen_ephemeral_secret()?;
-        // M-CRYPT-3: wrap the stack copy in Zeroizing.
-        let scalar = Zeroizing::new(*secret.as_array());
-        let static_secret = StaticSecret::from(*scalar);
-        let public = PublicKey::from(&static_secret);
-
+        let ephemeral_pub = public_from_locked(&secret);
         let new_epoch = self.epoch.checked_add(1).ok_or("epoch overflow")?;
         Ok(RotationInit {
             new_epoch,
-            ephemeral_pub: *public.as_bytes(),
+            ephemeral_pub,
             ephemeral_secret: secret,
         })
     }
@@ -480,7 +467,6 @@ impl SessionKeyManager {
             init.ephemeral_secret.as_array(),
             remote_ephemeral_pub,
             &init.ephemeral_pub,
-            remote_ephemeral_pub,
             /* is_initiator = */ true,
             init.new_epoch,
         )?;
@@ -528,10 +514,7 @@ impl SessionKeyManager {
         }
 
         let secret = gen_ephemeral_secret()?;
-        // M-CRYPT-3: Zeroizing wrap on the dereferenced rvalue copy.
-        let scalar = Zeroizing::new(*secret.as_array());
-        let static_secret = StaticSecret::from(*scalar);
-        let our_pub = *PublicKey::from(&static_secret).as_bytes();
+        let our_pub = public_from_locked(&secret);
 
         // Responder: our ephemeral is the "responder" pub, peer's is the
         // "initiator" pub. With role binding inside derive_rotation_keys
@@ -545,7 +528,6 @@ impl SessionKeyManager {
             secret.as_array(),
             remote_ephemeral_pub,
             &our_pub,
-            remote_ephemeral_pub,
             /* is_initiator = */ false,
             new_epoch,
         )?;
@@ -635,6 +617,7 @@ impl SessionKeyManager {
 
     /// Whether a deferred send-key swap is currently pending (used by
     /// tests; mirrors the `has_grace_period` accessor for the recv side).
+    #[cfg(test)]
     pub fn has_pending_send_swap(&self) -> bool {
         self.pending_new_send.is_some()
     }
@@ -701,6 +684,31 @@ impl SessionKeyManager {
     }
 }
 
+/// Shared decrypt-one-direction body for `SessionKeyManager::decrypt`'s
+/// current-epoch and prev-epoch (grace) arms, which differ only in which key
+/// and replay window they use. The AEAD decrypt runs unconditionally and its
+/// result is folded with the replay-window check so both failure modes
+/// (replayed or forged) return the SAME opaque error (audit M3). The replay
+/// window is advanced only on a fresh, authenticated packet.
+fn try_decrypt_dir(
+    key: &AesKey,
+    replay: &mut ReplayWindow,
+    nonce: &[u8; 12],
+    ciphertext: &[u8],
+    aad: &[u8],
+    seq: u64,
+) -> Result<Vec<u8>, String> {
+    let replay_ok = replay.check(seq);
+    let aead_result = key.decrypt(nonce, ciphertext, aad);
+    match (replay_ok, aead_result) {
+        (true, Ok(pt)) => {
+            replay.update(seq);
+            Ok(pt)
+        }
+        _ => Err("authentication failed".into()),
+    }
+}
+
 /// Derive send and recv keys from an ephemeral DH shared secret.
 /// Returns (initiator_send_key, initiator_recv_key) — each derived directly
 /// into a mlock'd heap buffer.
@@ -708,16 +716,9 @@ fn derive_rotation_keys(
     our_secret: &[u8; 32],
     remote_pub: &[u8; 32],
     our_pub: &[u8; 32],
-    peer_pub: &[u8; 32],
     is_initiator: bool,
     epoch: u32,
 ) -> Result<(LockedKey32, LockedKey32), String> {
-    // remote_pub and peer_pub are the same value (passed twice for API
-    // documentation clarity at callsites). Keep both parameters so the
-    // call site explicitly names which is being used for DH vs which is
-    // being mixed into the HKDF info.
-    debug_assert_eq!(remote_pub, peer_pub);
-    let _ = peer_pub;
     // M-CRYPT-3: wrap the dereferenced scalar copy in Zeroizing.
     let scalar = Zeroizing::new(*our_secret);
     let secret = StaticSecret::from(*scalar);
@@ -870,7 +871,6 @@ mod tests {
             &init_secret,
             &resp_pub,
             &init_pub,
-            &resp_pub,
             /* is_initiator = */ true,
             epoch,
         )
@@ -879,7 +879,6 @@ mod tests {
             &resp_secret,
             &init_pub,
             &resp_pub,
-            &init_pub,
             /* is_initiator = */ false,
             epoch,
         )
@@ -928,7 +927,7 @@ mod tests {
         let a_pub = *PublicKey::from(&StaticSecret::from(a_secret)).as_bytes();
         let b_pub = *PublicKey::from(&StaticSecret::from(b_secret)).as_bytes();
 
-        let (a_send, _) = derive_rotation_keys(&a_secret, &b_pub, &a_pub, &b_pub, true, 1).unwrap();
+        let (a_send, _) = derive_rotation_keys(&a_secret, &b_pub, &a_pub, true, 1).unwrap();
         // B also calls with is_initiator=true (wrong!). HKDF info
         // canonicalizes (init_pub, resp_pub), so B's view of the
         // initiator-vs-responder ordering disagrees with A's whenever
@@ -937,8 +936,7 @@ mod tests {
         // are different. The test asserts the strong property: the
         // first byte of A's send key is not equal to the first byte of
         // anything B derived.
-        let (b_send, b_recv) =
-            derive_rotation_keys(&b_secret, &a_pub, &b_pub, &a_pub, true, 1).unwrap();
+        let (b_send, b_recv) = derive_rotation_keys(&b_secret, &a_pub, &b_pub, true, 1).unwrap();
         // Either of these two must differ — most likely both.
         let a_send_eq_b_send = a_send.as_array() == b_send.as_array();
         let a_send_eq_b_recv = a_send.as_array() == b_recv.as_array();

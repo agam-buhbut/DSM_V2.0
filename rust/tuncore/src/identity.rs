@@ -1,45 +1,12 @@
 use crate::passphrase_store::{self, ARGON2_SALT_LEN, XCHACHA_NONCE_LEN};
-use crate::secure_memory::{random_locked_key32, LockedKey32};
-use hkdf::Hkdf;
-use hmac::{Hmac, Mac as _};
-use sha2::Sha256;
-use x25519_dalek::{PublicKey, StaticSecret};
-use zeroize::{Zeroize, Zeroizing};
-
-type HmacSha256 = Hmac<Sha256>;
+use crate::secure_memory::{public_from_locked, random_locked_key32, LockedKey32};
+use zeroize::Zeroize;
 
 /// X25519 scalar length — used in `decrypt_from_store`'s up-front
 /// blob-length check so a too-short blob fails with "blob too short"
 /// rather than going through Argon2 + AEAD only to produce a length-
 /// mismatch error at the end.
 const SECRET_LEN: usize = 32;
-
-/// Compute the X25519 public key for a static secret living in mlock'd
-/// memory.
-///
-/// **Unavoidable stack copy.** `x25519_dalek::StaticSecret::from` consumes
-/// `[u8; 32]` by value (no `&[u8; 32]` constructor is exposed in
-/// x25519-dalek 2.x), so dereferencing `secret.as_array()` materializes
-/// a transient stack copy of the scalar before `StaticSecret` copies it
-/// again into its own (clamped) internal storage. Both intermediate
-/// copies are scrubbed:
-///   * `static_secret` impls `ZeroizeOnDrop`, so its internal copy is
-///     wiped at end-of-scope below.
-///   * the unnamed `*secret.as_array()` temporary lives on this function's
-///     stack frame only; the next caller's stack frame overwrites it.
-///
-/// A leak window exists between function return and the next stack-frame
-/// reuse where a debugger / `/proc/PID/mem` reader could still observe
-/// the bytes. The wrapping daemon hardens against this via
-/// `PR_SET_DUMPABLE=0` + `PR_SET_NO_NEW_PRIVS=1` (see
-/// `secure_memory::harden_process`), and the temporary is short-lived
-/// (single function call). Tighter elimination would require a
-/// `StaticSecret::from(&[u8; 32])` upstream.
-fn derive_static_pub(secret: &LockedKey32) -> [u8; 32] {
-    let static_secret = StaticSecret::from(*secret.as_array());
-    *PublicKey::from(&static_secret).as_bytes()
-    // `static_secret` drops here — ZeroizeOnDrop scrubs its internal copy.
-}
 
 /// Static X25519 identity keypair for Noise XX handshake.
 /// Secret is pinned on the mlock'd heap and zeroized on drop via `LockedKey32`.
@@ -53,7 +20,7 @@ impl IdentityKeyPair {
     /// into a mlock'd heap buffer via `OsRng`.
     pub fn generate() -> Result<Self, String> {
         let secret = random_locked_key32()?;
-        let public = derive_static_pub(&secret);
+        let public = public_from_locked(&secret);
         Ok(Self { secret, public })
     }
 
@@ -61,7 +28,7 @@ impl IdentityKeyPair {
     /// disk). Derives the public key. Infallible — kept on the type so the
     /// public-key derivation lives next to the field that owns it.
     fn from_locked(secret: LockedKey32) -> Self {
-        let public = derive_static_pub(&secret);
+        let public = public_from_locked(&secret);
         Self { secret, public }
     }
 
@@ -84,39 +51,6 @@ impl IdentityKeyPair {
     /// the buffer was never read again.
     pub fn zeroize(&mut self) {
         self.secret.as_mut().zeroize();
-    }
-
-    /// Compute HMAC-SHA256 over `data` using a key derived from this
-    /// identity's secret via HKDF-SHA256 (info = `context`). The derived key
-    /// is scoped to this call, zeroized on drop, and never leaves Rust —
-    /// callers receive only the 32-byte tag.
-    ///
-    /// M-CRYPT-6 SAFETY NOTE: `context` is passed straight to HKDF as
-    /// `info`. HKDF info has NO internal length-prefixing, so the API is
-    /// unsafe for callers that concatenate multiple structured fields
-    /// into `context` (e.g. `host || port`) — `("example.com", 8080)`
-    /// and `("example.com:8080", "")` would produce the same key. The
-    /// only in-tree caller (Python known-hosts HMAC) passes a single
-    /// opaque host string. If you add a new caller that concatenates
-    /// fields, you MUST length-prefix each field (or use a fixed-shape
-    /// canonical encoding) before passing — DO NOT let the splits float.
-    ///
-    /// NOTE: currently has no in-tree caller — reserved for the
-    /// known-hosts HMAC path (exposed via PyO3 in lib.rs). Kept
-    /// intentionally; do not assume a live caller exists.
-    pub fn compute_hmac(&self, context: &[u8], data: &[u8]) -> Result<[u8; 32], String> {
-        let hkdf = Hkdf::<Sha256>::new(Some(b"dsm-known-hosts-hmac-v3-"), self.secret.as_array());
-        let mut key = Zeroizing::new([0u8; 32]);
-        hkdf.expand(context, key.as_mut())
-            .map_err(|e| format!("hkdf expand: {e}"))?;
-
-        let mut mac = <HmacSha256 as hmac::Mac>::new_from_slice(&*key)
-            .map_err(|e| format!("hmac init: {e}"))?;
-        hmac::Mac::update(&mut mac, data);
-        let tag = mac.finalize().into_bytes();
-        let mut out = [0u8; 32];
-        out.copy_from_slice(&tag);
-        Ok(out)
     }
 
     /// Encrypt the keypair to a blob using a passphrase
@@ -158,6 +92,7 @@ impl IdentityKeyPair {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use x25519_dalek::{PublicKey, StaticSecret};
 
     #[test]
     fn test_generate_keypair() {
@@ -214,16 +149,6 @@ mod tests {
         // Idempotent
         kp.zeroize();
         assert_eq!(kp.secret_key(), &[0u8; 32]);
-    }
-
-    #[test]
-    fn test_compute_hmac_deterministic_and_context_bound() {
-        let kp = IdentityKeyPair::generate().unwrap();
-        let tag1 = kp.compute_hmac(b"ctx-a", b"hello").unwrap();
-        let tag2 = kp.compute_hmac(b"ctx-a", b"hello").unwrap();
-        let tag3 = kp.compute_hmac(b"ctx-b", b"hello").unwrap();
-        assert_eq!(tag1, tag2);
-        assert_ne!(tag1, tag3);
     }
 
     #[test]

@@ -69,11 +69,6 @@ class TCPTransport:
             except OSError:
                 pass
             raise
-        # Belt-and-suspenders: re-apply via the writer's socket too. The
-        # socket above and the writer's socket are the same fd; this is a
-        # no-op if SO_MARK already set but cheap insurance against future
-        # asyncio changes that re-wrap.
-        self._apply_fwmark()
         log.debug("TCP connected to %s:%d", host, port)
 
     async def listen(

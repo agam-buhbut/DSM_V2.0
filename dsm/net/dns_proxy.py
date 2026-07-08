@@ -17,6 +17,7 @@ import hashlib
 import ipaddress
 import logging
 import time
+from collections.abc import Callable
 from typing import Any
 
 import dns.exception
@@ -206,7 +207,7 @@ class LocalDNSProxy:
         self,
         data: bytes,
         addr: tuple[str, int],
-        send: Any,
+        send: Callable[[bytes, tuple[str, int]], None],
     ) -> tuple[dns.message.Message, str, int] | None:
         """Parse wire bytes; return (query, qname, qtype) or None if handled.
 
@@ -302,11 +303,7 @@ class LocalDNSProxy:
                     inflight_future.set_result(result)
                     return result
                 except Exception as e:  # noqa: BLE001  # see linter report
-                    log_qname = (
-                        qname
-                        if self._debug_dns
-                        else f"qname-sha256={_redact_qname(qname)}"
-                    )
+                    log_qname = _dns.redact(qname, self._debug_dns)
                     log.warning(
                         "DNS resolve failed for %s: %s",
                         log_qname,
@@ -353,7 +350,7 @@ class LocalDNSProxy:
         self,
         data: bytes,
         addr: tuple[str, int],
-        send: Any,
+        send: Callable[[bytes, tuple[str, int]], None],
     ) -> None:
         """Orchestrate parse → dedup-resolve → respond for one DNS datagram.
 

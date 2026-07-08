@@ -16,6 +16,10 @@ import ctypes.util
 import logging
 import os
 import sys
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from dsm.core.config import Config
 
 log = logging.getLogger(__name__)
 
@@ -66,3 +70,46 @@ def set_process_nondumpable() -> None:
             f"prctl(PR_SET_DUMPABLE, 0) failed: errno={errno} "
             f"({os.strerror(errno)})"
         )
+
+
+def harden_and_gate(config: Config) -> bool:
+    """Harden the process (best-effort) and enforce the attest-backend policy.
+
+    Shared client/server startup preamble: runs ``tuncore.harden_process()``
+    plus the independent ctypes non-dumpable backstop (both best-effort,
+    logged on failure), then enforces the attestation-backend policy.
+
+    Returns ``False`` when the attest gate rejects the build (the caller
+    should exit non-zero); ``True`` otherwise.
+    """
+    import tuncore
+
+    try:
+        tuncore.harden_process()
+    except Exception as e:  # noqa: BLE001  # see linter report
+        log.warning(
+            "process hardening partially failed: %s — continuing without it. "
+            "Ensure the service has CAP_SYS_RESOURCE and unrestricted prctl.",
+            e,
+        )
+
+    # Independent ctypes backstop for the most security-critical bit, in
+    # case harden_process() above failed partway: a crash must not dump
+    # key material to a core file.
+    try:
+        set_process_nondumpable()
+    except ProcessHardeningError as e:
+        log.warning("core-dump backstop (PR_SET_DUMPABLE) failed: %s", e)
+
+    from dsm.crypto.attest_gate import (
+        MalformedAttestBuildError,
+        SoftAttestNotAllowedError,
+        enforce_attest_backend_policy,
+    )
+
+    try:
+        enforce_attest_backend_policy(config)
+    except (SoftAttestNotAllowedError, MalformedAttestBuildError) as e:
+        log.error("%s", e)
+        return False
+    return True

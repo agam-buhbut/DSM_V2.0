@@ -18,21 +18,20 @@ def atomic_write(
     *,
     mode: int = 0o600,
     mkdir: bool = True,
-    dir_mode: int = 0o700,
 ) -> None:
     """Write ``data`` to ``path`` atomically (tmpfile → fchmod → fsync → rename).
 
-    Newly-created parent directories use ``dir_mode`` (default 0o700) so the
-    secret-bearing file does not sit inside a world-readable directory that
-    leaks even its existence. Pre-existing parent directories are not
-    re-chmod'd (avoids breaking system layout like /etc/dsm).
+    Newly-created parent directories use mode 0o700 so the secret-bearing
+    file does not sit inside a world-readable directory that leaks even its
+    existence. Pre-existing parent directories are not re-chmod'd (avoids
+    breaking system layout like /etc/dsm).
 
     POSIX rename durability requires fsync'ing the parent directory after
     the rename — otherwise a crash can lose the directory entry update
     even though the tmpfile data is already on disk.
     """
     if mkdir:
-        path.parent.mkdir(parents=True, exist_ok=True, mode=dir_mode)
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd, tmp = tempfile.mkstemp(dir=path.parent)
     try:
         os.fchmod(fd, mode)

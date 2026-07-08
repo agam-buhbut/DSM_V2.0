@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from dsm.core.atomic_io import atomic_write
-from dsm.core.passphrase import read_passphrase, wipe_passphrase
 from dsm.core.path_security import check_user_file_permissions
 
 if TYPE_CHECKING:
@@ -132,32 +131,3 @@ class KeyStore:
             log.info("generated new identity keypair")
         log.info("identity loaded")
         return pub
-
-    def load_or_generate(
-        self,
-        passphrase_fd: int | None = None,
-        passphrase_env_file: str | None = None,
-    ) -> bytes:
-        """Load or generate identity, reading the passphrase once.
-
-        Tries passphrase sources in order:
-        1. ``passphrase_fd`` (fd passed by caller)
-        2. ``passphrase_env_file`` (path passed by caller)
-        3. ``DSM_PASSPHRASE_FILE`` env var (path, must be mode 0600)
-        4. ``DSM_PASSPHRASE`` env var (weakest, visible in /proc)
-        5. Interactive tty prompt (fallback)
-
-        Returns the public key bytes.
-        """
-        passphrase = read_passphrase(
-            passphrase_fd=passphrase_fd,
-            passphrase_env_file=passphrase_env_file,
-        )
-        try:
-            return self.load_or_generate_with_passphrase(passphrase)
-        finally:
-            wipe_passphrase(passphrase)
-
-    def load_or_generate_interactive(self) -> bytes:
-        """Legacy name for load_or_generate (interactive fallback only)."""
-        return self.load_or_generate()

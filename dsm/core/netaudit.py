@@ -49,10 +49,6 @@ _enabled = (
 )
 
 
-def is_enabled() -> bool:
-    return _enabled
-
-
 def configure(enabled: bool) -> None:
     """Enable or disable structured event emission.
 

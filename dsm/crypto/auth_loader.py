@@ -118,6 +118,18 @@ def load_cert_materials(config: Config) -> CertAuthMaterials:
             f"CA root at {ca_root_file} failed validation: {e}"
         ) from e
 
+    crl = _load_crl(config, ca_root)
+
+    return CertAuthMaterials(cert_der=cert_der, ca_root=ca_root, crl=crl)
+
+
+def _load_crl(config: Config, ca_root: x509.Certificate) -> CRL | None:
+    """Load + freshness/rollback-check the optional CRL per crl_strict policy.
+
+    Returns the loaded CRL, or None when no crl_file is configured (permitted
+    only under crl_strict=false). Raises ``AuthMaterialsError`` on a missing,
+    invalid, rolled-back, or (under crl_strict) stale / no-nextUpdate CRL.
+    """
     crl: CRL | None = None
     if not config.crl_file:
         # CRL absent means revoked certs are silently accepted. Under
@@ -221,8 +233,7 @@ def load_cert_materials(config: Config) -> CertAuthMaterials:
                 next_update=crl.next_update.isoformat(),
                 action="warned",
             )
-
-    return CertAuthMaterials(cert_der=cert_der, ca_root=ca_root, crl=crl)
+    return crl
 
 
 def verify_cert_matches_identity(

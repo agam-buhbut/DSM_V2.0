@@ -303,6 +303,7 @@ impl NoiseInitiator {
         Ok(NoiseTransport { inner: transport })
     }
 
+    #[cfg(test)]
     pub fn is_handshake_finished(&self) -> bool {
         self.state.is_handshake_finished()
     }
@@ -405,6 +406,7 @@ impl NoiseResponder {
         Ok(NoiseTransport { inner: transport })
     }
 
+    #[cfg(test)]
     pub fn is_handshake_finished(&self) -> bool {
         self.state.is_handshake_finished()
     }

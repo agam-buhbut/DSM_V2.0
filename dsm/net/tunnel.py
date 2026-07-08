@@ -397,10 +397,6 @@ class TunDevice:
         finally:
             loop.remove_reader(self.fd)
 
-    def write(self, data: bytes) -> int:
-        """Write a packet to the TUN device (synchronous, non-blocking)."""
-        return os.write(self.fd, data)
-
     async def awrite(self, data: bytes) -> int:
         """Write a packet to the TUN device (async, avoids blocking event loop).
 

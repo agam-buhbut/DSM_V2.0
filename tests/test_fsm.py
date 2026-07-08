@@ -53,14 +53,6 @@ class TestSessionFSM(unittest.TestCase):
             fsm.transition(State.CONNECTING)  # invalid from ESTABLISHED
         self.assertEqual(fsm.state, State.TEARDOWN)
 
-    def test_is_active(self) -> None:
-        fsm = SessionFSM()
-        self.assertFalse(fsm.is_active())
-        fsm.transition(State.CONNECTING)
-        self.assertTrue(fsm.is_active())
-        fsm.transition(State.TEARDOWN)
-        self.assertFalse(fsm.is_active())
-
     def test_multiple_rekeying_cycles(self) -> None:
         fsm = SessionFSM()
         fsm.transition(State.CONNECTING)

@@ -13,7 +13,6 @@ AAD = sequence number (8 bytes).  Nonce is bound as the GCM IV.
 from __future__ import annotations
 
 import logging
-import secrets
 import struct
 import time
 from dataclasses import dataclass, field
@@ -36,7 +35,7 @@ SIZE_CLASSES = (128, 256, 384, 512, 640, 768, 896, 1024, 1152, 1280, 1400)
 # Sampling weights for SIZE_CLASSES — approximate a typical web-traffic
 # size distribution (smaller packets more likely). Length MUST equal
 # len(SIZE_CLASSES); the assertion below catches drift at module load
-# time rather than on first call to pick_random_size_class.
+# time rather than at first use.
 SIZE_CLASS_WEIGHTS: tuple[int, ...] = (20, 15, 12, 10, 8, 7, 6, 6, 5, 6, 5)
 assert len(SIZE_CLASS_WEIGHTS) == len(
     SIZE_CLASSES
@@ -163,18 +162,6 @@ class OuterPacket:
         buf[8:OUTER_HEADER_SIZE] = self.nonce
         buf[OUTER_HEADER_SIZE:] = self.ciphertext
         return bytes(buf)
-
-
-def pick_random_size_class() -> int:
-    """Pick a random size class weighted toward smaller packets."""
-    total = sum(SIZE_CLASS_WEIGHTS)
-    r = secrets.randbelow(total)
-    cumulative = 0
-    for sc, w in zip(SIZE_CLASSES, SIZE_CLASS_WEIGHTS):
-        cumulative += w
-        if r < cumulative:
-            return sc
-    return SIZE_CLASSES[-1]
 
 
 # Fragment format within inner payload (Type=FRAGMENT):

@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import heapq
 import ipaddress
 import logging
 import struct
@@ -29,9 +28,6 @@ import dns.rdtypes.IN.A
 from dsm.net.transport._fwmark import apply_so_mark
 
 log = logging.getLogger(__name__)
-
-# DNS record types
-A_RECORD = 1
 
 # Cache limits
 MAX_CACHE_ENTRIES = 2_000
@@ -73,6 +69,19 @@ class _DnsResult:
     authoritative: bool
 
 
+def redact(hostname: str, debug: bool) -> str:
+    """Return ``hostname`` for logs, or an opaque sha256 pseudonym otherwise.
+
+    When ``debug`` is False (the default) qnames are replaced with a
+    truncated sha256 so an operator tailing journald cannot reconstruct the
+    user's browsing history from pinning/fallthrough error logs.
+    """
+    if debug:
+        return hostname
+    digest = hashlib.sha256(hostname.encode("utf-8", "replace")).hexdigest()[:16]
+    return f"qname-sha256={digest}"
+
+
 class DNSResolver:
     """Async DNS resolver with DoH/DoT and local cache.
 
@@ -108,8 +117,6 @@ class DNSResolver:
         self._providers = list(providers)
         self._hosts_file = Path(hosts_file)
         self._cache: dict[str, _CacheEntry] = {}
-        # Min-heap of (expires, hostname) for O(log n) eviction.
-        self._cache_heap: list[tuple[float, str]] = []
         self._static_hosts: dict[str, str] = {}
         self._load_hosts_file()
 
@@ -243,11 +250,7 @@ class DNSResolver:
                 # top-level dependency cycle with dns_pinning.
                 from dsm.net.dns_pinning import PinMismatchError
 
-                redacted = (
-                    hostname
-                    if self._debug_dns
-                    else f"qname-sha256={hashlib.sha256(hostname.encode('utf-8', 'replace')).hexdigest()[:16]}"  # noqa: E501  # single sha256(...).hexdigest()[:16] expr; splitting needs a temp var (logic change)
-                )
+                redacted = redact(hostname, self._debug_dns)
                 if isinstance(e, PinMismatchError):
                     log.warning(
                         "DNS provider %s SPKI pin MISMATCH for %s — possible MITM; "
@@ -264,11 +267,7 @@ class DNSResolver:
                     )
                 continue
 
-        redacted = (
-            hostname
-            if self._debug_dns
-            else f"qname-sha256={hashlib.sha256(hostname.encode('utf-8', 'replace')).hexdigest()[:16]}"  # noqa: E501  # single sha256(...).hexdigest()[:16] expr; splitting needs a temp var (logic change)
-        )
+        redacted = redact(hostname, self._debug_dns)
         log.error("all DNS providers failed for %s", redacted)
         # Transport failure across every provider — non-authoritative so the
         # proxy returns SERVFAIL, not NXDOMAIN.
@@ -349,7 +348,7 @@ class DNSResolver:
         if parsed.query:
             path = f"{path}?{parsed.query}"
 
-        query = _build_dns_query(hostname, A_RECORD)
+        query = _build_dns_query(hostname)
 
         async def _doh_send_recv(
             reader: asyncio.StreamReader,
@@ -386,12 +385,7 @@ class DNSResolver:
             _doh_send_recv,
             reverify_pin=True,
         )
-        result = _parse_dns_response(body)
-        if result.authoritative:
-            # Cache positive (addresses) and negative (NXDOMAIN/NODATA,
-            # empty list) authoritative answers alike, per RFC 2308.
-            self._cache_result(hostname, result.addresses, result.ttl, result.rcode)
-        return result
+        return self._parse_and_cache(hostname, body)
 
     async def _resolve_dot(self, provider: str, hostname: str) -> _DnsResult:
         """DNS-over-TLS query with SPKI pin checked before the qname is
@@ -408,7 +402,7 @@ class DNSResolver:
         if not host or not port:
             raise ValueError(f"invalid DoT provider format: {provider!r}")
 
-        query = _build_dns_query(hostname, A_RECORD)
+        query = _build_dns_query(hostname)
         # DoT uses TCP with 2-byte length prefix
         framed = struct.pack("!H", len(query)) + query
 
@@ -435,10 +429,18 @@ class DNSResolver:
             DOT_TIMEOUT,
             _dot_send_recv,
         )
-        result = _parse_dns_response(resp_data)
+        return self._parse_and_cache(hostname, resp_data)
+
+    def _parse_and_cache(self, hostname: str, wire: bytes) -> _DnsResult:
+        """Parse an upstream response; cache authoritative answers (RFC 2308).
+
+        Positive (addresses) and negative (NXDOMAIN/NODATA, empty list)
+        authoritative answers are cached alike; a non-authoritative result
+        (transport failure / retryable rcode) is returned uncached so the
+        caller keeps trying other providers.
+        """
+        result = _parse_dns_response(wire)
         if result.authoritative:
-            # Cache positive (addresses) and negative (NXDOMAIN/NODATA,
-            # empty list) authoritative answers alike, per RFC 2308.
             self._cache_result(hostname, result.addresses, result.ttl, result.rcode)
         return result
 
@@ -453,63 +455,31 @@ class DNSResolver:
 
         An empty ``addresses`` list with an authoritative ``rcode``
         (NXDOMAIN or NOERROR/NODATA) is a negative-cache entry per RFC 2308.
+
+        Expiry is lazy: reads (:meth:`resolve_detailed`) already treat an
+        expired entry as a miss, so stale entries need not be swept eagerly.
+        Only when the cache reaches ``MAX_CACHE_ENTRIES`` do we drop expired
+        entries and, if still full, evict the soonest-to-expire one — an O(n)
+        pass that is fine at the 2000-entry cap.
         """
         now = time.monotonic()
 
-        # Phase 1.10: opportunistically drop expired heap heads on every cache
-        # write so the heap can't grow unboundedly when the live cache stays
-        # below MAX_CACHE_ENTRIES (a server resolving <2000 distinct names
-        # never entered the eviction loop, leaking a heap entry per
-        # re-resolution).
-        while self._cache_heap and self._cache_heap[0][0] < now:
-            exp, key = heapq.heappop(self._cache_heap)
-            entry = self._cache.get(key)
-            if entry is not None and entry.expires <= now and entry.expires == exp:
+        if len(self._cache) >= MAX_CACHE_ENTRIES:
+            for key in [k for k, e in self._cache.items() if e.expires <= now]:
                 del self._cache[key]
-
-        # Re-caching the same (still-live) hostname leaves the old (expiry,
-        # key) tuple orphaned in the heap until it expires. Under a small,
-        # frequently-refreshed working set that never trips the eviction loop,
-        # those orphans accumulate. When the heap grows past 2x the live cache
-        # the head-reaping above can't catch up, so rebuild the heap from the
-        # live cache's current expiries (drops every orphan in one O(n) pass).
-        if len(self._cache_heap) > 2 * len(self._cache):
-            self._cache_heap = [(e.expires, k) for k, e in self._cache.items()]
-            heapq.heapify(self._cache_heap)
-
-        # Evict expired or soonest-expiring entries via min-heap (O(log n)).
-        while len(self._cache) >= MAX_CACHE_ENTRIES and self._cache_heap:
-            exp, key = heapq.heappop(self._cache_heap)
-            entry = self._cache.get(key)
-            # Only delete if this heap entry matches the current cache entry
-            # (avoids deleting a newer entry for the same hostname).
-            if entry is not None and entry.expires == exp:
-                del self._cache[key]
-                break
+            if len(self._cache) >= MAX_CACHE_ENTRIES:
+                victim = min(self._cache, key=lambda k: self._cache[k].expires)
+                del self._cache[victim]
 
         clamped_ttl = max(MIN_TTL, min(MAX_TTL, ttl))
-        expires = now + clamped_ttl
         self._cache[hostname] = _CacheEntry(
             addresses=addresses,
-            expires=expires,
+            expires=now + clamped_ttl,
             rcode=rcode,
         )
-        heapq.heappush(self._cache_heap, (expires, hostname))
-
-    def flush_cache(self) -> None:
-        """Flush the entire DNS cache."""
-        self._cache.clear()
-        self._cache_heap.clear()
-
-    async def close(self) -> None:
-        """No-op kept for API compatibility. The manual TLS+HTTP/1.1
-        path opens a fresh connection per query (Connection: close), so
-        there is no pool to drain. Server cleanup callers still invoke
-        this for symmetry with the prior httpx-based shape."""
-        return
 
 
-def _build_dns_query(hostname: str, qtype: int) -> bytes:
+def _build_dns_query(hostname: str) -> bytes:
     """Build a DNS query padded per RFC 7830 / RFC 8467.
 
     The query carries an EDNS(0) OPT record with a Padding option sized so
@@ -519,7 +489,7 @@ def _build_dns_query(hostname: str, qtype: int) -> bytes:
     """
     msg = dns.message.make_query(
         hostname,
-        dns.rdatatype.RdataType(qtype),
+        dns.rdatatype.A,
         use_edns=0,
         pad=EDNS_PADDING_BLOCK,
     )

@@ -83,37 +83,12 @@ async def run_client(
         failed connection is a nonzero exit (so ``Restart=on-failure`` fires
         and the kill switch is not left masking a silent outage).
     """
+    # Imported here (not module-level) and reused later in this function
+    # (the per-session ReplayWindow construction).
     import tuncore
+    from dsm.core.hardening import harden_and_gate
 
-    try:
-        tuncore.harden_process()
-    except Exception as e:  # noqa: BLE001  # see linter report
-        log.warning(
-            "process hardening partially failed: %s — continuing without it. "
-            "Ensure the service has CAP_SYS_RESOURCE and unrestricted prctl.",
-            e,
-        )
-
-    # Independent ctypes backstop for the most security-critical bit, in
-    # case harden_process() above failed partway: a crash must not dump
-    # key material to a core file.
-    from dsm.core.hardening import ProcessHardeningError, set_process_nondumpable
-
-    try:
-        set_process_nondumpable()
-    except ProcessHardeningError as e:
-        log.warning("core-dump backstop (PR_SET_DUMPABLE) failed: %s", e)
-
-    from dsm.crypto.attest_gate import (
-        MalformedAttestBuildError,
-        SoftAttestNotAllowedError,
-        enforce_attest_backend_policy,
-    )
-
-    try:
-        enforce_attest_backend_policy(config)
-    except (SoftAttestNotAllowedError, MalformedAttestBuildError) as e:
-        log.error("%s", e)
+    if not harden_and_gate(config):
         return 1
 
     fsm = SessionFSM()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ipaddress
+import logging
 import os
 import tomllib
 from dataclasses import dataclass, field
@@ -13,6 +14,8 @@ from dsm.core.path_security import (
     InsecureFilePermissionsError,
     check_user_file_permissions,
 )
+
+log = logging.getLogger(__name__)
 
 CONFIG_PATH = Path("/opt/mtun/config.toml")
 
@@ -283,9 +286,7 @@ def _validate_transport(c: Config) -> None:
 
 def _validate_dns(c: Config) -> None:
     if c.debug_dns:
-        import logging
-
-        logging.getLogger(__name__).warning(
+        log.warning(
             "debug_dns is ENABLED: plaintext DNS query names will be written "
             "to logs, defeating DNS-metadata privacy. Use ONLY for local "
             "debugging and disable it in production."
@@ -303,9 +304,7 @@ def _validate_dns(c: Config) -> None:
     # test fixtures and operator configs that pass non-URL placeholders.
     for provider in c.dns_providers:
         if not (provider.startswith("https://") or provider.startswith("tls://")):
-            import logging
-
-            logging.getLogger(__name__).warning(
+            log.warning(
                 "dns_provider %r has no 'https://' (DoH) or 'tls://' (DoT) "
                 "scheme; it will be silently skipped at query time. Fix the "
                 "config to include the scheme so this provider is actually used.",
@@ -516,9 +515,7 @@ def _validate_mtu(c: Config) -> None:
     # values above ~1400 risk silent kernel fragmentation or PMTU drops
     # on PPPoE / VPN-in-VPN paths where the link MTU is below 1500.
     if c.mtu > 1400:
-        import logging
-
-        logging.getLogger(__name__).warning(
+        log.warning(
             "configured tun mtu=%d is above the safe default 1400; "
             "wire packets will be ~%d B which may exceed link MTU on "
             "PPPoE/tunnel-in-tunnel paths. Lower to 1380 if ping works "
@@ -545,9 +542,7 @@ def _validate_auto_mtu(c: Config) -> None:
     # None otherwise. auto_mtu without pmtu_discover is silently inert, so warn
     # loudly rather than let an operator believe the path is adapting.
     if c.auto_mtu and not c.pmtu_discover:
-        import logging
-
-        logging.getLogger(__name__).warning(
+        log.warning(
             "auto_mtu=true has no effect unless pmtu_discover=true is also set "
             "(kernel PMTU is unavailable without it); the TUN MTU will not "
             "adapt. Set pmtu_discover=true to enable PMTU adaptation."

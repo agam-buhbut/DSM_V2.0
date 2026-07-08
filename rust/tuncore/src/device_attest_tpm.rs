@@ -311,12 +311,11 @@ impl TpmAttestKey {
         // size error surfaces as a typed crate error before touching the TPM.
         // `Auth::try_from` cannot fail for 32 bytes (well under `Auth::MAX_SIZE`),
         // but we map it rather than unwrap to honor the no-`unwrap` rule.
-        let auth = match &self.auth {
-            Some(a) => Some(
-                Auth::try_from(a.as_slice()).map_err(|e| format!("wrap TPM auth value: {e}"))?,
-            ),
-            None => None,
-        };
+        let auth = self
+            .auth
+            .as_ref()
+            .map(|a| Auth::try_from(a.as_slice()).map_err(|e| format!("wrap TPM auth value: {e}")))
+            .transpose()?;
         let signature = ctx
             .execute_with_nullauth_session(|ctx| -> Result<Signature, TpmOpError> {
                 // Re-derive the SAME deterministic Owner storage parent. An

@@ -1,5 +1,5 @@
 """Phase 1.10: DNS robustness — IP-literal providers, NXDOMAIN distinction,
-bounded cache heap, TTL clamp.
+TTL clamp.
 """
 
 from __future__ import annotations
@@ -185,46 +185,6 @@ class NxdomainFanOutAndCache(unittest.IsolatedAsyncioTestCase):
         r = self._resolver(wire)
         addresses = await r.resolve("ok.example")
         self.assertEqual(addresses, ["1.2.3.4"])
-
-
-class CacheHeapBound(unittest.TestCase):
-    def test_heap_does_not_grow_unboundedly_under_2000_names(self) -> None:
-        r = DNSResolver(
-            providers=["https://1.1.1.1/dns-query"],
-            provider_pins={"https://1.1.1.1/dns-query": ["a" * 64]},
-            hosts_file="/nonexistent",
-        )
-        # Re-resolve the SAME small set of names many times so each re-cache
-        # pushes a heap entry. The heap must self-compact.
-        for i in range(500):
-            r._cache_result(f"h{i % 5}.example", ["1.2.3.4"], ttl=1)
-        # The heap must never exceed ~2x the live cache (live cache is 5).
-        self.assertLessEqual(len(r._cache_heap), 2 * len(r._cache) + 10)
-
-    def test_expired_heads_are_reaped(self) -> None:
-        r = DNSResolver(
-            providers=["https://1.1.1.1/dns-query"],
-            provider_pins={"https://1.1.1.1/dns-query": ["a" * 64]},
-            hosts_file="/nonexistent",
-        )
-        # Insert a heap head whose expiry is already in the past, then trigger
-        # a normal cache write which must opportunistically reap it.
-        import heapq
-        import time as _time
-
-        from dsm.net.dns import _CacheEntry
-
-        past = _time.monotonic() - 1.0
-        r._cache["stale.example"] = _CacheEntry(
-            addresses=["9.9.9.9"], expires=past, rcode=0
-        )
-        heapq.heappush(r._cache_heap, (past, "stale.example"))
-        self.assertEqual(len(r._cache_heap), 1)
-
-        r._cache_result("fresh.example", ["1.2.3.4"], ttl=60)
-        # The stale head was reaped; only the fresh entry remains.
-        self.assertNotIn("stale.example", r._cache)
-        self.assertEqual(len(r._cache_heap), 1)
 
 
 class TtlClamp(unittest.TestCase):

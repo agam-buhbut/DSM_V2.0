@@ -29,3 +29,14 @@ DSM_TUN_NAME_RE: re.Pattern[str] = re.compile(r"^[a-zA-Z0-9_-]{1,15}$")
 # also already permitted by the strict pattern; included here to keep
 # the character class explicit when the historical regex was written).
 LINUX_IFACE_NAME_RE: re.Pattern[str] = re.compile(r"^[a-zA-Z0-9_.\-]{1,15}$")
+
+
+def validate_tun_name(name: str) -> None:
+    """Raise ``ValueError`` if ``name`` is not a valid dsm-issued TUN name.
+
+    Enforces :data:`DSM_TUN_NAME_RE` at every site that interpolates the
+    TUN name into an nftables/sysctl command, so an attacker-controlled
+    name cannot escape the interpolation.
+    """
+    if not DSM_TUN_NAME_RE.match(name):
+        raise ValueError(f"invalid tun_name: {name!r}")

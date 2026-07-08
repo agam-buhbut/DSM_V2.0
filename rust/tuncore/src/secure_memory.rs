@@ -2,6 +2,7 @@ use libc::{mlock, munlock, rlimit, setrlimit, RLIMIT_CORE};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex};
+use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroizing;
 
 /// Check a libc return code, mapping non-zero to a descriptive error.
@@ -20,11 +21,14 @@ fn syscall_check(ret: i32, name: &str) -> Result<(), String> {
 ///
 /// WARNING: bypasses [`PAGE_REFCOUNTS`]. `munlock_slice` on a region
 /// sharing a page with a live [`LockedKey32`] would re-enable swap for
-/// that key. Currently has no production callers — new key material must
-/// use `LockedKey32` (or route through `lock_key_pages`) instead.
+/// that key. No production callers — new key material must use
+/// `LockedKey32` (or route through `lock_key_pages`) instead; this
+/// syscall-wrapper survives only for its own unit test, so it is gated
+/// out of non-test builds.
 ///
 /// # Safety
 /// The slice must remain valid for the duration of the lock.
+#[cfg(test)]
 pub fn mlock_slice(data: &[u8]) -> Result<(), String> {
     if data.is_empty() {
         return Ok(());
@@ -35,7 +39,8 @@ pub fn mlock_slice(data: &[u8]) -> Result<(), String> {
     )
 }
 
-/// Unlock a previously locked byte slice.
+/// Unlock a previously locked byte slice. Test-only (see [`mlock_slice`]).
+#[cfg(test)]
 pub fn munlock_slice(data: &[u8]) -> Result<(), String> {
     if data.is_empty() {
         return Ok(());
@@ -76,11 +81,22 @@ pub fn harden_process() -> Result<(), String> {
     Ok(())
 }
 
-/// Securely zero a mutable byte slice.
-/// Uses the zeroize crate which guarantees the write is not optimized away.
-pub fn secure_zero(data: &mut [u8]) {
-    use zeroize::Zeroize;
-    data.zeroize();
+/// Derive the X25519 public key for a static secret pinned in mlock'd memory.
+///
+/// Shared by every site that turns a [`LockedKey32`] scalar into its public
+/// key (identity keypair, Noise Dh, session-key rotation, bootstrap ephemeral).
+///
+/// **Unavoidable stack copy.** `x25519_dalek::StaticSecret::from` consumes
+/// `[u8; 32]` by value (no `&[u8; 32]` constructor is exposed in x25519-dalek
+/// 2.x), so `*secret.as_array()` materializes a transient stack copy of the
+/// scalar. Both intermediate copies are scrubbed: the `*secret.as_array()`
+/// rvalue is wrapped in `Zeroizing` (M-CRYPT-3) so it is wiped at end of scope,
+/// and `StaticSecret` impls `ZeroizeOnDrop` so its own internal copy is wiped
+/// when it drops below. The public key is not secret and is returned by value.
+pub fn public_from_locked(secret: &LockedKey32) -> [u8; 32] {
+    let scalar = Zeroizing::new(*secret.as_array());
+    let static_secret = StaticSecret::from(*scalar);
+    *PublicKey::from(&static_secret).as_bytes()
 }
 
 /// Process-global page → live-key refcount. `mlock`/`munlock` are
@@ -298,13 +314,6 @@ mod tests {
         let data: Vec<u8> = vec![];
         assert!(mlock_slice(&data).is_ok());
         assert!(munlock_slice(&data).is_ok());
-    }
-
-    #[test]
-    fn test_secure_zero() {
-        let mut data = vec![0xFF; 32];
-        secure_zero(&mut data);
-        assert!(data.iter().all(|&b| b == 0));
     }
 
     #[test]

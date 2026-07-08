@@ -45,13 +45,6 @@ impl AesKey {
         Self { cipher, _key: key }
     }
 
-    /// Convenience constructor: accepts a 32-byte array by value. Incurs
-    /// a transient stack copy of the key before it reaches the heap — use
-    /// `from_locked` to avoid that where possible.
-    pub fn from_array(key_bytes: [u8; 32]) -> Result<Self, String> {
-        Ok(Self::from_locked(LockedKey32::from_array(key_bytes)?))
-    }
-
     /// Encrypt plaintext with the given 96-bit nonce and additional authenticated data.
     /// Returns ciphertext || 16-byte GCM tag.
     pub fn encrypt(

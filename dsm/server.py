@@ -316,7 +316,6 @@ async def _run_one_session(
         )
         await dns_proxy.start()
         session_stack.callback(dns_proxy.stop)  # sync
-        session_stack.push_async_callback(resolver.close)  # async (httpx.aclose)
 
         # Fresh per-session protocol state. A re-accepted client gets a clean
         # SequenceCounter / ReplayWindow / epoch — never reuse the previous
@@ -510,7 +509,7 @@ async def _run_one_session(
             post_authenticate=_post_authenticate,
             shutdown_log="server shutting down",
         )
-        # session_stack unwinds here (resolver → dns_proxy → masquerade →
+        # session_stack unwinds here (dns_proxy → masquerade →
         # ip_forward → tun, plus the bridge cancel and TCP transport close).
 
 
@@ -527,37 +526,9 @@ async def run_server(
         ``main()`` ``sys.exit``s this so a misconfigured server is a nonzero
         exit and ``Restart=on-failure`` behaves correctly.
     """
-    import tuncore
+    from dsm.core.hardening import harden_and_gate
 
-    try:
-        tuncore.harden_process()
-    except Exception as e:  # noqa: BLE001  # see linter report
-        log.warning(
-            "process hardening partially failed: %s — continuing without it. "
-            "Ensure the service has CAP_SYS_RESOURCE and unrestricted prctl.",
-            e,
-        )
-
-    # Independent ctypes backstop for the most security-critical bit, in
-    # case harden_process() above failed partway: a crash must not dump
-    # key material to a core file.
-    from dsm.core.hardening import ProcessHardeningError, set_process_nondumpable
-
-    try:
-        set_process_nondumpable()
-    except ProcessHardeningError as e:
-        log.warning("core-dump backstop (PR_SET_DUMPABLE) failed: %s", e)
-
-    from dsm.crypto.attest_gate import (
-        MalformedAttestBuildError,
-        SoftAttestNotAllowedError,
-        enforce_attest_backend_policy,
-    )
-
-    try:
-        enforce_attest_backend_policy(config)
-    except (SoftAttestNotAllowedError, MalformedAttestBuildError) as e:
-        log.error("%s", e)
+    if not harden_and_gate(config):
         return 1
 
     fsm = SessionFSM()

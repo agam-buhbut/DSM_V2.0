@@ -86,6 +86,8 @@ impl NonceGenerator {
     }
 
     /// Return the current counter value (number of nonces generated).
+    /// Test-only accessor (no production or FFI caller).
+    #[cfg(test)]
     #[must_use]
     pub fn count(&self) -> u32 {
         self.counter.load(Ordering::SeqCst).saturating_sub(1)

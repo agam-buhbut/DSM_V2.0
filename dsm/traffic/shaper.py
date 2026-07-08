@@ -54,6 +54,7 @@ documented "sustained volume is visible" residual.
 from __future__ import annotations
 
 import os
+import secrets
 import time
 from collections.abc import Callable
 
@@ -128,12 +129,9 @@ class TrafficShaper:
         )
         if not self._active_classes:
             # Phase 1.11: padding_min may exceed the largest SIZE_CLASS (1400)
-            # while still passing Config's <=1500 range check. Clamp to the
-            # largest available class rather than crashing on an empty
-            # generator.
-            largest = SIZE_CLASSES[-1]
-            candidates = [sc for sc in SIZE_CLASSES if sc >= padding_min]
-            self._active_classes = (candidates[0],) if candidates else (largest,)
+            # while still passing Config's <=1500 range check. Clamp to a
+            # usable class rather than crashing on an empty generator.
+            self._active_classes = self._fallback_classes(padding_min)
         # H-ANON: BOTH real and chaff packets size from this FIXED published
         # prior (no live real-traffic EMA — see module docstring). Precomputed
         # once so each draw is allocation-free (a single cumulative scan in
@@ -168,6 +166,15 @@ class TrafficShaper:
         # never dumps the queue (that would re-expose burst onset).
         self._deadline_pending = False
 
+    @staticmethod
+    def _fallback_classes(padding_min: int) -> tuple[int, ...]:
+        """One usable size class when the configured range excludes every
+        SIZE_CLASS: the smallest class >= ``padding_min`` (padding_min can
+        exceed 1400 while still passing Config's <=1500 check), else the
+        largest class. Never returns empty."""
+        candidates = [sc for sc in SIZE_CLASSES if sc >= padding_min]
+        return (candidates[0],) if candidates else (SIZE_CLASSES[-1],)
+
     def set_size_class_ceiling(self, max_outer: int) -> None:
         """Phase 1.7: cap the size classes the shaper pads to at ``max_outer``
         (the DSM outer-packet size budget = path_mtu - IP - UDP).
@@ -182,13 +189,9 @@ class TrafficShaper:
         ceiling = min(max_outer, self._padding_max)
         kept = tuple(sc for sc in SIZE_CLASSES if self._padding_min <= sc <= ceiling)
         if not kept:
-            # Below the smallest configured class — keep one usable class.
-            # Mirror __init__'s guard: prefer the smallest class >= padding_min,
-            # else the largest available (padding_min may exceed every class —
-            # 1450 still passes Config's <=1500 check — so the generator can be
-            # empty; never crash on min() of an empty iterable).
-            candidates = [sc for sc in SIZE_CLASSES if sc >= self._padding_min]
-            kept = (candidates[0],) if candidates else (SIZE_CLASSES[-1],)
+            # Below the smallest configured class — keep one usable class
+            # (mirror __init__'s guard).
+            kept = self._fallback_classes(self._padding_min)
         self._active_classes = kept
         # Rebuild the fixed size prior over the narrowed active set so neither
         # real nor chaff sizing ever samples a class the shaper can no longer
@@ -503,9 +506,7 @@ class TrafficShaper:
         # M-ANON-8: pick inner_length uniformly in [0, max_payload] so the
         # chaff's inner_length field matches real DATA's variable length; the
         # inner-padding path fills the rest of the slot to the wire class.
-        import secrets as _secrets
-
-        payload_len = _secrets.randbelow(max_payload + 1) if max_payload > 0 else 0
+        payload_len = secrets.randbelow(max_payload + 1) if max_payload > 0 else 0
         return InnerPacket(
             ptype=PacketType.CHAFF,
             epoch_id=epoch_id,

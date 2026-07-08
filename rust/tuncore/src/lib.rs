@@ -122,16 +122,6 @@ impl PyIdentityKeyPair {
         Ok(Self { inner })
     }
 
-    /// Compute HMAC-SHA256 over `data` using a key derived from this identity's
-    /// secret key. The derived key never crosses the FFI boundary — Python
-    /// receives only the 32-byte tag. `context` is HKDF info (domain separator).
-    fn compute_hmac(&self, context: &[u8], data: &[u8]) -> PyResult<Vec<u8>> {
-        self.inner
-            .compute_hmac(context, data)
-            .map(|tag| tag.to_vec())
-            .map_err(py_err)
-    }
-
     /// Zeroize the secret key in place. After this call, the keypair is unusable.
     /// Safe to call multiple times.
     fn zeroize(&mut self) {
@@ -154,10 +144,6 @@ impl PyReplayWindow {
         }
     }
 
-    fn check_and_update(&mut self, seq: u64) -> bool {
-        self.inner.check_and_update(seq)
-    }
-
     /// Read-only check: returns true if seq would be accepted.
     fn check(&self, seq: u64) -> bool {
         self.inner.check(seq)
@@ -166,11 +152,6 @@ impl PyReplayWindow {
     /// Mark seq as seen. Call only after successful authentication.
     fn update(&mut self, seq: u64) {
         self.inner.update(seq);
-    }
-
-    #[getter]
-    fn max_seq(&self) -> u64 {
-        self.inner.max_seq()
     }
 }
 
@@ -507,24 +488,6 @@ impl PySessionKeyManager {
         self.pending_rotation.take().is_some()
     }
 
-    /// Complete rotation as the responder. Returns (our_ephemeral_pub, new_epoch).
-    ///
-    /// Single-shot: applies rotation immediately. Network users should prefer
-    /// `prepare_rotation_responder` + `apply_rotation_responder` so the
-    /// REKEY_ACK can be sent with the old keys.
-    fn complete_rotation_responder(
-        &mut self,
-        remote_ephemeral_pub: &[u8],
-        new_epoch: u32,
-    ) -> PyResult<(Vec<u8>, u32)> {
-        let pub_bytes = pub_key_from_slice(remote_ephemeral_pub)?;
-        let (our_pub, complete) = self
-            .inner
-            .complete_rotation_responder(&pub_bytes, new_epoch)
-            .map_err(py_err)?;
-        Ok((our_pub.to_vec(), complete.new_epoch))
-    }
-
     /// First phase of two-phase responder rotation. Derives the new keys
     /// and our ephemeral public key WITHOUT mutating session state; stores
     /// the derived keys internally. Caller sends REKEY_ACK with the still
@@ -673,12 +636,6 @@ impl PyAttestKey {
     }
 }
 
-/// Disable core dumps (call once at startup).
-#[pyfunction]
-fn disable_core_dumps() -> PyResult<()> {
-    secure_memory::disable_core_dumps().map_err(py_err)
-}
-
 /// Harden the process: no core dumps, non-dumpable, no-new-privs.
 #[pyfunction]
 fn harden_process() -> PyResult<()> {
@@ -713,18 +670,12 @@ impl PyBootstrapEphemeral {
     /// reachable from Python.
     #[staticmethod]
     fn generate() -> PyResult<Self> {
-        use x25519_dalek::{PublicKey, StaticSecret};
-        use zeroize::Zeroizing;
         let secret = session_keys::gen_ephemeral_secret().map_err(py_err)?;
-        // M-CRYPT-3 (lib.rs): wrap the stack copy of the ephemeral
-        // scalar in Zeroizing so the unnamed `*secret.as_array()`
-        // rvalue is scrubbed when the function returns. Without this,
-        // the bootstrap ephemeral scalar — the source of forward
-        // secrecy for the entire upcoming session — lingers on this
-        // stack frame until later activity overwrites it.
-        let scalar = Zeroizing::new(*secret.as_array());
-        let static_secret = StaticSecret::from(*scalar);
-        let pub_bytes = *PublicKey::from(&static_secret).as_bytes();
+        // public_from_locked wraps the transient `*secret.as_array()` rvalue in
+        // Zeroizing (M-CRYPT-3) so the bootstrap ephemeral scalar — the source
+        // of forward secrecy for the whole session — is scrubbed off this stack
+        // frame once the public key is derived.
+        let pub_bytes = secure_memory::public_from_locked(&secret);
         Ok(Self {
             secret: Some(secret),
             pub_bytes,
@@ -793,7 +744,6 @@ fn tuncore(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PySessionKeyManager>()?;
     m.add_class::<PyAttestKey>()?;
     m.add_class::<PyBootstrapEphemeral>()?;
-    m.add_function(wrap_pyfunction!(disable_core_dumps, m)?)?;
     m.add_function(wrap_pyfunction!(harden_process, m)?)?;
     m.add_function(wrap_pyfunction!(complete_bootstrap, m)?)?;
     m.add(

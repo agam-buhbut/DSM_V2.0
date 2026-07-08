@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import NoReturn
 
 from dsm.core.config import ConfigError
 from dsm.core.config import load as config_load
@@ -35,7 +36,7 @@ _STATE_NAME = ".dsm-init-state.json"
 _STATE_SCHEMA = 1
 
 
-def _fail(msg: str) -> None:
+def _fail(msg: str) -> NoReturn:
     print(f"dsm init: {msg}", file=sys.stderr)
     sys.exit(2)
 
@@ -105,7 +106,6 @@ def _validate_ip_literal(ip: str) -> None:
         addr = ipaddress.ip_address(ip)
     except ValueError:
         _fail(f"server-ip must be a literal IPv4 address, got {ip!r}")
-        return
     if addr.version == 6:
         _fail(f"IPv6 server-ip {ip!r} is not supported (use an IPv4 endpoint)")
 
@@ -216,7 +216,6 @@ def _ensure_secret_dir(install_dir: Path) -> None:
             st = install_dir.stat()
         except OSError as e:
             _fail(f"cannot stat install dir {install_dir}: {e}")
-            return  # unreachable; _fail exits
         if st.st_uid != os.geteuid():
             _fail(
                 f"install dir {install_dir} is owned by uid {st.st_uid}, not "
@@ -296,7 +295,6 @@ def _phase_a(role: str, args: argparse.Namespace) -> int:
         # (it would otherwise enroll an unprotected empty-auth TPM key). Surface
         # it cleanly, mirroring the `dsm enroll` handler — no traceback, exit 2.
         _fail(str(e))
-        return 2  # unreachable; _fail exits
     try:
         try:
             result = generate_enrollment(
@@ -310,7 +308,6 @@ def _phase_a(role: str, args: argparse.Namespace) -> int:
             # generate_enrollment refuses to clobber existing keys; surface its
             # actionable "remove the file by hand" message rather than a trace.
             _fail(str(e))
-            return 2  # unreachable; _fail exits
     finally:
         wipe_passphrase(passphrase)
 

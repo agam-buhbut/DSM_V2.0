@@ -51,6 +51,23 @@ def parse_symlink_backup(data: bytes) -> str | None:
     return None
 
 
+def atomic_symlink_restore(target: str) -> None:
+    """Replace RESOLV_CONF with a symlink to ``target`` atomically.
+
+    Writes the symlink at a sibling temp path then renames it over
+    RESOLV_CONF — rename(2) replaces files/symlinks in one syscall, so the
+    path is never absent (no ENOENT window for co-running libc resolvers).
+    """
+    tmp = RESOLV_CONF.with_suffix(RESOLV_CONF.suffix + ".dsm-restore")
+    # If a stale temp exists from a previous crash, unlink it.
+    try:
+        tmp.unlink()
+    except FileNotFoundError:
+        pass
+    os.symlink(target, tmp)
+    os.rename(tmp, RESOLV_CONF)
+
+
 class ResolvConfManager:
     """Own /etc/resolv.conf for the lifetime of the VPN session."""
 
@@ -72,29 +89,15 @@ class ResolvConfManager:
     @staticmethod
     def _save_backup(contents: bytes) -> None:
         # Only write the backup once — never overwrite a good backup with a
-        # later (possibly dsm-managed) capture.
+        # later (possibly dsm-managed) capture. ``contents`` is either the
+        # original file bytes or a _SYMLINK_SENTINEL line recording the link
+        # target (so restore can recreate a symlink original).
         if RESOLV_BACKUP.exists():
             return
         try:
             atomic_write(RESOLV_BACKUP, contents, mode=0o600, mkdir=True)
         except OSError as e:
             log.warning("could not persist resolv.conf backup: %s", e)
-
-    @staticmethod
-    def _save_backup_symlink(target: str) -> None:
-        # Durably record that the original was a symlink pointing at ``target``
-        # so restore can recreate it. Write-once, like _save_backup.
-        if RESOLV_BACKUP.exists():
-            return
-        try:
-            atomic_write(
-                RESOLV_BACKUP,
-                _SYMLINK_SENTINEL + target.encode() + b"\n",
-                mode=0o600,
-                mkdir=True,
-            )
-        except OSError as e:
-            log.warning("could not persist resolv.conf symlink backup: %s", e)
 
     def _recover_from_backup(self) -> None:
         """Load the persistent backup into the right in-memory field.
@@ -111,36 +114,12 @@ class ResolvConfManager:
         else:
             self._original_contents = data
 
-    def apply(self) -> None:
-        """Replace resolv.conf with a single-nameserver file.
+    @staticmethod
+    def _warn_conflicting_dns_service() -> None:
+        """One-shot M-NET-1 warning if a known DNS-managing service is running.
 
-        Captures the prior state (symlink target or file contents) so
-        teardown can restore exactly what was there. The swap itself
-        goes through ``atomic_write`` — a sibling tempfile gets the new
-        contents, then ``os.rename`` replaces the destination atomically.
-        rename(2) overwrites both regular files AND symlinks in a single
-        syscall, so there is no window where /etc/resolv.conf is absent
-        between capturing the original and the new file appearing.
-
-        M-NET-1 WARNING: on systems running NetworkManager or systemd-
-        resolved, our /etc/resolv.conf swap is fighting against another
-        component that ALSO claims the file. systemd-resolved keeps
-        listening on 127.0.0.53:53 (with libc resolvers reaching it via
-        nsswitch.conf even when /etc/resolv.conf says otherwise) and
-        NetworkManager rewrites /etc/resolv.conf on every DHCP renew
-        (typically every few hours on consumer networks), restoring its
-        own nameserver and locking the user out of DNS until dsm is
-        restarted. We log a one-shot warning at apply() so operators
-        can disable the conflicting service (`systemctl disable
-        systemd-resolved`, `nmcli connection modify ... ipv4.dns-priority
-        -1`) before deploying. The kill switch's port-53 block prevents
-        leaks either way — this warning is about usability, not security.
+        Detection is best-effort — we never fail startup on it.
         """
-        if self._applied:
-            return
-
-        # M-NET-1 detection: warn if a known DNS-managing service is
-        # running. Detection is best-effort — we don't fail startup.
         for path in ("/run/systemd/resolve/stub-resolv.conf", "/run/NetworkManager"):
             if Path(path).exists():
                 log.warning(
@@ -152,12 +131,22 @@ class ResolvConfManager:
                 )
                 break
 
+    def _capture_original(self) -> None:
+        """Capture the prior resolv.conf state (symlink target or file bytes).
+
+        Persists a durable write-once backup on the first apply over a genuine
+        file/symlink so a crash before remove() can still recover the true
+        original. If the file didn't exist, both fields stay None and teardown
+        unlinks our override instead of restoring anything.
+        """
         if RESOLV_CONF.is_symlink():
             try:
                 self._original_symlink_target = os.readlink(RESOLV_CONF)
                 # Persist the target durably: a crash before remove() must be
                 # able to recreate the symlink, not lose it (B2).
-                self._save_backup_symlink(self._original_symlink_target)
+                self._save_backup(
+                    _SYMLINK_SENTINEL + self._original_symlink_target.encode() + b"\n"
+                )
             except OSError:
                 # Race: symlink was replaced between is_symlink() and
                 # readlink. Fall through to the regular-file branch so
@@ -193,8 +182,37 @@ class ResolvConfManager:
                 # First apply over a genuine file: persist it so a later
                 # crash can still recover it.
                 self._save_backup(current)
-        # If the file simply didn't exist, both fields stay None and we
-        # remove our override on teardown instead of restoring anything.
+
+    def apply(self) -> None:
+        """Replace resolv.conf with a single-nameserver file.
+
+        Captures the prior state (symlink target or file contents) so
+        teardown can restore exactly what was there. The swap itself
+        goes through ``atomic_write`` — a sibling tempfile gets the new
+        contents, then ``os.rename`` replaces the destination atomically.
+        rename(2) overwrites both regular files AND symlinks in a single
+        syscall, so there is no window where /etc/resolv.conf is absent
+        between capturing the original and the new file appearing.
+
+        M-NET-1 WARNING: on systems running NetworkManager or systemd-
+        resolved, our /etc/resolv.conf swap is fighting against another
+        component that ALSO claims the file. systemd-resolved keeps
+        listening on 127.0.0.53:53 (with libc resolvers reaching it via
+        nsswitch.conf even when /etc/resolv.conf says otherwise) and
+        NetworkManager rewrites /etc/resolv.conf on every DHCP renew
+        (typically every few hours on consumer networks), restoring its
+        own nameserver and locking the user out of DNS until dsm is
+        restarted. We log a one-shot warning at apply() so operators
+        can disable the conflicting service (`systemctl disable
+        systemd-resolved`, `nmcli connection modify ... ipv4.dns-priority
+        -1`) before deploying. The kill switch's port-53 block prevents
+        leaks either way — this warning is about usability, not security.
+        """
+        if self._applied:
+            return
+
+        self._warn_conflicting_dns_service()
+        self._capture_original()
 
         payload = (
             f"# Managed by dsm while the VPN is up — original restored on teardown.\n"
@@ -233,17 +251,9 @@ class ResolvConfManager:
                 # backup (a crash-restart manager that found a dsm-managed file).
                 self._recover_from_backup()
             if self._original_symlink_target is not None:
-                # Symlink restore: create a sibling temp symlink, then
-                # rename it over RESOLV_CONF. rename(2) replaces
-                # files/symlinks atomically — never an ENOENT window.
-                tmp = RESOLV_CONF.with_suffix(RESOLV_CONF.suffix + ".dsm-restore")
-                # If a stale temp exists from a previous crash, unlink it.
-                try:
-                    tmp.unlink()
-                except FileNotFoundError:
-                    pass
-                os.symlink(self._original_symlink_target, tmp)
-                os.rename(tmp, RESOLV_CONF)
+                # Symlink restore: recreate the original symlink atomically
+                # (temp symlink -> rename) — never an ENOENT window.
+                atomic_symlink_restore(self._original_symlink_target)
                 restored = True
             elif self._original_contents is not None:
                 # atomic_write uses tmpfile → fchmod → fsync → rename;

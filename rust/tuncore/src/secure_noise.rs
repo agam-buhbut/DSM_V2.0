@@ -29,7 +29,7 @@ use snow::types::{Cipher, Dh, Hash, Random};
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::secure_memory::LockedKey32;
+use crate::secure_memory::{public_from_locked, LockedKey32};
 
 /// X25519 Diffie-Hellman with mlock'd, zeroize-on-drop private scalar.
 pub struct SecureDh25519 {
@@ -82,15 +82,10 @@ impl Default for SecureDh25519 {
 
 impl SecureDh25519 {
     fn derive_pubkey(&mut self) {
-        // M-CRYPT-3: wrap the unnamed `*self.secret.as_array()` rvalue
-        // copy in Zeroizing so the stack slot is scrubbed when this
-        // function returns, not just `s`'s internal scalar buffer.
-        // Without this wrap the dereference produces a [u8; 32] on the
-        // stack frame that StaticSecret moves from but does NOT
-        // zeroize.
-        let scalar = Zeroizing::new(*self.secret.as_array());
-        let s = StaticSecret::from(*scalar);
-        self.pubkey = *PublicKey::from(&s).as_bytes();
+        // public_from_locked wraps the transient `*self.secret.as_array()`
+        // rvalue copy in Zeroizing (M-CRYPT-3) so it is scrubbed off this stack
+        // frame after the public key derives.
+        self.pubkey = public_from_locked(&self.secret);
     }
 
     /// Mark this Dh instance as permanently unusable and wipe any

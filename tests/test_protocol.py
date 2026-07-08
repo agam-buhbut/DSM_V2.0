@@ -6,12 +6,10 @@ import unittest
 
 from dsm.core.protocol import (
     OUTER_HEADER_SIZE,
-    SIZE_CLASSES,
     Fragment,
     InnerPacket,
     OuterPacket,
     PacketType,
-    pick_random_size_class,
 )
 
 
@@ -131,13 +129,6 @@ class TestFragment(unittest.TestCase):
         raw = struct.pack("!HBB", 1, 5, 5) + b"data"
         with self.assertRaises(ValueError):
             Fragment.deserialize(raw)
-
-
-class TestSizeClasses(unittest.TestCase):
-    def test_random_size_class_in_range(self) -> None:
-        for _ in range(100):
-            sc = pick_random_size_class()
-            self.assertIn(sc, SIZE_CLASSES)
 
 
 if __name__ == "__main__":

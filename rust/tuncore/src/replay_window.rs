@@ -73,6 +73,11 @@ impl ReplayWindow {
     /// Check a sequence number and mark it as seen if valid.
     /// Returns true if the packet should be accepted.
     /// Returns false if replayed or too old.
+    ///
+    /// Test-only: production splits `check` (before AEAD) and `update` (after
+    /// authentication) so the window never advances on a forged packet; this
+    /// combined form has no production or FFI caller.
+    #[cfg(test)]
     pub fn check_and_update(&mut self, seq: u64) -> bool {
         if !self.check(seq) {
             return false;
@@ -81,6 +86,9 @@ impl ReplayWindow {
         true
     }
 
+    /// Highest accepted sequence number. Test-only accessor (no production or
+    /// FFI caller).
+    #[cfg(test)]
     #[must_use]
     pub fn max_seq(&self) -> u64 {
         self.max_seq

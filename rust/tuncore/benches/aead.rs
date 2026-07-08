@@ -12,6 +12,7 @@
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use tuncore::aes_gcm::AesKey;
+use tuncore::secure_memory::LockedKey32;
 
 /// Plaintext sizes (bytes) spanning the size-class range the shaper pads to:
 /// 128 = smallest class, 1400 = largest (MTU-sized) class.
@@ -21,7 +22,8 @@ fn make_key() -> AesKey {
     // Fixed all-ones key — value is irrelevant to AEAD timing; we only need a
     // valid 32-byte key so the round-key schedule (cached in `AesKey`) is built
     // once, exactly as on the real data path.
-    AesKey::from_array([0x11u8; 32]).expect("32-byte key is infallible")
+    let locked = LockedKey32::from_array([0x11u8; 32]).expect("32-byte key is infallible");
+    AesKey::from_locked(locked)
 }
 
 fn bench_encrypt(c: &mut Criterion) {

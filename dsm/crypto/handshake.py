@@ -109,6 +109,25 @@ def _pad_to_frame(data: bytes, expected_size: int) -> bytes:
     return bytes(data) + os.urandom(HANDSHAKE_FRAME_SIZE - expected_size)
 
 
+def _pin_source(
+    transport: UDPTransport | TCPTransport,
+    got: tuple[str, int] | None,
+    expected: tuple[str, int] | None,
+    what: str,
+) -> None:
+    """Reject a UDP frame whose source addr does not match the pinned peer.
+
+    AEAD already rejects forged *content*; this additionally drops a
+    UDP-spoofed frame from any other source before it can influence the
+    handshake. A no-op for TCP (connection-oriented) and when the peer
+    address is not yet pinned (``expected is None``, e.g. server pre-msg1).
+    """
+    if isinstance(transport, UDPTransport) and expected is not None and got != expected:
+        raise HandshakeError(
+            f"{what} from unexpected source {got}, expected {expected}"
+        )
+
+
 def _unpad_from_frame(blob: bytes, expected_size: int) -> bytes:
     """Extract the ciphertext prefix from a fixed-size handshake frame."""
     if len(blob) != HANDSHAKE_FRAME_SIZE:
@@ -207,10 +226,7 @@ async def client_handshake(
         await _send(transport, msg1, server_addr)
 
     msg2, recv_addr = await _recv_with_retry(transport, retransmit=_retransmit_msg1)
-    if isinstance(transport, UDPTransport) and recv_addr != server_addr:
-        raise HandshakeError(
-            f"msg2 from unexpected source {recv_addr}, expected {server_addr}"
-        )
+    _pin_source(transport, recv_addr, server_addr, "msg2")
 
     # Snapshot the handshake hash that signs msg2's binding *before*
     # read_message_2 advances the Noise state past it.
@@ -291,11 +307,7 @@ async def client_handshake(
     # otherwise reach noise_transport.decrypt — fail AEAD, raise
     # HandshakeError, and waste a handshake retry. Pin to server_addr so
     # the server's legitimate response is the only one that lands here.
-    if isinstance(transport, UDPTransport) and bs_addr != server_addr:
-        raise HandshakeError(
-            f"bootstrap response from unexpected source {bs_addr}, "
-            f"expected {server_addr}"
-        )
+    _pin_source(transport, bs_addr, server_addr, "bootstrap response")
     bootstrap_resp_ct = _unpad_from_frame(
         bootstrap_resp_frame, BOOTSTRAP_CIPHERTEXT_SIZE
     )
@@ -396,10 +408,7 @@ async def server_handshake(
         await _send(transport, msg2, addr)
 
     msg3, msg3_addr = await _recv_with_retry(transport, retransmit=_retransmit_msg2)
-    if isinstance(transport, UDPTransport) and addr is not None and msg3_addr != addr:
-        raise HandshakeError(
-            f"msg3 from unexpected source {msg3_addr}, expected {addr}"
-        )
+    _pin_source(transport, msg3_addr, addr, "msg3")
 
     binding_hash_for_msg3 = bytes(responder.get_handshake_hash())
     client_static_raw, client_attest_payload = _translate_noise_errors(
@@ -442,10 +451,7 @@ async def server_handshake(
     # bootstrap_init must come from the same peer. AEAD blocks content forge,
     # but a UDP-spoofed bootstrap frame would otherwise fail AEAD and abort
     # the handshake — wasting state and a retry slot.
-    if isinstance(transport, UDPTransport) and addr is not None and bs_addr != addr:
-        raise HandshakeError(
-            f"bootstrap_init from unexpected source {bs_addr}, expected {addr}"
-        )
+    _pin_source(transport, bs_addr, addr, "bootstrap_init")
     bootstrap_init_ct = _unpad_from_frame(
         bootstrap_init_frame, BOOTSTRAP_CIPHERTEXT_SIZE
     )

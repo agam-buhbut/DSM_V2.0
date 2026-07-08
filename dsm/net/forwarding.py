@@ -20,14 +20,12 @@ from __future__ import annotations
 
 import logging
 import subprocess
-from pathlib import Path
 
-from dsm.core._validators import DSM_TUN_NAME_RE as _TUN_NAME_PATTERN
+from dsm.core._validators import validate_tun_name
 from dsm.core.sysctl import SysctlOverride
+from dsm.net.nftables import delete_tables
 
 log = logging.getLogger(__name__)
-
-IP_FORWARD_PATH = Path("/proc/sys/net/ipv4/ip_forward")
 
 
 class IPForwardingManager:
@@ -52,8 +50,8 @@ class IPForwardingManager:
         # DSM_TUN_NAME_RE so an attacker-controlled name cannot escape into
         # the sysctl path. None is allowed (those per-iface sysctls are
         # skipped) and is not validated.
-        if tun_name is not None and not _TUN_NAME_PATTERN.match(tun_name):
-            raise ValueError(f"invalid tun_name: {tun_name!r}")
+        if tun_name is not None:
+            validate_tun_name(tun_name)
         self._tun_name = tun_name
         self._sysctl = SysctlOverride()
 
@@ -93,8 +91,7 @@ class MasqueradeManager:
     TABLE = "dsm_server_nat"
 
     def __init__(self, tun_name: str) -> None:
-        if not _TUN_NAME_PATTERN.match(tun_name):
-            raise ValueError(f"invalid tun_name: {tun_name!r}")
+        validate_tun_name(tun_name)
         self._tun_name = tun_name
         self._applied = False
 
@@ -132,13 +129,6 @@ table inet {self.TABLE} {{
     def remove(self) -> None:
         if not self._applied:
             return
-        try:
-            subprocess.run(  # pylint: disable=subprocess-run-check  # FLAGGED: explicit check= (see report)
-                ["nft", "delete", "table", "inet", self.TABLE],
-                capture_output=True,
-                timeout=5,
-            )
-            log.info("MASQUERADE removed")
-        except (FileNotFoundError, subprocess.SubprocessError):
-            pass
+        delete_tables(self.TABLE)
+        log.info("MASQUERADE removed")
         self._applied = False

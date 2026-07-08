@@ -63,7 +63,3 @@ class SessionFSM:
         old = self._state
         self._state = target
         log.info("FSM: %s -> %s", old.name, target.name)
-
-    def is_active(self) -> bool:
-        """True if the session is in an active state (not IDLE or TEARDOWN)."""
-        return self._state not in (State.IDLE, State.TEARDOWN)

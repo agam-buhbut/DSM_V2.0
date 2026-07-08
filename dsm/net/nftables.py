@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import ipaddress
 import logging
-import re
 import subprocess
 from pathlib import Path
 
 from dsm.core import netaudit
+from dsm.core._validators import validate_tun_name
 
 log = logging.getLogger(__name__)
 
@@ -18,6 +18,11 @@ PRE_HANDSHAKE_TEMPLATE_PATH = (
     Path(__file__).parent.parent.parent / "nftables" / "pre_handshake.conf"
 )
 TCP_TIMESTAMPS_PATH = Path("/proc/sys/net/ipv4/tcp_timestamps")
+
+
+def _ip_proto(server_ip: str) -> str:
+    """Return the nftables IP-family matcher for ``server_ip``: ``ip6`` or ``ip``."""
+    return "ip6" if ipaddress.ip_address(server_ip).version == 6 else "ip"
 
 
 def _apply_ruleset(rules: str, *, log_label: str) -> None:
@@ -40,7 +45,7 @@ def _apply_ruleset(rules: str, *, log_label: str) -> None:
         raise RuntimeError(f"{log_label} apply failed: {stderr}")
 
 
-def _delete_tables(*table_names: str) -> None:
+def delete_tables(*table_names: str) -> None:
     """Best-effort delete of inet tables. Silently ignores missing tables."""
     for name in table_names:
         try:
@@ -134,7 +139,7 @@ class PreHandshakeKillSwitch:
         """Tear down the pre-handshake table. Idempotent."""
         if not self._applied:
             return
-        _delete_tables(self.TABLE_NAME)
+        delete_tables(self.TABLE_NAME)
         self._applied = False
         netaudit.emit(
             "nft_remove",
@@ -143,8 +148,7 @@ class PreHandshakeKillSwitch:
         )
 
     def _render(self) -> str:
-        addr = ipaddress.ip_address(self._server_ip)
-        ip_proto = "ip6" if addr.version == 6 else "ip"
+        ip_proto = _ip_proto(self._server_ip)
         template = PRE_HANDSHAKE_TEMPLATE_PATH.read_text()
         return (
             template.replace("{SERVER_IP}", self._server_ip)
@@ -197,7 +201,7 @@ class NFTablesManager:
         )
 
     def remove(self) -> None:
-        _delete_tables("dsm_killswitch", "dsm_dns_leak")
+        delete_tables("dsm_killswitch", "dsm_dns_leak")
         log.info("nftables rules removed")
         netaudit.emit(
             "nft_remove",
@@ -211,10 +215,8 @@ class NFTablesManager:
         # accept rule fires for legitimate VPN traffic, while IPv4 packets to
         # the same port hit the chain's `policy drop`. Same logic mirrored for
         # IPv4 servers.
-        addr = ipaddress.ip_address(self._server_ip)
-        ip_proto = "ip6" if addr.version == 6 else "ip"
-        if not re.match(r"^[a-zA-Z0-9_-]{1,15}$", self._tun_name):
-            raise ValueError(f"invalid tun_name: {self._tun_name!r}")
+        ip_proto = _ip_proto(self._server_ip)
+        validate_tun_name(self._tun_name)
         template = TEMPLATE_PATH.read_text()
         return (
             template.replace("{SERVER_IP}", self._server_ip)
@@ -256,7 +258,7 @@ class ServerRateLimitManager:
     def remove(self) -> None:
         if not self._applied:
             return
-        _delete_tables("dsm_server_ratelimit")
+        delete_tables("dsm_server_ratelimit")
         self._applied = False
         netaudit.emit("nft_remove", tables=["dsm_server_ratelimit"])
 

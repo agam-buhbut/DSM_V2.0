@@ -109,7 +109,7 @@ class TestNetAuditEnabled(unittest.TestCase):
 class TestNetAuditDisabled(unittest.TestCase):
     def test_disabled_by_default(self) -> None:
         # Module-level state should be disabled at import.
-        self.assertFalse(netaudit.is_enabled())
+        self.assertFalse(netaudit._enabled)
 
     def test_disabled_emit_is_noop(self) -> None:
         # Make sure we're disabled, and emit nothing comes out.
@@ -119,9 +119,9 @@ class TestNetAuditDisabled(unittest.TestCase):
 
     def test_configure_round_trip(self) -> None:
         netaudit.configure(True)
-        self.assertTrue(netaudit.is_enabled())
+        self.assertTrue(netaudit._enabled)
         netaudit.configure(False)
-        self.assertFalse(netaudit.is_enabled())
+        self.assertFalse(netaudit._enabled)
 
 
 class TestNetAuditSerialization(unittest.TestCase):
