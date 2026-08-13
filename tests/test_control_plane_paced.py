@@ -33,7 +33,7 @@ except ImportError:
     _HAS_TUNCORE = False
 
 from dsm.core.fsm import SessionFSM, State
-from dsm.core.protocol import InnerPacket, PacketType
+from dsm.core.protocol import PacketType
 from dsm.rekey import (
     handle_rekey_init,
     initiate_rekey,
@@ -266,8 +266,6 @@ class TeardownSessionCloseStaysDirect(unittest.IsolatedAsyncioTestCase):
         # Teardown close goes out directly; the scheduler is untouched.
         self.assertEqual(len(direct), 1, "teardown SESSION_CLOSE must be direct")
         self.assertEqual(sched.enqueued, [], "teardown SESSION_CLOSE must NOT be paced")
-        ptype = InnerPacket.deserialize  # referenced so the import is load-bearing
-        self.assertTrue(callable(ptype))
         self.assertEqual(PacketType.SESSION_CLOSE, 0x06)
 
 

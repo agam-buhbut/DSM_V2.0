@@ -18,13 +18,10 @@ MAX_DATAGRAM = 1472
 # distinguish a drop from loss on the link).
 RECV_QUEUE_SIZE = 256
 
-# Linux IP_MTU_DISCOVER values (from <linux/in.h>). Kept here to avoid a
-# runtime `socket` import-failure on non-Linux platforms where the
-# constants don't exist; actual use is still gated by a hasattr check.
+# Linux IP_MTU_DISCOVER values (from <linux/in.h>). CPython's `socket` module
+# does not export these on any platform, so they are spelled out here.
 _IP_MTU_DISCOVER = getattr(socket, "IP_MTU_DISCOVER", 10)
-_IP_PMTUDISC_DO = getattr(
-    socket, "IP_PMTUDISC_DO", 2
-)  # DF bit set, hard error on oversize
+_IP_PMTUDISC_DO = getattr(socket, "IP_PMTUDISC_DO", 2)  # DF set, hard error
 _IP_MTU = getattr(socket, "IP_MTU", 14)
 
 
@@ -33,7 +30,6 @@ class UDPTransport:
 
     def __init__(self) -> None:
         self._transport: asyncio.DatagramTransport | None = None
-        self._protocol: _UDPProtocol | None = None
         self._recv_queue: asyncio.Queue[tuple[bytes, tuple[str, int]]] = asyncio.Queue(
             maxsize=RECV_QUEUE_SIZE,
         )
@@ -41,11 +37,11 @@ class UDPTransport:
         # True if bind() enabled kernel PMTUD (IP_PMTUDISC_DO). Consulted
         # by `get_path_mtu()`.
         self._pmtu_enabled = False
-        # H-ANON-4: serialize send() vs rebind_to_fresh_port() so a
+        # Serialize send() vs rebind_to_fresh_port() so a
         # concurrent rebind cannot race the chaff/scheduler sendto.
         # Uncontended on the steady-state path.
         self._send_lock: asyncio.Lock = asyncio.Lock()
-        # Audit M2: track deferred-close TimerHandles so close()/aclose()
+        # Track deferred-close TimerHandles so close()/aclose()
         # can cancel them and close any pending old transports
         # synchronously. Without this, a shutdown during the 250ms
         # post-rebind window leaves the old transport alive until the
@@ -70,7 +66,6 @@ class UDPTransport:
         """
         loop = asyncio.get_running_loop()
         protocol = _UDPProtocol(self._recv_queue)
-        self._protocol = protocol
         # Pre-create the socket so we can set SO_REUSEADDR before bind.
         # Without this a fast restart on a fixed listen_port races the
         # kernel's TIME_WAIT cleanup and bind fails with EADDRINUSE —
@@ -125,7 +120,7 @@ class UDPTransport:
     async def send(self, data: bytes, addr: tuple[str, int]) -> None:
         """Send a datagram to the specified address.
 
-        H-ANON-4 review fix: take the swap-lock so a concurrent
+        Takes the swap-lock so a concurrent
         `rebind_to_fresh_port()` (called from `_handle_rekey_ack` in
         the recv-loop) cannot replace `self._transport` between the
         ``is None`` check and the ``sendto`` — which would race the
@@ -141,12 +136,12 @@ class UDPTransport:
             self._transport.sendto(data, addr)
 
     async def rebind_to_fresh_port(self) -> int:
-        """H-ANON-4 partial: rebind to a fresh ephemeral source port.
+        """Rebind to a fresh ephemeral source port.
 
         Closes the current socket and binds a new one with kernel-picked
         ephemeral port + the same options (SO_MARK, PMTUD). The
-        ``_recv_queue`` is preserved across the swap, so the recv loop
-        continues seamlessly — packets that arrive on the OLD socket
+        ``_recv_queue`` is preserved across the swap, so the recv loop continues —
+        packets that arrive on the OLD socket
         between the close and the next sock arrival are dropped (a
         protocol-level ACK or retransmit deals with any loss).
 
@@ -168,7 +163,6 @@ class UDPTransport:
         old_addr = old_sock.getsockname() if old_sock else ("0.0.0.0", 0)
         local_addr = old_addr[0]
 
-        # Same recv queue → same protocol class wired up identically.
         new_protocol = _UDPProtocol(self._recv_queue)
         new_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         new_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -197,26 +191,21 @@ class UDPTransport:
         # but never an in-flight half-state.
         async with self._send_lock:
             self._transport = new_transport
-            self._protocol = new_protocol
         new_port = new_transport.get_extra_info("sockname")[1]
 
-        # H-ANON-4 review fix: don't immediately close the old transport
+        # Don't immediately close the old transport
         # — server replies to the OLD src addr that are already in flight
         # (sent before the server's `post_authenticate` saw the NEW addr)
         # would otherwise be dropped at kernel ICMP-port-unreachable.
         # Defer the close ~250ms so the old socket keeps accepting
         # inbound until the server learns the new addr from our first
         # post-rebind packet. Both old and new protocols feed the SAME
-        # `self._recv_queue`, so deferred-old packets arrive seamlessly.
-        # Audit M2: track the handle + transport so shutdown can
+        # `self._recv_queue`, so deferred-old packets still arrive.
+        # Track the handle + transport so shutdown can
         # cancel/close cleanly without leaving an orphan callback.
-        # Audit L-AUDIT-1: register the deferred close WITHIN the
+        # Register the deferred close WITHIN the
         # send_lock context above (we re-take it briefly here) so
-        # `close()` running concurrently sees the new entry before
-        # tearing down. Under single-threaded asyncio this is purely
-        # belt-and-braces — call_later() is sync, append() is sync —
-        # but ensures the invariant survives any future move to a
-        # different scheduler.
+        # `close()` running concurrently sees the new entry before tearing down.
         async with self._send_lock:
             if self._closed:
                 old_transport.close()
@@ -228,30 +217,23 @@ class UDPTransport:
         return new_port
 
     async def recv(self, timeout: float | None = None) -> tuple[bytes, tuple[str, int]]:
-        """Receive a datagram. Returns (data, (host, port))."""
         if timeout is not None:
             return await asyncio.wait_for(self._recv_queue.get(), timeout)
         return await self._recv_queue.get()
 
     def close(self) -> None:
-        # Audit M2: drain pending deferred-close handles before tearing
+        # Drain pending deferred-close handles before tearing
         # down the current transport. Cancel each timer (if it hasn't
         # fired yet) and close the old transport synchronously so the
         # process doesn't leave behind orphan sockets on shutdown.
-        # Audit L-AUDIT-1: mark _closed FIRST so any concurrent
+        # Mark _closed FIRST so any concurrent
         # rebind_to_fresh_port() coroutine resuming after this point
         # observes the closed state and skips registering new deferred
         # handles (it closes its old transport synchronously instead).
         self._closed = True
         for handle, old_transport in self._deferred_closes:
-            try:
-                handle.cancel()
-            except Exception:  # noqa: BLE001
-                pass
-            try:
-                old_transport.close()
-            except Exception:  # noqa: BLE001
-                pass
+            handle.cancel()
+            old_transport.close()
         self._deferred_closes.clear()
         if self._transport:
             self._transport.close()
@@ -259,10 +241,6 @@ class UDPTransport:
     async def aclose(self) -> None:
         """Async close (UDP has no pending writes, delegates to sync close)."""
         self.close()
-
-    @property
-    def is_open(self) -> bool:
-        return self._transport is not None and not self._closed
 
 
 class _UDPProtocol(asyncio.DatagramProtocol):

@@ -29,7 +29,6 @@ from dsm.net.transport._fwmark import apply_so_mark
 
 log = logging.getLogger(__name__)
 
-# Cache limits
 MAX_CACHE_ENTRIES = 2_000
 MIN_TTL = 60
 MAX_TTL = 3600
@@ -53,8 +52,8 @@ class _CacheEntry:
 
 
 @dataclass(slots=True)
-class _DnsResult:
-    """Outcome of parsing an upstream DNS response (Phase 1.10).
+class DnsResult:
+    """Outcome of parsing an upstream DNS response.
 
     ``authoritative`` is True when the response was a well-formed DNS
     message with a definitive rcode (NOERROR / NXDOMAIN), so callers can
@@ -184,16 +183,15 @@ class DNSResolver:
     async def resolve(self, hostname: str) -> list[str]:
         """Resolve hostname to A-record IP addresses.
 
-        Backward-compatible ``list[str]`` contract (Phase 1.10): callers that
-        only need the addresses keep using this. The richer outcome
+        Callers that only need the addresses use this; the richer outcome
         (NXDOMAIN/NODATA vs transport failure) is available via
-        :meth:`resolve_detailed`. An empty list still means "no addresses",
+        :meth:`resolve_detailed`. An empty list means "no addresses",
         whether authoritative-empty or a failure — the proxy uses
         :meth:`resolve_detailed` to tell them apart.
         """
         return (await self.resolve_detailed(hostname)).addresses
 
-    async def resolve_detailed(self, hostname: str) -> _DnsResult:
+    async def resolve_detailed(self, hostname: str) -> DnsResult:
         """Resolve ``hostname``, distinguishing authoritative-empty from failure.
 
         Checks: static hosts -> cache -> DoH -> DoT -> custom. On an
@@ -204,28 +202,27 @@ class DNSResolver:
         """
         hostname = hostname.lower().rstrip(".")
 
-        # 1. Static hosts
         static = self._static_hosts.get(hostname)
         if static:
-            return _DnsResult(
+            return DnsResult(
                 addresses=[static],
                 ttl=MAX_TTL,
                 rcode=int(dns.rcode.NOERROR),
                 authoritative=True,
             )
 
-        # 2. Cache (positive and negative entries; an empty address list is a
-        # cached authoritative-empty answer per RFC 2308).
+        # Positive and negative entries; an empty address list is a
+        # cached authoritative-empty answer per RFC 2308.
         cached = self._cache.get(hostname)
         if cached and cached.expires > time.monotonic():
-            return _DnsResult(
+            return DnsResult(
                 addresses=list(cached.addresses),
                 ttl=MIN_TTL,
                 rcode=int(cached.rcode),
                 authoritative=True,
             )
 
-        # 3. Query providers in order; stop on the first authoritative answer.
+        # Stop on the first authoritative answer.
         for provider in self._providers:
             try:
                 if provider.startswith("https://"):
@@ -241,7 +238,8 @@ class DNSResolver:
                     # caching (positive or negative) already happened inside
                     # the per-protocol resolver.
                     return result
-            except Exception as e:  # noqa: BLE001  # see linter report
+            # any provider failure falls through to the next
+            except Exception as e:  # noqa: BLE001
                 # SPKI pin failures surface as PinMismatchError and indicate
                 # a possible MITM (cert chains to a trusted CA but is not
                 # the pinned key). Promote those to WARNING so an operator
@@ -271,7 +269,7 @@ class DNSResolver:
         log.error("all DNS providers failed for %s", redacted)
         # Transport failure across every provider — non-authoritative so the
         # proxy returns SERVFAIL, not NXDOMAIN.
-        return _DnsResult(addresses=[], ttl=MIN_TTL, rcode=-1, authoritative=False)
+        return DnsResult(addresses=[], ttl=MIN_TTL, rcode=-1, authoritative=False)
 
     async def _resolve_via_pinned_tls(
         self,
@@ -324,7 +322,7 @@ class DNSResolver:
             except (ConnectionError, OSError):
                 pass
 
-    async def _resolve_doh(self, url: str, hostname: str) -> _DnsResult:
+    async def _resolve_doh(self, url: str, hostname: str) -> DnsResult:
         """DNS-over-HTTPS query with SPKI pin checked BEFORE the qname
         is sent.
 
@@ -387,13 +385,12 @@ class DNSResolver:
         )
         return self._parse_and_cache(hostname, body)
 
-    async def _resolve_dot(self, provider: str, hostname: str) -> _DnsResult:
+    async def _resolve_dot(self, provider: str, hostname: str) -> DnsResult:
         """DNS-over-TLS query with SPKI pin checked before the qname is
         sent. Underlying socket is SO_MARK'd so the connection bypasses
         the VPN's ip-rule routing (otherwise the lookup would loop
         through our own TUN device — see _resolve_doh for the explanation).
         """
-        # Parse "tls://host:port" or "tls://[ipv6]:port"
         parsed = urlparse(provider)
         if parsed.scheme != "tls":
             raise ValueError(f"invalid DoT provider format: {provider!r}")
@@ -431,7 +428,7 @@ class DNSResolver:
         )
         return self._parse_and_cache(hostname, resp_data)
 
-    def _parse_and_cache(self, hostname: str, wire: bytes) -> _DnsResult:
+    def _parse_and_cache(self, hostname: str, wire: bytes) -> DnsResult:
         """Parse an upstream response; cache authoritative answers (RFC 2308).
 
         Positive (addresses) and negative (NXDOMAIN/NODATA, empty list)
@@ -496,38 +493,36 @@ def _build_dns_query(hostname: str) -> bytes:
     return msg.to_wire()
 
 
-def _parse_dns_response(data: bytes) -> _DnsResult:
+def _parse_dns_response(data: bytes) -> DnsResult:
     """Parse a DNS response into a typed result (addresses + rcode).
 
     Distinguishes an authoritative NXDOMAIN/NODATA answer (rcode set,
     ``authoritative=True``, empty addresses) from a transport-level
     failure or a retryable rcode (SERVFAIL/REFUSED, ``authoritative=False``)
     so callers can stop provider fan-out and negative-cache instead of
-    treating every empty answer as a failure (Phase 1.10).
+    treating every empty answer as a failure.
     """
     try:
         msg = dns.message.from_wire(data)
     except dns.exception.DNSException:
         # Not a parseable DNS message — a transport-level failure, NOT
         # authoritative; the caller should keep trying other providers.
-        return _DnsResult(addresses=[], ttl=MIN_TTL, rcode=-1, authoritative=False)
+        return DnsResult(addresses=[], ttl=MIN_TTL, rcode=-1, authoritative=False)
 
     rcode = msg.rcode()
     if rcode == dns.rcode.NXDOMAIN:
-        return _DnsResult(
+        return DnsResult(
             addresses=[], ttl=MIN_TTL, rcode=int(rcode), authoritative=True
         )
     if rcode != dns.rcode.NOERROR:
         # SERVFAIL / REFUSED etc. — treat as a (non-authoritative) failure so
         # other providers are still tried.
-        return _DnsResult(
+        return DnsResult(
             addresses=[], ttl=MIN_TTL, rcode=int(rcode), authoritative=False
         )
 
     addresses: list[str] = []
-    # Phase 1.10: seed with MAX_TTL (was 300) so the clamp in _cache_result
-    # can actually reach MAX_TTL — previously min(300, ttl) capped every
-    # answer at 300 s, making MAX_TTL dead.
+    # Seed with MAX_TTL so the clamp in _cache_result can actually reach it.
     min_ttl = MAX_TTL
     for rrset in msg.answer:
         if rrset.rdtype != dns.rdatatype.A:
@@ -542,10 +537,10 @@ def _parse_dns_response(data: bytes) -> _DnsResult:
     if not addresses:
         # NOERROR with no A records = NODATA, authoritative; negative-cache
         # at MIN_TTL.
-        return _DnsResult(
+        return DnsResult(
             addresses=[], ttl=MIN_TTL, rcode=int(rcode), authoritative=True
         )
-    return _DnsResult(
+    return DnsResult(
         addresses=addresses, ttl=min_ttl, rcode=int(rcode), authoritative=True
     )
 
@@ -621,9 +616,6 @@ async def _open_pinned_tls_connection(
 
     ctx = build_pinned_ssl_context()
     try:
-        # create_connection wraps the existing socket and then we
-        # start_tls. We use open_connection + sock parameter to get
-        # reader/writer.
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(
                 sock=sock,
@@ -639,10 +631,6 @@ async def _open_pinned_tls_connection(
             pass
         raise
 
-    # Pin check happens here, before the caller is handed the writer.
-    # If the pin fails the helper closes the connection and re-raises
-    # the PinMismatchError so the caller never gets a writer they could
-    # accidentally write the qname to.
     try:
         ssl_obj = writer.get_extra_info("ssl_object")
         if ssl_obj is None:
@@ -673,15 +661,12 @@ async def _read_http_response(reader: asyncio.StreamReader) -> bytes:
         RuntimeError on malformed status, missing required headers, or
             size cap violation.
     """
-    # Status line + headers terminated by \r\n\r\n.
     header_blob = await reader.readuntil(b"\r\n\r\n")
     if len(header_blob) > _HTTP_HEADER_MAX_BYTES:
         raise RuntimeError(
             f"HTTP response headers exceed cap ({_HTTP_HEADER_MAX_BYTES} B)"
         )
 
-    # Parse just enough: status line + headers we care about. Case-
-    # insensitive header lookup.
     head_text = header_blob.decode("ascii", errors="replace")
     lines = head_text.split("\r\n")
     if not lines:
@@ -725,8 +710,6 @@ async def _read_http_response(reader: asyncio.StreamReader) -> bytes:
         return body
 
     # No content-length: read until EOF (Connection: close framing).
-    # Read in chunks with a hard cap to defend against an unbounded
-    # peer.
     chunks: list[bytes] = []
     total = 0
     while True:

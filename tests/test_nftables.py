@@ -68,9 +68,6 @@ def _called_process_error(stderr: bytes) -> subprocess.CalledProcessError:
     return subprocess.CalledProcessError(returncode=1, cmd=["nft"], stderr=stderr)
 
 
-# --------------------------------------------------------------------------- #
-# Rendering / substitution
-# --------------------------------------------------------------------------- #
 class RenderSubstitutionTest(unittest.TestCase):
     def test_prehandshake_substitutes_all_placeholders(self) -> None:
         rendered = PreHandshakeKillSwitch(V4_IP, PORT)._render()
@@ -114,9 +111,6 @@ class RenderSubstitutionTest(unittest.TestCase):
         self.assertIn(V6_IP, rendered)
 
 
-# --------------------------------------------------------------------------- #
-# Fail-closed default-drop posture
-# --------------------------------------------------------------------------- #
 class FailClosedPolicyTest(unittest.TestCase):
     def _killswitch_chains(self, rendered: str) -> str:
         """Return only the dsm_killswitch[/_pre] table body.
@@ -142,9 +136,6 @@ class FailClosedPolicyTest(unittest.TestCase):
         self.assertEqual(body.count("policy drop"), 3)
 
 
-# --------------------------------------------------------------------------- #
-# Input validation
-# --------------------------------------------------------------------------- #
 class InputValidationTest(unittest.TestCase):
     def test_tun_name_injection_rejected(self) -> None:
         for bad in ("mtun0; drop", "a" * 16, "bad name", ""):
@@ -175,9 +166,6 @@ class InputValidationTest(unittest.TestCase):
                     ServerRateLimitManager(bad_port)
 
 
-# --------------------------------------------------------------------------- #
-# Per-manager fatal-ness (fail-closed posture)
-# --------------------------------------------------------------------------- #
 class ManagerFatalnessTest(unittest.TestCase):
     def test_prehandshake_apply_raises_on_nft_failure(self) -> None:
         fake = _FakeRun([_called_process_error(b"nope")])
@@ -207,9 +195,6 @@ class ManagerFatalnessTest(unittest.TestCase):
         self.assertFalse(mgr._applied)
 
 
-# --------------------------------------------------------------------------- #
-# Atomic pre->full upgrade transaction
-# --------------------------------------------------------------------------- #
 class AtomicUpgradeTest(unittest.TestCase):
     _DELETE_LINE = f"delete table inet {PreHandshakeKillSwitch.TABLE_NAME}"
 

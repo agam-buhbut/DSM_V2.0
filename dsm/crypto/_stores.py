@@ -62,7 +62,8 @@ def loaded_stores_cli(
     try:
         try:
             keystore.load_with_passphrase(passphrase)
-        except Exception as e:  # noqa: BLE001  # see linter report
+        # CLI boundary: any unlock failure exits 2
+        except Exception as e:  # noqa: BLE001
             print(
                 f"failed to unlock identity at {key_file_label}: "
                 f"{type(e).__name__}: {e}",
@@ -71,7 +72,8 @@ def loaded_stores_cli(
             sys.exit(2)
         try:
             attest_store.load_with_passphrase(passphrase)
-        except Exception as e:  # noqa: BLE001  # see linter report
+        # CLI boundary: any unlock failure exits 2
+        except Exception as e:  # noqa: BLE001
             print(
                 f"failed to unlock attest key at {attest_key_file_label}: "
                 f"{type(e).__name__}: {e}",

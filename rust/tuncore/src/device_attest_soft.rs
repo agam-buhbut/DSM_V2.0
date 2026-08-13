@@ -50,13 +50,8 @@ impl SoftAttestKey {
     }
 
     /// SubjectPublicKeyInfo DER of the verifying key. Returns
-    /// `Err("attest key has been zeroized")` once `zeroize()` has been
-    /// called (M-CRYPT-8: the previous code left the SPKI cache in
-    /// place after zeroize and would happily hand out a pubkey whose
-    /// corresponding scalar was the freshly-generated replacement —
-    /// signatures produced post-zeroize would not verify against the
-    /// returned SPKI). Callers can detect "already zeroized" via the
-    /// returned error rather than silently receiving stale bytes.
+    /// `Err("attest key has been zeroized")` once `zeroize()` has run, so a caller
+    /// can never receive an SPKI whose scalar is no longer callable (M-CRYPT-8).
     pub fn public_spki_der(&self) -> Result<&[u8], String> {
         if self.verifying_key_spki_der.is_empty() {
             return Err("attest key has been zeroized".into());
@@ -102,10 +97,6 @@ impl SoftAttestKey {
         let replacement = SigningKey::random(&mut OsRng);
         let old = std::mem::replace(&mut self.signing_key, Box::new(replacement));
         drop(old); // ZeroizeOnDrop wipes the scalar here.
-                   // M-CRYPT-8: clear the cached SPKI too so the post-zeroize
-                   // state is unambiguously "consumed" — every accessor returns
-                   // Err rather than silently handing out a public key that
-                   // doesn't match any callable signing capacity.
         use zeroize::Zeroize;
         self.verifying_key_spki_der.zeroize();
     }
@@ -118,13 +109,7 @@ impl SoftAttestKey {
     /// more (was previously exported via PyAttestKey, audit M4). TPM /
     /// Keystore backends MUST NOT expose this — they sign the CSR internally
     /// via platform APIs and never leak private key bytes.
-    ///
-    /// The return type is `Zeroizing<Vec<u8>>` rather than plain `Vec<u8>`
-    /// so a future caller cannot accidentally leave the encoded scalar in
-    /// a long-lived heap allocation. The wrapper costs nothing at the
-    /// borrow site (deref-to-slice still works) but makes the safety
-    /// invariant load-bearing in the type system.
-    pub fn private_pkcs8_der(&self) -> Result<Zeroizing<Vec<u8>>, String> {
+    fn private_pkcs8_der(&self) -> Result<Zeroizing<Vec<u8>>, String> {
         let pkcs8 = self
             .signing_key
             .to_pkcs8_der()
@@ -164,8 +149,6 @@ impl SoftAttestKey {
             ));
         }
 
-        // `private_pkcs8_der` now returns the encoded scalar already wrapped
-        // in `Zeroizing`, so we just bind the result directly.
         let pkcs8 = self.private_pkcs8_der()?;
         let key_pair =
             KeyPair::try_from(pkcs8.as_slice()).map_err(|e| format!("rcgen key import: {e}"))?;
@@ -179,8 +162,8 @@ impl SoftAttestKey {
         // encode_noise_static_binding_value in dsm.crypto.cert.
         let mut ext_value = Vec::with_capacity(2 + noise_static_pub.len());
         ext_value.push(0x04); // OCTET STRING tag
-                              // Length-byte cast: bounded above by the 32-byte length check
-                              // at L135–140; the truncation cannot lose information.
+                              // Bounded by the 32-byte length check above; the truncation
+                              // cannot lose information.
         #[allow(clippy::cast_possible_truncation)]
         ext_value.push(noise_static_pub.len() as u8);
         ext_value.extend_from_slice(noise_static_pub);

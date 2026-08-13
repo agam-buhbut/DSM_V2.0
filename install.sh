@@ -39,7 +39,7 @@ VENV="/opt/dsm/venv"
 
 die() { echo "install.sh: $*" >&2; exit 1; }
 
-# --- Argument parsing (flags in any order; reject unknown) -------------------
+# Argument parsing: flags in any order; unknown flags are rejected.
 EVAL=0
 SYSTEMD=0
 while [ "$#" -gt 0 ]; do
@@ -55,7 +55,6 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 
-# --- Preconditions -----------------------------------------------------------
 [ "$(id -u)" = "0" ] || die "must run as root (sudo)"
 [ "$(uname -m)" = "x86_64" ] || die "unsupported arch $(uname -m); build from source (deploy/GUIDE.md §1)"
 command -v apt-get >/dev/null 2>&1 || die "no apt-get; supported targets are Debian 12+/Ubuntu 22.04+. Build from source for others."
@@ -93,58 +92,55 @@ if [ "$EVAL" = 0 ] && [ ! -e /dev/tpmrm0 ]; then
   die "/dev/tpmrm0 not found — DSM requires a TPM 2.0 in production. For a no-hardware evaluation, re-run with --eval (NOT for production)."
 fi
 
-# --- Install the verifier itself (the ONLY thing done from the distro's
-#     trusted apt repo before any downloaded content is verified) -------------
+# Install the verifier itself — the ONLY thing taken from the distro's trusted
+# apt repo before any downloaded content is verified.
 if ! command -v minisign >/dev/null 2>&1; then
   apt-get update || die "apt-get update failed"
   apt-get install -y minisign || die "could not install minisign (the signature verifier); refusing to continue"
 fi
 command -v minisign >/dev/null 2>&1 || die "minisign still not available after install; refusing to continue"
 
-# --- Private working dir (mktemp; never a predictable /tmp name) -------------
+# Private working dir: mktemp, never a predictable /tmp name.
 WORK="$(mktemp -d)" || die "could not create a temporary working directory"
 trap 'rm -rf "$WORK"' EXIT
 cd "$WORK" || die "could not enter working directory"
 
 if [ "$EVAL" = 1 ]; then
-  echo "=============================================================" >&2
-  echo "=== EVALUATION INSTALL: +soft wheel, NO hardware binding. ===" >&2
-  echo "=== For EVALUATION ONLY — never production. No TPM bind.   ===" >&2
-  echo "=============================================================" >&2
+  echo "install.sh: EVALUATION INSTALL — soft wheel, no hardware binding." >&2
+  echo "install.sh: EVALUATION ONLY — never use this build in production." >&2
   WHEEL="dsm-${DSM_VERSION}+soft-cp311-abi3-linux_x86_64.whl"
 else
   WHEEL="dsm-${DSM_VERSION}-cp311-abi3-linux_x86_64.whl"
 fi
 
-# --- 1. Download checksum file + signature (NOT the wheel yet) ---------------
-curl -fsSL --proto '=https' --tlsv1.2 "$BASE/SHA256SUMS" \
+# Download checksum file + signature; the wheel is NOT fetched yet.
+curl -fsSL --proto '=https' --tlsv1.3 "$BASE/SHA256SUMS" \
   -o "$WORK/SHA256SUMS"          || die "cannot fetch SHA256SUMS"
-curl -fsSL --proto '=https' --tlsv1.2 "$BASE/SHA256SUMS.minisig" \
+curl -fsSL --proto '=https' --tlsv1.3 "$BASE/SHA256SUMS.minisig" \
   -o "$WORK/SHA256SUMS.minisig"  || die "cannot fetch signature"
 
-# --- 2. VERIFY the minisign signature over SHA256SUMS BEFORE touching any
-#        artifact. The exit code is checked explicitly (|| die); nothing is
-#        downstream of a pipe that could swallow a failure. -------------------
+# VERIFY the minisign signature over SHA256SUMS BEFORE touching any artifact.
+# The exit code is checked explicitly (|| die); nothing is downstream of a pipe
+# that could swallow a failure.
 printf '%s\n' "$MINISIGN_PUBKEY" > "$WORK/pubkey.pub" \
   || die "could not stage the minisign public key"
 minisign -V -p "$WORK/pubkey.pub" -m "$WORK/SHA256SUMS" \
   || die "minisign verification FAILED — refusing to continue"
 
-# --- 3. Anti-rollback / version pin: the signed list MUST contain a line for
-#        the EXACT wheel this script installs. We select that line by an exact
-#        FIELD match on the filename (awk $2 == name) — not a regex, so the
-#        '+' in '+soft' is not treated as a metacharacter and a decoy name
-#        cannot match. We extract the hash WITHOUT a pipe into the checker, so
-#        a missing entry fails closed rather than feeding empty input to
-#        sha256sum (whose empty-input exit is implementation-dependent across
-#        coreutils/busybox). awk prints exactly one canonical "<hash>  <name>"
-#        line; >1 match (a malformed/duplicated list) is also rejected. -------
+# Anti-rollback / version pin: the signed list MUST contain a line for the
+# EXACT wheel this script installs. We select that line by an exact FIELD match
+# on the filename (awk $2 == name) — not a regex, so the '+' in '+soft' is not
+# treated as a metacharacter and a decoy name cannot match. We extract the hash
+# WITHOUT a pipe into the checker, so a missing entry fails closed rather than
+# feeding empty input to sha256sum (whose empty-input exit is implementation-
+# dependent across coreutils/busybox). awk prints exactly one canonical
+# "<hash>  <name>" line; >1 match (a malformed/duplicated list) is rejected.
 EXPECTED_LINE="$(awk -v w="$WHEEL" '$2 == w {n++; line=$1"  "$2} END {if (n==1) print line}' "$WORK/SHA256SUMS")"
 [ -n "$EXPECTED_LINE" ] \
   || die "signed SHA256SUMS has no single entry for ${WHEEL} — refusing (wrong/rolled-back release, unsupported variant, or malformed list)"
 
-# --- 4. Download the wheel into the SAME temp dir, then verify the SAME file
-#        we downloaded (no re-download between verify and install: no TOCTOU). -
+# Download the wheel into the SAME temp dir, then verify the SAME file we
+# downloaded (no re-download between verify and install: no TOCTOU).
 curl -fsSL --proto '=https' --tlsv1.2 "$BASE/$WHEEL" \
   -o "$WORK/$WHEEL" || die "cannot fetch $WHEEL"
 
@@ -156,29 +152,28 @@ printf '%s\n' "$EXPECTED_LINE" > "$WORK/expected.sha256" \
 ( cd "$WORK" && sha256sum -c "$WORK/expected.sha256" ) \
   || die "wheel checksum mismatch — refusing to install"
 
-# --- 4b. Dependency wheelhouse: fetch + verify the RUNTIME-dep wheels ---------
-#        The venv install below is --no-index, so a fresh venv cannot reach
-#        PyPI for cryptography/dnspython (+ cffi/pycparser). The release bundles
-#        those dep wheels next to the DSM wheel and lists EVERY one in this
-#        already-minisign-VERIFIED SHA256SUMS — the SAME single trust anchor. We
-#        download each dependency wheel into $WORK and verify it against that
-#        signed list, reusing the exact-field selection + `sha256sum -c` pattern
-#        from step 4 (fail closed on a missing/duplicated entry or a hash
-#        mismatch). No new/unsigned dep source is introduced.
+# Dependency wheelhouse: fetch + verify the RUNTIME-dep wheels.
+# The venv install below is --no-index, so a fresh venv cannot reach PyPI for
+# cryptography/dnspython (+ cffi/pycparser). The release bundles those dep
+# wheels next to the DSM wheel and lists EVERY one in this
+# already-minisign-VERIFIED SHA256SUMS — the SAME single trust anchor. We
+# download each dependency wheel into $WORK and verify it against that signed
+# list, reusing the exact-field selection + `sha256sum -c` pattern used for the
+# DSM wheel above (fail closed on a missing/duplicated entry or a hash
+# mismatch). No new/unsigned dep source is introduced.
 #
-#        Selection: every SHA256SUMS entry whose name ends in `.whl` and does
-#        NOT start with `dsm-`. That is the third-party dependency set; it
-#        excludes BOTH DSM variant wheels — the one we want is already fetched
-#        and verified above ($WHEEL), and the OTHER DSM variant (e.g. the +soft
-#        wheel during a production install) is a different DSM build, not a
-#        dependency, so the installer must not pull it. The non-.whl entries
-#        (sdist, install.sh, SHA256SUMS*) are likewise skipped. The match is an
-#        exact awk FIELD test (not a regex), so a `+` in a local-version
-#        segment is never a metacharacter.
+# Selection: every SHA256SUMS entry whose name ends in `.whl` and does NOT
+# start with `dsm-`. That is the third-party dependency set; it excludes BOTH
+# DSM variant wheels — the one we want is already fetched and verified above
+# ($WHEEL), and the OTHER DSM variant (e.g. the +soft wheel during a production
+# install) is a different DSM build, not a dependency, so the installer must
+# not pull it. The non-.whl entries (sdist, install.sh, SHA256SUMS*) are
+# likewise skipped. The match is an exact awk FIELD test (not a regex), so a
+# `+` in a local-version segment is never a metacharacter.
 DEP_WHEELS="$(awk '$2 ~ /\.whl$/ && $2 !~ /^dsm-/ {print $2}' "$WORK/SHA256SUMS")"
 for dep in $DEP_WHEELS; do
   # Re-select THIS dep's canonical signed line by exact field match; require
-  # exactly one (a missing/duplicated entry fails closed, as in step 3).
+  # exactly one (a missing/duplicated entry fails closed, as above).
   dep_line="$(awk -v w="$dep" '$2 == w {n++; line=$1"  "$2} END {if (n==1) print line}' "$WORK/SHA256SUMS")"
   [ -n "$dep_line" ] \
     || die "signed SHA256SUMS has no single entry for dependency wheel ${dep} — refusing"
@@ -190,11 +185,8 @@ for dep in $DEP_WHEELS; do
     || die "dependency wheel checksum mismatch for $dep — refusing to install"
 done
 
-# ============================================================================
 #  VERIFIED-ARTIFACT GATE PASSED. Only past this line may we run apt/pip/venv.
-# ============================================================================
 
-# --- 5. System runtime deps -------------------------------------------------
 apt-get update || die "apt-get update failed"
 apt-get install -y nftables iproute2 ca-certificates python3-venv \
   || die "could not install base runtime dependencies"
@@ -209,18 +201,18 @@ else
     || echo "install.sh: WARNING — swtpm not installed; software-TPM eval may not work." >&2
 fi
 
-# --- 6. Dedicated venv + wheel install (no system-Python pollution) ---------
+# Dedicated venv keeps the wheel out of system Python.
 python3 -m venv "$VENV" || die "could not create the venv at $VENV"
 "$VENV/bin/pip" install --upgrade pip || die "could not upgrade pip in the venv"
 # --no-index + --find-links restricts the install to the local wheelhouse: the
 # verified DSM wheel PLUS the dependency wheels downloaded and checksum-verified
-# in step 4b (cryptography/dnspython + cffi/pycparser). pip resolves every
+# above (cryptography/dnspython + cffi/pycparser). pip resolves every
 # runtime dep from $WORK and never reaches the network.
 "$VENV/bin/pip" install --no-index --find-links "$WORK" "$WORK/$WHEEL" \
   || die "wheel install failed"
 ln -sf "$VENV/bin/dsm" /usr/local/bin/dsm || die "could not symlink dsm into /usr/local/bin"
 
-# --- 7. tss group (TPM access) + optional unit install (production only) -----
+# tss group grants /dev/tpmrm0 access; unit install is production-only.
 if [ "$EVAL" = 0 ]; then
   getent group tss >/dev/null 2>&1 || groupadd --system tss || die "could not create the tss group"
   echo "Note: the dsm daemon must be in the 'tss' group to reach /dev/tpmrm0." >&2

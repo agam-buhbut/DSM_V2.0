@@ -14,14 +14,12 @@
 #       MUST be marked critical on every issued leaf cert. The DSM runtime
 #       refuses non-critical entries.
 
-# ─── OID registration (required so openssl prints the friendly name) ─────
+# OID registration — required so openssl prints the friendly name.
 [ new_oids ]
 noiseStaticBinding = 1.3.6.1.4.1.99999.1.1
 
 
-# ═════════════════════════════════════════════════════════════════════════
 # CA database (offline, on encrypted USB)
-# ═════════════════════════════════════════════════════════════════════════
 [ ca ]
 default_ca = dsm_ca
 
@@ -56,9 +54,7 @@ commonName       = supplied
 # All other DN attributes are forbidden — DSM cert subjects are CN-only.
 
 
-# ═════════════════════════════════════════════════════════════════════════
 # Root CA bootstrap (one-time)
-# ═════════════════════════════════════════════════════════════════════════
 # Only used by the initial `openssl req -new -x509 ...` invocation.
 [ req ]
 # default_bits is RSA-only and IGNORED for EC keys. The CA actually uses
@@ -84,20 +80,12 @@ subjectKeyIdentifier   = hash
 # does NOT evaluate nameConstraints, so they are not relied upon for any DSM
 # security property.
 #
-# The previous `permitted;dirName:CN=dsm` subtree was dropped: a permitted
-# dirName of CN=dsm would reject every real DSM leaf (whose CN is
-# "dsm-<hex>-{client,server}", not exactly "dsm"), and it also failed to
-# parse (OpenSSL wants lowercase `dirName:` and mask-form IP ranges, not the
-# `DirName:`/CIDR syntax that was here).
-#
-# We keep only EXCLUDED constraints, in OpenSSL's required mask form, so the
-# CA key cannot be misused to issue an IP-SAN certificate for any address.
+# EXCLUDED constraints only, in OpenSSL's required mask form, so the CA key
+# cannot be misused to issue an IP-SAN certificate for any address.
 nameConstraints        = critical, excluded;DNS:., excluded;IP:0.0.0.0/0.0.0.0, excluded;IP:::/::, excluded;URI:., excluded;email:.
 
 
-# ═════════════════════════════════════════════════════════════════════════
 # Leaf cert profiles (selected per-issuance via -extensions)
-# ═════════════════════════════════════════════════════════════════════════
 # Both profiles enforce the same critical extensions; only EKU differs.
 # `copy_extensions = copy` carries the binding extension from the CSR
 # unmodified — operator MUST verify it is critical and 34 bytes

@@ -20,7 +20,6 @@ log = logging.getLogger(__name__)
 
 
 def sysctl_path(key: str) -> Path:
-    """Translate a dotted sysctl key into its /proc/sys path."""
     return Path("/proc/sys") / key.replace(".", "/")
 
 
@@ -68,7 +67,6 @@ class SysctlOverride:
         return current
 
     def restore_all(self) -> None:
-        """Restore every captured (key, prior value) pair."""
         for key, value in self._original.items():
             try:
                 sysctl_path(key).write_text(f"{value}\n")

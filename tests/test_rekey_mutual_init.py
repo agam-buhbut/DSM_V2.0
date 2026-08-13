@@ -35,12 +35,10 @@ class AbortRotation(unittest.TestCase):
     def test_abort_clears_pending_so_next_initiate_succeeds(self) -> None:
         km = _make_session_keys()
 
-        # First initiation sets pending_rotation.
         km.initiate_rotation()
         # A second initiation without completing must be rejected...
         with self.assertRaises(Exception):
             km.initiate_rotation()
-        # ...until we abort the pending one.
         self.assertTrue(km.abort_rotation())
 
         # A fresh rotation now starts cleanly (the DSM-003 teardown is gone).
@@ -53,7 +51,6 @@ class AbortRotation(unittest.TestCase):
         self.assertFalse(km.abort_rotation())
         km.initiate_rotation()
         self.assertTrue(km.abort_rotation())
-        # Second abort with nothing pending returns False, does not raise.
         self.assertFalse(km.abort_rotation())
 
 

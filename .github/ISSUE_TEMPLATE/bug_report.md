@@ -7,11 +7,10 @@ assignees: ""
 ---
 
 <!--
-⚠️  SECURITY ISSUES DO NOT BELONG HERE.
-    If this is a vulnerability, STOP and follow the private process in
-    SECURITY.md — do NOT open a public issue.
+SECURITY ISSUES DO NOT BELONG HERE. If this is a vulnerability, stop and
+follow the private process in SECURITY.md — do not open a public issue.
 
-⚠️  NEVER paste secrets or PII into this issue:
+Never paste secrets or PII into this issue:
     - private keys, passphrases, or sealed/wrapped key blobs
     - configs containing real IPs, certificates, CA roots, or SPKI pins
     - TPM attestation blobs or device certificates

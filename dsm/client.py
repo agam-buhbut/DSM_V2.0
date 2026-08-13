@@ -41,10 +41,6 @@ from dsm.session import (
 from dsm.traffic.scheduler import SendScheduler
 from dsm.traffic.shaper import TrafficShaper, make_chaff_packet
 
-# Re-export under the historical name for any external code that imports
-# `dsm.client.VPN_DNS_SERVER`. Internal uses go through SERVER_TUN_IP.
-VPN_DNS_SERVER = SERVER_TUN_IP
-
 log = logging.getLogger(__name__)
 
 
@@ -83,8 +79,6 @@ async def run_client(
         failed connection is a nonzero exit (so ``Restart=on-failure`` fires
         and the kill switch is not left masking a silent outage).
     """
-    # Imported here (not module-level) and reused later in this function
-    # (the per-session ReplayWindow construction).
     import tuncore
     from dsm.core.hardening import harden_and_gate
 
@@ -102,7 +96,7 @@ async def run_client(
         return 1
 
     async with AsyncExitStack() as stack:
-        # Phase 1.8 (H10): create the shutdown event and install signal
+        # Create the shutdown event and install signal
         # handlers BEFORE the pre-handshake kill switch. A SIGTERM during
         # connect/handshake must trigger the AsyncExitStack unwind (removing
         # the kill switch) rather than killing the process with the kill
@@ -178,7 +172,6 @@ async def run_client(
             envelope_latency_budget_ms=config.envelope_latency_budget_ms,
         )
 
-        # Transport
         if config.transport == "udp":
             transport = UDPTransport()
             await transport.bind(
@@ -201,20 +194,6 @@ async def run_client(
             CNMismatchError,
             HandshakeError,
             client_handshake,
-        )
-
-        # Per-error-class log prefix. Lookup is by exact type(e); the
-        # tuple in the except clause below preserves catch order
-        # (subclasses before parent classes is irrelevant here because
-        # every entry is checked by isinstance via the tuple, and the
-        # log prefix is then resolved from the concrete class).
-        _CLIENT_HANDSHAKE_ERR_LABELS: dict[type[BaseException], str] = (
-            {  # pylint: disable=invalid-name  # intentional/false positive (see report)
-                CNMismatchError: "server CN check failed",
-                CertRevokedError: "server cert revoked",
-                CertAuthError: "server cert auth failed",
-                HandshakeError: "handshake failed",
-            }
         )
 
         assert (
@@ -241,17 +220,16 @@ async def run_client(
             CertAuthError,
             HandshakeError,
         ) as e:
-            # Resolve the most-specific label: walk the dict in MRO order
-            # so e.g. CNMismatchError (subclass of CertAuthError) gets
-            # its dedicated prefix rather than CertAuthError's.
-            prefix = next(
-                (
-                    _CLIENT_HANDSHAKE_ERR_LABELS[cls]
-                    for cls in type(e).__mro__
-                    if cls in _CLIENT_HANDSHAKE_ERR_LABELS
-                ),
-                "handshake failed",
-            )
+            # Most-specific first: CNMismatchError and CertRevokedError are
+            # subclasses of CertAuthError, which is a subclass of HandshakeError.
+            if isinstance(e, CNMismatchError):
+                prefix = "server CN check failed"
+            elif isinstance(e, CertRevokedError):
+                prefix = "server cert revoked"
+            elif isinstance(e, CertAuthError):
+                prefix = "server cert auth failed"
+            else:
+                prefix = "handshake failed"
             log.error("%s: %s", prefix, e)
             _emit_handshake_failure(e)
             fsm.transition(State.TEARDOWN)
@@ -304,7 +282,8 @@ async def run_client(
                 # let the outer except undo tun.
                 try:
                     nft.remove()
-                except Exception:  # noqa: BLE001  # see linter report
+                # cleanup path: any failure here must not mask the original
+                except Exception:  # noqa: BLE001
                     log.warning("nft.remove during failed apply also failed")
                 raise
         except Exception:
@@ -313,7 +292,8 @@ async def run_client(
             # registered the cleanup.
             try:
                 tun.close()
-            except Exception:  # noqa: BLE001  # see linter report
+            # cleanup path: any failure here must not mask the original
+            except Exception:  # noqa: BLE001
                 log.warning("tun.close during failed apply also failed")
             raise
 
@@ -360,7 +340,7 @@ async def run_client(
         reassembly = ReassemblyBuffer()
 
         # shutdown + signal handlers were installed at the top of the stack
-        # (Phase 1.8 H10), before the pre-handshake kill switch. Reuse that
+        # before the pre-handshake kill switch. Reuse that
         # same event here so make_send_fn / DataPathContext observe signals.
         send_packet = make_send_fn(
             session_keys,
@@ -371,7 +351,7 @@ async def run_client(
             shutdown=shutdown,
         )
 
-        # Phase 2: envelope-driven. The shaper's paced wire budget
+        # Envelope-driven. The shaper's paced wire budget
         # (release_budget) decides how many packets (real first, chaff fill)
         # leave per poll, so the wire rate is independent of real volume.
         # should_chaff_fn is intentionally omitted (envelope mode).
@@ -396,19 +376,14 @@ async def run_client(
             liveness=liveness,
             shutdown=shutdown,
             reassembly=reassembly,
-            # H-ANON-4: pass the UDPTransport so post-rekey hook can
+            # Pass the UDPTransport so post-rekey hook can
             # rebind to a fresh ephemeral src port; None on TCP.
             udp_transport=transport if isinstance(transport, UDPTransport) else None,
-            # M-BUG-1 / audit H1: static pubs for mutual-init tie-break.
+            # Static pubs for mutual-init tie-break.
             local_static_pub=bytes(keystore.identity.public_key),
             remote_static_pub=server_static_pub,
         )
 
-        # Hand off the steady-state recv/send/liveness loops to the
-        # shared driver. Client-specific bits passed in:
-        #   * udp_addr_filter: drop UDP datagrams not from server_addr.
-        #     TCP doesn't need this (one connection only).
-        #   * extra_loops: auto_mtu_loop is client-only.
         # The AsyncExitStack stays in this module; ``run_data_loops``
         # only owns the loops + the SESSION_CLOSE / FSM teardown.
         from dsm.session import run_data_loops
@@ -423,7 +398,5 @@ async def run_client(
             udp_addr_filter=lambda addr: addr == server_addr,
             shutdown_log="shutting down",
         )
-        # AsyncExitStack unwinds remaining resources in reverse order.
 
-    # Clean shutdown (signal / SESSION_CLOSE / dead-peer): exit 0.
     return 0

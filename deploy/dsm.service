@@ -8,7 +8,7 @@ Documentation=file:///opt/dsm-repo/README.md
 After=network-online.target
 Wants=network-online.target
 
-# Phase 1.9: StartLimitIntervalSec is only honored in [Unit] (systemd
+# StartLimitIntervalSec is only honored in [Unit] (systemd
 # ignores it in [Service], silently removing the crash-loop guard).
 # 5 restarts in 10 minutes is generous for legitimate transient failures
 # (network blip on boot) and tight enough that a config error fails fast.
@@ -57,9 +57,8 @@ SupplementaryGroups=tss
 # at $CREDENTIALS_DIRECTORY/passphrase (mode 0400, root-owned, in tmpfs).
 LoadCredential=passphrase:/etc/dsm/passphrase
 
-# --mode server is the correct CLI form. The previous `dsm server --mode udp`
-# was wrong: `server` is not a subcommand and `--mode` only accepts
-# {client,server}. Transport (udp/tcp) lives in config.toml.
+# --mode server is the correct CLI form: `server` is not a subcommand and
+# --mode accepts only {client,server}. Transport (udp/tcp) lives in config.toml.
 #
 # install.sh creates a dedicated venv at /opt/dsm/venv and installs the wheel
 # into it, producing the `dsm` console-script at /opt/dsm/venv/bin/dsm (its
@@ -75,7 +74,7 @@ ExecStart=/opt/dsm/venv/bin/dsm --mode server \
 KillSignal=SIGTERM
 TimeoutStopSec=15
 
-# Phase 1.9: crash-safe cleanup. ExecStopPost runs on BOTH clean and crash
+# Crash-safe cleanup. ExecStopPost runs on BOTH clean and crash
 # stops (SIGKILL/OOM that bypass the in-process AsyncExitStack unwind), so
 # the host never stays with the kill switch up, a dead resolv.conf, a stale
 # table-100 route / ip rule, or modified sysctls. Idempotent — safe to run
@@ -88,7 +87,7 @@ RestartSec=10s
 StandardOutput=journal
 StandardError=journal
 
-# ─── Sandboxing (Phase 2 conservative subset) ─────────────────────────────
+# Sandboxing — conservative subset.
 # Each flag below was selected because it is known-safe given dsm's syscall
 # surface (Python interpreter + Rust extension + ip / nft subprocess calls).
 # Run `systemd-analyze security dsm` after a fresh deploy to track score;
@@ -144,10 +143,8 @@ KeyringMode=private
 #                           first key allocation (SecureDh25519::default
 #                           or IdentityKeyPair::generate) panics with
 #                           "RLIMIT_MEMLOCK exhausted or kernel refusal".
-# Everything else is dropped. CAP_SYS_ADMIN was previously included with a
-# justification of "nft set/table operations + mount-related ioctls", but
-# nft operates entirely through CAP_NET_ADMIN on the inet/netdev families
-# we use; the mount-ioctl claim was speculative. Dropped after audit.
+# Everything else is dropped. Do NOT add CAP_SYS_ADMIN: nft operates entirely
+# through CAP_NET_ADMIN on the inet/netdev families we use.
 # If the strace audit (§7) surfaces an EPERM in the cellular demo, restore
 # the specific cap with a documented reason.
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_IPC_LOCK
@@ -172,11 +169,6 @@ LimitMEMLOCK=infinity
 # and LimitCORE=0 alone still suppresses the dump.)
 LimitCORE=0
 CoredumpFilter=0x00
-
-# Bound automatic restart so a crash loop doesn't burn CPU and amplify a
-# fault into a denial of service for whatever else shares this host. The
-# StartLimit* directives that enforce this live in [Unit] above — systemd
-# silently ignores StartLimitIntervalSec when it is placed in [Service].
 
 # Tighten the file-creation default so any file dsm creates is mode 0600
 # regardless of where it's written. Already what we do for cert + key
@@ -221,20 +213,9 @@ SystemCallFilter=@system-service
 SystemCallFilter=~@clock @cpu-emulation @debug @module @mount @obsolete @raw-io @reboot @swap @privileged
 SystemCallErrorNumber=EPERM
 
-# ─── Sandboxing TODOs (gated on the strace audit step) ────────────────────
-# The two flags below are likely safe but can break TUN ioctl / netlink in
-# subtle ways depending on kernel build. Enable empirically after walking
-# deploy/GUIDE.md §9f (strace audit on the cellular client).
-#
+# TODO(owner): the two flags below are gated on the strace audit (GUIDE.md §9f).
 # RestrictNamespaces=true
-#     Should not break dsm in the common case — we don't enter any namespaces
-#     at runtime — but `ip(8)` may attempt unshare()/setns() calls on some
-#     distros. Verify: `journalctl -u dsm | grep -i 'permission denied'` after
-#     enabling, and test the kill-switch nftables apply path specifically.
-#
 # SystemCallFilter=@system-service ~@privileged ~@resources @network-io ...
-#     The exact allowlist is captured by the strace audit step. Without the
-#     audit, a too-tight filter will SIGSYS the daemon mid-handshake.
 #
 # Permanently skipped (would break /opt/mtun + /etc/resolv.conf writes):
 #   DynamicUser=yes

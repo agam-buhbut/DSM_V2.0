@@ -1,29 +1,17 @@
 # Security Policy
 
-DSM is security-sensitive software: it is a VPN / network-anonymity tool, and
-people rely on it to protect traffic from a passive observer and an active
-on-path adversary. The server is the tunnel terminator and is assumed to be
-operator-owned and trusted: it necessarily sees the client's source IP and the
-decrypted tunneled traffic, so DSM does NOT promise confidentiality of that
-traffic against the server operator. What the device attestation and CA-signed
-certificate binding DO guarantee even against a misbehaving server is that the
-server cannot forge a client's device identity, swap the bound Noise static, or
-escalate to other enrolled devices (see the threat-model section of the README
-for the full split of protected vs. residual properties). We take vulnerability
-reports seriously and appreciate responsible disclosure.
+DSM is a VPN and network-anonymity tool. The server terminates the tunnel and is
+assumed operator-owned: it sees the client's source IP and the decrypted traffic,
+so DSM promises no confidentiality against the server operator. The device
+attestation and certificate binding still hold against a misbehaving server; see
+the README threat model for the full split.
 
 ## Supported Versions
 
 DSM has not yet had a stable release. Security fixes are provided only for the
 current pre-release line.
 
-| Version            | Supported          |
-|--------------------|--------------------|
-| `v0.1.0` (pre-release) | :white_check_mark: |
-| anything older     | :x:                |
-
-Because there is no stable release yet, all users should track the latest
-`v0.1.x` pre-release.
+Only the current pre-release line, `v0.1.0`, receives security fixes.
 
 ## Reporting a Vulnerability
 
@@ -92,7 +80,7 @@ closed as known:
 
 These are described in the project's threat-model documentation. If you believe
 a property is materially worse than documented — or that one of these can be
-escalated into a stronger attack — that **is** in scope; please report it.
+escalated into a stronger attack — that is in scope; please report it.
 
 ## Out of Scope
 

@@ -19,11 +19,10 @@ session, and reverting on teardown.
 from __future__ import annotations
 
 import logging
-import subprocess
 
 from dsm.core._validators import validate_tun_name
 from dsm.core.sysctl import SysctlOverride
-from dsm.net.nftables import delete_tables
+from dsm.net.nftables import apply_ruleset, delete_tables
 
 log = logging.getLogger(__name__)
 
@@ -60,7 +59,7 @@ class IPForwardingManager:
         # Stop the kernel from telling clients about "better" paths.
         self._sysctl.set("net.ipv4.conf.all.send_redirects", "0")
         self._sysctl.set("net.ipv4.conf.default.send_redirects", "0")
-        # L-NET-1 belt-and-braces: also refuse to ACCEPT redirects from
+        # Belt-and-braces: also refuse to ACCEPT redirects from
         # the LAN side. nftables already drops them but a kernel that
         # honored a stale route table entry from before nft applied is
         # eliminated by this sysctl. Set on both `all` and `default` so
@@ -111,20 +110,10 @@ table inet {self.TABLE} {{
 }}
 """
         try:
-            subprocess.run(
-                ["nft", "-f", "-"],
-                input=ruleset.encode(),
-                check=True,
-                capture_output=True,
-                timeout=5,
-            )
+            apply_ruleset(ruleset, log_label=f"MASQUERADE for {self._tun_name}")
             self._applied = True
-            log.info("MASQUERADE for %s applied", self._tun_name)
-        except FileNotFoundError:
-            log.warning("nft not installed; client traffic won't reach the internet")
-        except subprocess.CalledProcessError as e:
-            stderr = e.stderr.decode(errors="replace").strip()
-            log.warning("MASQUERADE apply failed: %s", stderr)
+        except (RuntimeError, FileNotFoundError) as e:
+            log.warning("MASQUERADE not applied; client traffic won't reach WAN: %s", e)
 
     def remove(self) -> None:
         if not self._applied:

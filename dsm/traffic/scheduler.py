@@ -13,7 +13,7 @@ import logging
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypeVar
 
 from dsm.core.rand import csprng_float
 
@@ -21,6 +21,8 @@ if TYPE_CHECKING:
     from dsm.traffic.shaper import TrafficShaper
 
 log = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
 
 # Bounded queue. Sized for low-RAM targets: 512 * ~1500B ≈ 768 KiB
 # worst-case. Drop policy is drop-oldest regardless of packet type,
@@ -115,12 +117,10 @@ class SendScheduler:
         self._event.set()
 
     async def start(self) -> None:
-        """Start the scheduler loop."""
         self._running = True
         self._task = asyncio.create_task(self._run())
 
     async def stop(self) -> None:
-        """Stop the scheduler loop."""
         self._running = False
         self._event.set()
         if self._task:
@@ -132,16 +132,9 @@ class SendScheduler:
 
     async def _run(self) -> None:
         while self._running:
-            # M-BUG-11: clear the event BEFORE checking the queue, not
-            # after sleeping. Previous order: send-loop → chaff-inject
-            # → _event.clear() → wait_for(_event.wait()). If
-            # `enqueue()` fired during the send-loop iteration (between
-            # the queue check and the clear), it called `_event.set()`;
-            # then the subsequent `clear()` discarded that signal and
-            # the loop waited the full poll_jitter (~30-70 ms) before
-            # noticing the new packet. Clearing first means any
-            # `_event.set()` during the iteration arrives AFTER our
-            # clear and survives to the next wait_for.
+            # Clear the event BEFORE the queue check: an enqueue() during the
+            # iteration then sets it after our clear and survives to the next
+            # wait_for. Clearing after would swallow it and stall ~30-70 ms.
             self._event.clear()
             now = self._clock()
             if self._shaper is not None:
@@ -150,25 +143,31 @@ class SendScheduler:
                 await self._legacy_tick(now)
             await self._sleep_until_next()
 
-    async def _send_one(self, pkt: _ScheduledPacket) -> None:
-        """Send a single packet, keeping the detached loop alive on error.
+    async def _keep_alive(self, coro: Awaitable[_T], what: str) -> _T | None:
+        """Await ``coro``, absorbing failures so the detached loop stays alive.
 
         Transport-level failures (network down, peer closed, socket closed
         under us) are logged at WARNING and skipped. Any OTHER exception is
-        logged at ERROR with a traceback and the loop CONTINUES (DSM-002):
-        this detached task must stay alive so chaff and real egress keep
-        flowing — a dead scheduler silently breaks the constant-traffic
-        anonymity property with no shutdown signal.
+        logged at ERROR with a traceback and the loop CONTINUES: this detached
+        task must stay alive so chaff and real egress keep flowing — a dead
+        scheduler silently breaks the constant-traffic anonymity property with
+        no shutdown signal. Returns ``None`` when ``coro`` failed.
         """
         try:
-            await self._send_fn(pkt.data, pkt.target_size)
+            return await coro
         except (TimeoutError, ConnectionError, OSError) as e:
-            log.warning("send failed: %s", type(e).__name__)
+            log.warning("%s failed: %s", what, type(e).__name__)
         except Exception:
             log.error(
-                "scheduler send_fn raised unexpectedly — keeping loop alive",
+                "scheduler %s raised unexpectedly — keeping loop alive",
+                what,
                 exc_info=True,
             )
+        return None
+
+    async def _send_one(self, pkt: _ScheduledPacket) -> None:
+        """Send a single packet, keeping the detached loop alive on error."""
+        await self._keep_alive(self._send_fn(pkt.data, pkt.target_size), "send")
 
     async def _legacy_tick(self, now: float) -> None:
         """Additive-Poisson path: drain all due packets, then poll chaff."""
@@ -212,20 +211,14 @@ class SendScheduler:
     async def _emit_chaff(self) -> None:
         """Legacy path: generate one chaff packet and enqueue it.
 
-        Keeps the detached loop alive on a chaff_fn error (DSM-002).
+        Keeps the detached loop alive on a chaff_fn error.
         """
         if self._chaff_fn is None:
             return
-        try:
-            chaff_data, chaff_size = await self._chaff_fn()
+        result = await self._keep_alive(self._chaff_fn(), "chaff generation")
+        if result is not None:
+            chaff_data, chaff_size = result
             self.enqueue(chaff_data, chaff_size)
-        except (TimeoutError, ConnectionError, OSError) as e:
-            log.warning("chaff generation failed: %s", type(e).__name__)
-        except Exception:
-            log.error(
-                "scheduler chaff_fn raised unexpectedly — keeping loop alive",
-                exc_info=True,
-            )
 
     async def _send_chaff_direct(self) -> None:
         """Envelope path: generate one chaff packet and send it immediately.
@@ -235,17 +228,10 @@ class SendScheduler:
         """
         if self._chaff_fn is None:
             return
-        try:
-            chaff_data, chaff_size = await self._chaff_fn()
-        except (TimeoutError, ConnectionError, OSError) as e:
-            log.warning("chaff generation failed: %s", type(e).__name__)
+        result = await self._keep_alive(self._chaff_fn(), "chaff generation")
+        if result is None:
             return
-        except Exception:
-            log.error(
-                "scheduler chaff_fn raised unexpectedly — keeping loop alive",
-                exc_info=True,
-            )
-            return
+        chaff_data, chaff_size = result
         await self._send_one(_ScheduledPacket(0.0, chaff_data, chaff_size))
 
     async def _sleep_until_next(self) -> None:

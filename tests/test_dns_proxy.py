@@ -6,7 +6,8 @@ import unittest
 import dns.message
 import dns.rdatatype
 
-from dsm.net.dns_proxy import LocalDNSProxy, _redact_qname
+from dsm.net.dns import DnsResult, redact
+from dsm.net.dns_proxy import LocalDNSProxy
 
 
 class _StubResolver:
@@ -15,7 +16,7 @@ class _StubResolver:
     def __init__(self) -> None:
         self.closed = False
 
-    async def resolve(self, hostname: str) -> list[str]:
+    async def resolve_detailed(self, hostname: str) -> DnsResult:
         raise RuntimeError("stub-upstream-fail")
 
     async def close(self) -> None:
@@ -24,13 +25,12 @@ class _StubResolver:
 
 class TestQnameRedaction(unittest.TestCase):
     def test_redaction_is_stable_and_short(self) -> None:
-        redacted = _redact_qname("example.com")
-        self.assertEqual(len(redacted), 16)
+        redacted = redact("example.com", False)
         expected = hashlib.sha256(b"example.com").hexdigest()[:16]
-        self.assertEqual(redacted, expected)
+        self.assertEqual(redacted, f"qname-sha256={expected}")
 
     def test_different_qnames_produce_different_hashes(self) -> None:
-        self.assertNotEqual(_redact_qname("a.com"), _redact_qname("b.com"))
+        self.assertNotEqual(redact("a.com", False), redact("b.com", False))
 
 
 def _build_query_wire(qname: str) -> bytes:
@@ -58,7 +58,7 @@ class TestDebugDnsFlag(unittest.IsolatedAsyncioTestCase):
     async def test_default_redacts_qname(self) -> None:
         log_text = await self._run_with_flag(debug_dns=False)
         self.assertNotIn("secret-site.example", log_text)
-        self.assertIn(_redact_qname("secret-site.example"), log_text)
+        self.assertIn(redact("secret-site.example", False), log_text)
 
     async def test_debug_flag_emits_plaintext_qname(self) -> None:
         log_text = await self._run_with_flag(debug_dns=True)

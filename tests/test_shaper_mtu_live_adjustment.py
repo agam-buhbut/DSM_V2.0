@@ -4,8 +4,8 @@ When the DSM path MTU drops at runtime, the auto_mtu adapter calls
 ``TrafficShaper.set_size_class_ceiling`` to cap the outer-packet size the
 shaper may emit (Phase 1.7/1.11). The security-relevant invariant pinned
 here is that the cap is *live*: after it is lowered, BOTH chaff sizing
-(the fixed published-prior sampler, Task 2.3 — ``make_chaff_padded`` /
-``pad_chaff`` / ``_sample_chaff_wire_class``) AND real-packet padding
+(the fixed published-prior sampler — ``make_chaff_padded`` /
+``pad_chaff_to_class`` / ``_sample_chaff_wire_class``) AND real-packet padding
 (``pad_packet``) immediately respect the narrowed active class set, so no
 emitted wire size exceeds the new ceiling.
 
@@ -60,7 +60,7 @@ def _real_chaff_sizes(shaper: TrafficShaper, trials: int) -> set[int]:
 
 
 def _pad_chaff_sizes(shaper: TrafficShaper, trials: int) -> set[int]:
-    """Collect chaff wire sizes from the standalone ``pad_chaff`` path.
+    """Collect chaff wire sizes from the standalone ``pad_chaff_to_class`` path.
 
     An empty payload is used so the only thing driving the wire class is the
     fixed-prior draw (``_sample_chaff_wire_class``); a non-trivial payload
@@ -70,7 +70,9 @@ def _pad_chaff_sizes(shaper: TrafficShaper, trials: int) -> set[int]:
     sizes: set[int] = set()
     inner = InnerPacket(ptype=PacketType.CHAFF, epoch_id=0, payload=b"")
     for _ in range(trials):
-        _, target = shaper.pad_chaff(inner)
+        # pylint: disable=protected-access
+        wire_class = shaper._sample_chaff_wire_class()
+        _, target = shaper.pad_chaff_to_class(inner, wire_class)
         sizes.add(target)
     return sizes
 
@@ -126,7 +128,7 @@ class TestSizeClassCeilingLiveAdjustment(unittest.TestCase):
         # would leave classes 640..1400 in the support and fail here.
         for label, sizes in (
             ("make_chaff_packet", after_chaff),
-            ("pad_chaff", after_pad_chaff),
+            ("pad_chaff_to_class", after_pad_chaff),
             ("pad_packet", after_real),
         ):
             with self.subTest(path=label):

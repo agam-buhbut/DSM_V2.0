@@ -52,7 +52,7 @@ def test_missing_file_raises_typed_error_not_empty_allowlist(
     with pytest.raises(CNAllowlistError) as exc:
         CNAllowlist.from_file(missing)
 
-    # KEY: a missing file must NOT degrade into an empty (deny-all but
+    # A missing file must NOT degrade into an empty (deny-all but
     # silently-loaded) allowlist object — it must raise, fail-closed,
     # and the typed error must chain the underlying stat/permission
     # failure rather than swallowing it.
@@ -77,7 +77,7 @@ def test_read_denied_raises_typed_error_chaining_oserror(tmp_path: Path) -> None
     finally:
         os.chmod(path, 0o600)
 
-    # KEY: a read failure must surface as the typed allowlist error with
+    # A read failure must surface as the typed allowlist error with
     # the original PermissionError chained — never as a bare OSError that
     # a caller might mistake for "no clients configured", and never a
     # success.
@@ -108,7 +108,7 @@ def test_malformed_cn_with_tab_rejects_whole_file(tmp_path: Path) -> None:
     with pytest.raises(CNAllowlistError) as exc:
         CNAllowlist.from_file(path)
 
-    # KEY: the malformed entry must abort the whole load — the otherwise
+    # The malformed entry must abort the whole load — the otherwise
     # valid CN on the preceding line must NOT leak through into an
     # allowlist object. Prove no partial CNAllowlist is returned by
     # confirming the call raised (no object) and reporting the offending
@@ -162,6 +162,6 @@ def test_valid_secure_file_loads_so_negatives_are_meaningful(
 
     allowlist = CNAllowlist.from_file(path)
 
-    assert len(allowlist) == 2
+    assert len(allowlist.cns) == 2
     assert allowlist.is_allowed("dsm-a3f29c81-client")
     assert not allowlist.is_allowed("dsm-deadbeef-client")

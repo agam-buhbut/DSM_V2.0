@@ -32,6 +32,16 @@ use tss_esapi::Context;
 
 use tuncore::device_attest_tpm::TpmAttestKey;
 
+/// Verify a TPM-produced DER ECDSA signature under `key`'s exported SPKI, using
+/// the fully independent `p256` implementation. Parse failures panic (they are
+/// harness bugs); only the verification outcome is returned.
+fn verify_sig(key: &TpmAttestKey, msg: &[u8], sig_der: &[u8]) -> Result<(), p256::ecdsa::Error> {
+    let vk =
+        VerifyingKey::from_public_key_der(key.public_spki_der().expect("spki")).expect("parse vk");
+    let sig = Signature::from_der(sig_der).expect("parse DER ECDSA signature");
+    vk.verify(msg, &sig)
+}
+
 /// Max time to wait for the swtpm command port to start accepting.
 const READINESS_TIMEOUT: Duration = Duration::from_secs(5);
 /// Poll interval while waiting for the command port.
@@ -217,7 +227,6 @@ fn swtpm_harness_get_random_roundtrip() {
         "16 zero bytes is not plausible RNG output"
     );
 
-    // A second draw differs — the TPM RNG actually produces fresh entropy.
     let second = ctx.get_random(16).expect("second get_random over swtpm");
     assert_eq!(second.value().len(), 16);
     assert_ne!(
@@ -236,8 +245,6 @@ fn swtpm_harness_get_random_roundtrip() {
 
 #[test]
 fn two_harnesses_use_distinct_ports_and_both_work() {
-    // Proves per-test isolation: two concurrent swtpm instances get different
-    // port pairs and independently serve GetRandom.
     let a = Swtpm::start();
     let b = Swtpm::start();
     assert_ne!(a.port, b.port, "harness instances must not share a port");
@@ -252,11 +259,6 @@ fn two_harnesses_use_distinct_ports_and_both_work() {
     assert_eq!(ra.value().len(), 16);
     assert_eq!(rb.value().len(), 16);
 }
-
-// ---------------------------------------------------------------------------
-// Task 3.4: `TpmAttestKey::generate` + `public_spki_der` + the SECURITY-CRITICAL
-// child-template attribute lock.
-// ---------------------------------------------------------------------------
 
 #[test]
 fn generate_produces_loadable_key() {
@@ -281,7 +283,6 @@ fn public_spki_der_parses_as_p256() {
     let key = TpmAttestKey::generate_with_tcti(&tpm.tcti).expect("generate");
     let spki = key.public_spki_der().expect("spki");
 
-    // Independent parser proves the exported pubkey is valid P-256.
     VerifyingKey::from_public_key_der(spki).expect("SPKI must parse as a P-256 verifying key");
     // P-256 SubjectPublicKeyInfo over an uncompressed point is a fixed 91 bytes
     // — same shape the soft backend produces.
@@ -350,27 +351,16 @@ fn distinct_generations_produce_distinct_keys() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Task 3.5: in-TPM ECDSA `sign` + independent `p256` verification. These prove
-// the TPM produces a valid P-256 ECDSA-SHA256 signature over the exported key,
-// indistinguishable in DER shape from the soft backend's output, and that
-// `sign` re-opens its own context (the persistence proof).
-// ---------------------------------------------------------------------------
-
 #[test]
 fn sign_then_verify_with_p256() {
-    // The core property: a TPM-produced signature verifies as P-256
-    // ECDSA-SHA256 under the exported SPKI, using a fully independent verifier
-    // (`p256`). This proves the in-TPM key signs correctly and the DER round-trips.
+    // Verification uses a fully independent implementation (`p256`), so this proves the
+    // TPM's DER output is interoperable, not just self-consistent.
     let tpm = Swtpm::start();
     let key = TpmAttestKey::generate_with_tcti(&tpm.tcti).expect("generate");
     let msg = b"DSM-BIND-v1\x00 test handshake hash material";
 
     let sig_der = key.sign(msg).expect("sign in TPM");
-    let vk =
-        VerifyingKey::from_public_key_der(key.public_spki_der().expect("spki")).expect("parse vk");
-    let sig = Signature::from_der(&sig_der).expect("parse DER ECDSA signature");
-    vk.verify(msg, &sig)
+    verify_sig(&key, msg, &sig_der)
         .expect("TPM signature must verify as P-256 ECDSA-SHA256 under the exported SPKI");
 }
 
@@ -384,19 +374,13 @@ fn sign_in_fresh_context_after_generate() {
     // deterministic and the child genuinely persists in the TPM.
     let tpm = Swtpm::start();
     let key = TpmAttestKey::generate_with_tcti(&tpm.tcti).expect("generate");
-    // No handle from generate is reused — sign always re-opens (see impl). A
-    // second sign on the same key likewise re-opens, proving repeatability.
     let msg = b"persistence-proof: child reloads under re-derived primary";
-    let vk =
-        VerifyingKey::from_public_key_der(key.public_spki_der().expect("spki")).expect("parse vk");
 
     for round in 0..2 {
         let sig_der = key
             .sign(msg)
             .unwrap_or_else(|e| panic!("sign round {round}: {e}"));
-        let sig = Signature::from_der(&sig_der).expect("parse sig");
-        vk.verify(msg, &sig)
-            .unwrap_or_else(|e| panic!("verify round {round}: {e}"));
+        verify_sig(&key, msg, &sig_der).unwrap_or_else(|e| panic!("verify round {round}: {e}"));
     }
 }
 
@@ -407,29 +391,22 @@ fn tampered_message_fails_verify() {
     let tpm = Swtpm::start();
     let key = TpmAttestKey::generate_with_tcti(&tpm.tcti).expect("generate");
     let sig_der = key.sign(b"original message").expect("sign");
-    let vk =
-        VerifyingKey::from_public_key_der(key.public_spki_der().expect("spki")).expect("parse vk");
-    let sig = Signature::from_der(&sig_der).expect("parse sig");
     assert!(
-        vk.verify(b"tampered message", &sig).is_err(),
+        verify_sig(&key, b"tampered message", &sig_der).is_err(),
         "a signature over a different message must not verify"
     );
 }
 
 #[test]
 fn wrong_key_fails_verify() {
-    // A signature from key1 must NOT verify against key2's SPKI — the signature
-    // is bound to the specific in-TPM key, not the message alone.
+    // The signature is bound to the specific in-TPM key, not to the message alone.
     let tpm = Swtpm::start();
     let key1 = TpmAttestKey::generate_with_tcti(&tpm.tcti).expect("k1");
     let key2 = TpmAttestKey::generate_with_tcti(&tpm.tcti).expect("k2");
     let msg = b"shared message signed by key1";
     let sig_der = key1.sign(msg).expect("sign with k1");
-    let vk2 =
-        VerifyingKey::from_public_key_der(key2.public_spki_der().expect("k2 spki")).expect("vk2");
-    let sig = Signature::from_der(&sig_der).expect("parse sig");
     assert!(
-        vk2.verify(msg, &sig).is_err(),
+        verify_sig(&key2, msg, &sig_der).is_err(),
         "key1's signature must not verify under key2's SPKI"
     );
 }
@@ -441,15 +418,10 @@ fn sign_enforces_1mib_cap() {
     let tpm = Swtpm::start();
     let key = TpmAttestKey::generate_with_tcti(&tpm.tcti).expect("generate");
 
-    // Exactly at the cap: accepted + verifies (matches soft, which accepts it).
     let at_cap = vec![0x5Au8; 1 << 20];
     let sig_der = key.sign(&at_cap).expect("sign at 1 MiB cap must succeed");
-    let vk = VerifyingKey::from_public_key_der(key.public_spki_der().expect("spki")).expect("vk");
-    let sig = Signature::from_der(&sig_der).expect("parse sig");
-    vk.verify(&at_cap, &sig)
-        .expect("at-cap signature must verify");
+    verify_sig(&key, &at_cap, &sig_der).expect("at-cap signature must verify");
 
-    // One byte over the cap: rejected with the same typed error as soft.
     let over_cap = vec![0x5Au8; (1 << 20) + 1];
     let err = key
         .sign(&over_cap)
@@ -460,25 +432,16 @@ fn sign_enforces_1mib_cap() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Task 3.6: `to_store_blob` / `from_store_blob` persistence roundtrip, tampered
-// -blob rejection, and the SECURITY-CRITICAL cross-TPM residency proof — a blob
-// provisioned on one TPM must NOT yield a working key on another.
-// ---------------------------------------------------------------------------
-
 #[test]
 fn store_blob_roundtrip_same_tpm() {
-    // Persist the key as a DSMT blob, restore it (on the SAME swtpm), and prove
-    // the restored key is the original: identical SPKI, and it signs a message
-    // that verifies under the original SPKI. The restored key drives a real
-    // TPM2_Load on first sign, so a working signature proves the blob carries a
-    // genuinely loadable private area.
+    // The restored key drives a real TPM2_Load on its first sign, so a verifying
+    // signature proves the blob carries a genuinely loadable private area.
     let tpm = Swtpm::start();
     let key = TpmAttestKey::generate_with_tcti(&tpm.tcti).expect("generate");
     let original_spki = key.public_spki_der().expect("spki").to_vec();
 
     let blob = key.to_store_blob().expect("to_store_blob");
-    drop(key); // the original is gone; only the blob survives
+    drop(key);
 
     let restored =
         TpmAttestKey::from_store_blob_with_tcti(&blob, &tpm.tcti).expect("restore from blob");
@@ -509,9 +472,8 @@ fn store_blob_parse_rejects_tampered() {
     let mut blob = key.to_store_blob().expect("to_store_blob");
     drop(key);
 
-    // Flip the version byte in the DSMT header (offset 4). `TpmAttestKey` is
-    // intentionally NOT `Debug` (it holds private key material), so we destructure
-    // the `Err` with a `let-else` instead of `expect_err`.
+    // `TpmAttestKey` is intentionally NOT `Debug` (it holds private key material), so
+    // destructure the `Err` with `let-else` instead of `expect_err`.
     blob[4] = 0xFE;
     let Err(err) = TpmAttestKey::from_store_blob_with_tcti(&blob, &tpm.tcti) else {
         panic!("tampered DSMT header must be rejected");
@@ -521,7 +483,6 @@ fn store_blob_parse_rejects_tampered() {
         "tampered header must surface tpm_blob's typed rejection, got: {err}"
     );
 
-    // Flipping the magic is likewise a typed rejection (not a panic).
     let mut bad_magic = key_blob_for(&tpm);
     bad_magic[0] = b'X';
     let Err(err2) = TpmAttestKey::from_store_blob_with_tcti(&bad_magic, &tpm.tcti) else {
@@ -554,11 +515,10 @@ fn key_blob_for(tpm: &Swtpm) -> Vec<u8> {
 /// useless on any other device.
 #[test]
 fn cross_tpm_residency_fails() {
-    // Provision on TPM A and capture the blob.
     let tpm_a = Swtpm::start();
     let key_a = TpmAttestKey::generate_with_tcti(&tpm_a.tcti).expect("generate on A");
     let blob = key_a.to_store_blob().expect("to_store_blob on A");
-    // Sanity: the blob is valid ON A (would sign fine here). Drop A's handle.
+    // Nothing on A is kept live — only the blob crosses to B.
     drop(key_a);
 
     // Spin up a genuinely SEPARATE TPM B: fresh state dir + different ports +
@@ -569,26 +529,17 @@ fn cross_tpm_residency_fails() {
         "B must be a different TPM instance than A (distinct TCTI/ports)"
     );
 
-    // Parsing/reconstruction on B succeeds — it is the same bytes, no TPM call.
     let restored_on_b = TpmAttestKey::from_store_blob_with_tcti(&blob, &tpm_b.tcti)
         .expect("parse + reconstruct on B must succeed (no TPM interaction yet)");
 
-    // The actual residency check: signing on B re-derives B's primary and tries
-    // to TPM2_Load A's child blob under it — this MUST fail.
     let sign_res = restored_on_b.sign(b"attempt to use A's key on B");
     let err = sign_res.expect_err(
         "RESIDENCY VIOLATION: A's key blob signed on TPM B — the key is NOT TPM-bound!",
     );
 
-    // The residency proof is SPECIFICALLY a `TPM2_Load` integrity rejection:
-    // B re-derives a DIFFERENT Owner primary, so the child's private area
-    // (wrapped to A's primary) fails its integrity check on load. tss-esapi
-    // formats the format-1 RC `TPM2_RC_INTEGRITY` (0x9F) as
-    // "integrity check failed (...)", wrapped by `sign` as
-    // "TPM error: integrity check failed (...)". Asserting on that exact RC
-    // text — not merely "any error containing tpm" — is what makes this test
-    // genuinely prove residency rather than incidentally pass on some other
-    // failure.
+    // Assert the exact RC text: tss-esapi formats TPM2_RC_INTEGRITY (0x9F) as
+    // "integrity check failed (...)". Matching merely "any error containing tpm"
+    // would let this pass on an unrelated failure.
     let lower = err.to_ascii_lowercase();
     assert!(
         lower.contains("tpm error") && lower.contains("integrity check failed"),
@@ -613,26 +564,17 @@ fn cross_tpm_residency_fails() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Task 3.8: `zeroize` makes the key unusable (parity with the soft backend's
-// "attest key has been zeroized" contract), is idempotent, and the stateless
-// re-open model leaks NO transient TPM handle across repeated provisions/signs
-// (every load is paired with a flush inside its own session).
-// ---------------------------------------------------------------------------
-
 /// After `zeroize`, every accessor must return the SAME typed error the soft
 /// backend returns (`"attest key has been zeroized"`). This locks the
 /// cross-backend FFI/Python contract: a verifier/store cannot distinguish a
 /// zeroized TPM key from a zeroized soft key by its error.
 #[test]
 fn zeroize_makes_key_unusable() {
-    // Post-zeroize, every accessor must return this exact soft-identical string.
     const ZEROIZED: &str = "attest key has been zeroized";
 
     let tpm = Swtpm::start();
     let mut key = TpmAttestKey::generate_with_tcti(&tpm.tcti).expect("generate");
 
-    // Pre-zeroize: everything works.
     assert!(key.public_spki_der().is_ok(), "spki must work pre-zeroize");
     assert!(key.sign(b"x").is_ok(), "sign must work pre-zeroize");
     assert!(
@@ -642,7 +584,6 @@ fn zeroize_makes_key_unusable() {
 
     key.zeroize();
 
-    // Post-zeroize: every accessor fails with the soft-identical error string.
     let spki_err = key
         .public_spki_der()
         .expect_err("public_spki_der must fail post-zeroize");
@@ -672,7 +613,7 @@ fn zeroize_is_idempotent() {
     let mut key = TpmAttestKey::generate_with_tcti(&tpm.tcti).expect("generate");
 
     key.zeroize();
-    key.zeroize(); // second call: no panic, no double-free, no resurrection.
+    key.zeroize();
 
     assert!(
         key.public_spki_der().is_err(),
@@ -722,16 +663,6 @@ fn no_transient_handle_leak_across_provisions() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Task 3.12: bind the operator passphrase to the attest key's TPM auth value.
-// `encrypt_to_store(pass)` runs TPM2_ObjectChangeAuth to set the child key's
-// auth = HKDF(pass); `decrypt_from_store(blob, pass)` caches the derived auth
-// and `sign` installs it via tr_set_auth. The headline property: the WRONG
-// passphrase cannot sign (TPM authorization rejection). An empty passphrase
-// keeps the empty-auth behaviour (back-compat), and the fresh `generate`d key
-// signs with empty auth (the enroll CSR path).
-// ---------------------------------------------------------------------------
-
 /// SECURITY — the two-factor proof. After binding a passphrase as the key's TPM
 /// auth, restoring with the CORRECT passphrase signs and verifies, but restoring
 /// with a WRONG passphrase derives the wrong auth and the TPM REJECTS the sign
@@ -743,13 +674,11 @@ fn sign_requires_correct_passphrase_auth() {
     let key = TpmAttestKey::generate_with_tcti(&tpm.tcti).expect("generate");
     let spki = key.public_spki_der().expect("spki").to_vec();
 
-    // Bind the passphrase as the key's TPM auth at store time.
     let blob = key
         .encrypt_to_store(b"correct-horse-battery-staple")
         .expect("encrypt_to_store with passphrase (ObjectChangeAuth)");
     drop(key); // only the auth-bound blob survives
 
-    // CORRECT passphrase: restore, sign, and verify under the original SPKI.
     let good = TpmAttestKey::decrypt_from_store_with_tcti(
         &blob,
         &tpm.tcti,
@@ -765,12 +694,9 @@ fn sign_requires_correct_passphrase_auth() {
     vk.verify(msg, &sig)
         .expect("correctly-authed TPM signature must verify");
 
-    // WRONG passphrase: the derived auth is wrong, so TPM2_Sign under the
-    // nullauth session fails the authorization HMAC check. tss-esapi formats
-    // TPM2_RC_AUTH_FAIL as "the authorization HMAC check failed and DA counter
-    // incremented (...)"; `sign` wraps it as "TPM error: ...". Asserting on that
-    // exact authorization wording — not "any error" — is what makes this prove
-    // the passphrase is genuinely load-bearing rather than incidentally failing.
+    // tss-esapi formats TPM2_RC_AUTH_FAIL as "the authorization HMAC check failed and DA
+    // counter incremented (...)", wrapped by `sign` as "TPM error: ...". Asserting that
+    // exact wording rather than "any error" is what makes the passphrase load-bearing.
     let bad = TpmAttestKey::decrypt_from_store_with_tcti(&blob, &tpm.tcti, b"WRONG-passphrase")
         .expect("parse blob (wrong-pass still parses; auth is wrong, not the bytes)");
     let err = bad
@@ -810,7 +736,6 @@ fn empty_passphrase_keeps_empty_auth() {
     let key = TpmAttestKey::generate_with_tcti(&tpm.tcti).expect("generate");
     let spki = key.public_spki_der().expect("spki").to_vec();
 
-    // The enroll CSR path: the fresh empty-auth key signs before any store.
     let csr_msg = b"enroll: fresh empty-auth key signs the CSR before store";
     let csr_sig = key
         .sign(csr_msg)
@@ -822,7 +747,6 @@ fn empty_passphrase_keeps_empty_auth() {
     )
     .expect("fresh-key signature must verify");
 
-    // Empty passphrase: no auth bound; restore + sign works (back-compat).
     let blob = key
         .encrypt_to_store(b"")
         .expect("encrypt_to_store with empty passphrase == to_store_blob");

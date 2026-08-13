@@ -10,7 +10,6 @@ from __future__ import annotations
 import argparse
 import grp
 import hashlib
-import ipaddress
 import json
 import os
 import shutil
@@ -83,8 +82,8 @@ def _check_preconditions(tcti: str | None) -> None:
         )
     if _backend_is_soft():
         print(
-            "=== EVALUATION BUILD — soft attest backend, NOT hardware-bound. "
-            "Do NOT deploy in production. ===",
+            "warning: evaluation build — soft attest backend, not "
+            "hardware-bound. Do not deploy in production.",
             file=sys.stderr,
         )
         return
@@ -92,22 +91,6 @@ def _check_preconditions(tcti: str | None) -> None:
         preflight_tpm(tcti)
     except TpmPreflightError as e:
         _fail(str(e))
-
-
-def _validate_ip_literal(ip: str) -> None:
-    """Reuse the audited Config IP-literal rule instead of a duplicated regex.
-
-    ``Config._validate_server_ip`` accepts only a literal IPv4 address (no
-    hostnames, no IPv6 — the AF_INET transport cannot use either). We mirror
-    that exact rule here so a bad ``--server-ip`` fails before the config is
-    written, with the same semantics the real validator enforces downstream.
-    """
-    try:
-        addr = ipaddress.ip_address(ip)
-    except ValueError:
-        _fail(f"server-ip must be a literal IPv4 address, got {ip!r}")
-    if addr.version == 6:
-        _fail(f"IPv6 server-ip {ip!r} is not supported (use an IPv4 endpoint)")
 
 
 def _render_config(role: str, args: argparse.Namespace, install_dir: Path) -> str:
@@ -181,7 +164,6 @@ def _write_state(
 
 
 def _require_server_args(role: str, args: argparse.Namespace) -> None:
-    """Fail closed on missing required non-interactive inputs."""
     missing: list[str] = []
     if not args.server_ip:
         missing.append("--server-ip")
@@ -222,7 +204,6 @@ def _ensure_secret_dir(install_dir: Path) -> None:
                 f"the current uid {os.geteuid()}; refusing to chmod a dir owned "
                 "by another user (provision it yourself at mode 0700)"
             )
-            return  # unreachable; _fail exits
     install_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     try:
         install_dir.chmod(0o700)
@@ -260,7 +241,6 @@ def _force_remove_enrollment(install_dir: Path, state_path: Path) -> None:
 
 def _phase_a(role: str, args: argparse.Namespace) -> int:
     _require_server_args(role, args)
-    _validate_ip_literal(args.server_ip)
     _check_preconditions(getattr(args, "tcti", None))
     install_dir = Path(args.install_dir)
     _ensure_secret_dir(install_dir)

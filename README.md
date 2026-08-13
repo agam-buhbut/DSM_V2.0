@@ -36,7 +36,7 @@ evaluation only and must never be deployed in production.
 
 ## Goal
 
-Provide a highly secure, anonymity-preserving VPN tunnel resistant to ISP surveillance, DPI, traffic analysis, and active adversaries.
+Provide a VPN tunnel that resists ISP surveillance, DPI, traffic analysis, and active on-path adversaries.
 
 ## Non-Goals
 
@@ -47,55 +47,50 @@ Provide a highly secure, anonymity-preserving VPN tunnel resistant to ISP survei
 
 ## Architecture
 
-**Flow:**
+### Flow
 
 ```
 Client -> Client-Owned Server -> Destination
 ```
 
-**Components:**
+### Components
 
-- Client: initiates handshake, encrypts traffic, generates chaff
-- Server: completes handshake, decrypts and forwards traffic
+The client initiates the handshake, encrypts traffic, and generates chaff.
+The server completes the handshake, decrypts, and forwards.
 
-**State Model:**
+### State Model
 
-- Session-based finite state machine (6 states)
-- `IDLE -> CONNECTING -> HANDSHAKING -> ESTABLISHED -> REKEYING -> TEARDOWN -> IDLE`
+A session-based finite state machine with six states:
+`IDLE -> CONNECTING -> HANDSHAKING -> ESTABLISHED -> REKEYING -> TEARDOWN -> IDLE`
 
-**Concurrency:**
+### Concurrency
 
-- Python asyncio (single-threaded async I/O)
-- Concurrent recv_loop + tun_send_loop + liveness_loop via asyncio.gather
-  (client also runs auto_mtu_loop alongside the others)
+Single-threaded asyncio. recv_loop, tun_send_loop, and liveness_loop run
+concurrently under asyncio.gather; the client adds auto_mtu_loop.
 
 ## Networking
 
-**Transport:**
+### Transport
 
 - UDP (default)
 - TCP (fallback, with 4-byte big-endian length-prefix framing; all frames
   padded to the max size class so the length prefix is constant on the wire)
 
-  IMPORTANT — TCP is "obfuscation only against simple DPI", not against
-  passive traffic analysis. The TCP handshake (SYN / SYN-ACK / ACK),
-  teardown (FIN / RST), and connection-establishment fingerprint
-  remain visible to a passive on-path adversary regardless of DSM's
-  inner padding/timing defenses. TLS-fronting (wrapping the wire in
-  a TLS connection that mimics a common origin) would close this gap
-  but is intentionally out of scope. Use UDP for the strongest
-  anonymity properties this codebase provides; reach for TCP only
-  when a network strictly blocks UDP or NAT-symmetric routing makes
-  UDP unusable.
+  TCP is obfuscation against simple DPI only, not against passive traffic
+  analysis. The TCP handshake (SYN / SYN-ACK / ACK), teardown (FIN / RST),
+  and connection-establishment fingerprint remain visible to a passive
+  on-path adversary regardless of DSM's inner padding and timing defenses.
+  TLS-fronting would close this gap but is out of scope. Use UDP for the
+  strongest anonymity properties this codebase provides; reach for TCP
+  only when a network blocks UDP or symmetric NAT makes UDP unusable.
 
-**Connection:**
+### Connection
 
-- Single client per server instance (server binds one socket and, for TCP,
-  accepts a single connection; for UDP the server locks onto the first
-  authenticated peer address)
-- Session-based with graceful shutdown (SESSION_CLOSE packet)
+One client per server instance: the server binds a single socket and, for
+TCP, accepts one connection; for UDP it locks onto the first authenticated
+peer address. Sessions shut down gracefully via a SESSION_CLOSE packet.
 
-**Reliability:**
+### Reliability
 
 - Handshake retransmission with exponential backoff (3 attempts, 1s/2s/4s)
 - Bootstrap ephemeral-DH retransmit on lost response (retransmits msg3 +
@@ -109,7 +104,7 @@ Client -> Client-Owned Server -> Destination
   INITs replay the ACK without re-rotating.
 - No application-level retransmission for data packets (relies on inner protocol or TCP)
 
-**Fragmentation:**
+### Fragmentation
 
 - FRAGMENT packet type (0x07) defined
 - Receive-side reassembly implemented (capacity-bounded, 5-second timeout,
@@ -119,7 +114,7 @@ Client -> Client-Owned Server -> Destination
   split into up to 16 FRAGMENT inner packets, each chunk sized to fit a
   single padded outer packet
 
-**Path MTU:**
+### Path MTU
 
 - Configurable TUN MTU (default 1400, bounds 576-1500)
 - Optional kernel-level Path MTU Discovery on the UDP socket
@@ -135,7 +130,7 @@ Client -> Client-Owned Server -> Destination
 
 ## Cryptography
 
-**Key Exchange:**
+### Key Exchange
 
 - Noise XX pattern (X25519 + AES-256-GCM + SHA-256)
 - Prologue-tagged: `"DSM\x00\x01\x00\x01"`
@@ -164,7 +159,7 @@ Client -> Client-Owned Server -> Destination
   client checks the server cert's CN against expected_server_cn
 - Optional CRL distributed via walked-USB on the offline-CA cadence
 
-**Key Rotation:**
+### Key Rotation
 
 - Every 5000 packets or 600 seconds (configurable)
 - Ephemeral X25519 DH per rotation
@@ -172,11 +167,11 @@ Client -> Client-Owned Server -> Destination
 - 5-second grace period for in-flight packets from previous epoch
 - Rate-limited to one rotation per 60 seconds
 
-**Encryption:**
+### Encryption
 
-- AES-256-GCM (AEAD) with sequence number as AAD
+Encryption is AES-256-GCM (AEAD) with the sequence number as AAD.
 
-**Nonce Strategy:**
+### Nonce Strategy
 
 - Structured 96-bit nonce: epoch(32) || counter(32) || random(32)
 - Counter provides uniqueness guarantee within an epoch
@@ -185,29 +180,22 @@ Client -> Client-Owned Server -> Destination
 - Counter is poisoned on exhaustion (returns None permanently) to prevent
   nonce reuse if a session is somehow continued past 2^32 packets
 
-**Replay Protection:**
+### Replay Protection
 
-- 128-bit sliding window bitmap (separate window per epoch during grace)
-- Check-before-decrypt, update-after-authentication
+A 128-bit sliding window bitmap, with a separate window per epoch during
+the grace period. Checked before decrypt, updated after authentication.
 
-**Key Storage:**
+### Key Storage
 
 - Identity key (X25519 Noise static): encrypted at rest with Argon2id +
   XChaCha20-Poly1305, mlock'd during use, single-pass zeroized on drop.
-- Attest key (ECDSA P-256), DEFAULT tpm-attest backend: generated inside
-  and non-extractable from a TPM 2.0; signs in-TPM (TPM2_Sign). The
-  on-disk attest_key_file is a versioned, TPM-bound DSMT context blob
-  (marshalled TPMT_PUBLIC + the TPM-encrypted TPM2B_PRIVATE) that loads
-  ONLY on the TPM that created it — there is no extractable private
-  scalar. The operator passphrase ALSO protects the attest key on this
-  backend: it is bound as the in-TPM key's authorization value (set via
-  TPM2_ObjectChangeAuth at store time, re-installed via tr_set_auth before
-  each sign), so a wrong passphrase fails the sign with TPM_RC_AUTH_FAIL.
-  This is defense-in-depth on top of hardware residency — signing then
-  requires BOTH this TPM and the passphrase. A forgotten passphrase makes
-  the key unusable and forces a re-enroll. The dev/test soft backend
-  instead Argon2id-seals a software attest key file under the same
-  passphrase (extractable from memory).
+- Attest key (ECDSA P-256): stored per the backend described under Key
+  Exchange. On tpm-attest the on-disk file is a versioned TPM-bound DSMT
+  context blob that loads only on the originating TPM; the operator
+  passphrase is the key's in-TPM authorization value, so signing needs
+  both the TPM and the passphrase, and a forgotten passphrase forces
+  re-enrollment. On dev-soft-attest the key is Argon2id-sealed on disk
+  under the same passphrase.
 - Argon2id parameters: 512 MiB memory, 4 iterations, 2 parallelism
 - Memory locked (mlock) during use
 - Single-pass zeroization via Rust zeroize crate on drop
@@ -216,14 +204,14 @@ Client -> Client-Owned Server -> Destination
 
 ## Anonymity and Traffic Resistance
 
-**Padding:**
+### Padding
 
 - 11 size classes: 128, 256, 384, 512, 640, 768, 896, 1024, 1152, 1280, 1400 bytes
 - Inner padding fills the AEAD envelope to the target class boundary so no
   unauthenticated outer padding remains on the wire
 - TCP frames padded to max size class (1400) for constant wire size
 
-**Chaff and adaptive-envelope shaping:**
+### Chaff and adaptive-envelope shaping
 
 - The wire packet rate (real + chaff) is paced to a slowly-varying
   ENVELOPE — a target packets/sec that the scheduler emits exactly,
@@ -254,14 +242,14 @@ Client -> Client-Owned Server -> Destination
   class within tens of packets, re-spiking the histogram at the user's
   modal size; that feedback loop has been removed.)
 
-  DOCUMENTED RESIDUALS (what is NOT hidden — be explicit):
+  Not hidden by this model:
   - SUSTAINED high-volume traffic (e.g. a bulk download) IS visible on
     the wire: the budget override raises the envelope to match within
     ~1 s, so a long steady-state flow at high rate is observable.
     Only the onset (the transition from idle to active) is smeared;
     steady-state volume is not hidden by this model.
-  - SIZE "CAN'T-PAD-DOWN" FLOOR: a real payload of P bytes MUST pad to a
-    size class >= P — padding can only grow a packet, never shrink it.
+  - Padding floor: a real payload of P bytes must pad to a size class >= P —
+    padding can only grow a packet, never shrink it.
     So while the size histogram trends to the fixed prior, real packets
     are never sized BELOW their own payload: large/near-MTU payloads
     (bulk transfers) unavoidably use the large class, leaving the
@@ -281,12 +269,10 @@ Client -> Client-Owned Server -> Destination
     observer can fingerprint DSM session establishment from this
     recognizable fixed-1400-byte exchange. Masking pre-key traffic is
     post-v1 research; it is documented here as an accepted v1 risk.
-  - TCP transport: see IMPORTANT note in NETWORKING above. TCP is
-    obfuscation-only against simple DPI; the SYN/FIN/RST connection
-    fingerprint remains visible regardless of inner padding or timing.
-    Use UDP for the strongest anonymity properties.
+  - TCP transport: the connection fingerprint remains visible. See the
+    TCP note under Networking.
 
-**Timing:**
+### Timing
 
 - Configurable jitter (default 1-100ms) on all outgoing packets
 - Send scheduler with priority queue and randomized delays
@@ -295,7 +281,7 @@ Client -> Client-Owned Server -> Destination
   envelope_idle_floor_min_pps, envelope_idle_floor_max_pps) are
   documented with bandwidth/latency tradeoffs in config.example.toml
 
-**Leak Prevention:**
+### Leak Prevention
 
 - nftables kill switch blocks all non-VPN traffic
 - mDNS (5353) and LLMNR (5355) blocked to prevent LAN enumeration
@@ -306,16 +292,13 @@ Client -> Client-Owned Server -> Destination
   server while every other DoH destination is dropped.
 - VPN sockets marked with SO_MARK=0x1 so the ip-rule skips the TUN table
   and avoids routing loops
-
-**DNS:**
-
-- Resolution module implemented (DoH, DoT, static hosts file, caching)
-- Server-side DNS interception wired into the data path (UDP:53 intercept,
-  async resolution, encrypted response back to client)
+- Resolution itself runs server-side: UDP:53 is intercepted off the data
+  path, resolved asynchronously (DoH, DoT, static hosts file, caching),
+  and the answer returned to the client inside the tunnel
 
 ## Threat Model
 
-**Adversaries:**
+### Adversaries
 
 - ISP surveillance
 - DPI systems
@@ -323,7 +306,7 @@ Client -> Client-Owned Server -> Destination
 - State-level adversaries
 - Hostile/unsecured WiFi networks
 
-**Assumptions:**
+### Assumptions
 
 - Network is hostile
 - Server is trusted (operator-owned). The server is the tunnel terminator:
@@ -336,55 +319,29 @@ Client -> Client-Owned Server -> Destination
   keys remain sound. SECURITY.md states the same split.
 - Client device is physically secure
 
-**Out of Scope:**
+### Out of Scope
 
 - Physical access to client/server
 - Compromised dependencies or libraries
 - Anonymity from the server operator (server sees client IP)
 
-**Accepted v1 Risks (documented, not fixed in this release):**
-
-- BOOT / HANDSHAKE FINGERPRINT: the Noise XX establishment exchange
-  emits a recognizable fixed-1400-byte pre-key frame sequence before
-  any session keys exist. This window is outside the adaptive-envelope
-  shaper (the envelope governs post-key data traffic only). A passive
-  on-path observer can detect and fingerprint DSM session establishment
-  from this sequence. Masking pre-key traffic is post-v1 research.
-  (The attest key signs once per connection-establishment, not per
-  packet; the TPM sign adds tens of ms of setup latency. In a MIXED
-  soft/TPM fleet that latency could distinguish backends, but v1
-  MANDATES the TPM backend for ALL production devices — the soft
-  backend is dev/test only — so there is no soft-vs-TPM timing
-  distinction in production.)
-- SUSTAINED VOLUME: the envelope hides burst ONSET and short-term
-  volume within the configurable latency budget (default 1 s). A
-  sustained high-rate transfer that exceeds the budget for long enough
-  drives the envelope to match the real rate within ~1 s, making the
-  steady-state wire rate visible. Volume over many seconds is not
-  hidden; only the transition is smeared.
-- TCP TRANSPORT: see IMPORTANT note in NETWORKING above. TCP is
-  obfuscation-only against simple DPI; connection establishment and
-  teardown patterns are visible. Use UDP for the strongest anonymity
-  properties.
-- PACKET-RATE (not byte-rate) ENVELOPE: the shaper paces packets/sec.
-  Residual byte-rate signal is bounded by the fixed-prior chaff sizes
-  but not eliminated; a bytes/sec envelope is post-v1 work.
-- ATTEST KEY RESIDENCY (scope): the default tpm-attest backend keeps the
-  ECDSA attest key non-extractable in a TPM 2.0 (see CRYPTOGRAPHY above),
-  which defeats disk/memory key theft. It proves key residency only — it
-  does NOT bind the key to a measured-boot state (no PCR policy) and does
-  NOT do remote attestation / quotes; those are future work. The optional
-  soft-attest dev/test build has NO hardware binding and its key is
-  extractable — never deploy it.
+Accepted v1 risks. The traffic-analysis residuals listed under Anonymity
+and Traffic Resistance (handshake fingerprint, sustained volume, TCP
+connection fingerprint, packet-rate rather than byte-rate pacing) are
+accepted for v1, not fixed. One further scope limit: the default
+tpm-attest backend proves key residency only. It keeps the ECDSA attest
+key non-extractable in a TPM 2.0, which defeats disk and memory key
+theft, but it does not bind the key to a measured-boot state (no PCR
+policy) and does no remote attestation or quotes. The dev-soft-attest
+build has no hardware binding and an extractable key; never deploy it.
 
 ## Implementation
 
-**Languages:**
+Python handles the protocol, networking, traffic shaping, and session
+management; the cryptographic primitives, key management, and memory
+protection live in Rust behind PyO3.
 
-- Python (protocol, networking, traffic shaping, session management)
-- Rust via PyO3 (cryptographic primitives, key management, memory protection)
-
-**Rust crate (tuncore):**
+### Rust crate (tuncore)
 
 - AES-256-GCM encrypt/decrypt
 - X25519 key exchange
@@ -399,7 +356,7 @@ Client -> Client-Owned Server -> Destination
   (default, via tss-esapi — generate/sign/store/zeroize in-TPM, DSMT
   context blob) and a software backend (dev/CI only, extractable)
 
-**Dependencies:**
+### Dependencies
 
 - Python: cryptography (X.509 cert + CRL parsing), dnspython (server
   DNS proxy wire-format parsing). DoH transport is a hand-rolled
@@ -420,7 +377,7 @@ Client -> Client-Owned Server -> Destination
 
 **Path:** `/opt/mtun/config.toml`
 
-**Parameters:**
+### Parameters
 
 - mode: client | server
 - server_ip: literal IPv4/IPv6 address ONLY (hostnames are rejected;
@@ -467,10 +424,8 @@ Client -> Client-Owned Server -> Destination
   Recommended for cellular / roaming clients.
 - pmtu_check_interval_s: how often the auto_mtu loop polls the kernel
   PMTU, seconds (default: 30, bounds (0, 3600]).
-- log_level: debug | info | warning | error (default: info — operational
-  lines like "server forwarding subsystem active", "MASQUERADE for
-  mtun0 applied", "tunnel established", "client connected" only appear
-  at info or below. Use "debug" for protocol-level packet tracing.)
+- log_level: debug | info | warning | error (default: info). See Logging
+  below.
 - padding_min, padding_max: padding range (default: 128-1400)
 - jitter_ms_min, jitter_ms_max: jitter range in ms (default: 1-100,
   bumped from 1-50 under M-ANON-4 to give the per-packet reorder
@@ -488,20 +443,10 @@ Client -> Client-Owned Server -> Destination
 
 ## Operator Guide
 
-The full step-by-step operator walkthrough — prerequisites, build,
-offline-CA bootstrap, per-device enrollment, run, verification, common
-operator tasks (rotation/revocation/CRL refresh), single-host smoke
-test, two-box demo across two real ISPs, symptom-keyed debugging,
-uninstall, file-placement reference, and CLI reference — lives in:
-
-    deploy/GUIDE.md
-
-Every command in that guide is copy-paste-runnable and was cross-
-checked against the current codebase. Companion config files in the
-same directory:
-
-    deploy/openssl-ca.cnf  — OpenSSL config used by the offline CA
-    deploy/dsm.service     — systemd unit for the daemon
+`deploy/GUIDE.md` is the operator walkthrough: prerequisites through
+verification, plus routine tasks and symptom-keyed debugging. Companion
+files in the same directory are `openssl-ca.cnf` (offline-CA OpenSSL
+config) and `dsm.service` (systemd unit).
 
 ## Logging
 
@@ -527,30 +472,15 @@ operation.
   (`cargo test --no-default-features --features dev-soft-attest`) and the
   swtpm-driven TPM lane (`cargo test --no-default-features --features
   tpm-attest --test tpm_swtpm --test dsmt_format`)
-- Covers: protocol serialization, FSM transitions, config validation
-  (including auto_mtu/pmtu_check_interval bounds), replay window, nonce
-  generation (including exhaustion), key rotation, AES-GCM, identity +
-  attest-key storage (Argon2id + XChaCha20), Noise XX handshake (with
-  fixed-size attest payload), X.509 cert parse + chain validation,
-  noiseStaticBinding extension validation, attest-payload build/verify,
-  CN allowlist + CRL, device enrollment (CSR build + signed-cert import
-  with binding/SPKI/chain checks), post-handshake DH bootstrap, full
-  end-to-end handshake over UDP and TCP with cert policy, full data path
-  (TUN -> fragment -> encrypt -> wire -> decrypt -> reassemble -> TUN)
-  round-trip, rekey with duplicate-INIT idempotency and retry-on-timeout
-  scheduler, handshake retry under simulated cellular outage,
-  auto_mtu adapter (lower/raise/floor/ceiling/oscillation/shutdown),
-  netaudit JSON event stream + schema lock, DNS proxy coalescing and
-  semaphore bounds, IPv6 state save/restore, CLI subcommands, PMTU
-  sockopt plumbing. The TPM lane additionally covers (under swtpm):
-  in-TPM generate/sign/zeroize, independent p256 signature verification,
-  the residency-critical TPMA_OBJECT bitmask, cross-TPM blob rejection
-  (a blob from one TPM fails to load on another), the DSMT
-  serialize/parse format with tampered-header rejection, the backend-
-  aware AttestStore passphrase sourcing, the enroll-time TPM preflight,
-  and the in-TPM-signed CSR assembly.
+- Covers protocol serialization and framing, FSM transitions, config
+  validation, replay window and nonce handling, key rotation, key storage,
+  Noise XX with the attest payload, X.509 chain/binding/CRL/CN policy,
+  enrollment, the full TUN-to-TUN data path over UDP and TCP, rekey retry,
+  auto_mtu, the netaudit event schema, and the DNS proxy. The TPM lane adds
+  in-TPM generate/sign/zeroize, the residency-critical object attributes,
+  cross-TPM blob rejection, and the DSMT format.
 
-**Run:**
+### Run
 
 ```sh
 # Soft lane (the broad gate; needs a soft wheel):
@@ -570,15 +500,6 @@ single-server, Linux-only with cert-based auth (CA-signed device certs
 binding the ECDSA attest key to the X25519 Noise static via a custom
 critical X.509 extension).
 
-- TPM 2.0 attestation (key residency): IMPLEMENTED — the default backend
-  (`tpm-attest` Cargo feature, via tss-esapi). The ECDSA P-256 attest key
-  is generated in and non-extractable from the TPM and signs in-TPM; the
-  on-disk artifact is a TPM-bound DSMT context blob. This delivers key
-  residency only: it does NOT add PCR-policy sealing and does NOT do
-  remote attestation / TPM quotes (both remain future work). The
-  extractable software backend (`dev-soft-attest`) is retained as a
-  dev/test build.
-
 Live items on the punch list:
 
 - Future TPM hardening — bind the attest key to a PCR policy (measured
@@ -595,10 +516,3 @@ Live items on the punch list:
   implementation across Linux + Android.
 - Third-party pentest: threat model authoring, hardening checklist
   execution, telemetry build toggle, engagement coordination.
-
-**Explicit non-goals (reaffirmed):**
-
-- Multiple clients per server / multi-tenant infrastructure — out of
-  scope by design (NON-GOALS at top of file).
-- Server hopping / relay chains / geographic load balancing — out of
-  scope; the threat model assumes a single client-owned server.

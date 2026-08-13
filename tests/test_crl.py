@@ -115,7 +115,7 @@ class TestCRLLoad(unittest.TestCase):
 
     def test_load_der(self) -> None:
         crl = CRL.load(self.tmp, self.ca.certificate)
-        self.assertEqual(len(crl), 2)
+        self.assertEqual(len(crl.crl), 2)
         self.assertTrue(crl.is_revoked(self.serial_a))
         self.assertTrue(crl.is_revoked(self.serial_b))
         self.assertFalse(crl.is_revoked(self.serial_c))
@@ -197,7 +197,7 @@ class TestCRLRejections(unittest.TestCase):
         path = _write_tmp(empty)
         try:
             crl = CRL.load(path, self.ca.certificate)
-            self.assertEqual(len(crl), 0)
+            self.assertEqual(len(crl.crl), 0)
             self.assertFalse(crl.is_revoked(0xAA00))
         finally:
             path.unlink()

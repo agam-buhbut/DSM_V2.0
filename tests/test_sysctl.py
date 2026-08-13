@@ -49,8 +49,7 @@ class SysctlOverrideTest(unittest.TestCase):
         return path
 
     def test_noop_when_current_equals_value(self) -> None:
-        # (a) Setting a key to the value already on disk records nothing and
-        # restore_all must not rewrite the file.
+        # A no-op set captures nothing, so restore_all must not rewrite the file.
         key = "net.ipv4.ip_forward"
         path = self._seed(key, "1")
         before = path.read_bytes()
@@ -63,7 +62,7 @@ class SysctlOverrideTest(unittest.TestCase):
         self.assertEqual(path.read_bytes(), before)  # byte-identical
 
     def test_set_records_only_first_capture(self) -> None:
-        # (b) set('1') then set('2'); restore writes back the FIRST original.
+        # set('1') then set('2'); restore writes back the FIRST original.
         key = "net.ipv4.conf.all.rp_filter"
         path = self._seed(key, "2")  # original on disk
 
@@ -81,7 +80,7 @@ class SysctlOverrideTest(unittest.TestCase):
         self.assertEqual(path.read_text().strip(), "2")
 
     def test_restore_all_writes_all_then_clears(self) -> None:
-        # (c) every captured original is restored; a second restore is a no-op.
+        # Every captured original is restored; a second restore is a no-op.
         k1 = "net.ipv4.conf.all.send_redirects"
         k2 = "net.ipv4.conf.default.send_redirects"
         p1 = self._seed(k1, "1")
@@ -106,8 +105,8 @@ class SysctlOverrideTest(unittest.TestCase):
         self.assertEqual(p2.read_text().strip(), "9")
 
     def test_oserror_on_unreadable_key_is_logged_and_records_nothing(self) -> None:
-        # (d) A key whose path does not exist -> read_text raises OSError;
-        # set() must return None, log a WARNING, and capture nothing.
+        # A key whose path does not exist -> read_text raises OSError; set() must
+        # return None, log a WARNING, and capture nothing.
         key = "net.ipv4.conf.nonexistent.value"  # never seeded -> ENOENT
 
         ovr = SysctlOverride()

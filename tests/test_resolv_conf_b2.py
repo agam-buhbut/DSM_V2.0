@@ -25,7 +25,7 @@ from pathlib import Path
 import pytest
 
 from dsm.net import cleanup, resolv_conf
-from dsm.net.resolv_conf import _DSM_MARKER, ResolvConfManager
+from dsm.net.resolv_conf import DSM_MARKER, ResolvConfManager
 
 NAMESERVER = "10.8.0.1"
 
@@ -46,9 +46,6 @@ def paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]:
 
 def _managed() -> ResolvConfManager:
     return ResolvConfManager(NAMESERVER)
-
-
-# ── (a) a failed restore must NOT destroy the backup ─────────────────────────
 
 
 def test_failed_restore_keeps_backup(
@@ -80,9 +77,6 @@ def test_failed_restore_keeps_backup(
     assert not backup.exists()
 
 
-# ── (b) a crash while the original was a symlink must recover the symlink ─────
-
-
 def test_apply_over_symlink_persists_target(paths: tuple[Path, Path]) -> None:
     resolv, backup = paths
     sentinel = resolv.parent / "stub-resolv.conf"
@@ -108,7 +102,7 @@ def test_symlink_crash_recovery_via_cleanup(paths: tuple[Path, Path]) -> None:
     # backup are on disk; the in-memory manager is gone.
     mgr = _managed()
     mgr.apply()
-    assert resolv.read_bytes().startswith(_DSM_MARKER)
+    assert resolv.read_bytes().startswith(DSM_MARKER)
     del mgr
 
     # The systemd ExecStopPost coarse cleanup runs.

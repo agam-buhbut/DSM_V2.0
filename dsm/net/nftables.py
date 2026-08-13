@@ -25,7 +25,7 @@ def _ip_proto(server_ip: str) -> str:
     return "ip6" if ipaddress.ip_address(server_ip).version == 6 else "ip"
 
 
-def _apply_ruleset(rules: str, *, log_label: str) -> None:
+def apply_ruleset(rules: str, *, log_label: str) -> None:
     """Load a rendered nftables ruleset via ``nft -f -``.
 
     Raises ``RuntimeError`` on ``nft`` failure and re-raises
@@ -49,7 +49,7 @@ def delete_tables(*table_names: str) -> None:
     """Best-effort delete of inet tables. Silently ignores missing tables."""
     for name in table_names:
         try:
-            subprocess.run(  # pylint: disable=subprocess-run-check  # FLAGGED: explicit check= (see report)
+            subprocess.run(  # pylint: disable=subprocess-run-check  # best-effort delete
                 ["nft", "delete", "table", "inet", name],
                 capture_output=True,
                 timeout=5,
@@ -73,10 +73,10 @@ class TcpTimestampsDisabler:
         try:
             self._original = (
                 TCP_TIMESTAMPS_PATH.read_text().strip()
-            )  # pylint: disable=unspecified-encoding  # FLAGGED: explicit encoding= (see report)
+            )  # pylint: disable=unspecified-encoding
             TCP_TIMESTAMPS_PATH.write_text(
                 "0\n"
-            )  # pylint: disable=unspecified-encoding  # FLAGGED: explicit encoding= (see report)
+            )  # pylint: disable=unspecified-encoding
             log.info("tcp_timestamps disabled (was %s)", self._original)
         except OSError as e:
             log.warning("could not disable tcp_timestamps: %s", e)
@@ -88,7 +88,7 @@ class TcpTimestampsDisabler:
         try:
             TCP_TIMESTAMPS_PATH.write_text(
                 f"{self._original}\n"
-            )  # pylint: disable=unspecified-encoding  # FLAGGED: explicit encoding= (see report)
+            )  # pylint: disable=unspecified-encoding
             log.info("tcp_timestamps restored to %s", self._original)
         except OSError as e:
             log.warning("could not restore tcp_timestamps: %s", e)
@@ -122,7 +122,7 @@ class PreHandshakeKillSwitch:
         self._applied = False
 
     def apply(self) -> None:
-        _apply_ruleset(
+        apply_ruleset(
             self._render(),
             log_label="pre-handshake kill switch",
         )
@@ -182,12 +182,12 @@ class NFTablesManager:
             f"delete table inet {PreHandshakeKillSwitch.TABLE_NAME}\n" + self._render()
         )
         try:
-            _apply_ruleset(rules, log_label="nftables kill switch")
+            apply_ruleset(rules, log_label="nftables kill switch")
         except RuntimeError:
             # The pre-handshake table may not exist (e.g. operator wired
             # apply() manually without the pre-handshake step). Retry
             # without the delete.
-            _apply_ruleset(
+            apply_ruleset(
                 self._render(),
                 log_label="nftables kill switch",
             )
@@ -209,8 +209,7 @@ class NFTablesManager:
         )
 
     def _render(self) -> str:
-        # Determine the nftables IP-family matcher: "ip" for IPv4, "ip6" for
-        # IPv6. The default-drop policy on the chain handles the complementary
+        # The default-drop policy on the chain handles the complementary
         # AF: if the server is IPv6, the killswitch's `ip6 daddr SERVER`
         # accept rule fires for legitimate VPN traffic, while IPv4 packets to
         # the same port hit the chain's `policy drop`. Same logic mirrored for
@@ -242,9 +241,9 @@ class ServerRateLimitManager:
     def apply(self) -> None:
         # Fail closed: handshake rate-limiting is the server's first line of
         # defense against unauthenticated flood/DoS. If the ruleset cannot be
-        # installed (no nft, permission failure), _apply_ruleset raises so the
+        # installed (no nft, permission failure), apply_ruleset raises so the
         # caller aborts startup rather than serving unprotected.
-        _apply_ruleset(
+        apply_ruleset(
             self._render(),
             log_label=f"server rate-limit (port {self._listen_port})",
         )

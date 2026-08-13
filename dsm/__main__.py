@@ -25,7 +25,7 @@ from dsm.core.config import Config, ConfigError, load
 
 def _load_config_or_exit(config_path: Path | None) -> Config:
     """Load config, turning every load-time failure into a clean stderr
-    message + exit(2) instead of a raw traceback (Phase 1.8 / Phase-0 tail).
+    message + exit(2) instead of a raw traceback.
     """
     try:
         return load(config_path)
@@ -47,7 +47,7 @@ def _load_config_or_exit(config_path: Path | None) -> Config:
 def _add_passphrase_args(p: argparse.ArgumentParser) -> None:
     """Non-interactive passphrase sources (stronger than DSM_PASSPHRASE env).
 
-    Phase 1.11: default=SUPPRESS so a flag placed BEFORE the subcommand
+    default=SUPPRESS so a flag placed before the subcommand
     (`dsm --passphrase-fd 3 enroll ...`) is not clobbered by the subparser's
     own default — argparse only writes the attr when the flag is present.
     """
@@ -251,7 +251,7 @@ def _run_enroll(
             )
             sys.exit(2)
 
-        # Phase 1.11: validate the CSR output path BEFORE we persist any keys.
+        # Validate the CSR output path before we persist any keys.
         # generate_enrollment writes identity + attest keys to disk; if the CSR
         # write then fails the operator is stranded with keys on disk and no
         # CSR, and re-running errors "identity key already exists".
@@ -398,7 +398,7 @@ def _run_show_pubkey(
         try:
             keystore.load_with_passphrase(passphrase)
         except (RuntimeError, OSError) as e:
-            # DSM-018: widen to OSError so a key file with insecure perms
+            # Widen to OSError so a key file with insecure perms
             # (InsecureFilePermissionsError, an OSError subclass) produces the
             # clean "show-pubkey: <msg>" + exit 2 instead of a raw traceback —
             # the same UX as the missing-file path. Still excludes

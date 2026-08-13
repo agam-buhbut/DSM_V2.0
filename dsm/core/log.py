@@ -6,7 +6,7 @@ import logging
 import sys
 
 _configured = (
-    False  # pylint: disable=invalid-name  # intentional/false positive (see report)
+    False  # pylint: disable=invalid-name  # module-private flag, not a constant
 )
 
 

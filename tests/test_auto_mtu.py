@@ -87,7 +87,6 @@ async def _run_loop_for(
     transport: Any,
     *,
     ticks: int,
-    initial_mtu: int | None = None,
 ) -> tuple[MagicMock, list[int]]:
     """Run ``auto_mtu_loop`` for at least ``ticks`` poll cycles, then
     shut it down. Returns (tun mock, list of mtu args passed to set_mtu).
@@ -98,11 +97,6 @@ async def _run_loop_for(
 
     shutdown = asyncio.Event()
     ctx = _StubCtx(tun=tun, shutdown=shutdown)
-
-    if initial_mtu is not None:
-        # The loop tracks `current` internally starting from config.mtu.
-        # Tests parametrize via config.mtu, not initial_mtu directly.
-        pass  # initial_mtu kept for future flexibility; tests drive via config.mtu
 
     task = asyncio.create_task(auto_mtu_loop(ctx, transport, config))
     # Each tick = pmtu_check_interval_s. Add a small slack so we don't
@@ -247,8 +241,6 @@ class TestAutoMtuConfigValidation(unittest.TestCase):
             _make_config(pmtu_check_interval_s=4000.0)
 
     def test_pmtu_check_interval_default(self) -> None:
-        c = _make_config()  # noqa: F841  # dead; see report
-        del_overrides = {k: v for k, v in {}.items()}  # noqa: F841  # no-op; see report
         # Default is 30.0 per Config (we override in _make_config to 1.0).
         # Build raw Config to verify the actual default.
         from dsm.core.config import Config as RawConfig

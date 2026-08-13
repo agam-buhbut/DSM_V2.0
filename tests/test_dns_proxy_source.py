@@ -8,14 +8,21 @@ import asyncio
 import unittest
 
 import dns.message
+import dns.rcode
 import dns.rdatatype
 
+from dsm.net.dns import DnsResult
 from dsm.net.dns_proxy import LocalDNSProxy, _ProxyProtocol
 
 
 class _StubResolver:
-    async def resolve(self, hostname: str) -> list[str]:
-        return ["10.0.0.99"]
+    async def resolve_detailed(self, hostname: str) -> DnsResult:
+        return DnsResult(
+            addresses=["10.0.0.99"],
+            ttl=60,
+            rcode=int(dns.rcode.NOERROR),
+            authoritative=True,
+        )
 
     async def close(self) -> None:
         return None
@@ -48,13 +55,11 @@ class TestDnsProxySourceFilter(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake.sent, [])
         self.assertEqual(len(proxy._tasks), 0)
         self.assertEqual(proxy._inflight, {})
-        # Drop counter must have incremented.
         self.assertEqual(proxy._dropped_offnet, 1)
 
     async def test_in_subnet_source_served(self) -> None:
         proxy, proto, fake = await self._make_proxy()
         proto.datagram_received(_query_wire("example.com"), ("10.8.0.2", 5353))
-        # A task was scheduled; let it run and confirm a reply was sent.
         self.assertGreaterEqual(len(proxy._tasks), 1)
         await asyncio.gather(*list(proxy._tasks))
         self.assertEqual(len(fake.sent), 1)

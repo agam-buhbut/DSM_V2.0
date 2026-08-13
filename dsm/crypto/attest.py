@@ -52,12 +52,6 @@ BINDING_DOMAIN = b"DSM-BIND-v1\x00"
 BINDING_VERSION = 0x01
 HANDSHAKE_HASH_LEN = 32
 
-# Signed pre-image: 12 (domain) + 1 (version) + 8 (ts) + 32 (h) + 32 (s)
-# + 1 (role) = 86.
-_BINDING_PRE_IMAGE_LEN = (
-    len(BINDING_DOMAIN) + 1 + 8 + HANDSHAKE_HASH_LEN + NOISE_STATIC_PUB_LEN + 1
-)
-
 DEFAULT_CLOCK_SKEW = datetime.timedelta(seconds=300)
 
 
@@ -163,8 +157,6 @@ def _unframe_payload(payload: bytes) -> tuple[int, bytes, bytes]:
         raise AttestPayloadFormatError(
             f"attest payload wrong size: {len(payload)} != {payload_size}"
         )
-    if len(payload) < 8 + 2:
-        raise AttestPayloadFormatError("attest payload truncated")
     (timestamp,) = struct.unpack(">Q", payload[:8])
     (cert_len,) = struct.unpack(">H", payload[8:10])
     cert_end = 10 + cert_len
@@ -233,16 +225,13 @@ def verify_attest_payload(
     if now is None:
         now = datetime.datetime.now(datetime.UTC)
 
-    # 1. Unframe the wire payload.
     ts_secs, cert_der, sig_der = _unframe_payload(payload)
     if not cert_der or not sig_der:
         raise AttestPayloadFormatError("attest payload missing cert or signature")
 
-    # 2. Cert chain.
     leaf = DeviceCert.from_der(cert_der)
     validate_chain(leaf, ca_root, now=now, required_eku=required_eku)
 
-    # 3. Binding checks: cert ext == expected_remote_static.
     cert_binding = leaf.noise_static_pub
     if cert_binding != bytes(expected_remote_static):
         raise AttestBindingMismatchError(
@@ -250,7 +239,6 @@ def verify_attest_payload(
             "key recovered from the Noise handshake"
         )
 
-    # 4. Reconstruct + verify signature.
     pre_image = _binding_pre_image(
         timestamp=ts_secs,
         handshake_hash=handshake_hash,
@@ -264,7 +252,7 @@ def verify_attest_payload(
             "binding signature does not verify under cert pubkey"
         ) from e
 
-    # 5. Timestamp window. An attacker-controlled `ts_secs` of u64::MAX
+    # An attacker-controlled `ts_secs` of u64::MAX
     # (~5.84e11 years) would raise OverflowError from fromtimestamp,
     # which is NOT in the AttestError hierarchy and would leak out of
     # the handshake driver's typed-error filter. Catch it explicitly.
@@ -281,18 +269,3 @@ def verify_attest_payload(
         )
 
     return leaf
-
-
-__all__ = [
-    "AttestBindingMismatchError",
-    "AttestError",
-    "AttestPayloadFormatError",
-    "AttestSignatureError",
-    "AttestTimestampError",
-    "BINDING_DOMAIN",
-    "BINDING_VERSION",
-    "DEFAULT_CLOCK_SKEW",
-    "PeerRole",
-    "build_attest_payload",
-    "verify_attest_payload",
-]

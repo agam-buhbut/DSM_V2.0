@@ -1,11 +1,10 @@
 # Contributing to DSM
 
-Thanks for your interest in DSM. This guide covers building from source,
-running the test suite (including the software-TPM lane), and the formatting /
-lint / type-check gates a change must pass before it can land.
+This file covers building from source, running the test suite (including the
+software-TPM lane), and the gates a change must pass before it lands.
 
 DSM is a Python + Rust project: the pure-Python `dsm/` package is bundled with
-the compiled `tuncore` Rust extension into a **single wheel** by
+the compiled `tuncore` Rust extension into a single wheel by
 [maturin](https://www.maturin.rs/). There is no PyPI distribution — releases
 ship as signed GitHub Release artifacts. For operating a deployed instance, see
 [`deploy/GUIDE.md`](deploy/GUIDE.md); this file is about working on the code.
@@ -13,8 +12,8 @@ ship as signed GitHub Release artifacts. For operating a deployed instance, see
 ## Supported target
 
 The production wheel dynamically links the host TPM 2.0 stack
-(`libtss2-esys.so.0`) and is built for **Debian 12+ / Ubuntu 22.04+ / x86_64
-with a TPM 2.0**. A portable manylinux wheel is not possible. Other distros can
+(`libtss2-esys.so.0`) and is built for Debian 12+ / Ubuntu 22.04+ / x86_64 with
+a TPM 2.0. A portable manylinux wheel is not possible. Other distros can
 build from source, but development and CI target the above.
 
 ## Prerequisites
@@ -22,15 +21,15 @@ build from source, but development and CI target the above.
 - Python 3.11+ with `python3-venv`.
 - A recent Rust toolchain (`rustup` recommended — distro `cargo` is often too
   old for maturin).
-- For the **default (TPM) build**: `libtss2-dev` (the tss2-esys headers).
-  `tess-esapi-sys` ships pregenerated x86_64 bindings, so no `libclang` /
+- For the default (TPM) build: `libtss2-dev` (the tss2-esys headers).
+  `tss-esapi-sys` ships pregenerated x86_64 bindings, so no `libclang` /
   `bindgen` is needed.
-- For the **software / eval build**: nothing beyond Rust + Python — the
+- For the software / eval build: nothing beyond Rust + Python — the
   `dev-soft-attest` feature has no TPM dependency.
 
 ## Building from source
 
-DSM ships **two wheel flavors** selected by a Cargo feature. The default Cargo
+DSM ships two wheel flavors, selected by a Cargo feature. The default Cargo
 feature is `tpm-attest`; the dev/eval feature is `dev-soft-attest`. Both import
 identically as `dsm` + `tuncore`, but the soft build's attest key is **NOT
 hardware-bound** and must never be deployed.
@@ -62,7 +61,7 @@ install, use `maturin build --release …` (the wheel lands under
 pytest tests/ -q
 ```
 
-Tests that need the `tuncore` extension are **skipped** (not failed) if it is
+Tests that need the `tuncore` extension are skipped (not failed) if it is
 not built, so build it first (see above) for full coverage.
 
 ### Software-TPM lane (swtpm)
@@ -70,7 +69,7 @@ not built, so build it first (see above) for full coverage.
 The TPM-backed tests run against [`swtpm`](https://github.com/stefanberger/swtpm),
 a software TPM emulator, so no physical TPM is required. The `swtpm_tcti`
 pytest fixture (in `tests/conftest.py`) starts a per-test `swtpm` instance over
-loopback TCP and tears it down afterward; tests are **skipped** if `swtpm` /
+loopback TCP and tears it down afterward; tests are skipped if `swtpm` /
 `swtpm_setup` are not installed.
 
 Install the emulator and the TSS2 stack, then run with the TPM build:
@@ -142,16 +141,7 @@ pyright pytest pytest-asyncio pip-audit`).
 - **Security vulnerabilities:** do **not** open a public issue — follow the
   private disclosure process in [`SECURITY.md`](SECURITY.md).
 
-### Never include secrets or PII
-
-DSM is a security tool. When filing issues, opening PRs, or pasting logs, **do
-NOT include**:
-
-- Private keys, passphrases, or sealed/wrapped key blobs.
-- Config files containing real IPs, certificates, CA roots, or SPKI pins —
-  redact them or use placeholder values.
-- TPM attestation blobs or device certificates.
-- Any personally identifying information.
-
-Redact before you paste. When in doubt, leave it out and describe the shape of
-the data instead.
+Never include secrets or PII. DSM is a security tool: keep private keys,
+passphrases, sealed key blobs, TPM attestation blobs, device certificates, real
+IPs, CA roots, SPKI pins, and personal information out of issues, PRs, and
+pasted logs. Redact first, or describe the shape of the data instead.

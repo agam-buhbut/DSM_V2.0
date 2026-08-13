@@ -44,8 +44,7 @@ class ResolvConfManagerTest(unittest.TestCase):
         return ResolvConfManager(NAMESERVER)
 
     def test_prior_regular_file_restored_byte_exact(self) -> None:
-        # (1) seed a known regular file; apply installs our block; remove
-        # restores the original bytes EXACTLY.
+        # remove() must restore the original bytes EXACTLY, not a normalized copy.
         original = b"nameserver 1.1.1.1\noptions timeout:1\n# user comment\n"
         self.resolv.write_bytes(original)
 
@@ -61,8 +60,7 @@ class ResolvConfManagerTest(unittest.TestCase):
         self.assertFalse(self.resolv.is_symlink())
 
     def test_prior_symlink_restored_to_same_target(self) -> None:
-        # (2) RESOLV_CONF is a symlink to a sentinel target; remove() must
-        # leave it a symlink whose readlink matches the original target.
+        # remove() must leave a symlink whose readlink matches the original target.
         sentinel = self.root / "stub-resolv.conf"
         sentinel.write_bytes(b"nameserver 127.0.0.53\n")
         target = str(sentinel)
@@ -82,7 +80,6 @@ class ResolvConfManagerTest(unittest.TestCase):
         self.assertEqual(sentinel.read_bytes(), b"nameserver 127.0.0.53\n")
 
     def test_absent_file_created_then_unlinked(self) -> None:
-        # (3) no prior file; apply() creates it, remove() unlinks it.
         self.assertFalse(self.resolv.exists())
 
         mgr = self._managed()
@@ -95,8 +92,6 @@ class ResolvConfManagerTest(unittest.TestCase):
         self.assertFalse(self.resolv.is_symlink())
 
     def test_double_apply_and_double_remove_are_noops(self) -> None:
-        # (4) idempotency: second apply does not re-capture / re-write,
-        # second remove does not raise.
         original = b"nameserver 9.9.9.9\n"
         self.resolv.write_bytes(original)
 

@@ -16,7 +16,7 @@ existing ``test_dns_robustness.py`` does not exercise:
   * **Negative-cache behaviour** — an authoritative NXDOMAIN reached after a
     failover stops fan-out and is negative-cached, so a repeat query issues
     zero upstream calls.
-  * **Typed result** — the returned object is a ``_DnsResult`` with the
+  * **Typed result** — the returned object is a ``DnsResult`` with the
     expected ``authoritative`` / ``rcode`` / ``addresses`` fields.
 
 The mock boundary is ``DNSResolver._resolve_via_pinned_tls`` — the shared
@@ -41,7 +41,7 @@ import dns.rdataclass
 import dns.rdatatype
 import dns.rrset
 
-from dsm.net.dns import DNSResolver, _DnsResult
+from dsm.net.dns import DNSResolver, DnsResult
 from dsm.net.dns_pinning import PinMismatchError
 
 # Provider URLs in the exact order the resolver must try them.
@@ -129,7 +129,7 @@ class FailoverOrder(unittest.IsolatedAsyncioTestCase):
     async def test_failed_first_provider_skipped_second_answers(self) -> None:
         """A transport failure on provider A is skipped; B's answer wins.
 
-        KEY discriminating assertion: the loop visits A *then* B in order, A's
+        Discriminating assertion: the loop visits A *then* B in order, A's
         OSError does not abort the resolve, and the typed result carries B's
         address. A broken implementation that aborted on the first exception,
         or that did not preserve order, would fail here.
@@ -144,7 +144,7 @@ class FailoverOrder(unittest.IsolatedAsyncioTestCase):
         result = await r.resolve_detailed("ok.example")
 
         self.assertEqual(r.attempts, [DOH_A, DOH_B])
-        self.assertIsInstance(result, _DnsResult)
+        self.assertIsInstance(result, DnsResult)
         self.assertTrue(result.authoritative)
         self.assertEqual(result.rcode, int(dns.rcode.NOERROR))
         self.assertEqual(result.addresses, ["9.9.9.9"])
@@ -173,7 +173,7 @@ class FailoverOrder(unittest.IsolatedAsyncioTestCase):
     async def test_pin_mismatch_is_skipped_like_any_failure(self) -> None:
         """A PinMismatchError (possible MITM) on A must fall through to B.
 
-        KEY assertion: a pin failure is a *skip*, never a propagated raise —
+        Assertion: a pin failure is a *skip*, never a propagated raise —
         a MITM on one provider cannot deny resolution when an honest provider
         follows. The result must come from B, and A must have been attempted.
         """
@@ -218,7 +218,7 @@ class ProtocolMismatch(unittest.IsolatedAsyncioTestCase):
         """A non-authoritative SERVFAIL rcode from A fails over to B.
 
         SERVFAIL/REFUSED are *retryable* (non-authoritative) per
-        ``_parse_dns_response``: the loop must keep going. KEY assertion: A is
+        ``_parse_dns_response``: the loop must keep going. Assertion: A is
         attempted, its SERVFAIL is not returned, and B's authoritative answer
         is the result.
         """
@@ -276,7 +276,7 @@ class ProtocolMismatch(unittest.IsolatedAsyncioTestCase):
         """A provider whose URL is neither https:// nor tls:// is skipped.
 
         ``resolve_detailed`` ``continue``s on an unknown scheme *before* any
-        I/O, so the TLS boundary is never reached for it. KEY assertion: the
+        I/O, so the TLS boundary is never reached for it. Assertion: the
         bad-scheme provider never appears in ``attempts`` (no connection made),
         yet the valid provider still answers.
         """
@@ -324,7 +324,7 @@ class NegativeCacheAfterFailover(unittest.IsolatedAsyncioTestCase):
 
         First query: A errors, B returns authoritative NXDOMAIN → fan-out
         stops, result is negative-cached. Second query: served from cache with
-        ZERO new upstream attempts. KEY assertion: ``attempts`` does not grow
+        ZERO new upstream attempts. Assertion: ``attempts`` does not grow
         on the repeat query, proving the negative-cache survives a failover
         path (not just a first-provider hit).
         """
@@ -354,7 +354,7 @@ class NegativeCacheAfterFailover(unittest.IsolatedAsyncioTestCase):
         """A total transport failure must NOT be cached as authoritative.
 
         After both providers error, a follow-up query must retry upstream
-        rather than serve a bogus cached SERVFAIL. KEY assertion: the second
+        rather than serve a bogus cached SERVFAIL. Assertion: the second
         query consults providers again (attempts grows).
         """
         r = _ScriptedResolver(

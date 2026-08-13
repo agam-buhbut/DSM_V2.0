@@ -63,10 +63,8 @@ class TestNetAuditEnabled(unittest.TestCase):
         events = cap.events()
         self.assertEqual(len(events), 1)
         ev = events[0]
-        # Required keys
         self.assertIn("ts", ev)
         self.assertEqual(ev["event"], "test_event")
-        # Caller fields preserved
         self.assertEqual(ev["role"], "client")
         self.assertEqual(ev["value"], 42)
 
@@ -74,7 +72,6 @@ class TestNetAuditEnabled(unittest.TestCase):
         with _Capture() as cap:
             netaudit.emit("t")
         ev = cap.events()[0]
-        # Parse and verify UTC timezone.
         ts = ev["ts"]
         self.assertIsInstance(ts, str)
         parsed = datetime.datetime.fromisoformat(ts)  # type: ignore[arg-type]
@@ -108,11 +105,9 @@ class TestNetAuditEnabled(unittest.TestCase):
 
 class TestNetAuditDisabled(unittest.TestCase):
     def test_disabled_by_default(self) -> None:
-        # Module-level state should be disabled at import.
         self.assertFalse(netaudit._enabled)
 
     def test_disabled_emit_is_noop(self) -> None:
-        # Make sure we're disabled, and emit nothing comes out.
         netaudit.configure(False)
         with self.assertNoLogs(netaudit.LOGGER_NAME, level="INFO"):
             netaudit.emit("e", x=1)

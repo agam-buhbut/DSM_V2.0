@@ -100,14 +100,12 @@ class CRL:
     ) -> CRL:
         crl = _parse_crl(raw, source)
 
-        # Issuer DN match.
         if crl.issuer != ca_root.subject:
             raise CRLIssuerMismatchError(
                 f"CRL issuer {crl.issuer.rfc4514_string()!r} does not "
                 f"match CA subject {ca_root.subject.rfc4514_string()!r}"
             )
 
-        # Signature verify.
         ca_pub = ca_root.public_key()
         if not isinstance(ca_pub, EllipticCurvePublicKey):
             raise CRLSignatureError(
@@ -157,10 +155,6 @@ class CRL:
             # treat as a missing freshness signal — caller decides.
             raise CRLError("CRL has no nextUpdate; cannot check freshness")
         return nu
-
-    @property
-    def this_update(self) -> datetime.datetime:
-        return self.crl.last_update_utc
 
     @property
     def crl_number(self) -> int | None:
@@ -217,9 +211,6 @@ class CRL:
             # No nextUpdate present — refuse to call it stale or
             # fresh; caller sees a CRLError if they ask.
             return False
-
-    def __len__(self) -> int:
-        return len(self._revoked_serials)
 
 
 def _read_last_crl_number(store_path: Path) -> int | None:

@@ -24,7 +24,6 @@ class ConfigError(Exception):
     """Config file is missing, malformed, or has insecure permissions."""
 
 
-# Validation bounds
 MIN_PORT = 1
 MAX_PORT = 65535
 MIN_PADDING = 64
@@ -104,13 +103,13 @@ class Config:
     padding_min: int = 128
     padding_max: int = 1400
     jitter_ms_min: int = 1
-    # M-ANON-4 default bump: 50→100 ms. The wider span covers more
+    # Wider jitter span covers more
     # consecutive packets at line rate (10 Mbps × 100 ms = 12 packets)
     # without adding visible latency to interactive traffic. Operators
     # who care about sub-50 ms RTT for VoIP/gaming can configure
     # lower; everyone else benefits from the larger reorder window.
     jitter_ms_max: int = 100
-    # ── Adaptive-envelope traffic-shaping knobs (Phase 2 / Fork 8) ────────
+    # Adaptive-envelope traffic-shaping knobs.
     # All fields are optional (backward-compatible). The defaults form a
     # coherent envelope profile; see config.example.toml for per-knob notes.
     # Per-packet latency budget: a real packet is never delayed more than this
@@ -178,7 +177,7 @@ class Config:
 
 
 def _validate_types(c: Config) -> None:
-    """Phase 1.11: type-check numeric/bool fields before range validators so a
+    """Type-check numeric/bool fields before range validators so a
     wrong-typed TOML value (e.g. server_port = "51820") raises a readable
     ValueError instead of a cryptic TypeError from a `<=` comparison.
     """
@@ -239,7 +238,7 @@ def _validate_server_ip(c: Config) -> None:
             f"server_ip must be a literal IP, got {c.server_ip!r}. "
             f"Resolve your hostname first: `dig +short <host> | head -1`"
         ) from e
-    # Phase 1.11 / OWNER DECISION: reject IPv6 until a v6 data path exists.
+    # Reject IPv6 until a v6 data path exists.
     # The transport binds AF_INET only, so an IPv6 endpoint passes this
     # literal check but is unusable downstream — fail loudly at config load.
     if addr.version == 6:
@@ -310,7 +309,7 @@ def _validate_dns(c: Config) -> None:
                 "config to include the scheme so this provider is actually used.",
                 provider,
             )
-        # Phase 1.10: provider host MUST be an IP literal. A hostname-form
+        # Provider host must be an IP literal. A hostname-form
         # provider triggers per-query getaddrinfo, whose unmarked UDP is
         # routed into the server's own TUN (tunnel.py ip rule), dead-looping
         # resolution. Mirror _validate_server_ip's IP-literal requirement.
@@ -345,7 +344,6 @@ def _validate_dns(c: Config) -> None:
 
 
 def _validate_cert_paths(c: Config) -> None:
-    # cert_file / ca_root_file / attest_key_file: required, absolute paths.
     for name, value in (
         ("cert_file", c.cert_file),
         ("ca_root_file", c.ca_root_file),
@@ -356,7 +354,6 @@ def _validate_cert_paths(c: Config) -> None:
         if not Path(value).is_absolute():
             raise ValueError(f"{name} must be absolute, got {value!r}")
 
-    # crl_file: optional but absolute when present.
     if c.crl_file is not None:
         if not c.crl_file:
             raise ValueError("crl_file must not be empty")
@@ -435,10 +432,6 @@ def _validate_jitter(c: Config) -> None:
 
 
 def _validate_envelope(c: Config) -> None:
-    # Bounds match the Task-2.8 spec: latency_budget_ms in [10, 5000];
-    # rise_per_s in (1.0, 100.0]; fall_half_life_s in (0, 60];
-    # ceiling_pps in [idle_floor_max, 100000];
-    # 0 < idle_floor_min <= idle_floor_max <= 1000.
     if not (10 <= c.envelope_latency_budget_ms <= 5000):
         raise ValueError(
             f"envelope_latency_budget_ms must be 10–5000 ms, "

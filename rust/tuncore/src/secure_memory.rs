@@ -5,7 +5,6 @@ use std::sync::{LazyLock, Mutex};
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroizing;
 
-/// Check a libc return code, mapping non-zero to a descriptive error.
 fn syscall_check(ret: i32, name: &str) -> Result<(), String> {
     if ret != 0 {
         Err(format!(
@@ -52,7 +51,7 @@ pub fn munlock_slice(data: &[u8]) -> Result<(), String> {
 }
 
 /// Disable core dumps to prevent key material from being written to disk.
-pub fn disable_core_dumps() -> Result<(), String> {
+fn disable_core_dumps() -> Result<(), String> {
     let rlim = rlimit {
         rlim_cur: 0,
         rlim_max: 0,
@@ -120,7 +119,6 @@ fn page_size() -> usize {
     sz
 }
 
-/// Page base addresses spanned by `[addr, addr+len)`.
 fn page_bases(addr: usize, len: usize) -> Vec<usize> {
     let page = page_size();
     let first = addr & !(page - 1);
@@ -272,10 +270,7 @@ impl LockedKey32 {
 /// This is the only path that writes a fresh secret scalar directly into
 /// mlock'd memory without going through a stack copy — `LockedKey32::zeroed`
 /// reserves the page, then `OsRng.fill_bytes` writes into the heap buffer
-/// in place. Audit-relevant: this pattern previously lived inline at two
-/// callsites (`identity::IdentityKeyPair::generate` and
-/// `session_keys::gen_ephemeral_secret`); centralised so a reviewer reads
-/// the invariant once.
+/// in place.
 pub fn random_locked_key32() -> Result<LockedKey32, String> {
     use rand::rngs::OsRng;
     use rand::RngCore;

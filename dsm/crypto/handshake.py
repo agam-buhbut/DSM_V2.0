@@ -143,7 +143,7 @@ _NoiseT = TypeVar("_NoiseT")
 def _translate_noise_errors(what: str, call: Callable[[], _NoiseT]) -> _NoiseT:
     """Run a tuncore Noise/transport call that parses peer-controlled
     bytes, translating the PyO3 ``RuntimeError`` it raises on malformed
-    input into a typed :class:`HandshakeError` (finding C1).
+    input into a typed :class:`HandshakeError`.
 
     Rust's Noise readers (``read_message_1/2/3``) and
     ``NoiseTransport.decrypt`` surface every internal failure — wrong
@@ -341,7 +341,7 @@ async def client_handshake(
         peer_serial=server_cert.serial_number,
         duration_s=round(duration_s, 4),
     )
-    # Audit H1 / M-BUG-1: return the server's Noise static pub too so
+    # Return the server's Noise static pub too so
     # the data path can plumb it into DataPathContext for the
     # mutual-rekey tie-break.
     return session_keys, handshake_hash, bytes(server_static)
@@ -386,7 +386,10 @@ async def server_handshake(
     # there's no peer state to time out against before any client has
     # connected; MSG1_WAIT_TIMEOUT still bounds it so a spoofed/dropped
     # msg1 cannot stall the loop.
-    msg1, recv_addr = await _recv_initial(transport)
+    try:
+        msg1, recv_addr = await _recv_one(transport, MSG1_WAIT_TIMEOUT)
+    except TimeoutError:
+        raise HandshakeError(f"msg1 wait timed out after {MSG1_WAIT_TIMEOUT}s")
     started_at = asyncio.get_event_loop().time()
     _translate_noise_errors("read msg1", lambda: responder.read_message_1(msg1))
     addr = recv_addr or client_addr
@@ -441,11 +444,8 @@ async def server_handshake(
         except CRLError as e:
             raise CertAuthError(f"CRL check failed: {e}") from e
 
-    # Final handshake hash (post-msg3).
-    handshake_hash = bytes(responder.get_handshake_hash())
     noise_transport = responder.into_transport()
 
-    # Bootstrap: receive client ephemeral, send server ephemeral.
     bootstrap_init_frame, bs_addr = await _recv_with_retry(transport)
     # Pin source: msg1 + msg3 are already source-pinned to ``addr``; the
     # bootstrap_init must come from the same peer. AEAD blocks content forge,
@@ -492,7 +492,6 @@ async def server_handshake(
         peer_serial=client_cert.serial_number,
         duration_s=round(duration_s, 4),
     )
-    _ = handshake_hash  # captured for diagnostic symmetry with client
     return session_keys, client_static
 
 
@@ -533,21 +532,6 @@ async def _recv_one(
         return bytes(frame), addr
     frame = await asyncio.wait_for(transport.recv(), timeout)
     return bytes(frame), None
-
-
-async def _recv_initial(
-    transport: UDPTransport | TCPTransport,
-) -> tuple[bytes, tuple[str, int] | None]:
-    """Block on the first handshake frame (server side).
-
-    Single timeout, no retries — there's no peer state to time out
-    against before the client has connected. ``MSG1_WAIT_TIMEOUT`` still
-    bounds it so a spoofed/dropped msg1 cannot stall the accept loop.
-    """
-    try:
-        return await _recv_one(transport, MSG1_WAIT_TIMEOUT)
-    except TimeoutError:
-        raise HandshakeError(f"msg1 wait timed out after {MSG1_WAIT_TIMEOUT}s")
 
 
 async def _recv_with_retry(

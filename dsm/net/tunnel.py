@@ -42,9 +42,7 @@ IFF_NO_PI = 0x1000  # No packet info header
 def _run_commands(cmds: list[list[str]], *, strict: bool = True) -> None:
     """Run a sequence of shell commands.
 
-    Args:
-        cmds: list of command argument lists
-        strict: if True, raise on failure; if False, ignore errors (best-effort)
+    ``strict=False`` ignores failures (best-effort teardown path).
     """
     for cmd in cmds:
         try:
@@ -61,9 +59,6 @@ def _run_commands(cmds: list[list[str]], *, strict: bool = True) -> None:
                     e.stderr.decode(errors="replace"),
                 )
                 raise RuntimeError(f"TUN configure failed: {' '.join(cmd)}")
-        except Exception:
-            if strict:
-                raise
 
 
 class TunDevice:
@@ -81,7 +76,7 @@ class TunDevice:
         # Guards deconfigure() from restoring IPv6 state that belongs to
         # a prior crashed run rather than this process.
         self._configured = False
-        # Phase 1.4: set True the moment configure() disables IPv6, BEFORE
+        # Set True the moment configure() disables IPv6, BEFORE
         # _configured. deconfigure() restores IPv6 whenever this is set, even
         # if a later configure() command failed and _configured stayed False.
         self._ipv6_mutated = False
@@ -120,14 +115,14 @@ class TunDevice:
                 try:
                     state[iface] = (
                         sysctl_path.read_text().strip() == "1"
-                    )  # pylint: disable=unspecified-encoding  # FLAGGED: explicit encoding= (see report)
+                    )  # pylint: disable=unspecified-encoding
                 except OSError:
                     # Some virtual interfaces (e.g., removed between iterdir
                     # and read) or IPv6-less kernels won't have this knob.
                     continue
         except OSError as e:
             log.warning("failed to capture IPv6 state: %s", e)
-        # Phase 1.4: configure() also writes net.ipv6.conf.all.disable_ipv6=1
+        # configure() also writes net.ipv6.conf.all.disable_ipv6=1
         # but the per-iface loop above never sees `all`/`default`. Capture them
         # explicitly so _restore_ipv6_state can put them back. Both keys are
         # alphanumeric and pass LINUX_IFACE_NAME_RE on restore.
@@ -166,7 +161,7 @@ class TunDevice:
                 mode=0o600,
             )
             log.debug("saved IPv6 state to %s", self._IPV6_STATE_PATH)
-        except Exception as e:  # noqa: BLE001  # see linter report
+        except Exception as e:  # noqa: BLE001  # state save is best-effort
             log.warning("failed to save IPv6 state: %s", e)
 
     def _restore_ipv6_state(self) -> None:
@@ -187,7 +182,7 @@ class TunDevice:
         try:
             with open(
                 self._IPV6_STATE_PATH
-            ) as f:  # pylint: disable=unspecified-encoding  # FLAGGED: explicit encoding= (see report)
+            ) as f:  # pylint: disable=unspecified-encoding
                 raw_state: object = json.load(f)
             if not isinstance(raw_state, dict):
                 log.warning(
@@ -220,11 +215,10 @@ class TunDevice:
                 _run_commands(cmds, strict=False)
             self._IPV6_STATE_PATH.unlink(missing_ok=True)
             log.debug("restored IPv6 state from %s", self._IPV6_STATE_PATH)
-        except Exception as e:  # noqa: BLE001  # see linter report
+        except Exception as e:  # noqa: BLE001  # restore is best-effort
             log.warning("failed to restore IPv6 state: %s", e)
 
     def open(self) -> None:
-        """Create and open the TUN device."""
         tun_fd = os.open("/dev/net/tun", os.O_RDWR)
         # struct ifreq: 16 bytes name + 2 bytes flags + padding
         ifr = struct.pack("16sH", self._name.encode(), IFF_TUN | IFF_NO_PI)
@@ -257,10 +251,9 @@ class TunDevice:
         back into the TUN instead of out the WAN (Phase 1.3). The server
         relies on the main routing table + MASQUERADE for egress.
         """
-        # Capture IPv6 state before disabling globally
         ipv6_state = self._capture_ipv6_state()
         self._save_ipv6_state(ipv6_state)
-        # Phase 1.4: from here on IPv6 may be disabled; mark mutated so
+        # From here on IPv6 may be disabled; mark mutated so
         # deconfigure() restores even if a later command fails.
         self._ipv6_mutated = True
 
@@ -301,7 +294,7 @@ class TunDevice:
                 "priority",
                 "10",
             ]
-            subprocess.run(  # pylint: disable=subprocess-run-check  # FLAGGED: explicit check= (see report)
+            subprocess.run(  # pylint: disable=subprocess-run-check
                 ["ip", "rule", "del", *rule_args],
                 capture_output=True,
                 timeout=5,
@@ -355,7 +348,7 @@ class TunDevice:
             ],
             strict=False,
         )
-        # Phase 1.4: restore IPv6 if EITHER configure fully succeeded OR it
+        # Restore IPv6 if EITHER configure fully succeeded OR it
         # disabled IPv6 before failing partway. The state file still reflects
         # the pre-disable host state in both cases. Without the _ipv6_mutated
         # flag, a partial configure() (raised after disabling IPv6 but before
@@ -367,7 +360,7 @@ class TunDevice:
             self._ipv6_mutated = False
             netaudit.emit("tun_deconfigure", iface=self._name)
 
-    async def read(self, bufsize: int = 2048) -> bytes:
+    async def read(self) -> bytes:
         """Read a packet from the TUN device (async).
 
         IMPORTANT: callers that wrap this in ``asyncio.wait_for(...)``
@@ -382,12 +375,12 @@ class TunDevice:
 
         def _readable() -> None:
             try:
-                data = os.read(self.fd, bufsize)
+                data = os.read(self.fd, 2048)
                 if not fut.done():
                     fut.set_result(data)
             except BlockingIOError:
                 pass  # Spurious wakeup
-            except Exception as e:  # noqa: BLE001  # see linter report
+            except Exception as e:  # noqa: BLE001  # surfaced to the awaiting future
                 if not fut.done():
                     fut.set_exception(e)
 
@@ -420,7 +413,6 @@ class TunDevice:
             return 0
 
     def close(self) -> None:
-        """Close the TUN device."""
         if self._fd is None:
             return
         try:

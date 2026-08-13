@@ -122,10 +122,7 @@ def _try_source(
     warn_msg: str,
     *warn_args: object,
 ) -> bytearray | None:
-    """Run ``fn()``; on OSError-family failure log ``warn_msg``-formatted
-    with the exception appended and return None.
-
-    The three file/fd sources share the same shape ("try read; on OS-level
+    """The three file/fd sources share the same shape ("try read; on OS-level
     failure log and fall through"); centralising the try/except keeps the
     fallback chain readable without changing observable behavior (each
     source still emits its caller-supplied warning string).

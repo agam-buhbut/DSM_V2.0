@@ -20,12 +20,9 @@
 //! = `salt || nonce` — and decrypt with the frozen production
 //! parameters below.
 //!
-//! Argon2 parameters are deliberately strong (512 MiB / 4 iters /
-//! parallelism 2). The constants are kept stable and exposed for any
-//! callers that need a lower-bound blob size for an up-front "blob too
-//! short" check; the actual v1 blob is `V1_HEADER_LEN` (17) bytes longer
-//! than the legacy `salt + nonce + tag` minimum, and callers correctly
-//! use a `<` (not `==`) comparison so both generations pass.
+//! Argon2 parameters are deliberately strong (512 MiB / 4 iters / parallelism 2).
+//! A v1 blob is `V1_HEADER_LEN` bytes longer than the legacy minimum, so length
+//! checks against [`MIN_BLOB_LEN`] must use `<`, not `==`.
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::{
@@ -277,26 +274,9 @@ fn open_v1(blob: &[u8], passphrase: &[u8]) -> Result<Zeroizing<Vec<u8>>, String>
     let nonce_bytes =
         &blob[V1_HEADER_LEN + ARGON2_SALT_LEN..V1_HEADER_LEN + ARGON2_SALT_LEN + XCHACHA_NONCE_LEN];
     let ciphertext = &blob[V1_HEADER_LEN + ARGON2_SALT_LEN + XCHACHA_NONCE_LEN..];
-
-    let derived = derive_argon2_key(passphrase, salt, &params)?;
-
-    let cipher = XChaCha20Poly1305::new_from_slice(derived.as_array())
-        .map_err(|e| format!("cipher init: {e}"))?;
-
-    let nonce = XNonce::from_slice(nonce_bytes);
     let aad = build_aad_v1(header, salt, nonce_bytes);
 
-    let plaintext = cipher
-        .decrypt(
-            nonce,
-            Payload {
-                msg: ciphertext,
-                aad: &aad,
-            },
-        )
-        .map_err(|_| "decryption failed: wrong passphrase or corrupted data".to_string())?;
-
-    Ok(Zeroizing::new(plaintext))
+    decrypt_sealed(salt, nonce_bytes, ciphertext, &aad, &params, passphrase)
 }
 
 /// Legacy path: pre-header layout, AAD = `salt || nonce`, frozen
@@ -312,21 +292,34 @@ fn open_legacy(blob: &[u8], passphrase: &[u8]) -> Result<Zeroizing<Vec<u8>>, Str
     let salt = &blob[..ARGON2_SALT_LEN];
     let nonce_bytes = &blob[ARGON2_SALT_LEN..ARGON2_SALT_LEN + XCHACHA_NONCE_LEN];
     let ciphertext = &blob[ARGON2_SALT_LEN + XCHACHA_NONCE_LEN..];
+    let aad = build_aad(salt, nonce_bytes);
 
-    let derived = derive_argon2_key(passphrase, salt, &PARAMS_V1)?;
+    decrypt_sealed(salt, nonce_bytes, ciphertext, &aad, &PARAMS_V1, passphrase)
+}
+
+/// Shared KDF + AEAD-open tail of [`open_v1`] and [`open_legacy`]; the arms
+/// differ only in blob offsets, AAD construction and KDF parameter source.
+fn decrypt_sealed(
+    salt: &[u8],
+    nonce_bytes: &[u8],
+    ciphertext: &[u8],
+    aad: &[u8],
+    params: &KdfParams,
+    passphrase: &[u8],
+) -> Result<Zeroizing<Vec<u8>>, String> {
+    let derived = derive_argon2_key(passphrase, salt, params)?;
 
     let cipher = XChaCha20Poly1305::new_from_slice(derived.as_array())
         .map_err(|e| format!("cipher init: {e}"))?;
 
     let nonce = XNonce::from_slice(nonce_bytes);
-    let aad = build_aad(salt, nonce_bytes);
 
     let plaintext = cipher
         .decrypt(
             nonce,
             Payload {
                 msg: ciphertext,
-                aad: &aad,
+                aad,
             },
         )
         .map_err(|_| "decryption failed: wrong passphrase or corrupted data".to_string())?;
@@ -405,8 +398,6 @@ mod tests {
 
     #[test]
     fn distinct_seals_per_call() {
-        // Random salt + nonce per call must produce distinct blobs even
-        // when the plaintext and passphrase are identical.
         let b1 = seal(b"secret", b"pass").expect("seal 1");
         let b2 = seal(b"secret", b"pass").expect("seal 2");
         assert_ne!(b1, b2);
@@ -426,15 +417,11 @@ mod tests {
             blob.len(),
             V1_HEADER_LEN + ARGON2_SALT_LEN + XCHACHA_NONCE_LEN + 3 + TAG_LEN
         );
-        // Magic at [0..4]; version at [4]; the three big-endian KDF
-        // params at [5..17] equal to the production constants.
         assert_eq!(&blob[..4], &BLOB_MAGIC);
         assert_eq!(blob[4], BLOB_VERSION_1);
         assert_eq!(&blob[5..9], &ARGON2_MEM_COST_KIB.to_be_bytes());
         assert_eq!(&blob[9..13], &ARGON2_TIME_COST.to_be_bytes());
         assert_eq!(&blob[13..17], &ARGON2_PARALLELISM.to_be_bytes());
-        // Salt is the next 32 bytes; nonce the next 24; ciphertext+tag
-        // is the rest.
         let salt = &blob[V1_HEADER_LEN..V1_HEADER_LEN + ARGON2_SALT_LEN];
         let nonce = &blob
             [V1_HEADER_LEN + ARGON2_SALT_LEN..V1_HEADER_LEN + ARGON2_SALT_LEN + XCHACHA_NONCE_LEN];
@@ -463,8 +450,7 @@ mod tests {
         use rand::rngs::OsRng;
         use rand::RngCore;
 
-        // Argon2id is expensive (512 MiB per call). Use small `iters`
-        // outside of the 32-byte case so the test runs in seconds.
+        // Argon2id is expensive (512 MiB per call), so the length set is kept small.
         for &len in &[0usize, 1, 16, 31, 32, 33, 64, 128, 512] {
             let mut plaintext = vec![0u8; len];
             OsRng.fill_bytes(&mut plaintext);

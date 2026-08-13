@@ -48,7 +48,6 @@ def test_tpm_csr_signature_is_valid(swtpm_tcti: str) -> None:
 
 
 def test_tpm_csr_spki_matches_tpm_key(swtpm_tcti: str) -> None:
-    """The CSR's SubjectPublicKeyInfo equals the TPM key's exported SPKI."""
     import tuncore
 
     attest_key = tuncore.AttestKey.generate()
@@ -59,7 +58,6 @@ def test_tpm_csr_spki_matches_tpm_key(swtpm_tcti: str) -> None:
 
 
 def test_tpm_csr_subject_matches(swtpm_tcti: str) -> None:
-    """The CSR subject is exactly the requested CN."""
     import tuncore
 
     attest_key = tuncore.AttestKey.generate()

@@ -51,7 +51,6 @@ FRAG_STRUCT = struct.Struct("!HBB")
 
 class PacketType(IntEnum):
     DATA = 0x00
-    HANDSHAKE = 0x01
     REKEY_INIT = 0x02
     REKEY_ACK = 0x03
     CHAFF = 0x04
@@ -81,20 +80,12 @@ class InnerPacket:
     def serialize(self) -> bytes:
         """Serialize to inner plaintext format.
 
-        Audit M3: epoch_id widened from 2 bits → 4 bits (top nibble of
-        the flags byte). With 2 bits, epoch_id repeats every 4
-        rotations (~40 min at default cadence); a captured packet
-        could replay back into the SAME epoch_id slot 4 rotations
-        later. AEAD key rotation invalidates the replay (different
-        nonce-key) but eliminating the slot collision is cheap and
-        removes that as a "future code path could rely on epoch_id
-        uniqueness within a session lifetime" subtle hazard.
-        4-bit space cycles every 16 rotations (~2.6 hours at default),
-        still well below the 64-bit seq exhaustion + outside any
-        realistic session lifetime under normal operation.
-        Bottom 4 bits stay reserved.
+        epoch_id occupies the top nibble of the flags byte (4 bits, 16
+        rotations ~= 2.6 h at default cadence). A 2-bit field would recycle
+        every 4 rotations, so a captured packet could land in the same
+        epoch_id slot again within one session.
         """
-        flags = (self.epoch_id & 0x0F) << 4  # 4 MSBs = epoch_id, 4 LSBs reserved
+        flags = (self.epoch_id & 0x0F) << 4
         inner_len = len(self.payload)
         if inner_len > MAX_INNER_PAYLOAD:
             raise ValueError(f"payload too large: {inner_len} > {MAX_INNER_PAYLOAD}")
@@ -105,7 +96,6 @@ class InnerPacket:
 
     @classmethod
     def deserialize(cls, data: bytes) -> InnerPacket:
-        """Deserialize from inner plaintext."""
         if len(data) < INNER_HEADER_SIZE:
             raise ValueError("inner packet too short")
         ptype_raw, flags, inner_len = INNER_STRUCT.unpack_from(data)
@@ -113,9 +103,7 @@ class InnerPacket:
             ptype = PacketType(ptype_raw)
         except ValueError:
             raise ValueError(f"unknown packet type: {ptype_raw:#x}")
-        # Audit M3: 4-bit epoch_id (top nibble); bottom 4 bits reserved.
         epoch_id = (flags >> 4) & 0x0F
-        # Reserved bits (lower 4) must be zero.
         if flags & 0x0F:
             raise ValueError(f"reserved flag bits set: {flags:#x}")
         if inner_len > MAX_INNER_PAYLOAD:
@@ -257,16 +245,12 @@ def fragment_ip_packet(
     return out
 
 
-# ── Fragment reassembly ──
-
 REASSEMBLY_MAX_PENDING = 256
 REASSEMBLY_TIMEOUT_S = 5.0
 
 
 @dataclass
 class _PendingReassembly:
-    """Tracks fragments for a single fragment_id."""
-
     total: int
     received: dict[int, bytes] = field(default_factory=lambda: {})
     first_seen: float = field(default_factory=time.monotonic)
@@ -302,7 +286,6 @@ class ReassemblyBuffer:
 
         entry = self._pending[fid]
 
-        # Validate consistency
         if entry.total != frag.total:
             log.debug(
                 "fragment total mismatch for id=%d: %d != %d",
@@ -312,7 +295,6 @@ class ReassemblyBuffer:
             )
             return None
 
-        # Duplicate check
         if frag.index in entry.received:
             return None
 
@@ -326,7 +308,6 @@ class ReassemblyBuffer:
 
         entry.received[frag.index] = frag.data
 
-        # Check if complete
         if len(entry.received) == entry.total:
             payload = b"".join(entry.received[i] for i in range(entry.total))
             del self._pending[fid]
@@ -335,7 +316,6 @@ class ReassemblyBuffer:
         return None
 
     def _cleanup_expired(self) -> None:
-        """Remove entries that have timed out."""
         now = time.monotonic()
         expired = [
             fid

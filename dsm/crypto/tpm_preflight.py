@@ -21,12 +21,6 @@ class TpmPreflightError(Exception):
     """
 
 
-def _backend_is_software() -> bool:
-    import tuncore
-
-    return bool(getattr(tuncore, "ATTEST_BACKEND_IS_SOFTWARE", True))
-
-
 def preflight_tpm(tcti: str | None) -> None:
     """Confirm the TPM responds before provisioning the attest key.
 
@@ -47,7 +41,7 @@ def preflight_tpm(tcti: str | None) -> None:
     """
     import tuncore
 
-    if _backend_is_software():
+    if bool(getattr(tuncore, "ATTEST_BACKEND_IS_SOFTWARE", True)):
         return  # soft backend: nothing to preflight
 
     where = tcti or "device:/dev/tpmrm0"

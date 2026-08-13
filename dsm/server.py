@@ -64,7 +64,7 @@ def _emit_handshake_failure(err: Exception) -> None:
     """Emit the failed-handshake audit event WITHOUT the exception message,
     and with a COARSE family label for cert-auth rejections.
 
-    Phase 1.13: the human WARNING/DEBUG logs already hide cert-auth detail so
+    The human WARNING/DEBUG logs already hide cert-auth detail so
     a journald reader can't distinguish CNNotAllowedError (allowlist miss)
     from CertRevokedError (CRL hit) from a binding mismatch and enumerate the
     allowlist / CRL. The netaudit stream (enabled by --debug-net) must apply
@@ -109,7 +109,7 @@ async def _backoff_or_shutdown(
     delay = max(0.0, base + jitter)
     try:
         await asyncio.wait_for(process_shutdown.wait(), timeout=delay)
-        return True  # shutdown arrived during backoff
+        return True
     except TimeoutError:
         return False
 
@@ -202,15 +202,13 @@ async def _accept_one_session(
                 log.info("handshake failed — waiting for next client")
                 log.debug("handshake failure detail: %s: %s", err_name, e)
             _emit_handshake_failure(e)
-            # Reset FSM for the next attempt:
-            # HANDSHAKING → TEARDOWN → IDLE → CONNECTING.
             fsm.transition(State.TEARDOWN)
             fsm.transition(State.IDLE)
             fsm.transition(State.CONNECTING)
 
             consecutive_failures += 1
             if await _backoff_or_shutdown(consecutive_failures, process_shutdown):
-                break  # shutdown arrived during backoff
+                break
 
     return None, None, transport_obj
 
@@ -264,11 +262,11 @@ async def _run_one_session(
     # anonymity property. The first 16 hex chars of SHA-256(pub) are still
     # device-stable so operators can cross-reference logs to known clients,
     # but don't expose the raw key material in journald.
-    import hashlib as _hl
+    import hashlib
 
     log.info(
         "client connected (noise_static_sha256=%s)",
-        _hl.sha256(client_pub_bytes).hexdigest()[:16],
+        hashlib.sha256(client_pub_bytes).hexdigest()[:16],
     )
 
     fsm.transition(State.ESTABLISHED)
@@ -362,46 +360,27 @@ async def _run_one_session(
 
         session_stack.push_async_callback(_cancel_bridge)
 
-        # M-BUG-9: wrap the client_addr cell in a small class that enforces
-        # the monotonic-set-once invariant via the type system rather than
-        # convention. set() rejects None and a wrong shape (post_authenticate
-        # may overwrite with the SAME addr — or a new src port after rebind —
-        # which is allowed; setting to None is a programming error).
-        class _ClientAddr:
-            __slots__ = ("_addr",)
-
-            def __init__(self) -> None:
-                self._addr: tuple[str, int] | None = None
-
-            def set(self, addr: tuple[str, int]) -> None:
-                # Defensive runtime guard against a future caller passing
-                # None or wrong shape (the type annotation is the primary
-                # contract; this catches type-eraser misuse).
-                if addr is None or len(addr) != 2:  # type: ignore[unreachable]
-                    raise TypeError(f"client_addr must be (host, port), got {addr!r}")
-                self._addr = addr
-
-            def get(self) -> tuple[str, int] | None:
-                return self._addr
-
-        client_addr = _ClientAddr()
+        # One-element cell holding the committed egress addr. None until the
+        # first authenticated packet; post_authenticate may later overwrite it
+        # with the SAME addr, or a new src port after a validated roam.
+        client_addr: list[tuple[str, int] | None] = [None]
 
         send_packet = make_send_fn(
             session_keys,
             transport,
-            client_addr.get,
+            lambda: client_addr[0],
             seq,
             liveness=liveness,
             shutdown=session_shutdown,
         )
 
-        # Phase 2: envelope-driven (mirrors the client). The shaper's paced
+        # Envelope-driven (mirrors the client). The shaper's paced
         # wire budget decides how many packets leave per poll; should_chaff
         # is now only a GATE that suppresses chaff-fill until client_addr is
         # known — otherwise the direct chaff send would hit make_send_fn's
         # "destination addr not yet known" path and trigger shutdown.
         def _chaff_allowed() -> bool:
-            return client_addr.get() is not None
+            return client_addr[0] is not None
 
         # Scheduler+shaper params must mirror the client's — divergence here
         # reintroduces a direction-correlation fingerprint. See
@@ -428,7 +407,7 @@ async def _run_one_session(
             liveness=liveness,
             shutdown=session_shutdown,
             reassembly=reassembly,
-            # M-BUG-1: static pubs for mutual-init tie-break.
+            # Static pubs for mutual-init tie-break.
             local_static_pub=bytes(keystore.identity.public_key),
             remote_static_pub=client_pub_bytes,
         )
@@ -451,7 +430,7 @@ async def _run_one_session(
             # the scheduler (which always targets the committed egress) and
             # WITHOUT touching the committed egress. Bounded so a wedged/unroutable
             # candidate (e.g. the spoofed victim) cannot pin the recv loop.
-            # local import (avoids cycle churn):
+            # imported here: private helper, not part of dsm.session's public surface
             from dsm.session import (
                 _build_control_packet,  # pyright: ignore[reportPrivateUsage]
             )
@@ -470,11 +449,11 @@ async def _run_one_session(
             from dsm.core.protocol import InnerPacket
 
             assert isinstance(inner, InnerPacket)
-            committed = client_addr.get()
+            committed = client_addr[0]
 
             # First authenticated addr: commit (no challenge for the first one).
             if committed is None:
-                client_addr.set(addr)
+                client_addr[0] = addr
                 return
 
             # A PATH_RESPONSE from the pending candidate with a matching token
@@ -483,7 +462,7 @@ async def _run_one_session(
             # committed addr) is acted on here.
             if inner.ptype == PacketType.PATH_RESPONSE:
                 if path_validation.validate(addr, inner.payload):
-                    client_addr.set(addr)
+                    client_addr[0] = addr
                     path_validation.clear()
                     log.info("egress roam validated, committed to new peer addr")
                 return
@@ -509,8 +488,6 @@ async def _run_one_session(
             post_authenticate=_post_authenticate,
             shutdown_log="server shutting down",
         )
-        # session_stack unwinds here (dns_proxy → masquerade →
-        # ip_forward → tun, plus the bridge cancel and TCP transport close).
 
 
 async def run_server(
@@ -591,7 +568,7 @@ async def run_server(
         # (TUN, forwarding, masquerade, DNS) lives on a separate INNER stack
         # inside _run_one_session, so it is torn down and rebuilt around each
         # accepted client. Sync cleanups use stack.callback; async ones use
-        # stack.push_async_callback (mixing them is the classic footgun).
+        # stack.push_async_callback.
 
         # Register keystore unload first so it unwinds last — the encrypted
         # identity must stay in memory for the lifetime of the run. Mirrors
@@ -668,7 +645,7 @@ async def run_server(
                 # it manually here.
                 if config.transport == "tcp" and transport_obj is not None:
                     await transport_obj.aclose()
-                break  # clean process shutdown during accept
+                break
 
             try:
                 await _run_one_session(
@@ -703,8 +680,4 @@ async def run_server(
             if not process_shutdown.is_set():
                 fsm.transition(State.CONNECTING)
 
-        # OUTER stack cleanup (rate limiter, tcp_ts, UDP transport, store
-        # unloads) happens automatically here.
-
-    # Clean shutdown (signal arrived during accept or a live session): exit 0.
     return 0

@@ -2,14 +2,12 @@
 # Copy to /opt/mtun/config.toml (mode 0600) and edit. All file paths must be
 # absolute.
 #
-# ┌──────────────────────────────────────────────────────────────────────────┐
-# │ BEFORE FIRST START — this example will NOT boot as-shipped. You must:     │
-# │   1. Replace ca_root_sha256 with the real 64-hex SHA-256 of the CA root   │
-# │      (the all-zeros placeholder below is rejected at CA-load time).       │
-# │   2. Resolve the CRL: this example sets crl_strict = false so it boots in  │
-# │      a lab, but PRODUCTION must instead provision a crl_file and leave     │
-# │      crl_strict at its fail-closed default of true (see the CRL section).  │
-# └──────────────────────────────────────────────────────────────────────────┘
+# BEFORE FIRST START — this example will NOT boot as-shipped. You must:
+#   1. Replace ca_root_sha256 with the real 64-hex SHA-256 of the CA root
+#      (the all-zeros placeholder below is rejected at CA-load time).
+#   2. Resolve the CRL: this example sets crl_strict = false so it boots in
+#      a lab, but PRODUCTION must instead provision a crl_file and leave
+#      crl_strict at its fail-closed default of true (see the CRL section).
 #
 # Trust model: every device runs `dsm enroll --csr-out` once, walks the CSR to
 # the offline CA laptop, gets a cert back, and runs `dsm enroll --import`.
@@ -21,7 +19,7 @@ server_ip = "203.0.113.1"                    # Server public IPv4 literal (not a
 server_port = 51820                          # Server's service port
 listen_port = 0                              # client: 0 = ephemeral; server: real bind port
 
-# ─── Identity & device cert ────────────────────────────────────────────────
+# Identity & device cert
 key_file = "/opt/mtun/identity.key"          # Argon2id-wrapped X25519 Noise static (absolute path)
 cert_file = "/opt/mtun/device.crt"           # X.509 leaf cert (DER or PEM), signed by internal CA
 ca_root_file = "/opt/mtun/dsm_ca_root.pem"   # Pinned CA root cert (PEM)
@@ -60,7 +58,7 @@ attest_key_file = "/opt/mtun/attest.key"
 #   attest_tpm_tcti = "swtpm:host=127.0.0.1,port=2321"  # hermetic test TPM
 # attest_tpm_tcti =
 
-# ─── Certificate revocation (CRL) ──────────────────────────────────────────
+# Certificate revocation (CRL)
 # crl_strict is true BY DEFAULT and fail-closed: the daemon refuses to start
 # unless a crl_file is configured AND it is not past next_update. A fresh copy
 # of this example WITHOUT a crl_file would refuse to start, so this example
@@ -74,7 +72,7 @@ attest_key_file = "/opt/mtun/attest.key"
 crl_strict = false
 # crl_file = "/opt/mtun/dsm_ca.crl"          # DER or PEM; refresh monthly via walked-USB
 
-# ─── Role-specific cert policy ─────────────────────────────────────────────
+# Role-specific cert policy
 # Client only: subject CN we accept on the server cert.
 expected_server_cn = "dsm-1234abcd-server"
 
@@ -90,7 +88,7 @@ expected_server_cn = "dsm-1234abcd-server"
 # "https://1.1.1.1/dns-query" = ["<64-char hex SPKI SHA-256>"]
 # debug_dns = false                          # true logs plaintext qnames (privacy off)
 
-# ─── Network ───────────────────────────────────────────────────────────────
+# Network
 transport = "udp"                            # "udp" | "tcp"
 tun_name = "mtun0"
 log_level = "warning"                        # "debug" | "info" | "warning" | "error"
@@ -106,7 +104,7 @@ mtu = 1400
 # handshake-failure detail; see deploy/GUIDE.md §9.
 # debug_net = false
 
-# ─── Traffic shaping ───────────────────────────────────────────────────────
+# Traffic shaping
 padding_min = 128
 padding_max = 1400
 jitter_ms_min = 1
@@ -114,7 +112,7 @@ jitter_ms_min = 1
 # M-ANON-4 default; lower values trade anonymity for interactive latency.
 jitter_ms_max = 100
 
-# ─── Adaptive-envelope shaping knobs (Phase 2 / Fork 8) ───────────────────
+# Adaptive-envelope shaping knobs
 # These are all optional; leaving them unset uses the defaults below.
 # The defaults form a coherent anonymity profile — operators who don't need
 # to tune leave them commented out.
@@ -150,6 +148,6 @@ jitter_ms_max = 100
 # envelope_idle_floor_min_pps = 0.5
 # envelope_idle_floor_max_pps = 2.0
 
-# ─── Key rotation ──────────────────────────────────────────────────────────
+# Key rotation
 rotation_packets = 5000                      # Rotate after N packets
 rotation_seconds = 600                       # Rotate after N seconds (10 min)

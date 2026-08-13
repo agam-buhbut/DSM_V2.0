@@ -7,7 +7,7 @@ by size or timing distribution.
 
 These tests do not boot the transport layer. They construct client-side
 and server-side TrafficShaper instances with matching parameters and
-assert that the *primitives used by both ends* (pad_packet, make_chaff)
+assert that the *primitives used by both ends* (pad_packet, make_chaff_padded)
 emit output drawn from the same size-class support set.
 """
 

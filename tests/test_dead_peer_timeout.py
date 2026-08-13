@@ -16,7 +16,7 @@ by injecting a fake clock at that boundary and shrinking
 ``LIVENESS_CHECK_INTERVAL`` so the loop's ``wait_for`` returns promptly with
 no meaningful real sleep. No tuncore, no sockets, no disk.
 
-KEY discriminating assertion: with a silent peer (``last_recv_time`` far in
+Discriminating assertion: with a silent peer (``last_recv_time`` far in
 the past relative to the injected clock) the loop fires exactly one
 ``liveness_fire`` with ``reason='dead_peer_timeout'`` and sets shutdown;
 with *recent* traffic it fires ZERO such events and never sets shutdown on
@@ -89,7 +89,6 @@ def _make_ctx(
 ) -> DataPathContext:
     liveness = LivenessState(
         last_recv_time=last_recv_time,
-        last_send_time=last_real_send_time,
         last_real_send_time=last_real_send_time,
     )
     return DataPathContext(

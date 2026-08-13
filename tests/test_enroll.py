@@ -130,20 +130,17 @@ class TestEnrollRoundtrip(unittest.TestCase):
         self.ca_path.write_bytes(ca.pem)
 
         keystore, attest, result = self._build_enrollment()
-        # Persisted on disk, mode 0o600
         self.assertTrue(self.identity_path.is_file())
         self.assertTrue(self.attest_path.is_file())
         self.assertEqual(self.identity_path.stat().st_mode & 0o777, 0o600)
         self.assertEqual(self.attest_path.stat().st_mode & 0o777, 0o600)
 
-        # CN derived from pubkey + role
         self.assertEqual(
             result.cn,
             derive_default_cn(result.noise_static_pub, "client"),
         )
         self.assertTrue(result.cn.endswith("-client"))
 
-        # CSR is parseable + signature verifies
         csr = x509.load_der_x509_csr(result.csr_der)
         self.assertTrue(csr.is_signature_valid)
         self.assertEqual(
@@ -151,7 +148,6 @@ class TestEnrollRoundtrip(unittest.TestCase):
             result.cn,
         )
 
-        # CA signs and we import
         cert_pem = _sign_csr(ca, result.csr_der)
         cert_path = Path(self.tmpdir) / "signed.pem"
         cert_path.write_bytes(cert_pem)
@@ -180,7 +176,6 @@ class TestEnrollRoundtrip(unittest.TestCase):
         self.assertEqual(result.cn, "dsm-custom-server")
 
     def test_refuses_to_overwrite_identity(self) -> None:
-        # First enrollment writes identity.
         self._build_enrollment()
         # Second enrollment must refuse — we don't auto-clobber.
         keystore = KeyStore(str(self.identity_path))

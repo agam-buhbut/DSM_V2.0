@@ -650,9 +650,7 @@ class TestDataPathRoundtrip(unittest.IsolatedAsyncioTestCase):
                 if server["tun"].received:
                     break
                 await asyncio.sleep(0.01)
-            # Now client sends SESSION_CLOSE.
             await send_session_close(client["ctx"])
-            # Server's shutdown event should flip within ~100ms.
             for _ in range(200):
                 if server["ctx"].shutdown.is_set():
                     break
@@ -708,7 +706,6 @@ class TestTCPFixedSizePadding(unittest.IsolatedAsyncioTestCase):
         inner_for_smallest = smallest - OUTER_HEADER_SIZE - GCM_TAG_SIZE
         await send(b"x" * inner_for_smallest, smallest)
 
-        # Mid class
         mid = 512
         inner_for_mid = mid - OUTER_HEADER_SIZE - GCM_TAG_SIZE
         await send(b"y" * inner_for_mid, mid)
@@ -855,7 +852,6 @@ class TestDataPathReplayRejection(unittest.TestCase):
 
         wire, n1 = self._frame(a_keys, seq, b"first packet")
 
-        # First delivery succeeds and yields the inner packet.
         first = decrypt_packet(wire, b_keys, replay)
         self.assertIsNotNone(first)
         inner, prev = first  # type: ignore[misc]
@@ -863,7 +859,6 @@ class TestDataPathReplayRejection(unittest.TestCase):
         self.assertEqual(inner.payload, b"first packet")
         self.assertFalse(prev)
 
-        # The window now rejects this seq on a re-check.
         self.assertFalse(replay.check(n1))
 
         # Same bytes again → dropped (None), not a second decode.

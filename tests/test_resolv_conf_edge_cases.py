@@ -6,7 +6,7 @@ never touch:
 
   * the write-once persistent backup (``RESOLV_BACKUP``) and its guard against
     being overwritten by a later (possibly dsm-managed) capture,
-  * the ``_DSM_MARKER`` guard — apply() reading back OUR OWN file after a crash
+  * the ``DSM_MARKER`` guard — apply() reading back OUR OWN file after a crash
     must recover the *real* original from the backup, never adopt the managed
     file as the original,
   * the Phase-1.5 OSError fix — if the file disappears between ``exists()`` and
@@ -30,7 +30,7 @@ from pathlib import Path
 import pytest
 
 from dsm.net import resolv_conf
-from dsm.net.resolv_conf import _DSM_MARKER, ResolvConfManager
+from dsm.net.resolv_conf import DSM_MARKER, ResolvConfManager
 
 NAMESERVER = "10.8.0.1"
 
@@ -58,9 +58,6 @@ def _crash(mgr: ResolvConfManager) -> None:
     """Simulate a process crash after apply(): the on-disk dsm file and the
     persistent backup survive, but the in-memory manager state is gone."""
     del mgr
-
-
-# ── write-once persistent backup ─────────────────────────────────────────────
 
 
 def test_apply_over_genuine_file_persists_backup(paths: tuple[Path, Path]) -> None:
@@ -111,9 +108,6 @@ def test_backup_is_write_once_not_clobbered_by_later_genuine_file(
     assert backup.read_bytes() != decoy
 
 
-# ── _DSM_MARKER guard (crash recovery) ───────────────────────────────────────
-
-
 def test_crash_restart_restores_real_original_not_managed_file(
     paths: tuple[Path, Path],
 ) -> None:
@@ -125,7 +119,7 @@ def test_crash_restart_restores_real_original_not_managed_file(
     s1 = _managed()
     s1.apply()
     managed_bytes = resolv.read_bytes()
-    assert managed_bytes.startswith(_DSM_MARKER)
+    assert managed_bytes.startswith(DSM_MARKER)
     _crash(s1)
 
     # Session 2: a fresh manager finds the dsm-managed file. apply() must read
@@ -140,7 +134,7 @@ def test_crash_restart_restores_real_original_not_managed_file(
     # (with our nameserver) back as if it were the operator's config, silently
     # pinning DNS at the VPN server forever after the VPN is gone.
     assert resolv.read_bytes() == original
-    assert not resolv.read_bytes().startswith(_DSM_MARKER)
+    assert not resolv.read_bytes().startswith(DSM_MARKER)
 
 
 def test_remove_prefers_persistent_backup_when_nothing_captured(
@@ -154,7 +148,7 @@ def test_remove_prefers_persistent_backup_when_nothing_captured(
     # Manager with no in-memory original (both capture fields None), but marked
     # applied as a crash-restart takeover would leave it.
     mgr = _managed()
-    resolv.write_bytes(_DSM_MARKER + b" placeholder\n")
+    resolv.write_bytes(DSM_MARKER + b" placeholder\n")
     mgr._applied = True  # type: ignore[attr-defined]
 
     mgr.remove()
@@ -162,9 +156,6 @@ def test_remove_prefers_persistent_backup_when_nothing_captured(
     # KEY: with nothing captured in-memory, remove() falls back to the
     # persistent backup and restores it exactly.
     assert resolv.read_bytes() == original
-
-
-# ── Phase-1.5 OSError fix: do not poison the backup with b"" ──────────────────
 
 
 def test_disappearing_file_does_not_poison_backup_with_empty(
@@ -196,7 +187,7 @@ def test_disappearing_file_does_not_poison_backup_with_empty(
     # silently break DNS resolution for the host.
     assert not backup.exists()
     # The managed file is still installed (apply completed).
-    assert resolv.read_bytes().startswith(_DSM_MARKER)
+    assert resolv.read_bytes().startswith(DSM_MARKER)
 
 
 def test_disappearing_file_restore_removes_override_no_empty_write(
@@ -223,9 +214,6 @@ def test_disappearing_file_restore_removes_override_no_empty_write(
     # Captured nothing and no backup -> remove() unlinks our override rather
     # than writing an empty file back.
     assert not resolv.exists()
-
-
-# ── restore when prior state is unusual ──────────────────────────────────────
 
 
 def test_restore_symlink_target_exactly(paths: tuple[Path, Path]) -> None:
@@ -256,7 +244,7 @@ def test_restore_missing_original_unlinks_override(
 
     mgr = _managed()
     mgr.apply()
-    assert resolv.read_bytes().startswith(_DSM_MARKER)
+    assert resolv.read_bytes().startswith(DSM_MARKER)
     mgr.remove()
 
     # No original existed -> the override is unlinked, leaving the path absent

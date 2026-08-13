@@ -33,7 +33,7 @@ MIN_REKEY_INTERVAL = 60  # seconds — minimum time between rekey operations
 # our INIT (because its 60s window hasn't elapsed) still has time to
 # accept us on a later retransmit. Previous values (5s × 3 = 15s) gave
 # up well before the responder's rate-limit window cleared, causing
-# spurious teardowns under tight-budget configs (H-CRYPT-6 audit).
+# spurious teardowns under tight-budget configs.
 # 8s × 9 = 72s comfortably crosses the 60s threshold.
 REKEY_ACK_TIMEOUT = 8.0
 MAX_REKEY_RETRIES = 9
@@ -41,8 +41,8 @@ MAX_REKEY_RETRIES = 9
 
 SendFn = Callable[[bytes, int], Awaitable[None]]
 
-# Task 2.6 (Fork 7 = YES): a synchronous, fire-and-forget paced-enqueue
-# callable — the same ``SendScheduler.enqueue`` real data/chaff packets use.
+# A synchronous, fire-and-forget paced-enqueue callable — the same
+# ``SendScheduler.enqueue`` real data/chaff packets use.
 # When supplied, control-plane REKEY_INIT/REKEY_ACK are released at the
 # envelope rate (≤ one latency budget late) instead of leaving immediately
 # via ``send_fn``, so their wire timing is indistinguishable from the steady
@@ -65,17 +65,15 @@ async def _send_rekey_packet(
 
     All four REKEY_INIT/REKEY_ACK construction sites share the same
     shape — same epoch_id derivation, same shaper.pad_packet call,
-    same send invocation. Centralised here so future protocol
-    fields (e.g. an explicit rekey reason) land in one place.
+    same send invocation.
 
-    Task 2.6: when ``paced_send`` is supplied the padded packet is handed
+    When ``paced_send`` is supplied the padded packet is handed
     to the paced scheduler queue (fire-and-forget) instead of the bounded
     direct ``send_fn``, so it leaves at the envelope rate. The padding is
     identical either way — the wire packet is the same size class / AEAD
     shape as a real data packet, only its release timing differs. When
-    ``paced_send`` is None the legacy direct-await path is used (kept so
-    pre-existing call sites / tests that pass only ``send_fn`` are
-    unchanged, and so the duplicate-ACK retransmit can stay bounded).
+    ``paced_send`` is None the direct-await path is used, which keeps the
+    duplicate-ACK retransmit bounded.
     """
     inner = InnerPacket(
         ptype=ptype,
@@ -90,7 +88,6 @@ async def _send_rekey_packet(
 
 
 def _is_rate_limited(last_rekey_time: float | None) -> bool:
-    """Return True if a rekey should be skipped due to rate limiting."""
     if last_rekey_time is None:
         return False
     elapsed = time.monotonic() - last_rekey_time
@@ -117,7 +114,7 @@ async def initiate_rekey(
     ``resend_rekey_init`` can retransmit the same INIT on ACK timeout.
     Returns ``(last_rekey_time, None, None)`` if the rekey was skipped.
 
-    Task 2.6: when ``paced_send`` is supplied the REKEY_INIT rides the
+    When ``paced_send`` is supplied the REKEY_INIT rides the
     paced envelope (fire-and-forget enqueue) instead of the bounded direct
     ``send_fn``. This is safe because the retransmit budget is driven by
     REKEY_ACK_TIMEOUT (ACK *receipt*), not by send completion — a paced
@@ -161,7 +158,7 @@ async def resend_rekey_init(
     re-randomized per call via ``shaper.pad_packet``; an observer
     cannot see a byte-identical retransmit.
 
-    Task 2.6: when ``paced_send`` is supplied the retransmit also rides
+    When ``paced_send`` is supplied the retransmit also rides
     the paced envelope (same justification as ``initiate_rekey`` — the
     next ACK-timeout retry is the recovery mechanism, not send completion).
     """
@@ -202,7 +199,7 @@ async def handle_rekey_init(
     would fail its ``new_epoch == current_epoch + 1`` precondition after
     the first one applied.
 
-    Mutual-init tie-break (audit M-BUG-1): if our own rekey is in
+    Mutual-init tie-break: if our own rekey is in
     flight (``rekey_state.in_progress``) AND the incoming INIT arrives
     in REKEYING state, both sides have initiated within an RTT. Without
     a tie-break, each side's `handle_rekey_init` rejects the other's
@@ -211,11 +208,9 @@ async def handle_rekey_init(
     canonical pub is the "winning initiator", the side with the higher
     pub yields its own init and processes the peer's. Requires the
     caller to pass both ``local_static_pub`` and ``remote_static_pub``;
-    if either is omitted (older call sites), the tie-break is skipped
-    and behavior matches the pre-fix code.
+    if either is omitted the tie-break is skipped.
     """
     if fsm.state != State.ESTABLISHED:
-        # Mutual-init tie-break point.
         if (
             fsm.state == State.REKEYING
             and rekey_state is not None
@@ -236,7 +231,7 @@ async def handle_rekey_init(
                 "mutual REKEY_INIT race — local pub is higher; "
                 "yielding to peer's INIT, aborting our pending one",
             )
-            # DSM-003: drop the Rust-side pending_rotation that our own
+            # Drop the Rust-side pending_rotation that our own
             # initiate_rotation() set. Clearing only the Python rekey_state
             # leaves the abandoned initiator init inside the SessionKeyManager,
             # so the next needs_rotation()-driven initiate_rotation() raises
@@ -251,7 +246,7 @@ async def handle_rekey_init(
             rekey_state.in_progress = False
             rekey_state.reset_retry()
             rekey_state.pending_epoch = None
-            # B4: our own initiate_rekey just stamped last_rekey_time, which
+            # Our own initiate_rekey just stamped last_rekey_time, which
             # would rate-limit-drop the peer's winning INIT below. Clear the
             # anchor here — and ONLY on this genuine-yield path — so the peer's
             # INIT is processed rather than silently dropped.
@@ -281,7 +276,7 @@ async def handle_rekey_init(
             "duplicate REKEY_INIT for epoch %d — re-sending cached ACK",
             new_epoch,
         )
-        # M-BUG-12: bound the await so a stuck TCP send (peer backpressure)
+        # Bound the await so a stuck TCP send (peer backpressure)
         # can't pin the recv loop for arbitrary time.
         try:
             await asyncio.wait_for(
@@ -299,9 +294,8 @@ async def handle_rekey_init(
         return last_rekey_time, cached_ack_epoch, cached_ack_payload
 
     if _is_rate_limited(last_rekey_time):
-        # H-CRYPT-6: previous code logged this at DEBUG so a stalled
-        # rekey was invisible to operators. Bump to WARNING so the
-        # symptom shows up in journald before the initiator hits its
+        # WARNING, not DEBUG: a stalled rekey must be visible in journald before
+        # the initiator hits its
         # extended retry budget. The initiator's MAX_REKEY_RETRIES *
         # REKEY_ACK_TIMEOUT is now > MIN_REKEY_INTERVAL so eventually
         # one of the retries lands after our rate-limit clears and the
@@ -324,27 +318,28 @@ async def handle_rekey_init(
             remote_ephemeral_pub,
             new_epoch,
         )
-    except Exception as e:  # noqa: BLE001  # see linter report
+    # tuncore raises opaque PyO3 errors; treat all as prepare failure
+    except Exception as e:  # noqa: BLE001
         log.warning("rekey responder prepare failed: %s", e)
         fsm.transition(State.ESTABLISHED)
         return last_rekey_time, cached_ack_epoch, cached_ack_payload
 
     # Send ACK under old keys (session_keys epoch not yet rotated).
     ack_payload = struct.pack("!I", prepared_epoch) + bytes(our_ephemeral_pub)
+    # Pace the ACK so its wire timing matches the steady stream.
+    # The packet is BUILT now (old-epoch nibble) but LEAVES later at the
+    # envelope rate. Two safety properties keep this correct across the
+    # immediately-following apply_rotation_responder():
+    #   * the receiver EXEMPTS REKEY_ACK from the epoch-nibble check
+    #     (decrypt_packet), so a NEW nibble restamped at send
+    #     time by make_send_fn does not drop it; and
+    #   * the responder DEFERS its send-key swap for the grace window
+    #     (session_keys.rs), so the paced ACK still encrypts
+    #     under the OLD send key the pre-rotation initiator can decrypt.
+    # enqueue is fire-and-forget: no TimeoutError self-heal is needed
+    # because the scheduler — not this recv-loop frame — owns delivery
+    # and cannot pin the recv loop on a wedged transport (it drops oldest).
     if paced_send is not None:
-        # Task 2.6: pace the ACK so its wire timing matches the steady stream.
-        # The packet is BUILT now (old-epoch nibble) but LEAVES later at the
-        # envelope rate. Two safety properties keep this correct across the
-        # immediately-following apply_rotation_responder():
-        #   * the receiver EXEMPTS REKEY_ACK from the epoch-nibble check
-        #     (decrypt_packet, Phase 1.1), so a NEW nibble restamped at send
-        #     time by make_send_fn does not drop it; and
-        #   * the responder DEFERS its send-key swap for the grace window
-        #     (session_keys.rs H-BUG-2/3), so the paced ACK still encrypts
-        #     under the OLD send key the pre-rotation initiator can decrypt.
-        # enqueue is fire-and-forget: no TimeoutError self-heal is needed
-        # because the scheduler — not this recv-loop frame — owns delivery
-        # and cannot pin the recv loop on a wedged transport (it drops oldest).
         await _send_rekey_packet(
             PacketType.REKEY_ACK,
             ack_payload,
@@ -354,8 +349,8 @@ async def handle_rekey_init(
             paced_send=paced_send,
         )
     else:
-        # Legacy direct path. M-BUG-12: bound the send so TCP backpressure
-        # doesn't stall the recv loop indefinitely.
+        # Direct path: bound the send so TCP backpressure doesn't stall the
+        # recv loop indefinitely.
         try:
             await asyncio.wait_for(
                 _send_rekey_packet(
@@ -369,18 +364,18 @@ async def handle_rekey_init(
             )
         except TimeoutError:
             log.warning("REKEY_ACK send timed out — peer may be wedged")
-            # Phase 1.2: this leaves pending_responder_rotation set in Rust with
-            # no apply. That is tolerated: the next REKEY_INIT's
+            # This leaves pending_responder_rotation set in Rust with no apply.
+            # That is tolerated: the next REKEY_INIT's
             # prepare_rotation_responder overwrites the stale pending (dropping
             # and zeroizing its keys), so the responder self-heals on the next
             # rekey instead of wedging permanently.
             fsm.transition(State.ESTABLISHED)
             return last_rekey_time, cached_ack_epoch, cached_ack_payload
 
-    # Now apply the rotation.
     try:
         completed_epoch = session_keys.apply_rotation_responder()
-    except Exception as e:  # noqa: BLE001  # see linter report
+    # tuncore raises opaque PyO3 errors; treat all as prepare failure
+    except Exception as e:  # noqa: BLE001
         log.warning("rekey responder apply failed: %s", e)
         fsm.transition(State.ESTABLISHED)
         return last_rekey_time, cached_ack_epoch, cached_ack_payload
@@ -428,7 +423,8 @@ def handle_rekey_ack(
 
     try:
         completed_epoch = session_keys.complete_rotation_initiator(remote_ephemeral_pub)
-    except Exception as e:  # noqa: BLE001  # see linter report
+    # tuncore raises opaque PyO3 errors; treat all as completion failure
+    except Exception as e:  # noqa: BLE001
         log.warning("rekey initiator completion failed: %s", e)
         fsm.transition(State.ESTABLISHED)
         return None

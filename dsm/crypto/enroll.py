@@ -143,8 +143,6 @@ def _build_csr_tpm(
         encode_noise_static_binding_value,
     )
 
-    # ``serialization`` is imported at module scope (used by import_signed_cert).
-
     tpm_spki = bytes(attest_key.public_spki_der())
     if len(tpm_spki) != 91:
         raise EnrollError(
@@ -275,13 +273,6 @@ def generate_enrollment(
     )
 
 
-def _load_cert_any_format(raw: bytes) -> DeviceCert:
-    try:
-        return DeviceCert.from_pem_or_der(raw)
-    except CertError as e:
-        raise EnrollError(f"failed to parse cert: {e}") from e
-
-
 def import_signed_cert(
     *,
     cert_input_path: Path,
@@ -307,7 +298,10 @@ def import_signed_cert(
     if not ca_root_path.is_file():
         raise EnrollError(f"ca_root not found: {ca_root_path}")
 
-    leaf = _load_cert_any_format(cert_input_path.read_bytes())
+    try:
+        leaf = DeviceCert.from_pem_or_der(cert_input_path.read_bytes())
+    except CertError as e:
+        raise EnrollError(f"failed to parse cert: {e}") from e
     ca_root = load_ca_root(ca_root_path)
 
     try:

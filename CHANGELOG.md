@@ -12,10 +12,9 @@ _Nothing yet._
 ## [0.1.0] - 2026-06-12
 
 First public release. Pre-1.0: wire / sealed-blob / config formats may still
-evolve, so this carries **no SemVer-stability promise** yet.
+evolve, so this carries no SemVer-stability promise yet.
 
-Production-readiness work taking DSM from its strong-crypto-core internal state
-toward a public, MIT-licensed release. High-level summary:
+Work taking DSM from an internal state to a public, MIT-licensed release.
 
 ### Security
 - Hardened the crypto glue and unauthenticated-input handling on the server

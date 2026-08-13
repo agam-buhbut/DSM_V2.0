@@ -13,7 +13,7 @@ on:
 # in release.yml so the gate and the signed-release pipeline stay consistent.
 # The SHAs were resolved against the GitHub API (tag/branch -> commit).
 
-# Two attest lanes (Phase-3 Task 3.11): the soft and tpm backends are
+# Two attest lanes: the soft and tpm backends are
 # mutually exclusive at compile time, so each backend needs its own wheel and
 # its own job.
 #   * soft lane (`test`)        — builds the dev-soft-attest wheel and runs the
@@ -81,7 +81,7 @@ jobs:
           pip download --dest dist "cryptography>=46.0.7,<49" "dnspython>=2.6,<3.0"
           pip install --no-index --find-links dist dsm
 
-      # ── Python gates (CLAUDE.md order: black → isort → ruff → pylint → pyright) ──
+      # Python gates, in CLAUDE.md order.
       - name: black (format check)
         run: black --check dsm tests
       - name: isort (import-order check)
@@ -93,7 +93,6 @@ jobs:
       - name: pyright
         run: pyright
 
-      # ── Rust gates (rustfmt → clippy → audit) ──
       # clippy runs on the soft feature here (this runner has no TSS2 headers);
       # the tpm-attest clippy gate lives in the tpm-attest job below.
       - name: rustfmt (format check)
@@ -118,11 +117,9 @@ jobs:
           --ignore RUSTSEC-2026-0176
           --ignore RUSTSEC-2026-0177
 
-      # ── Supply chain: Python runtime deps ──
       - name: pip-audit
         run: pip-audit --progress-spinner off
 
-      # ── Tests (soft lane) ──
       - name: Rust tests (soft)
         run: >-
           cargo test --manifest-path rust/tuncore/Cargo.toml --release
@@ -132,11 +129,11 @@ jobs:
           DSM_REQUIRE_TUNCORE: "1"
         run: pytest tests/ -q
 
-      # ── DSM-004 packaging smoke: the installed dsm must import from any cwd ──
+      # Packaging smoke: the installed dsm must import from any cwd.
       - name: Packaging smoke
         run: cd /tmp && python -c "import dsm, tuncore; print('packaging OK')"
 
-  # ── TPM lane: the real tpm-attest backend, exercised against swtpm ──────────
+  # TPM lane: the real tpm-attest backend, exercised against swtpm.
   # ubuntu-latest runners do NOT ship the TSS2 stack or swtpm by default, so
   # this job installs them. Verified package names on a current Debian/Ubuntu:
   #   swtpm                       — the /usr/bin/swtpm emulator binary

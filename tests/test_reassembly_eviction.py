@@ -157,9 +157,7 @@ class TestReassemblyEviction(unittest.TestCase):
             # KEY assertion: completion is byte-exact and ordered by index,
             # and the sweep on the same call did not disturb it.
             self.assertEqual(result, b"hello world")
-            # The stale set was evicted by that same sweep...
             self.assertNotIn(10, rb._pending)
-            # ...and the completed set was removed on completion.
             self.assertNotIn(11, rb._pending)
 
     def test_eviction_runs_well_under_pending_cap(self) -> None:

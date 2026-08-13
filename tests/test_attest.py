@@ -175,13 +175,11 @@ class TestAttestRejections(unittest.TestCase):
             self._verify(required_eku=CLIENT_AUTH_OID)
 
     def test_tampered_signature_byte_rejected(self) -> None:
-        # Locate sig in the framed payload and flip a byte.
         ts_field_end = 8
         cert_len = struct.unpack(">H", self.payload[ts_field_end : ts_field_end + 2])[0]
         cert_end = ts_field_end + 2 + cert_len
         sig_len = struct.unpack(">H", self.payload[cert_end : cert_end + 2])[0]
         sig_start = cert_end + 2
-        # Flip a middle byte of the signature.
         bad = bytearray(self.payload)
         bad[sig_start + sig_len // 2] ^= 0xFF
         with self.assertRaises(AttestSignatureError):
@@ -196,7 +194,6 @@ class TestAttestRejections(unittest.TestCase):
             self._verify(payload=bytes(bad))
 
     def test_tampered_cert_byte_rejected(self) -> None:
-        # Flip a byte inside the cert region.
         bad = bytearray(self.payload)
         cert_offset = 8 + 2 + 50  # ts(8) + len(2) + a few bytes in
         bad[cert_offset] ^= 0xFF
@@ -212,7 +209,6 @@ class TestAttestRejections(unittest.TestCase):
 
     def test_cert_len_overflow_rejected(self) -> None:
         bad = bytearray(self.payload)
-        # Overwrite the cert_len field with a value that overflows.
         bad[8:10] = struct.pack(">H", tuncore.HANDSHAKE_ATTEST_PAYLOAD_SIZE)
         with self.assertRaises(AttestPayloadFormatError):
             self._verify(payload=bytes(bad))
@@ -231,7 +227,6 @@ class TestAttestRejections(unittest.TestCase):
             )
 
     def test_expired_cert_rejected(self) -> None:
-        # Build a cert that's already expired.
         old = datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=400)
         attest_key = tuncore.AttestKey.generate()
         ns = secrets.token_bytes(32)

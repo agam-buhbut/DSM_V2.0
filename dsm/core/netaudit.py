@@ -70,15 +70,6 @@ def configure(enabled: bool) -> None:
         _log.setLevel(logging.CRITICAL + 1)
 
 
-def _json_default(obj: Any) -> str:
-    """Best-effort fallback for non-JSON-serializable values.
-
-    We never want emit() to crash a real session over a logging detail,
-    so anything we don't know how to serialize falls back to repr().
-    """
-    return repr(obj)
-
-
 def emit(event: str, **fields: Any) -> None:
     """Emit one structured event as a JSON line on the audit logger.
 
@@ -96,7 +87,8 @@ def emit(event: str, **fields: Any) -> None:
         **fields,
     }
     try:
-        line = json.dumps(payload, default=_json_default)
+        # repr() fallback: emit() must never crash a session over a logging detail.
+        line = json.dumps(payload, default=repr)
     except (TypeError, ValueError):
         # Last-ditch: even the default fallback failed. Drop a sentinel
         # event so the operator can see the audit had a hole.

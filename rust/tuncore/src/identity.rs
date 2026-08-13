@@ -64,7 +64,6 @@ impl IdentityKeyPair {
         passphrase_store::seal(self.secret.as_array(), passphrase)
     }
 
-    /// Decrypt a keypair from a stored blob using a passphrase.
     pub fn decrypt_from_store(blob: &[u8], passphrase: &[u8]) -> Result<Self, String> {
         // Up-front blob length check tied to the *expected* plaintext
         // (32-byte scalar) so the failure message is the precise "blob

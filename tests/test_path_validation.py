@@ -274,7 +274,7 @@ class PathValidationDriver(unittest.IsolatedAsyncioTestCase):
             reassembly=None,
         )
 
-        # ---- Mirror dsm/server.py::_run_one_session path-validation wiring ----
+        # Mirror dsm/server.py::_run_one_session path-validation wiring.
         path_validation = PathValidationState(clock=clock)
         path_send = make_addr_send_fn(server_keys, transport, seq)
 
@@ -307,8 +307,6 @@ class PathValidationDriver(unittest.IsolatedAsyncioTestCase):
             token = path_validation.should_challenge(addr)
             if token is not None:
                 await _send_challenge(addr, token)
-
-        # ----------------------------------------------------------------------
 
         async def _run() -> None:
             await run_data_loops(
@@ -357,7 +355,6 @@ class PathValidationDriver(unittest.IsolatedAsyncioTestCase):
             stop_when=_stop,
         )
 
-        # Egress was NOT redirected.
         self.assertEqual(
             addr_cell["addr"],
             _COMMITTED_ADDR,
@@ -373,7 +370,6 @@ class PathValidationDriver(unittest.IsolatedAsyncioTestCase):
             1,
             "exactly one challenge to the spoofed candidate expected",
         )
-        # Everything else is addressed to the committed real client.
         self.assertTrue(
             all(
                 d == _COMMITTED_ADDR
@@ -388,7 +384,6 @@ class PathValidationDriver(unittest.IsolatedAsyncioTestCase):
             len(_extract_token(to_spoofed[0][0], client_keys)),
             PATH_TOKEN_SIZE,
         )
-        # Payload still delivered to TUN.
         self.assertEqual(tun_writes, [b"reinjected-data"])
 
     async def test_roamed_client_answering_challenge_commits(self) -> None:

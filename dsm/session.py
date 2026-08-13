@@ -1,19 +1,15 @@
-"""Shared session data path: encrypt/send, decrypt/dispatch, TUN forwarding.
-
-Extracted from client.py and server.py to eliminate duplication.
-"""
+"""Shared session data path: encrypt/send, decrypt/dispatch, TUN forwarding."""
 
 # This module concentrates the whole encrypt/send + decrypt/dispatch + TUN
 # forwarding + liveness + rekey + auto-MTU data path in one place by design
 # (the loops share a DataPathContext and tight ordering guarantees), so it
-# exceeds pylint's 1000-line module ceiling. Like the too-many-* metrics
-# disabled in pyproject.toml, this is a refactorer-territory size metric
-# inherent to the data path, not a bug.
+# exceeds pylint's 1000-line module ceiling.
 # pylint: disable=too-many-lines
 
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
 import os
 import time
@@ -37,6 +33,7 @@ from dsm.core.protocol import (
     ReassemblyBuffer,
     fragment_ip_packet,
 )
+from dsm.core.rand import csprng_float
 from dsm.net.transport.tcp import TCPTransport
 from dsm.net.transport.udp import UDPTransport
 from dsm.net.tunnel import TunDevice
@@ -69,14 +66,15 @@ WIRE_OVERHEAD = 68
 
 # Outer header layout: seq(SEQ_STRUCT.size=8) ‖ nonce(12) ‖ ciphertext, with
 # the nonce occupying the bytes between the sequence number and the start of
-# the ciphertext (OUTER_HEADER_SIZE=20). Derived from the imported protocol
-# constants so it tracks any future header change; the assert pins today's
-# 12-byte AES-GCM nonce.
-NONCE_OFFSET = (
-    SEQ_STRUCT.size
-)  # pylint: disable=invalid-name  # intentional/false positive (see report)
-NONCE_SIZE = OUTER_HEADER_SIZE - SEQ_STRUCT.size
-assert NONCE_SIZE == 12
+# the ciphertext (OUTER_HEADER_SIZE=20).
+
+# The outer DSM packet rides inside IP(20)+UDP(8), so a kernel path MTU
+# converts to a wire size-class ceiling by subtracting this.
+IP_UDP_OVERHEAD = 28
+
+# Per-fragment extra-delay window (seconds). Comfortably larger than the
+# scheduler's max jitter so fragments interleave with other queued packets.
+FRAG_SPREAD_S = 0.05
 
 # auto-MTU adapter: how many consecutive same-or-higher path-MTU
 # observations are required before raising the TUN MTU back toward
@@ -91,18 +89,15 @@ class LivenessState:
     Seeded with ``time.monotonic()`` so a freshly-established session is
     not flagged dead before the first packet arrives.
 
-    M-BUG-15: ``last_real_send_time`` separates from ``last_send_time``
-    so the KEEPALIVE-trigger doesn't get bumped by chaff. With the
-    Poisson-rate chaff model always firing, the previous "any-send
-    idle > 15s" check meant KEEPALIVE was effectively never sent —
-    silently making the typed-keepalive path dead code rather than the
-    intended fixed-cadence ping. ``last_send_time`` stays for any
-    callers that care about absolute wire-presence; the keepalive loop
-    now consults ``last_real_send_time``.
+    ``last_real_send_time`` tracks real-data sends only, so the
+    KEEPALIVE-trigger doesn't get bumped by chaff. With the
+    Poisson-rate chaff model always firing, an "any-send idle > 15s"
+    check would mean KEEPALIVE was effectively never sent — silently
+    making the typed-keepalive path dead code rather than the intended
+    fixed-cadence ping.
     """
 
     last_recv_time: float = field(default_factory=time.monotonic)
-    last_send_time: float = field(default_factory=time.monotonic)
     last_real_send_time: float = field(default_factory=time.monotonic)
 
 
@@ -169,7 +164,7 @@ class FragmentIdCounter:
         return self.value
 
 
-def make_send_fn(
+def make_send_fn(  # pylint: disable=unused-argument  # `liveness` kept for call-site compatibility
     session_keys: tuncore.SessionKeyManager,
     transport: UDPTransport | TCPTransport,
     dest_addr: Callable[[], tuple[str, int] | None],
@@ -206,7 +201,7 @@ def make_send_fn(
             if shutdown is not None:
                 shutdown.set()
             return
-        # H-BUG-1: epoch_id is baked into the InnerPacket header at
+        # epoch_id is baked into the InnerPacket header at
         # build (queue) time, but encryption happens here at send time.
         # If a rekey completes between queue and send, the header says
         # OLD epoch_id, the AEAD key is NEW, and the receiver drops the
@@ -220,7 +215,7 @@ def make_send_fn(
         # exempt from the receiver's check, but patching them is
         # harmless.
         #
-        # M-PERF: the shaper already stamped the queue-time epoch nibble
+        # The shaper already stamped the queue-time epoch nibble
         # into byte 1 (shaper._serialize_padded). When NO rekey happened
         # between queue and send — the overwhelmingly common case — that
         # nibble already equals the live epoch, so we can hand the
@@ -261,7 +256,7 @@ def make_send_fn(
         if isinstance(transport, UDPTransport):
             addr = dest_addr()
             if addr is None:
-                # DSM-002: destination addr not yet known (the server has no
+                # Destination addr not yet known (the server has no
                 # peer addr until the first authenticated client packet sets
                 # it via post_authenticate). Raising here escapes the detached
                 # SendScheduler task and silently kills it — stopping ALL
@@ -277,8 +272,6 @@ def make_send_fn(
             await transport.send(wire, addr)
         else:
             await transport.send(wire)
-        if liveness is not None:
-            liveness.last_send_time = time.monotonic()
 
     return send_packet
 
@@ -436,7 +429,6 @@ class PathValidationState:
             assert self.token is not None
             token = self.token
         else:
-            # New candidate, or the slot is empty/expired: arm a fresh token.
             token = os.urandom(PATH_TOKEN_SIZE)
             self.pending_addr = candidate
             self.token = token
@@ -460,8 +452,6 @@ class PathValidationState:
             return False
         # Constant-time compare: the token is a secret the attacker is trying
         # to guess; a timing oracle on the echo path would leak it.
-        import hmac
-
         return hmac.compare_digest(token, self.token)
 
 
@@ -476,34 +466,17 @@ def _decrypt_with_fallback(
 
     Returns (plaintext, used_prev_epoch) or None on failure.
 
-    M-PERF-5: prefer the Rust-side `try_decrypt_with_fallback` which
+    Prefer the Rust-side `try_decrypt_with_fallback` which
     returns `None` on auth failure instead of raising. Constructing a
     Python exception + traceback on every dropped packet costs ~30µs
     of CPU each; at any meaningful forgery-flood rate this dominates
-    the recv-side cost. The fallback to the exception-driven path
-    handles older `tuncore` builds that don't yet have the new method
-    (e.g. an in-place upgrade without a rebuild).
+    the recv-side cost.
     """
-    try_fn = getattr(session_keys, "try_decrypt_with_fallback", None)
-    if try_fn is not None:
-        result = try_fn(nonce, ciphertext, aad, seq)
-        if result is None:
-            log.debug("decrypt failed, dropping packet")
-            return None
-        return result  # (plaintext, used_prev)
-
-    # Legacy fallback for tuncore builds without M-PERF-5 method.
-    try:
-        return session_keys.decrypt(nonce, ciphertext, aad, seq, False), False
-    except RuntimeError:
-        pass
-    if session_keys.has_grace_period:
-        try:
-            return session_keys.decrypt(nonce, ciphertext, aad, seq, True), True
-        except RuntimeError:
-            pass
-    log.debug("decrypt failed, dropping packet")
-    return None
+    result = session_keys.try_decrypt_with_fallback(nonce, ciphertext, aad, seq)
+    if result is None:
+        log.debug("decrypt failed, dropping packet")
+        return None
+    return result
 
 
 def decrypt_packet(
@@ -516,7 +489,7 @@ def decrypt_packet(
     Returns (inner_packet, decrypted_prev_epoch) or None if the packet
     should be dropped (too short, replay, auth failure, malformed, epoch mismatch).
 
-    M-BUG-14 DESIGN NOTE: there are TWO replay windows — this
+    There are TWO replay windows — this
     Python-side ``replay`` ARG (checked here BEFORE AEAD work) and the
     Rust-side window INSIDE ``session_keys.decrypt``. The Python check
     saves the AEAD cost on replays; the Rust check is the authoritative
@@ -537,9 +510,8 @@ def decrypt_packet(
         log.debug("replay detected, dropping seq=%d", seq)
         return None
 
-    # nonce sits between the 8-byte seq and the ciphertext; see NONCE_OFFSET
-    # / NONCE_SIZE. Byte-identical to the former data[8:20].
-    nonce_bytes = data[NONCE_OFFSET : NONCE_OFFSET + NONCE_SIZE]
+    # nonce sits between the 8-byte seq and the ciphertext.
+    nonce_bytes = data[SEQ_STRUCT.size : OUTER_HEADER_SIZE]
     ciphertext = data[OUTER_HEADER_SIZE:]
     aad = SEQ_STRUCT.pack(seq)
 
@@ -556,10 +528,9 @@ def decrypt_packet(
         log.debug("malformed inner packet, dropping")
         return None
 
-    # Verify epoch_id matches the key epoch used for decryption.
-    # Audit M3: epoch_id widened to 4 bits (0x0F mask).
+    # epoch_id is 4 bits (0x0F mask).
     #
-    # Phase 1.1: REKEY_ACK is ALSO exempt. A re-sent cached ACK is stamped
+    # REKEY_ACK is ALSO exempt. A re-sent cached ACK is stamped
     # with the responder's NEW epoch nibble, but a retransmitted INIT means
     # the initiator is still at the OLD epoch, so the nibble check would drop
     # the very ACK that completes recovery. REKEY_ACK self-validates via its
@@ -651,11 +622,11 @@ class DataPathContext:
     shutdown: asyncio.Event
     reassembly: ReassemblyBuffer | None = None
     fragment_ids: FragmentIdCounter = field(default_factory=FragmentIdCounter)
-    # H-ANON-4: optional UDPTransport reference for the client to call
+    # Optional UDPTransport reference for the client to call
     # `rebind_to_fresh_port()` on rekey completion, breaking the
     # stable-src-port session fingerprint. None on server / TCP.
     udp_transport: UDPTransport | None = None
-    # Audit H1 / M-BUG-1: our and peer's 32-byte Noise static pubs.
+    # Our and peer's 32-byte Noise static pubs.
     # Consumed by ``_handle_rekey_init`` for the mutual-init tie-break.
     # Optional fields here (None when unset) so older test fixtures
     # don't have to populate them; the tie-break degrades to its
@@ -683,8 +654,8 @@ async def _handle_fragment(ctx: DataPathContext, inner: InnerPacket) -> None:
 
 
 async def _handle_rekey_init(ctx: DataPathContext, inner: InnerPacket) -> None:
-    # Audit H1: plumb rekey_state + static pubs into handle_rekey_init so
-    # the M-BUG-1 mutual-init tie-break actually fires. Without these
+    # Plumb rekey_state + static pubs into handle_rekey_init so the
+    # mutual-init tie-break actually fires. Without these
     # kwargs the tie-break guard fails closed and a simultaneous-rekey
     # collision tears down both sides.
     (
@@ -703,7 +674,7 @@ async def _handle_rekey_init(ctx: DataPathContext, inner: InnerPacket) -> None:
         rekey_state=ctx.rekey,
         local_static_pub=ctx.local_static_pub,
         remote_static_pub=ctx.remote_static_pub,
-        # Task 2.6: route the (normal) REKEY_ACK through the paced envelope so
+        # Route the (normal) REKEY_ACK through the paced envelope so
         # its wire timing matches the steady stream. The duplicate-INIT
         # cached-ACK replay inside handle_rekey_init keeps the bounded direct
         # send_fn (lost-ACK recovery must stay observable within 5 s).
@@ -729,7 +700,7 @@ async def _handle_rekey_ack(ctx: DataPathContext, inner: InnerPacket) -> None:
     ctx.rekey.reset_retry()
     ctx.rekey.in_progress = False
 
-    # H-ANON-4: client rebinds UDP socket to fresh ephemeral port on
+    # Client rebinds UDP socket to fresh ephemeral port on
     # successful rekey, so the (src_ip, src_port, dst_ip, dst_port)
     # quadruple changes per rekey. Without this the src_port is stable
     # for the session lifetime and an ISP-side passive observer can
@@ -803,28 +774,22 @@ async def send_session_close(ctx: DataPathContext) -> None:
     """
     try:
         padded, target_size = _build_control_packet(ctx, PacketType.SESSION_CLOSE)
-        # DSM-024: bound the send so a wedged peer or TCP backpressure cannot
+        # Bound the send so a wedged peer or TCP backpressure cannot
         # pin the teardown. send_session_close runs in run_data_loops' finally,
         # BEFORE the caller unwinds nft/tun/resolv; an unbounded drain here
         # would delay the whole leak-safe teardown. Mirrors the rekey sends.
         await asyncio.wait_for(ctx.send_fn(padded, target_size), timeout=5.0)
-    except Exception as e:  # noqa: BLE001  # see linter report
+    # shutdown must continue regardless of send failure
+    except Exception as e:  # noqa: BLE001
         # Debug-level: the peer being gone at shutdown is the common case
         # (we may be shutting down BECAUSE the peer disappeared). Warning
         # would be noise on every disconnect.
         log.debug("SESSION_CLOSE send failed (continuing shutdown): %s", e)
 
 
-async def _handle_noop(ctx: DataPathContext, inner: InnerPacket) -> None:
-    # pylint: disable=unused-argument  # signature fixed by the _DISPATCH table
-    """No-op for CHAFF and KEEPALIVE — liveness is accounted in recv_loop."""
-
-
 _DISPATCH: dict[
     PacketType, Callable[[DataPathContext, InnerPacket], Awaitable[None]]
 ] = {
-    PacketType.CHAFF: _handle_noop,
-    PacketType.KEEPALIVE: _handle_noop,
     PacketType.DATA: _handle_data,
     PacketType.FRAGMENT: _handle_fragment,
     PacketType.REKEY_INIT: _handle_rekey_init,
@@ -834,12 +799,10 @@ _DISPATCH: dict[
     PacketType.PATH_CHALLENGE: _handle_path_challenge,
     # PATH_RESPONSE: the server validates+commits in post_authenticate (it has
     # recv_addr there); reaching dispatch it is a no-op (client never gets one).
-    PacketType.PATH_RESPONSE: _handle_noop,
 }
 
 
 async def dispatch_inner(ctx: DataPathContext, inner: InnerPacket) -> None:
-    """Dispatch a decrypted inner packet to the appropriate handler."""
     handler = _DISPATCH.get(inner.ptype)
     if handler is None:
         return
@@ -876,9 +839,9 @@ async def liveness_loop(ctx: DataPathContext) -> None:
             ctx.shutdown.set()
             return
 
-        # M-BUG-15: trigger on real-data idleness, not all-send idleness.
-        # With Poisson-rate chaff always firing, last_send_time would
-        # never go stale and KEEPALIVE would never fire. Tracking
+        # Trigger on real-data idleness, not all-send idleness.
+        # With Poisson-rate chaff always firing, an any-send timestamp
+        # would never go stale and KEEPALIVE would never fire. Tracking
         # last_real_send_time separately gives KEEPALIVE its intended
         # fixed-cadence diagnostic value.
         if now - ctx.liveness.last_real_send_time > KEEPALIVE_SEND_INTERVAL:
@@ -964,7 +927,7 @@ async def run_data_loops(
     """
 
     async def recv_loop() -> None:
-        # Phase 1.6: for TCP, race each framed read against shutdown via a
+        # For TCP, race each framed read against shutdown via a
         # single long-lived waiter (_tcp_recv_raced). See that helper for why.
         is_tcp = not isinstance(transport, UDPTransport)
         shutdown_wait: asyncio.Task[bool] | None = (
@@ -1029,7 +992,7 @@ async def run_data_loops(
                     pass
 
     async def _tcp_idle_tick_loop() -> None:
-        # Phase 1.6: drive session_keys.tick() (grace-period cleanup) on a
+        # Drive session_keys.tick() (grace-period cleanup) on a
         # fixed cadence independent of the blocking framed recv. UDP gets its
         # tick from the recv_loop's 0.1s timeout; TCP's recv blocks, so it
         # needs its own ticker. Exits promptly on shutdown.
@@ -1043,7 +1006,7 @@ async def run_data_loops(
                 session_keys.tick()
 
     async def _supervised(coro: Awaitable[None], name: str) -> None:
-        # DSM-001: contain each loop so one loop's terminal exception cannot
+        # Contain each loop so one loop's terminal exception cannot
         # orphan its siblings. asyncio.gather() does NOT cancel the other
         # awaitables when one raises a non-CancelledError — it surfaces the
         # first exception while the rest keep running as detached tasks. For
@@ -1117,7 +1080,7 @@ async def auto_mtu_loop(
                 ctx.shutdown.wait(),
                 timeout=config.pmtu_check_interval_s,
             )
-            return  # shutdown
+            return
         except TimeoutError:
             pass
 
@@ -1130,14 +1093,15 @@ async def auto_mtu_loop(
         if usable < current:
             try:
                 ctx.tun.set_mtu(usable)
-            except Exception as e:  # noqa: BLE001  # see linter report
+            # set_mtu backends raise varied OS-level errors
+            except Exception as e:  # noqa: BLE001
                 log.warning("auto_mtu: set_mtu(%d) failed: %s", usable, e)
                 continue
-            # Phase 1.7: also clamp the shaper's size-class ceiling so padded
+            # Also clamp the shaper's size-class ceiling so padded
             # / chaff outer packets fit the constrained path. The outer DSM
             # packet rides inside IP(20)+UDP(8), so the size-class ceiling is
-            # path_mtu - 28.
-            ctx.shaper.set_size_class_ceiling(path_mtu - 28)
+            # path_mtu - IP_UDP_OVERHEAD.
+            ctx.shaper.set_size_class_ceiling(path_mtu - IP_UDP_OVERHEAD)
             log.info(
                 "auto_mtu: lowered tun mtu %d -> %d (kernel pmtu=%d)",
                 current,
@@ -1158,14 +1122,15 @@ async def auto_mtu_loop(
             if rises_observed >= AUTO_MTU_HYSTERESIS_RISES:
                 try:
                     ctx.tun.set_mtu(usable)
-                except Exception as e:  # noqa: BLE001  # see linter report
+                # set_mtu backends raise varied OS-level errors
+                except Exception as e:  # noqa: BLE001
                     log.warning("auto_mtu: set_mtu(%d) failed: %s", usable, e)
                     rises_observed = 0
                     continue
-                # Phase 1.7: track the recovered path on the shaper too. The
+                # Track the recovered path on the shaper too. The
                 # ceiling is bounded above by padding_max, so this restores the
                 # size-class set toward the full budget as the path heals.
-                ctx.shaper.set_size_class_ceiling(path_mtu - 28)
+                ctx.shaper.set_size_class_ceiling(path_mtu - IP_UDP_OVERHEAD)
                 log.info(
                     "auto_mtu: raised tun mtu %d -> %d after %d stable "
                     "observations (kernel pmtu=%d)",
@@ -1199,7 +1164,7 @@ async def tun_send_loop(ctx: DataPathContext) -> None:
     """
     while not ctx.shutdown.is_set():
         if ctx.session_keys.needs_rotation() and not ctx.rekey.in_progress:
-            # NOTE: do NOT set in_progress=True before calling initiate_rekey.
+            # Do NOT set in_progress=True before calling initiate_rekey.
             # initiate_rekey can short-circuit (rate-limit, wrong FSM state)
             # and return (last_time, None, None) without sending an INIT.
             # If we set in_progress first, the flag would stick at True
@@ -1217,7 +1182,7 @@ async def tun_send_loop(ctx: DataPathContext) -> None:
                     ctx.shaper,
                     ctx.send_fn,
                     ctx.rekey.last_time,
-                    # Task 2.6: pace the REKEY_INIT onto the envelope. The
+                    # Pace the REKEY_INIT onto the envelope. The
                     # retransmit budget is gated on REKEY_ACK_TIMEOUT (ACK
                     # receipt), not send completion, so fire-and-forget enqueue
                     # is safe — a paced INIT leaves within one latency budget.
@@ -1230,7 +1195,6 @@ async def tun_send_loop(ctx: DataPathContext) -> None:
                 raise
             ctx.rekey.last_time = new_last_time
             ctx.rekey.pending_epoch = new_pending_epoch
-            # Only commit to in_progress=True if a real INIT went out.
             # Without payload there's nothing to retry against.
             if init_payload is not None:
                 ctx.rekey.in_progress = True
@@ -1267,7 +1231,7 @@ async def tun_send_loop(ctx: DataPathContext) -> None:
                     ctx.session_keys,
                     ctx.shaper,
                     ctx.send_fn,
-                    # Task 2.6: pace the retransmitted INIT (same envelope path
+                    # Pace the retransmitted INIT (same envelope path
                     # as the original; the next ACK timeout is the recovery
                     # mechanism, so fire-and-forget is correct).
                     paced_send=ctx.scheduler.enqueue,
@@ -1289,11 +1253,11 @@ async def tun_send_loop(ctx: DataPathContext) -> None:
             log.warning("dropping oversized TUN packet (%d bytes): %s", len(pkt), e)
             continue
 
-        # Phase 2: the adaptive envelope (TrafficShaper.update_envelope /
+        # The adaptive envelope (TrafficShaper.update_envelope /
         # release_budget, driven by the scheduler) smooths burst onset by
         # PACING the queue — real packets enter the same paced queue and the
         # envelope governs when they leave (within the latency budget).
-        # H-ANON-1: spread out fragments across multiple jitter windows
+        # Spread out fragments across multiple jitter windows
         # so an oversized TUN packet doesn't produce a recognizable
         # "1 → N tightly-spaced packets" wire signature. Per-fragment
         # extra delay is uniformly distributed in [0, FRAG_SPREAD_S);
@@ -1304,20 +1268,17 @@ async def tun_send_loop(ctx: DataPathContext) -> None:
         # fragments is ~16 * 50 = 800 ms — meaningful but acceptable
         # for the rare oversized packet path; bulk transfers that
         # routinely fragment should configure a larger inner MTU.
-        from dsm.core.rand import csprng_float
-
-        # M-BUG-15: mark a real-data send so the keepalive loop's
+        # Mark a real-data send so the keepalive loop's
         # 15s-idle check doesn't get bumped by chaff.
         ctx.liveness.last_real_send_time = time.monotonic()
         for i, inner in enumerate(inners):
             padded, target_size = ctx.shaper.pad_packet(inner)
-            # H-ANON (size-feedback fix): real-packet sizes are no longer fed
+            # Real-packet sizes are no longer fed
             # back into any distribution. pad_packet draws the target class
             # from the FIXED published prior (the same one chaff uses) and
             # bumps up to fit the payload, so the real-traffic size histogram
-            # cannot collapse onto one dominant class. The former
-            # observe_real_packet feedback (the Polya-urn loop) is removed.
+            # cannot collapse onto one dominant class.
             # i=0 gets no extra delay; later fragments shuffle within
             # the per-position window.
-            extra = (i + csprng_float()) * 0.05 if i > 0 else 0.0
+            extra = (i + csprng_float()) * FRAG_SPREAD_S if i > 0 else 0.0
             ctx.scheduler.enqueue(padded, target_size, extra_delay=extra)

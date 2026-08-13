@@ -122,10 +122,10 @@ class KeyStoreErrorPathsTest(unittest.TestCase):
         _chmod_0600(path)
         return KeyStore(str(path))
 
-    # ── structural rejections (must fail BEFORE the Argon2id KDF) ─────────
+    # Structural rejections must fail before the Argon2id KDF runs.
 
     def test_truncated_blob_raises_blob_too_short(self) -> None:
-        # KEY PROPERTY: a too-short blob is rejected by the up-front length
+        # A too-short blob is rejected by the up-front length
         # guard with the DISTINCT "blob too short" message — not the
         # wrong-passphrase / corruption string — and crucially before the
         # 512-MiB KDF runs. Truncate the real blob to one byte under the
@@ -150,7 +150,7 @@ class KeyStoreErrorPathsTest(unittest.TestCase):
         self.assertFalse(store.is_loaded)
 
     def test_bad_version_byte_raises_unsupported_version(self) -> None:
-        # KEY PROPERTY: a blob carrying the v1 magic but an unknown version
+        # A blob carrying the v1 magic but an unknown version
         # byte is rejected with "unsupported sealed-blob version" — a
         # forward-compat guard distinct from both the short-blob and the
         # wrong-passphrase paths — again before any KDF work.
@@ -164,7 +164,7 @@ class KeyStoreErrorPathsTest(unittest.TestCase):
         self.assertFalse(store.is_loaded)
 
     def test_hostile_oversize_kdf_params_rejected_before_kdf(self) -> None:
-        # KEY PROPERTY (DoS guard): a hostile blob advertising
+        # DoS guard: a hostile blob advertising
         # m_cost = u32::MAX in its header must be rejected by the bounds
         # check ("out of bounds") BEFORE the KDF — no multi-GiB allocation
         # is ever attempted. Asserting the bounds message (not a generic
@@ -197,10 +197,8 @@ class KeyStoreErrorPathsTest(unittest.TestCase):
             store.load(CORRECT)
         self.assertFalse(store.is_loaded)
 
-    # ── passphrase edge cases ────────────────────────────────────────────
-
     def test_empty_passphrase_rejected_on_generate(self) -> None:
-        # KEY PROPERTY: an empty passphrase is refused at seal time with
+        # An empty passphrase is refused at seal time with
         # the explicit "must not be empty" message — it never produces a
         # weakly-protected blob on disk. (Reaches the cheap guard before
         # the KDF.)
@@ -223,7 +221,7 @@ class KeyStoreErrorPathsTest(unittest.TestCase):
         self.assertFalse(store.is_loaded)
 
     def test_non_utf8_passphrase_round_trips_and_fails_closed(self) -> None:
-        # KEY PROPERTY: the passphrase path is raw-bytes, never UTF-8
+        # The passphrase path is raw-bytes, never UTF-8
         # decoded. A non-UTF-8 passphrase (lone 0x80, NUL, 0xFF...) must
         # (a) successfully seal AND unlock a real identity round-trip, and
         # (b) when a DIFFERENT non-UTF-8 guess is used, fail closed with a

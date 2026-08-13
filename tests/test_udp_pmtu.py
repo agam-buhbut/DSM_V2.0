@@ -115,9 +115,7 @@ class TestUDPRebind(unittest.IsolatedAsyncioTestCase):
                 old_queue,
                 "recv queue must be preserved across rebind",
             )
-            # New transport is functional: send to self over loopback
-            # actually requires another socket to talk to — verify only
-            # that send() doesn't raise immediately on the new socket.
+            # The new socket is the live one: sockname reports the fresh port.
             current_port = t._transport.get_extra_info("sockname")[1]  # type: ignore[union-attr]
             self.assertEqual(current_port, new_port)
         finally:

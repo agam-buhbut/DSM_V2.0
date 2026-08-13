@@ -155,8 +155,7 @@ disable = [
     "too-many-statements",
     "too-many-return-statements",
     "too-many-instance-attributes",
-    # False positives / intentional idioms — disabled here (rather than the
-    # ~8 per-line noqas the note above envisioned) to converge the lint pass:
+    # False positives / intentional idioms:
     #   invalid-name           - UPPER_CASE module constants with a runtime RHS
     #                            (e.g. NONCE_OFFSET = SEQ_STRUCT.size) and the
     #                            intentional lowercase one-shot module-state

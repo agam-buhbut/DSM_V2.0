@@ -92,17 +92,11 @@ class TCPTransport:
         log.debug("TCP listening on %s:%d", host, actual_port)
 
         self._reader, self._writer = await accepted
-        self._apply_fwmark()
+        apply_so_mark(self._writer.get_extra_info("socket"))
         self._server.close()
         return actual_port
 
-    def _apply_fwmark(self) -> None:
-        if self._writer is None:
-            return
-        apply_so_mark(self._writer.get_extra_info("socket"))
-
     async def send(self, data: bytes) -> None:
-        """Send a length-prefixed frame."""
         if self._writer is None:
             raise RuntimeError("not connected")
         if len(data) > MAX_FRAME_SIZE:
@@ -132,7 +126,7 @@ class TCPTransport:
                     raise ValueError(
                         f"frame length {length} exceeds max {MAX_FRAME_SIZE}"
                     )
-                # L-NET-6: reject zero-length frames. They have no meaning
+                # Reject zero-length frames. They have no meaning
                 # in the DSM wire protocol (smallest legitimate frame is
                 # OUTER_HEADER_SIZE + GCM_TAG_SIZE = 36 bytes for an
                 # empty inner payload) and a peer spamming `\x00\x00\x00\x00`
@@ -161,14 +155,10 @@ class TCPTransport:
             self._server.close()
 
     async def aclose(self) -> None:
-        """Async close with proper TCP teardown."""
+        """Close and await the writer's FIN handshake."""
         if self._writer and not self._closed:
             self._writer.close()
             await self._writer.wait_closed()
             self._closed = True
         if self._server:
             self._server.close()
-
-    @property
-    def is_open(self) -> bool:
-        return self._writer is not None and not self._closed

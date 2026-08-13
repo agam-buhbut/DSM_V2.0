@@ -31,7 +31,6 @@ fn priv_len_off(pub_len: usize) -> usize {
 fn roundtrip_serialize_parse() {
     let b = sample();
     let bytes = tpm_blob::serialize(&b);
-    // header(8) + 2 + 120 + 2 + 100
     assert_eq!(bytes.len(), 8 + 2 + 120 + 2 + 100);
     assert_eq!(&bytes[..4], b"DSMT");
     assert_eq!(bytes[4], 0x01); // version
@@ -113,7 +112,6 @@ fn truncated_in_header_rejected() {
 #[test]
 fn truncated_missing_pub_len_rejected() {
     let bytes = tpm_blob::serialize(&sample());
-    // Header present but only one of the two pub_len bytes survives.
     assert!(matches!(
         tpm_blob::parse(&bytes[..PUB_LEN_OFF]),
         Err(DsmtError::Truncated)
@@ -139,7 +137,6 @@ fn truncated_mid_pub_rejected() {
 fn truncated_missing_priv_len_rejected() {
     let bytes = tpm_blob::serialize(&sample());
     let plo = priv_len_off(120);
-    // All of pub present, but priv_len header is absent / half-present.
     assert!(matches!(
         tpm_blob::parse(&bytes[..plo]),
         Err(DsmtError::Truncated)
@@ -174,7 +171,6 @@ fn pub_len_overflow_rejected() {
 
 #[test]
 fn priv_len_overflow_rejected() {
-    // priv_len claims 0xFFFF while only ~100 bytes follow.
     let mut bytes = tpm_blob::serialize(&sample());
     let plo = priv_len_off(120);
     bytes[plo] = 0xFF;
@@ -190,7 +186,6 @@ fn trailing_garbage_rejected() {
         tpm_blob::parse(&bytes),
         Err(DsmtError::TrailingBytes)
     ));
-    // Several extra bytes is the same typed rejection.
     bytes.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
     assert!(matches!(
         tpm_blob::parse(&bytes),
@@ -203,8 +198,7 @@ fn empty_pub_and_priv_roundtrip() {
     // The format does not forbid zero-length fields (a real key blob is
     // non-empty, but the wire format itself round-trips them cleanly: no
     // out-of-band sentinel is needed because the explicit length fields make
-    // 0 unambiguous). Locks that empty pub/priv parse back identically and
-    // do NOT spuriously trip Truncated/TrailingBytes.
+    // 0 unambiguous).
     let empty = DsmtBlob {
         public_tpmt: Vec::new(),
         private_buf: Vec::new(),

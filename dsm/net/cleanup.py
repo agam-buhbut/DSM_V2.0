@@ -26,7 +26,10 @@ import logging
 import subprocess
 
 from dsm.core.atomic_io import atomic_write
+from dsm.net.forwarding import MasqueradeManager
+from dsm.net.nftables import PreHandshakeKillSwitch
 from dsm.net.resolv_conf import (
+    DSM_MARKER,
     RESOLV_BACKUP,
     RESOLV_CONF,
     atomic_symlink_restore,
@@ -36,22 +39,16 @@ from dsm.net.transport._fwmark import SO_MARK_VALUE as FWMARK
 
 log = logging.getLogger(__name__)
 
-# Every inet table dsm can create. Mirrors:
-#   PreHandshakeKillSwitch.TABLE_NAME  -> dsm_killswitch_pre
-#   NFTablesManager (full kill switch) -> dsm_killswitch, dsm_dns_leak
-#   ServerRateLimitManager             -> dsm_server_ratelimit
-#   MasqueradeManager.TABLE            -> dsm_server_nat
+# Every inet table dsm can create. The two managers below own their names;
+# NFTablesManager (full kill switch) and ServerRateLimitManager use literals.
 # Keep in sync if a new table is added.
 _DSM_TABLES = (
-    "dsm_killswitch_pre",
+    PreHandshakeKillSwitch.TABLE_NAME,
     "dsm_killswitch",
     "dsm_dns_leak",
     "dsm_server_ratelimit",
-    "dsm_server_nat",
+    MasqueradeManager.TABLE,
 )
-
-# Marker prefix of a resolv.conf file dsm wrote (see resolv_conf._DSM_MARKER).
-_DSM_RESOLV_MARKER = b"# Managed by dsm"
 
 
 def _best_effort(cmd: list[str]) -> None:
@@ -66,12 +63,12 @@ def _best_effort(cmd: list[str]) -> None:
 
 def cleanup_host_state() -> None:
     """Remove every host mutation dsm could have made. Idempotent."""
-    # 1. nftables tables (delete-by-name is stateless; no instance needed).
+    # Delete-by-name is stateless; no manager instance needed.
     for table in _DSM_TABLES:
         _best_effort(["nft", "delete", "table", "inet", table])
-    # 2. Flush the policy-route table and delete the not-fwmark ip rule.
-    #    The rule is added with priority 10 by TunDevice.configure; delete by
-    #    the same selector so we hit exactly that rule and nothing else.
+    # Flush the policy-route table and delete the not-fwmark ip rule.
+    # The rule is added with priority 10 by TunDevice.configure; delete by
+    # the same selector so we hit exactly that rule and nothing else.
     _best_effort(["ip", "route", "flush", "table", "100"])
     _best_effort(
         [
@@ -87,10 +84,9 @@ def cleanup_host_state() -> None:
             "10",
         ]
     )
-    # 3. Restore resolv.conf from the persistent backup if present.
     _restore_resolv_conf()
-    # 4. Restore the global IPv6 + forwarding sysctls to safe defaults.
-    #    Coarse crash-path fallback only — see the module docstring GAP note.
+    # Restore the global IPv6 + forwarding sysctls to safe defaults.
+    # Coarse crash-path fallback only — see the module docstring GAP note.
     for key, value in (
         ("net.ipv6.conf.all.disable_ipv6", "0"),
         ("net.ipv6.conf.default.disable_ipv6", "0"),
@@ -125,8 +121,8 @@ def _restore_resolv_conf() -> None:
             # No backup: if the live file is dsm-managed, remove it so the
             # host falls back to DHCP / NetworkManager regeneration. A
             # non-dsm file is the operator's own and is left untouched.
-            head = RESOLV_CONF.read_bytes()[: len(_DSM_RESOLV_MARKER)]
-            if head.startswith(_DSM_RESOLV_MARKER):
+            head = RESOLV_CONF.read_bytes()[: len(DSM_MARKER)]
+            if head.startswith(DSM_MARKER):
                 RESOLV_CONF.unlink(missing_ok=True)
     except OSError as e:
         log.warning("resolv.conf cleanup failed: %s", e)

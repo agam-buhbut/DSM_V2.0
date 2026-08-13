@@ -53,26 +53,24 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
-// ── PyO3 Wrappers ──
 // Raw key bytes never cross the FFI boundary for secret keys.
 // Python receives opaque handles and public keys only.
 
-/// Get a mutable reference to the inner `Option`, returning a PyErr if already consumed.
 macro_rules! require_inner {
     ($self:expr, $msg:expr) => {
         $self.inner.as_mut().ok_or_else(|| py_err($msg))?
     };
 }
 
-/// Convert a Rust error into a PyRuntimeError.
 fn py_err(e: impl std::fmt::Display) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
 }
 
 /// Copy a Python byte slice into a fixed-size array, returning an error
-/// whose message names the expected field. `desc` is the human-readable
-/// field name (e.g. "nonce", "public key"); it appears in the Python
-/// exception so misuse from Python prints the precise mismatch.
+/// whose message names the expected field.
+///
+/// `desc` is the human-readable field name (e.g. "nonce", "public key");
+/// it lands in the Python exception so misuse prints the precise mismatch.
 fn fixed_from_slice<const N: usize>(data: &[u8], desc: &str) -> PyResult<[u8; N]> {
     if data.len() != N {
         return Err(py_err(format!("{desc} must be {N} bytes")));
@@ -82,17 +80,14 @@ fn fixed_from_slice<const N: usize>(data: &[u8], desc: &str) -> PyResult<[u8; N]
     Ok(arr)
 }
 
-/// Parse a Python byte slice into a fixed 12-byte nonce array.
 fn nonce_from_slice(nonce: &[u8]) -> PyResult<[u8; 12]> {
     fixed_from_slice::<12>(nonce, "nonce")
 }
 
-/// Parse a Python byte slice into a fixed 32-byte public key array.
 fn pub_key_from_slice(data: &[u8]) -> PyResult<[u8; 32]> {
     fixed_from_slice::<32>(data, "public key")
 }
 
-/// Python-visible identity keypair.
 #[pyclass(name = "IdentityKeyPair")]
 struct PyIdentityKeyPair {
     inner: identity::IdentityKeyPair,
@@ -129,7 +124,6 @@ impl PyIdentityKeyPair {
     }
 }
 
-/// Python-visible replay window.
 #[pyclass(name = "ReplayWindow")]
 struct PyReplayWindow {
     inner: replay_window::ReplayWindow,
@@ -155,7 +149,6 @@ impl PyReplayWindow {
     }
 }
 
-/// Python-visible Noise XX initiator.
 #[pyclass(name = "NoiseInitiator")]
 struct PyNoiseInitiator {
     inner: Option<noise_xx::NoiseInitiator>,
@@ -163,7 +156,6 @@ struct PyNoiseInitiator {
 
 #[pymethods]
 impl PyNoiseInitiator {
-    /// Create an initiator. `identity` must be a PyIdentityKeyPair.
     #[new]
     fn new(identity: &PyIdentityKeyPair) -> PyResult<Self> {
         let init = noise_xx::NoiseInitiator::new(identity.inner.secret_key()).map_err(py_err)?;
@@ -205,8 +197,7 @@ impl PyNoiseInitiator {
         })
     }
 
-    /// Get the handshake hash for deriving session keys.
-    /// Must be called after handshake completes, before into_transport().
+    /// Must be called after the handshake completes, before into_transport().
     fn get_handshake_hash(&self) -> PyResult<Vec<u8>> {
         Ok(self
             .inner
@@ -216,7 +207,6 @@ impl PyNoiseInitiator {
     }
 }
 
-/// Python-visible Noise XX responder.
 #[pyclass(name = "NoiseResponder")]
 struct PyNoiseResponder {
     inner: Option<noise_xx::NoiseResponder>,
@@ -264,8 +254,7 @@ impl PyNoiseResponder {
         })
     }
 
-    /// Get the handshake hash for deriving session keys.
-    /// Must be called after handshake completes, before into_transport().
+    /// Must be called after the handshake completes, before into_transport().
     fn get_handshake_hash(&self) -> PyResult<Vec<u8>> {
         Ok(self
             .inner
@@ -275,7 +264,6 @@ impl PyNoiseResponder {
     }
 }
 
-/// Python-visible Noise transport (post-handshake).
 #[pyclass(name = "NoiseTransport")]
 struct PyNoiseTransport {
     inner: Option<noise_xx::NoiseTransport>,
@@ -417,13 +405,11 @@ impl PySessionKeyManager {
             if let Ok(pt) = self.inner.decrypt(&n, ciphertext, aad, seq, false) {
                 return Some((pt, false));
             }
-            // M1: always attempt prev-epoch path, even without grace.
-            // Decrypt with is_prev_epoch=true will short-circuit AUTH_FAILED
-            // in Rust if prev_recv is None, but that branch costs one
-            // memory load + one branch — far less than one AEAD —
-            // so we add a SECOND current-epoch attempt as a constant-
-            // time fill when prev isn't available, keeping the failure
-            // path = 2 AEAD ops regardless of grace state.
+            // Prev-epoch attempt (see M1 note above); the grace check itself
+            // is one load + one branch, far cheaper than the AEAD.
+            // A SECOND current-epoch attempt fills in when prev isn't
+            // available, keeping the failure path = 2 AEAD ops regardless
+            // of grace state.
             if self.inner.has_grace_period() {
                 if let Ok(pt) = self.inner.decrypt(&n, ciphertext, aad, seq, true) {
                     return Some((pt, true));
@@ -550,11 +536,6 @@ impl PySessionKeyManager {
     }
 
     #[getter]
-    fn packets_sent(&self) -> u64 {
-        self.inner.packets_sent()
-    }
-
-    #[getter]
     fn has_grace_period(&self) -> bool {
         self.inner.has_grace_period()
     }
@@ -570,7 +551,6 @@ struct PyAttestKey {
 
 #[pymethods]
 impl PyAttestKey {
-    /// Generate a fresh attestation keypair using the active backend.
     #[staticmethod]
     fn generate() -> PyResult<Self> {
         let inner = device_attest::AttestKey::generate().map_err(py_err)?;
@@ -682,7 +662,6 @@ impl PyBootstrapEphemeral {
         })
     }
 
-    /// Return the 32-byte X25519 public key for transmission on the wire.
     #[getter]
     fn public_key_bytes(&self) -> Vec<u8> {
         self.pub_bytes.to_vec()
@@ -699,10 +678,7 @@ impl PyBootstrapEphemeral {
 ///
 /// Consumes the ephemeral's secret in place (so a second call returns an error).
 /// The X25519 DH and the subsequent HKDF expansion happen entirely in Rust;
-/// the secret scalar never crosses the FFI boundary. The earlier
-/// `bootstrap_session_from_dh` and `generate_ephemeral` paths were removed
-/// during the audit (M4) because they shuttled the secret through a Python
-/// `bytes` object that cannot be reliably zeroed.
+/// the secret scalar never crosses the FFI boundary.
 #[pyfunction]
 #[pyo3(signature = (ephemeral, peer_public, is_initiator,
                     rotation_packets=None, rotation_seconds=None))]

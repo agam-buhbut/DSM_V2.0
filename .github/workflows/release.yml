@@ -9,11 +9,7 @@ name: Release
 # SUPPLY-CHAIN PINNING: every third-party action is pinned to a full 40-hex
 # commit SHA (not a floating tag), with a trailing comment naming the version
 # that SHA corresponds to. The SHAs were resolved against the GitHub API at
-# authoring time. NOTE: ci.yml currently pins its actions to floating MAJOR
-# tags (actions/checkout@v4 etc.) with an in-file note acknowledging that as a
-# deliberate follow-up; this release.yml does NOT follow that convention —
-# release artifacts are signed and published, so the stricter SHA pinning is
-# applied here. (Inconsistency with ci.yml is intentional and flagged.)
+# authoring time.
 
 on:
   push:
@@ -148,8 +144,6 @@ jobs:
             --only-binary=:all: \
             --python-version 311 \
             --dest dist
-          echo "Wheelhouse contents (DSM wheels + vendored runtime deps):"
-          ls -1 dist/*.whl
       - name: Generate SHA256SUMS over all artifacts
         run: |
           cd dist

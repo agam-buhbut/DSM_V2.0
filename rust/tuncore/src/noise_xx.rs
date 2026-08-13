@@ -11,7 +11,6 @@ use crate::secure_noise::SecureResolver;
 /// Format: "DSM" || version(2 bytes) || initiator_role || responder_role
 const PROLOGUE: &[u8] = b"DSM\x00\x01\x00\x01";
 
-/// Noise XX cipher suite: X25519 DH, AES-256-GCM, SHA-256.
 const NOISE_PATTERN: &str = "Noise_XX_25519_AESGCM_SHA256";
 
 /// Maximum handshake message size (padded to hide message lengths).
@@ -85,7 +84,6 @@ fn validate_ephemeral_not_low_order(pub_bytes: &[u8]) -> Result<(), String> {
     // regardless of where the first differing byte lies.
     let zero = [0u8; 32];
     let is_zero: u8 = shared.as_bytes().ct_eq(&zero).unwrap_u8();
-    // is_zero == 1 → non-contributory → reject
     if is_zero == 1 {
         return Err("rejected low-order ephemeral public key".into());
     }
@@ -158,15 +156,11 @@ fn unpack_handshake(buf: &[u8], expected_len: usize) -> Result<&[u8], String> {
     Ok(&buf[..expected_len])
 }
 
-/// Initiator (client) side of the Noise XX handshake.
 /// Shared Noise-XX `HandshakeState` builder used by both
 /// [`NoiseInitiator::new`] and [`NoiseResponder::new`].
 ///
-/// Encapsulates the `Builder::with_resolver(NOISE_PATTERN, SecureResolver)
-///   .local_private_key(...).prologue(PROLOGUE)` sequence so the
-/// audit-relevant invariants (pattern, secure resolver, prologue tag)
-/// live in one place rather than being copy-pasted at two callsites.
-/// The `finish` closure picks `.build_initiator()` vs `.build_responder()`.
+/// Keeps the audit-relevant invariants — pattern, `SecureResolver`, prologue — in one place;
+/// `finish` picks `build_initiator()` vs `build_responder()`.
 fn build_handshake_state<F>(
     static_secret: &[u8; 32],
     role_label: &'static str,
@@ -550,12 +544,10 @@ mod tests {
         let msg1 = initiator.write_message_1().unwrap();
         responder.read_message_1(&msg1).unwrap();
 
-        // Too small.
         let too_small = vec![0u8; HANDSHAKE_ATTEST_PAYLOAD_SIZE - 1];
         let err = responder.write_message_2(&too_small).unwrap_err();
         assert!(err.contains("attest payload"), "got: {err}");
 
-        // Too large.
         let too_large = vec![0u8; HANDSHAKE_ATTEST_PAYLOAD_SIZE + 1];
         let err = responder.write_message_2(&too_large).unwrap_err();
         assert!(err.contains("attest payload"), "got: {err}");
@@ -732,7 +724,6 @@ mod tests {
                 );
             }
 
-            // Random msg3 — responder rejects.
             {
                 let mut initiator = NoiseInitiator::new(&client_secret).unwrap();
                 let mut responder = NoiseResponder::new(&server_secret).unwrap();
@@ -763,14 +754,11 @@ mod tests {
         let mut initiator = NoiseInitiator::new(&client_secret).unwrap();
         let mut responder = NoiseResponder::new(&server_secret).unwrap();
 
-        // Initiator tries to read a fake msg2 BEFORE writing msg1.
         let fake = vec![0u8; HANDSHAKE_PAD_SIZE];
         assert!(initiator.read_message_2(&fake).is_err());
 
-        // Responder tries to write msg2 BEFORE reading msg1.
         assert!(responder.write_message_2(&random_attest_payload()).is_err());
 
-        // Initiator tries to write msg3 BEFORE reading msg2.
         assert!(initiator.write_message_3(&random_attest_payload()).is_err());
     }
 
@@ -786,13 +774,11 @@ mod tests {
 
         let msg1 = initiator.write_message_1().unwrap();
         responder.read_message_1(&msg1).unwrap();
-        // Replay of msg1 — second read must fail.
         let res = responder.read_message_1(&msg1);
         assert!(res.is_err(), "replay of msg1 must fail");
 
         let msg2 = responder.write_message_2(&random_attest_payload()).unwrap();
         initiator.read_message_2(&msg2).unwrap();
-        // Replay of msg2 — second read must fail.
         let res = initiator.read_message_2(&msg2);
         assert!(res.is_err(), "replay of msg2 must fail");
     }

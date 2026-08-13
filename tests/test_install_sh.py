@@ -421,9 +421,6 @@ class TestDependencyWheelhouse(unittest.TestCase):
     dependency wheel listed there and verify each one's SHA256 against the SAME
     signed list (no separate/unsigned dep source). The final ``pip install``
     stays ``--no-index`` so deps resolve only from that verified local dir.
-
-    These assertions are ADD-ON coverage for the dep-wheelhouse flow; they do
-    not relax any existing verify-before-execute / fail-closed assertion above.
     """
 
     def setUp(self) -> None:

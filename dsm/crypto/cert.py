@@ -332,7 +332,6 @@ def validate_chain(
     if now is None:
         now = datetime.datetime.now(datetime.UTC)
 
-    # 1. Issuer / subject DN match.
     if leaf.cert.issuer != ca_root.subject:
         raise CertChainError(
             "leaf issuer does not match CA subject: "
@@ -340,8 +339,8 @@ def validate_chain(
             f"{ca_root.subject.rfc4514_string()!r}"
         )
 
-    # 2. Signature: cryptography's verify is constant-time on the MAC
-    #    comparison; the chain-walk shape (single hop) is fixed here.
+    # cryptography's verify is constant-time on the MAC comparison; the
+    # chain-walk shape (single hop) is fixed here.
     ca_pub = ca_root.public_key()
     if not isinstance(ca_pub, EllipticCurvePublicKey):
         raise CertChainError(
@@ -361,7 +360,6 @@ def validate_chain(
     except InvalidSignature as e:
         raise CertChainError("leaf signature does not verify under CA pubkey") from e
 
-    # 3. Validity window.
     if now < leaf.not_before:
         raise CertExpiredError(
             f"cert not yet valid (not_before={leaf.not_before.isoformat()}, "
@@ -373,8 +371,7 @@ def validate_chain(
             f"now={now.isoformat()})"
         )
 
-    # 4. Required EKU (if asked — server checks clientAuth, client
-    #    checks serverAuth; this lets us enforce role separation).
+    # Server checks clientAuth, client checks serverAuth — role separation.
     if required_eku is not None:
         try:
             eku = leaf.cert.extensions.get_extension_for_class(
@@ -387,10 +384,10 @@ def validate_chain(
                 f"leaf EKU does not include {required_eku.dotted_string}"
             )
 
-    # 4b. keyUsage (DSM-010): the leaf signs the per-handshake binding
-    #     attestation (a digitalSignature use). Strict — the extension
-    #     must be present AND assert digitalSignature; a leaf with no
-    #     keyUsage, or one that forbids digitalSignature, is rejected.
+    # DSM-010: the leaf signs the per-handshake binding
+    # attestation (a digitalSignature use). Strict — the extension
+    # must be present AND assert digitalSignature; a leaf with no
+    # keyUsage, or one that forbids digitalSignature, is rejected.
     try:
         ku = leaf.cert.extensions.get_extension_for_class(x509.KeyUsage).value
     except x509.ExtensionNotFound as e:
@@ -398,12 +395,12 @@ def validate_chain(
     if not ku.digital_signature:
         raise CertChainError("leaf keyUsage must assert digitalSignature")
 
-    # 5. Force binding-extension validation; this raises if absent or
-    #    malformed, so callers downstream can rely on
-    #    ``leaf.noise_static_pub``.
+    # Force binding-extension validation; this raises if absent or
+    # malformed, so callers downstream can rely on
+    # ``leaf.noise_static_pub``.
     _ = leaf.noise_static_pub
 
-    # 6. basicConstraints CA:FALSE enforcement. The CA's openssl-ca.cnf
+    # basicConstraints CA:FALSE enforcement. The CA's openssl-ca.cnf
     # leaf profile sets this critical, but a misconfigured CA (or a
     # malicious operator with key access) could issue a leaf with
     # CA:TRUE — that leaf could then sign further certs that this code

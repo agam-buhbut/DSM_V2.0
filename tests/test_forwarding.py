@@ -8,14 +8,9 @@ only the I/O boundary mocked:
     the module-level ``sysctl_path`` into a tmp tree (same technique as
     tests/test_sysctl.py) so the real set/restore runs against files we
     control. No root, no real kernel state touched.
-  * MasqueradeManager shells out to ``nft``; we patch
-    ``forwarding.subprocess.run`` and assert the argv + ruleset, and that
-    remove() reverses apply() and is best-effort/idempotent.
-
-KEY properties proved: apply() turns ip_forward ON and tightens the
-redirect/rp_filter sysctls; remove() restores every original; MASQUERADE
-emits the correct delete-table teardown and is idempotent when never
-applied.
+  * MasqueradeManager shells out to ``nft`` via ``nftables.apply_ruleset``;
+    we patch ``nftables.subprocess.run`` and assert the argv + ruleset, and
+    that remove() reverses apply() and is best-effort/idempotent.
 """
 
 from __future__ import annotations
@@ -27,7 +22,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from dsm.core import sysctl
-from dsm.net import forwarding
+from dsm.net import forwarding, nftables
 from dsm.net.forwarding import IPForwardingManager, MasqueradeManager
 
 
@@ -151,7 +146,7 @@ class MasqueradeManagerTest(unittest.TestCase):
     def test_apply_loads_masquerade_ruleset_via_nft(self) -> None:
         fake = _RecordingRun()
         mgr = MasqueradeManager(self.TUN)
-        with patch.object(forwarding.subprocess, "run", fake):
+        with patch.object(nftables.subprocess, "run", fake):
             mgr.apply()
 
         self.assertTrue(mgr._applied)
@@ -169,7 +164,7 @@ class MasqueradeManagerTest(unittest.TestCase):
     def test_remove_deletes_the_table(self) -> None:
         fake = _RecordingRun()
         mgr = MasqueradeManager(self.TUN)
-        with patch.object(forwarding.subprocess, "run", fake):
+        with patch.object(nftables.subprocess, "run", fake):
             mgr.apply()
             mgr.remove()
 
@@ -185,7 +180,7 @@ class MasqueradeManagerTest(unittest.TestCase):
         # shell out at all (nothing to tear down).
         fake = _RecordingRun()
         mgr = MasqueradeManager(self.TUN)
-        with patch.object(forwarding.subprocess, "run", fake):
+        with patch.object(nftables.subprocess, "run", fake):
             mgr.remove()
         self.assertEqual(fake.calls, [])
         self.assertFalse(mgr._applied)
@@ -194,7 +189,7 @@ class MasqueradeManagerTest(unittest.TestCase):
         # nft missing -> apply logs and leaves _applied False, never raises.
         fake = _RecordingRun([FileNotFoundError("nft")])
         mgr = MasqueradeManager(self.TUN)
-        with patch.object(forwarding.subprocess, "run", fake):
+        with patch.object(nftables.subprocess, "run", fake):
             with self.assertLogs(forwarding.log, level="WARNING"):
                 mgr.apply()  # must not raise
         self.assertFalse(mgr._applied)
@@ -205,7 +200,7 @@ class MasqueradeManagerTest(unittest.TestCase):
         )
         fake = _RecordingRun([err])
         mgr = MasqueradeManager(self.TUN)
-        with patch.object(forwarding.subprocess, "run", fake):
+        with patch.object(nftables.subprocess, "run", fake):
             with self.assertLogs(forwarding.log, level="WARNING") as cm:
                 mgr.apply()
         self.assertFalse(mgr._applied)

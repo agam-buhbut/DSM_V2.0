@@ -328,7 +328,7 @@ class ServerPeerRoaming(unittest.IsolatedAsyncioTestCase):
             reassembly=None,
         )
 
-        # ---- Mirror dsm/server.py::_run_one_session path-validation wiring ----
+        # Mirror dsm/server.py::_run_one_session path-validation wiring.
         # The challenge MUST go DIRECTLY to the pending candidate via a
         # by-addr send (NOT through the scheduler, which always targets the
         # committed egress, and WITHOUT mutating the committed egress).
@@ -373,8 +373,6 @@ class ServerPeerRoaming(unittest.IsolatedAsyncioTestCase):
             token = path_validation.should_challenge(addr)
             if token is not None:
                 await _send_challenge(addr, token)
-
-        # ----------------------------------------------------------------------
 
         async def _run() -> None:
             await run_data_loops(
@@ -612,7 +610,6 @@ class ServerPeerRoaming(unittest.IsolatedAsyncioTestCase):
         token = _extract_token(transport.sent[0][0], client_keys)
         response = _frame(client_keys, cseq, PacketType.PATH_RESPONSE, token)
         transport._inbound.append((response, _ROAMED_ADDR))
-        # Wait for the commit.
         for _ in range(400):
             if client_addr["addr"] == _ROAMED_ADDR:
                 break

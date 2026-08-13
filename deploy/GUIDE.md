@@ -1,11 +1,8 @@
 # DSM VPN — Operator Guide
 
-This is the single source of truth for deploying, running, verifying, and
-troubleshooting DSM. Every command is copy-paste-runnable. If you have a
-fresh Linux box and the repo checked out, working through sections 0 → 7
-end-to-end gives you a live tunnel. The later sections (8 single-host
-smoke test, 9 two-box demo, 10 debugging, 11 uninstall) are reference
-material you reach when you need them.
+Deployment, operation, verification, and troubleshooting for DSM.
+Sections 0 through 7 taken in order bring up a live tunnel on a fresh
+Linux box; 8 onward are reference.
 
 Architecture in one sentence:  one client connects to one operator-owned
 server over UDP (default) or TCP. Both ends authenticate with X.509
@@ -14,19 +11,13 @@ ECDSA attestation signing key AND the device's X25519 Noise static
 via a custom critical extension, so a stolen cert OR a stolen Noise key
 alone is useless.
 
-ATTESTATION (the default is now hardware-bound):  the default build uses
-the TPM 2.0 attestation backend (the tpm-attest Cargo feature). The ECDSA
-P-256 attest key is GENERATED INSIDE the TPM, never leaves it, and SIGNS
-inside it — it is non-extractable even by code running as root. The on-disk
-attest_key_file holds only a TPM-bound DSMT context blob (a sealed handle,
-useless on any other TPM), not the key itself. This is KEY RESIDENCY: it
-proves the signing key lives in this device's TPM. It is NOT a PCR-policy
-seal and NOT remote attestation / TPM quotes — those remain future work, so
-do not treat a valid binding as proof of a measured-boot state. Prerequisite:
-the host needs a TPM 2.0 (see §0e). The dev/test SOFTWARE backend is still
-available as the `dev-soft-attest` build (see §1, "soft wheel"); its key is
-Argon2id-wrapped on disk and EXTRACTABLE from process memory, so use it for
-testing only — never treat its binding as a hardware root of trust.
+ATTESTATION: the default build (tpm-attest) generates the ECDSA P-256
+attest key inside a TPM 2.0, where it signs and from which it never
+leaves; attest_key_file holds only a TPM-bound DSMT blob. This is key
+residency, not PCR sealing and not remote attestation — a valid binding
+is not proof of measured boot. The host needs a TPM 2.0 (§0e). The
+dev-soft-attest build's key is extractable from process memory; test
+only.
 
 Hardware binding on Android (Keystore/StrongBox) remains planned (Phase 3).
 
@@ -38,10 +29,8 @@ Companion files in this directory:
   extension) whether the key is soft or TPM-resident.
 - `deploy/dsm.service` — systemd unit shipped with the repo.
 
-Top-level `README.md` covers everything ABOVE the operator layer: protocol
-state machine, cryptographic primitives, anonymity properties, threat
-model, configuration parameter list. Read it once when you want to
-understand WHY the operator steps below look the way they do.
+Protocol, crypto, anonymity properties, threat model, and the full config
+reference are in the top-level `README.md`.
 
 ## Table of Contents
 
@@ -151,7 +140,7 @@ stack. (Only the dev-soft-attest test build skips this — see §1.)
   $ sudo usermod -aG tss "$USER"   # then log out / back in
   ```
 
-  or simply prefix the enroll commands in §3 with `sudo` (the guide
+  or prefix the enroll commands in §3 with `sudo` (the guide
   already does).
 
 - Optional inspection tooling (not required by dsm):
@@ -177,7 +166,7 @@ message if the TPM or the tss group is missing.)
 
 The dsm process runs under `sudo` (CAP_NET_ADMIN + CAP_NET_BIND_SERVICE),
 which means Python's interpreter is the system one at /usr/bin/python3 —
-NOT a venv, NOT a --user install. Every Python module dsm imports
+not a venv and not a --user install. Every Python module dsm imports
 (tuncore, dns, cryptography) MUST be visible to /usr/bin/python3.
 
 If you previously created a .venv under the repo from an earlier
@@ -208,12 +197,11 @@ $ sudo apt install -y libtss2-dev      # tss2-esys headers + pkg-config
 #  libclang / bindgen is needed — only this dev package.)
 ```
 
-DEV/TEST ONLY — the soft wheel:  to build the extractable SOFTWARE
-attest backend for local testing (no TPM, no libtss2-dev), pass
-`--no-default-features --features dev-soft-attest` to the maturin build
-commands below. The result imports identically but its attest key is
-NOT hardware-bound — never deploy it. The rest of this section assumes
-the default (TPM) wheel.
+Soft wheel (dev/test): pass `--no-default-features --features
+dev-soft-attest` to the maturin commands below to build the software
+attest backend (no TPM, no libtss2-dev). It imports identically but is
+not hardware-bound. The rest of this section assumes the default TPM
+wheel.
 
 ```sh
 $ python3 -m venv /tmp/dsm-build-venv
@@ -278,7 +266,7 @@ SSL object before the qname crosses the wire.
 
 ### 1c. Verify the install
 
-Run this EXACT command FROM A DIRECTORY THAT IS NOT THE REPO (e.g.
+Run this command from a directory outside the repo (e.g.
 /tmp) — running from the repo root would let cwd-on-sys.path mask a
 bad install. It confirms root's Python sees every import dsm needs,
 including the `dsm` package itself out of the installed wheel:
@@ -636,22 +624,13 @@ noise_static_pub = <hex>
 
 Record both in your device inventory.
 
-BACKUP / RECOVERY of attest.key on TPM:  attest.key is a TPM-BOUND
-blob, not the key. It loads ONLY on the exact TPM that created it, so:
-
-- The blob's key requires the operator enroll passphrase as its TPM
-  authorization value. You do NOT back up a SEPARATE attest-key
-  passphrase — it is the SAME enroll passphrase that wraps the identity
-  key — but you DO still need that passphrase to use the attest key. A
-  forgotten passphrase ⇒ the attest key is unusable ⇒ re-enroll.
-- Backing up the blob file guards only against losing the FILE (e.g.
-  a wiped /opt/mtun). Restore it and the key works again, as long as
-  the SAME TPM is intact AND you know the passphrase.
-- If the TPM itself is cleared, replaced, or fails, the blob is dead
-  and the key is UNRECOVERABLE — you must RE-ENROLL (new attest key,
-  new CSR, new signed cert; see §7g). The blob is worthless to a
-  thief who steals only the disk (no TPM, no passphrase), which is the
-  point.
+BACKUP / RECOVERY of attest.key on TPM:  attest.key is a TPM-bound blob,
+not a key, and loads only on the TPM that created it. Backing it up
+protects against losing the file, nothing else — restoring it works only
+if that TPM is intact and you still have the enroll passphrase. If the
+TPM is cleared, replaced, or fails, or the passphrase is forgotten, the
+key is unrecoverable and you must re-enroll (§7g). A thief with only the
+disk gets nothing, which is the point.
 
 ### 3c. Server: walk CSR to CA, sign, walk cert back
 
@@ -661,7 +640,7 @@ Stick B. On the laptop:
 ```sh
 $ cd ca
 
-# 1. Inspect the CSR (THIS IS THE CRITICAL REVIEW STEP)
+# 1. Inspect the CSR — this is the review step that gates issuance
 $ openssl req -in /mnt/transport/dsm-csr-server.der \
       -inform DER -text -noout -verify
 # Verify by eye:
@@ -1110,12 +1089,10 @@ allowlist is empty. Adding the CN now lets §8f succeed.)
 
 ### 8f. Start both sides (§5)
 
-Expected client log: see §5.
-Expected server log: see §5.
-
 ### 8g. Verify everything (§6)
 
-Run every command in §6. Pass criterion: every check produces its
+Expected client and server logs are in §5. Run every command in §6.
+Pass criterion: every check produces its
 expected output AND graceful shutdown leaves NO residue.
 
 ### 8h. Failure drills
@@ -1339,9 +1316,16 @@ $ cat /tmp/dsm-syscalls.txt
 ```
 
 Convert /tmp/dsm-syscalls.txt into a SystemCallFilter= allowlist in
-deploy/dsm.service. Then enable RestrictNamespaces empirically:
-restart, re-run §9e. If dsm fails to open /dev/net/tun or netlink,
-drop the flag with a comment in the unit.
+deploy/dsm.service. Without the audit a too-tight filter will SIGSYS
+the daemon mid-handshake.
+
+Then enable RestrictNamespaces empirically: restart, re-run §9e. It
+should not break dsm in the common case — dsm enters no namespaces at
+runtime — but `ip(8)` attempts unshare()/setns() on some distros. After
+enabling, check `journalctl -u dsm | grep -i 'permission denied'` and
+exercise the kill-switch nftables apply path specifically. If dsm fails
+to open /dev/net/tun or netlink, drop the flag with a comment in the
+unit.
 
 ### 9g. What to capture and ship back from each demo run
 

@@ -11,7 +11,7 @@ DER certificates built with ``cryptography`` (mirroring tests/cert_helpers).
 No network: a fake SSL object stands in for the only I/O boundary
 (``getpeercert``).
 
-The KEY discriminating test is ``test_wrong_pin_rejected`` — a cert with a
+The discriminating test is ``test_wrong_pin_rejected`` — a cert with a
 different key MUST raise PinMismatchError (fail-closed).
 """
 
@@ -95,7 +95,7 @@ class VerifyPinTest(unittest.TestCase):
         self.assertIsNone(verify_pin(der, [other_pin, pin], "multi"))
 
     def test_wrong_pin_rejected(self) -> None:
-        # KEY SECURITY PROPERTY: a cert whose SPKI differs from every
+        # A cert whose SPKI differs from every
         # configured pin is rejected. This is the MitM-with-a-different-cert
         # case — the gate must fail closed.
         der, _good_pin = _self_signed_cert("victim.example")

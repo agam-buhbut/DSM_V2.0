@@ -60,12 +60,6 @@ fn randomized_threshold(base: u64) -> u64 {
     ((base as i64) + jitter).max(1) as u64
 }
 
-#[inline]
-fn randomized_time_threshold(base_secs: u64) -> Duration {
-    Duration::from_secs(randomized_threshold(base_secs))
-}
-
-/// Session key state for one direction of traffic.
 struct DirectionKeys {
     key: AesKey,
     nonce_gen: NonceGenerator,
@@ -228,10 +222,6 @@ impl SessionKeyManager {
     /// X25519 DH; the length check guards against a future Rust caller (or a
     /// re-introduced Python binding) handing us a wrong-sized buffer.
     ///
-    /// Crate-private since audit M4: the Python wrapper that exposed this
-    /// directly was removed in favor of `complete_bootstrap`, which performs
-    /// the DH inside Rust so no shared secret ever crosses the FFI.
-    ///
     /// `is_initiator`: true for client (initiator), false for server (responder).
     pub(crate) fn from_bootstrap_shared_secret(
         shared_secret: &[u8],
@@ -260,11 +250,6 @@ impl SessionKeyManager {
     /// and `from_bootstrap_shared_secret`. Caller picks the salt + IKM
     /// (encoded into the `Hkdf`) and the per-direction info labels.
     ///
-    /// The labels (`initiator_label` / `responder_label`) are the HKDF
-    /// info strings the two constructors used previously; on-the-wire-
-    /// derived keys are byte-identical to the pre-dedup code path
-    /// because the two constructors' label byte strings remain
-    /// caller-supplied.
     fn from_hkdf(
         hk: Hkdf<Sha256>,
         initiator_label: &[u8],
@@ -292,9 +277,9 @@ impl SessionKeyManager {
         let initial_epoch = u32::from_be_bytes(epoch_bytes) & 0x0FFF_FFFF;
 
         let (send_key, recv_key) = if is_initiator {
-            (key_a, key_b) // initiator sends with key_a, receives with key_b
+            (key_a, key_b)
         } else {
-            (key_b, key_a) // responder sends with key_b, receives with key_a
+            (key_b, key_a)
         };
 
         Self::new(
@@ -331,7 +316,7 @@ impl SessionKeyManager {
             packets_sent: 0,
             epoch_start: Instant::now(),
             packet_threshold: randomized_threshold(packet_base),
-            time_threshold: randomized_time_threshold(time_base),
+            time_threshold: Duration::from_secs(randomized_threshold(time_base)),
             packet_threshold_base: packet_base,
             time_threshold_base_secs: time_base,
         })
@@ -339,15 +324,8 @@ impl SessionKeyManager {
 
     /// Encrypt a packet. Returns (nonce, ciphertext) and the current epoch.
     ///
-    /// H-CRYPT-1 defensive check: the caller MUST pass `aad` exactly
-    /// equal to `seq.to_be_bytes()` (8 bytes). The audit flagged that
-    /// Rust trusts the Python caller to keep wire-seq and AAD bound;
-    /// a future refactor that lets these drift apart would silently
-    /// break replay protection. We don't take a separate `seq`
-    /// parameter on encrypt (sender computes its own), but we DO
-    /// require the AAD to be exactly 8 bytes — any other length is
-    /// a contract violation and returns Err rather than silently
-    /// producing a packet the receiver might mis-handle.
+    /// H-CRYPT-1: `aad` MUST be exactly `seq.to_be_bytes()` (8 bytes) so wire-seq
+    /// and authenticated AAD cannot drift apart; any other length is rejected.
     pub fn encrypt(
         &mut self,
         plaintext: &[u8],
@@ -476,16 +454,10 @@ impl SessionKeyManager {
     /// Complete rotation as the responder after receiving the initiator's INIT.
     /// Returns (ephemeral_pub, RotationComplete) — send ephemeral_pub in ACK.
     ///
-    /// This is the single-shot variant — a thin wrapper around the
-    /// two-phase `prepare_rotation_responder` + `apply_rotation_responder`
-    /// pair that's kept around for unit-test convenience (the rotation-
-    /// roundtrip tests don't need the prepare/ack/apply gap). Network
-    /// users should call the two-phase pair directly so that the
-    /// REKEY_ACK can be sent under the OLD keys, which the initiator
-    /// must decrypt before it has applied its own rotation. There is no
-    /// independent logic in this method — every line of behavior lives
-    /// in the prepare/apply functions.
+    /// Single-shot wrapper over `prepare_rotation_responder` + `apply_rotation_responder`,
+    /// kept for tests. Network callers use the two-phase pair so REKEY_ACK is sent under the old keys.
     #[inline]
+    #[cfg(test)]
     pub fn complete_rotation_responder(
         &mut self,
         remote_ephemeral_pub: &[u8; 32],
@@ -572,11 +544,11 @@ impl SessionKeyManager {
         self.apply_rotation_with_grace(new_send_key, new_recv_key, new_epoch, false)
     }
 
-    /// Internal: shared apply-rotation body with optional deferred
-    /// send-key swap. When `defer_send=true` (responder), the new
-    /// send key is parked in `pending_new_send` and `send` keeps the
-    /// OLD key; `tick()` swaps it in once grace expires. When
-    /// `defer_send=false` (initiator), the swap is immediate.
+    /// Shared apply-rotation body with optional deferred send-key swap.
+    /// When `defer_send=true` (responder), the new send key is parked in
+    /// `pending_new_send` and `send` keeps the OLD key; `tick()` swaps it
+    /// in once grace expires. When `defer_send=false` (initiator), the
+    /// swap is immediate.
     fn apply_rotation_with_grace(
         &mut self,
         new_send_key: LockedKey32,
@@ -587,7 +559,6 @@ impl SessionKeyManager {
         let new_recv = DirectionKeys::new(new_recv_key, new_epoch);
         let new_send = DirectionKeys::new(new_send_key, new_epoch);
 
-        // Move current recv to previous for grace period.
         let old_recv = std::mem::replace(&mut self.recv, new_recv);
         let old_replay = std::mem::take(&mut self.replay);
 
@@ -610,13 +581,12 @@ impl SessionKeyManager {
         // Re-roll thresholds for the new epoch so the next rotation is also
         // unpredictable to a passive observer.
         self.packet_threshold = randomized_threshold(self.packet_threshold_base);
-        self.time_threshold = randomized_time_threshold(self.time_threshold_base_secs);
+        self.time_threshold =
+            Duration::from_secs(randomized_threshold(self.time_threshold_base_secs));
 
         Ok(RotationComplete { new_epoch })
     }
 
-    /// Whether a deferred send-key swap is currently pending (used by
-    /// tests; mirrors the `has_grace_period` accessor for the recv side).
     #[cfg(test)]
     pub fn has_pending_send_swap(&self) -> bool {
         self.pending_new_send.is_some()
@@ -635,11 +605,6 @@ impl SessionKeyManager {
     /// gated by a time check, not by packet content. No observable
     /// timing leak from packet stream.
     pub fn tick(&mut self) {
-        // L-AUDIT-2: sample now once and use uniformly for both checks
-        // so both grace-period and pending-send-swap paths consume the
-        // same Instant::now() call, eliminating the prior "grace-set
-        // takes elapsed() + branch; grace-unset takes only is_some()
-        // branch" asymmetry.
         let now = Instant::now();
         let grace_expired = self
             .grace_start
@@ -655,7 +620,6 @@ impl SessionKeyManager {
             self.prev_replay = None;
             self.grace_start = None;
         }
-        // H-BUG-2/3: promote pending_new_send after grace expires.
         if send_swap_due {
             if let Some(new_send) = self.pending_new_send.take() {
                 self.send = new_send;
@@ -673,10 +637,6 @@ impl SessionKeyManager {
     /// the new epoch but `self.send` still holds the old key.
     pub fn send_epoch(&self) -> u32 {
         self.send.nonce_gen.epoch()
-    }
-
-    pub fn packets_sent(&self) -> u64 {
-        self.packets_sent
     }
 
     pub fn has_grace_period(&self) -> bool {
@@ -771,12 +731,10 @@ fn derive_rotation_keys(
     let info_r2i = build_info(b"dsm-rot-r2i-v2-");
 
     if is_initiator {
-        // Initiator: we send via i2r, receive via r2i.
         let send_key = expand_key(&info_i2r, "i2r")?;
         let recv_key = expand_key(&info_r2i, "r2i")?;
         Ok((send_key, recv_key))
     } else {
-        // Responder: we send via r2i, receive via i2r.
         let send_key = expand_key(&info_r2i, "r2i")?;
         let recv_key = expand_key(&info_i2r, "i2r")?;
         Ok((send_key, recv_key))
@@ -852,10 +810,6 @@ mod tests {
     /// correctness. With role binding inside the HKDF info, the
     /// initiator's send key is the responder's recv key and vice
     /// versa, regardless of which order the caller unpacks the tuple.
-    /// Test verifies that:
-    ///   1. Initiator's send_key == Responder's recv_key
-    ///   2. Initiator's recv_key == Responder's send_key
-    ///   3. Initiator's send_key != Initiator's recv_key (no collapse)
     #[test]
     fn rotation_key_direction_binding_is_role_bound() {
         let mut init_secret = [0u8; 32];
@@ -993,7 +947,6 @@ mod tests {
 
         let (nonce, ct, _) = client.encrypt(b"data", aad).unwrap();
         server.decrypt(&nonce, &ct, aad, 1, false).unwrap();
-        // Same seq number again
         assert!(server.decrypt(&nonce, &ct, aad, 1, false).is_err());
     }
 
@@ -1016,21 +969,17 @@ mod tests {
         let aad = &1u64.to_be_bytes();
 
         let start_epoch = client.epoch();
-        // Pre-rotation: verify communication works
         let (n, ct, _) = client.encrypt(b"before", aad).unwrap();
         let pt = server.decrypt(&n, &ct, aad, 1, false).unwrap();
         assert_eq!(pt, b"before");
 
-        // Initiate rotation from client
         let init = client.initiate_rotation().unwrap();
         assert_eq!(init.new_epoch, start_epoch + 1);
 
-        // Server processes init and responds
         let (server_eph_pub, _) = server
             .complete_rotation_responder(&init.ephemeral_pub, init.new_epoch)
             .unwrap();
 
-        // Client completes with server's response
         client
             .complete_rotation_initiator(init, &server_eph_pub)
             .unwrap();
@@ -1038,7 +987,6 @@ mod tests {
         assert_eq!(client.epoch(), start_epoch + 1);
         assert_eq!(server.epoch(), start_epoch + 1);
 
-        // Post-rotation: verify communication still works
         let (n, ct, epoch) = client.encrypt(b"after", aad).unwrap();
         assert_eq!(epoch, start_epoch + 1);
         let pt = server.decrypt(&n, &ct, aad, 1, false).unwrap();
@@ -1050,10 +998,8 @@ mod tests {
         let (mut client, mut server) = make_paired_managers();
         let aad = &1u64.to_be_bytes();
 
-        // Encrypt a packet before rotation
         let (_n_old, _ct_old, _) = client.encrypt(b"old-data", aad).unwrap();
 
-        // Rotate
         let init = client.initiate_rotation().unwrap();
         let (server_eph, _) = server
             .complete_rotation_responder(&init.ephemeral_pub, init.new_epoch)
@@ -1062,9 +1008,6 @@ mod tests {
             .complete_rotation_initiator(init, &server_eph)
             .unwrap();
 
-        // Old packet arrives during grace period — use prev epoch flag
-        // Note: in practice the old packet would use the old key, so this
-        // test verifies the grace period mechanism exists
         assert!(server.has_grace_period());
     }
 
@@ -1082,7 +1025,6 @@ mod tests {
 
     #[test]
     fn test_from_handshake_hash_roundtrip() {
-        // Simulate both sides deriving keys from the same handshake hash
         let mut hash = [0u8; 32];
         OsRng.fill_bytes(&mut hash);
 
@@ -1090,17 +1032,14 @@ mod tests {
         let mut server = SessionKeyManager::from_handshake_hash(&hash, false, None, None).unwrap();
         let aad = &1u64.to_be_bytes();
 
-        // Both peers derive the same initial epoch from the handshake hash
         assert_eq!(client.epoch(), server.epoch());
         let initial_epoch = client.epoch();
 
-        // Client -> Server
         let (nonce, ct, epoch) = client.encrypt(b"hello from client", aad).unwrap();
         assert_eq!(epoch, initial_epoch);
         let pt = server.decrypt(&nonce, &ct, aad, 1, false).unwrap();
         assert_eq!(pt, b"hello from client");
 
-        // Server -> Client
         let (nonce, ct, epoch) = server.encrypt(b"hello from server", aad).unwrap();
         assert_eq!(epoch, initial_epoch);
         let pt = client.decrypt(&nonce, &ct, aad, 1, false).unwrap();
@@ -1117,7 +1056,6 @@ mod tests {
         let aad = &1u64.to_be_bytes();
         let start_epoch = client.epoch();
 
-        // Initiate rotation from client
         let init = client.initiate_rotation().unwrap();
         let (server_eph_pub, _) = server
             .complete_rotation_responder(&init.ephemeral_pub, init.new_epoch)
@@ -1129,7 +1067,6 @@ mod tests {
         assert_eq!(client.epoch(), start_epoch + 1);
         assert_eq!(server.epoch(), start_epoch + 1);
 
-        // Post-rotation: verify communication still works
         let (nonce, ct, epoch) = client.encrypt(b"after rotation", aad).unwrap();
         assert_eq!(epoch, start_epoch + 1);
         let pt = server.decrypt(&nonce, &ct, aad, 1, false).unwrap();
@@ -1191,7 +1128,6 @@ mod tests {
         let (mut client, mut server) = make_paired_managers();
         let aad = &1u64.to_be_bytes();
 
-        // Encrypt a legitimate packet at seq=1
         let (nonce, ct, _) = client.encrypt(b"legit", aad).unwrap();
 
         // Forge a packet with high seq (999) and invalid ciphertext
@@ -1199,7 +1135,6 @@ mod tests {
         let bad_nonce = [0u8; 12];
         let bad_aad = b"hdr";
 
-        // This should fail AEAD authentication
         assert!(server
             .decrypt(&bad_nonce, &bad_ct, bad_aad, 999, false)
             .is_err());
@@ -1209,7 +1144,6 @@ mod tests {
         let pt = server.decrypt(&nonce, &ct, aad, 1, false).unwrap();
         assert_eq!(pt, b"legit");
 
-        // Also verify that seq=999 is still fresh (not marked as seen)
         // Verify seq=999 is still fresh (not marked as seen) — second forged
         // attempt at same seq should fail on AEAD, not on replay
         assert!(server

@@ -1,6 +1,6 @@
 """Encrypted on-disk store for the device's hardware-bound attest key.
 
-The operator passphrase protects the attest key on BOTH backends (Task 3.12):
+The operator passphrase protects the attest key on BOTH backends:
 
   * Soft backend: the signing scalar is wrapped with Argon2id +
     XChaCha20-Poly1305, identical to the identity store.
@@ -11,6 +11,9 @@ The operator passphrase protects the attest key on BOTH backends (Task 3.12):
     both required to sign — an attacker holding the on-disk ``DSMT`` blob and
     TPM access still cannot sign without the passphrase, and the TPM's
     dictionary-attack lockout rate-limits guessing.
+
+The ``TCTI`` env var selecting which TPM to talk to is threaded by the
+enroll/daemon entry points (the Rust backend reads it), not by this store.
 
 Mirrors ``dsm.crypto.keystore.KeyStore`` so both stores can share the
 same passphrase: caller reads the passphrase once via
@@ -30,25 +33,6 @@ if TYPE_CHECKING:
     import tuncore
 
 log = logging.getLogger(__name__)
-
-
-def _store_passphrase(passphrase: bytes | bytearray) -> bytes:
-    """Operator passphrase for the Rust store shim — load-bearing on BOTH
-    backends (Task 3.12).
-
-    The real passphrase is passed through unchanged regardless of backend:
-
-      * Soft backend seals the signing scalar under it (Argon2id +
-        XChaCha20-Poly1305).
-      * TPM backend binds it as the key's TPM authorization value
-        (``encrypt_to_store`` runs ``TPM2_ObjectChangeAuth``;
-        ``decrypt_from_store`` caches the derived auth for ``sign``).
-
-    The TCTI that selects which TPM to talk to is threaded via the ``TCTI``
-    env var by the enroll/daemon entry points (the Rust backend reads it),
-    not by this store.
-    """
-    return bytes(passphrase)
 
 
 class AttestStore:
@@ -88,7 +72,7 @@ class AttestStore:
         import tuncore
 
         ak = tuncore.AttestKey.generate()
-        blob = bytes(ak.encrypt_to_store(_store_passphrase(passphrase)))
+        blob = bytes(ak.encrypt_to_store(bytes(passphrase)))
         atomic_write(self._path, blob)
         self._key = ak
         return bytes(ak.public_spki_der())
@@ -104,7 +88,7 @@ class AttestStore:
         import tuncore
 
         blob = self._path.read_bytes()
-        ak = tuncore.AttestKey.decrypt_from_store(blob, _store_passphrase(passphrase))
+        ak = tuncore.AttestKey.decrypt_from_store(blob, bytes(passphrase))
         self._key = ak
         return bytes(ak.public_spki_der())
 

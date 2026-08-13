@@ -26,7 +26,6 @@ class ProtocolError(Exception):
     pass
 
 
-# Valid transitions: {from_state: {to_state, ...}}
 _TRANSITIONS: dict[State, set[State]] = {
     State.IDLE: {State.CONNECTING},
     State.CONNECTING: {State.HANDSHAKING, State.TEARDOWN},
@@ -38,8 +37,6 @@ _TRANSITIONS: dict[State, set[State]] = {
 
 
 class SessionFSM:
-    """Enforced session state machine."""
-
     def __init__(self) -> None:
         self._state = State.IDLE
 
@@ -48,13 +45,11 @@ class SessionFSM:
         return self._state
 
     def transition(self, target: State) -> None:
-        """Transition to target state. Raises ProtocolError on invalid transition."""
         valid = _TRANSITIONS.get(self._state, set())
         if target not in valid:
             msg = f"invalid transition: {self._state.name} -> {target.name}"
             log.error(msg)
             if target != State.TEARDOWN and State.TEARDOWN in valid:
-                # Force teardown on invalid transition
                 self._do_transition(State.TEARDOWN)
             raise ProtocolError(msg)
         self._do_transition(target)

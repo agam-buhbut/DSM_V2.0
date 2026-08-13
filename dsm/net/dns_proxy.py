@@ -13,7 +13,6 @@ instead of a timeout).
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import ipaddress
 import logging
 import time
@@ -30,21 +29,11 @@ import dns.rrset
 
 import dsm.net.dns as _dns
 from dsm.net._addresses import TUN_PREFIX_LEN
-from dsm.net.dns import DNSResolver
-
-# _DnsResult is intentionally private in dsm.net.dns (Phase 1.10); the proxy is
-# a sibling that relays its rcode, so this cross-module use of an underscore
-# name is deliberate and the private-usage check is suppressed at the alias.
-_DnsResult = _dns._DnsResult  # pyright: ignore[reportPrivateUsage]  # noqa: E501
+from dsm.net.dns import DNSResolver, DnsResult
 
 log = logging.getLogger(__name__)
 
 DEFAULT_CACHED_TTL = 60
-
-
-def _redact_qname(qname: str) -> str:
-    """Return a short, stable pseudonym for a qname (truncated SHA-256 hex)."""
-    return hashlib.sha256(qname.encode("utf-8", "replace")).hexdigest()[:16]
 
 
 class LocalDNSProxy:
@@ -88,8 +77,8 @@ class LocalDNSProxy:
         self._transport: asyncio.DatagramTransport | None = None
         self._tasks: set[asyncio.Task[None]] = set()
         self._sem = asyncio.Semaphore(self._MAX_CONCURRENT_QUERIES)
-        # In-flight request deduplication: (qname, qtype) -> Future[_DnsResult]
-        self._inflight: dict[tuple[str, int], asyncio.Future[_DnsResult]] = {}
+        # In-flight request deduplication: (qname, qtype) -> Future[DnsResult]
+        self._inflight: dict[tuple[str, int], asyncio.Future[DnsResult]] = {}
         # Counter of dropped queries due to task-set saturation. Sampled into
         # the audit log so an operator can see when the proxy is shedding
         # load (rate-limited via _shed_log_throttle to avoid log flooding).
@@ -144,15 +133,14 @@ class LocalDNSProxy:
             task.cancel()
         self._tasks.clear()
 
-    def _schedule(self, coro: Any) -> bool:
-        """Schedule a query-handling coroutine. Returns False (and closes
-        the coroutine without scheduling) when the task set is saturated.
+    def _schedule(self, coro: Any) -> None:
+        """Schedule a query-handling coroutine, dropping it when the task
+        set is saturated.
 
-        Caller decides what to do with a False return; the protocol
-        datagram_received path drops the UDP query in that case — by the
-        nature of UDP the client retries, and once the proxy catches up
-        the next retry succeeds. There is no in-band way to send SERVFAIL
-        because the dropped path is the one that would have written it.
+        The dropped UDP query is not answered — by the nature of UDP the
+        client retries, and once the proxy catches up the next retry
+        succeeds. There is no in-band way to send SERVFAIL because the
+        dropped path is the one that would have written it.
         """
         if len(self._tasks) >= self._MAX_TASKS:
             coro.close()
@@ -167,14 +155,12 @@ class LocalDNSProxy:
                 )
                 self._tasks_shed_last_log = now
                 self._tasks_shed = 0
-            return False
+            return
         task = asyncio.create_task(coro)
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
-        return True
 
     def _source_allowed(self, addr: tuple[str, int]) -> bool:
-        """True iff ``addr`` is inside the in-tunnel source network."""
         try:
             src = ipaddress.ip_address(addr[0])
         except ValueError:
@@ -243,31 +229,14 @@ class LocalDNSProxy:
 
         return query, qname, qtype
 
-    async def _resolve_upstream(self, qname: str) -> _DnsResult:
-        """Call the resolver, preferring the rcode-bearing ``resolve_detailed``.
-
-        Resolvers that expose ``resolve_detailed`` (the real ``DNSResolver``)
-        let the proxy relay NXDOMAIN/NODATA. Test/stub resolvers that only
-        implement ``resolve() -> list[str]`` fall back to a non-authoritative
-        wrapper so an empty list still maps to SERVFAIL (the historic
-        fail-closed behavior).
-        """
-        detailed = getattr(self._resolver, "resolve_detailed", None)
-        if detailed is not None:
-            return await detailed(qname)
-        addresses = await self._resolver.resolve(qname)
-        return _DnsResult(
-            addresses=addresses,
-            ttl=DEFAULT_CACHED_TTL,
-            rcode=int(dns.rcode.NOERROR) if addresses else -1,
-            authoritative=bool(addresses),
-        )
+    async def _resolve_upstream(self, qname: str) -> DnsResult:
+        return await self._resolver.resolve_detailed(qname)
 
     async def _resolve_with_dedup(
         self,
         qname: str,
         qtype: int,
-    ) -> _DnsResult:
+    ) -> DnsResult:
         """Resolve ``qname`` for A records, coalescing concurrent duplicates.
 
         The first caller for a (qname, qtype) holds a semaphore slot while
@@ -275,7 +244,7 @@ class LocalDNSProxy:
         so the semaphore actually bounds upstream fan-out (not total
         duplicates waiting).
 
-        Returns a non-authoritative empty ``_DnsResult`` (signals SERVFAIL to
+        Returns a non-authoritative empty ``DnsResult`` (signals SERVFAIL to
         the caller) on inflight-map saturation or on resolver failure.
         """
         query_key = (qname, qtype)
@@ -283,16 +252,17 @@ class LocalDNSProxy:
         if inflight_future is not None:
             try:
                 return await inflight_future
-            except Exception:  # noqa: BLE001  # see linter report
-                return _DnsResult(addresses=[], ttl=0, rcode=-1, authoritative=False)
+            # coalesced waiter: any failure maps to SERVFAIL
+            except Exception:  # noqa: BLE001
+                return DnsResult(addresses=[], ttl=0, rcode=-1, authoritative=False)
 
         if len(self._inflight) >= self._MAX_INFLIGHT:
             log.debug(
                 "inflight map full (%d entries), SERVFAIL for %s",
                 len(self._inflight),
-                _redact_qname(qname),
+                _dns.redact(qname, self._debug_dns),
             )
-            return _DnsResult(addresses=[], ttl=0, rcode=-1, authoritative=False)
+            return DnsResult(addresses=[], ttl=0, rcode=-1, authoritative=False)
 
         inflight_future = asyncio.get_running_loop().create_future()
         self._inflight[query_key] = inflight_future
@@ -302,7 +272,8 @@ class LocalDNSProxy:
                     result = await self._resolve_upstream(qname)
                     inflight_future.set_result(result)
                     return result
-                except Exception as e:  # noqa: BLE001  # see linter report
+                # any resolver failure maps to SERVFAIL
+                except Exception as e:  # noqa: BLE001
                     log_qname = _dns.redact(qname, self._debug_dns)
                     log.warning(
                         "DNS resolve failed for %s: %s",
@@ -315,7 +286,7 @@ class LocalDNSProxy:
                     # unretrieved ("Future exception was never retrieved" loop
                     # diagnostics). Coalesced waiters receive the same SERVFAIL
                     # via the result instead of catching an exception.
-                    servfail = _DnsResult(
+                    servfail = DnsResult(
                         addresses=[], ttl=0, rcode=-1, authoritative=False
                     )
                     inflight_future.set_result(servfail)
@@ -354,8 +325,7 @@ class LocalDNSProxy:
     ) -> None:
         """Orchestrate parse → dedup-resolve → respond for one DNS datagram.
 
-        Each step is a separate helper; this method exists solely to
-        glue them together. Parsing and trivial-response paths run
+        Parsing and trivial-response paths run
         outside the semaphore — the semaphore exists to bound concurrent
         upstream resolver calls, not cheap wire parsing.
         """

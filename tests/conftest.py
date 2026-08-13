@@ -84,12 +84,10 @@ def pytest_configure(config: pytest.Config) -> None:
     )
 
 
-# ── TPM backend test support (Phase 3 / Task 3.10) ───────────────────────────
-#
-# Additive only — the hook above is untouched. The fixture spins up a
-# per-test swtpm over TCP (mirroring rust/tuncore/tests/tpm_swtpm.rs) and
-# points the Rust attest backend at it via the TCTI env var. It self-skips
-# under the soft wheel, so the normal soft suite is unaffected.
+# TPM backend test support: per-test swtpm over TCP (mirrors
+# rust/tuncore/tests/tpm_swtpm.rs). The fixture points the Rust attest backend
+# at it via the TCTI env var and self-skips under the soft wheel, so the normal
+# soft suite is unaffected.
 
 _SWTPM_READINESS_TIMEOUT_S = 5.0
 _SWTPM_POLL_S = 0.02

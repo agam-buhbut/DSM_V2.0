@@ -86,7 +86,8 @@ def harden_and_gate(config: Config) -> bool:
 
     try:
         tuncore.harden_process()
-    except Exception as e:  # noqa: BLE001  # see linter report
+    # best-effort hardening: any failure must not abort startup
+    except Exception as e:  # noqa: BLE001
         log.warning(
             "process hardening partially failed: %s — continuing without it. "
             "Ensure the service has CAP_SYS_RESOURCE and unrestricted prctl.",

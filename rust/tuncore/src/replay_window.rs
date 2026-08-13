@@ -3,7 +3,6 @@
 /// Tracks which sequence numbers have been seen within the window.
 /// Rejects duplicates and sequence numbers that fall behind the window.
 pub struct ReplayWindow {
-    /// Highest sequence number accepted so far.
     max_seq: u64,
     /// Bitmap covering [max_seq - WINDOW_SIZE + 1 .. max_seq].
     /// Bit 0 = max_seq, bit 1 = max_seq - 1, etc.
@@ -30,14 +29,14 @@ impl ReplayWindow {
             return true; // first packet
         }
         if seq > self.max_seq {
-            return true; // ahead of window
+            return true;
         }
         let diff = self.max_seq - seq;
         if diff >= Self::WINDOW_SIZE {
             return false; // too old
         }
         let bit = 1u128 << diff;
-        self.bitmap & bit == 0 // false if already seen
+        self.bitmap & bit == 0
     }
 
     /// Mark seq as seen. Caller must have verified check() returned true

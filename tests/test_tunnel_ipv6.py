@@ -44,7 +44,6 @@ class TestRestoreIpv6State(unittest.TestCase):
         self.state_path = Path(self._tmpdir.name) / "ipv6_state.json"
 
     def test_restore_noop_if_file_missing(self) -> None:
-        # File intentionally does not exist.
         self.assertFalse(self.state_path.exists())
         with (
             patch.object(TunDevice, "_IPV6_STATE_PATH", self.state_path),
@@ -55,7 +54,6 @@ class TestRestoreIpv6State(unittest.TestCase):
             run_mock.assert_not_called()
 
     def test_restore_issues_correct_sysctl_commands(self) -> None:
-        # Write a well-formed state file.
         with open(self.state_path, "w") as f:
             json.dump({"eth0": True, "wlan0": False}, f)
 
@@ -102,7 +100,6 @@ class TestRestoreIpv6State(unittest.TestCase):
             patch.object(tunnel, "_run_commands") as run_mock,
         ):
             tun = TunDevice(name="mtun0")
-            # Should not raise.
             tun._restore_ipv6_state()
             # With corrupted JSON we never reach the _run_commands call.
             run_mock.assert_not_called()

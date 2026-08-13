@@ -16,10 +16,5 @@ _rng = SystemRandom()
 
 
 def csprng_float() -> float:
-    """Return a cryptographically secure random float in [0, 1).
-
-    Backed by ``random.SystemRandom.random()`` which reads from the
-    kernel CSPRNG (same source as ``os.urandom``) and yields 53 bits of
-    entropy per call.
-    """
+    """Return a cryptographically secure random float in [0, 1)."""
     return _rng.random()

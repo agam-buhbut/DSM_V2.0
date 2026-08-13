@@ -60,7 +60,7 @@ class KeyStoreWrongPassphraseTest(unittest.TestCase):
         self.assertTrue(reloaded.is_loaded)
 
     def test_wrong_passphrase_raises_typed_error(self) -> None:
-        # KEY PROPERTY: a wrong passphrase fails closed with a typed,
+        # A wrong passphrase fails closed with a typed,
         # non-silent error (AEAD tag rejection), not a bogus key and not a
         # crash. We assert the error class and that the identity stays
         # unloaded.

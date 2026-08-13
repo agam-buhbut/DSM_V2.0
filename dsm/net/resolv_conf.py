@@ -30,7 +30,7 @@ RESOLV_BACKUP = Path("/var/lib/dsm/resolv.conf.orig")
 
 # Marker that identifies a file WE wrote. If apply() reads this back as the
 # "current" file (after a crash), it must NOT treat that as the original.
-_DSM_MARKER = b"# Managed by dsm"
+DSM_MARKER = b"# Managed by dsm"
 
 # A backup file may hold either the original resolv.conf CONTENTS (a regular
 # file was replaced) or — when the original was a symlink (systemd-resolved /
@@ -116,7 +116,7 @@ class ResolvConfManager:
 
     @staticmethod
     def _warn_conflicting_dns_service() -> None:
-        """One-shot M-NET-1 warning if a known DNS-managing service is running.
+        """One-shot warning if a known DNS-managing service is running.
 
         Detection is best-effort — we never fail startup on it.
         """
@@ -172,8 +172,8 @@ class ResolvConfManager:
                 current = None
             if current is None:
                 self._original_contents = None
-            elif current.startswith(_DSM_MARKER):
-                # Phase 1.5: this is OUR file (a prior run crashed before
+            elif current.startswith(DSM_MARKER):
+                # This is OUR file (a prior run crashed before
                 # restore). Do NOT capture it as the original — recover the
                 # real original (contents OR symlink target) from the backup.
                 self._recover_from_backup()
@@ -219,9 +219,6 @@ class ResolvConfManager:
             f"nameserver {self._nameserver}\n"
             f"options edns0 trust-ad\n"
         ).encode()
-        # atomic_write: tmpfile -> fchmod -> fsync -> rename. The final
-        # rename overwrites any existing file OR symlink at RESOLV_CONF
-        # atomically — no transient absence.
         atomic_write(RESOLV_CONF, payload, mode=0o644, mkdir=False)
 
         self._applied = True
@@ -230,7 +227,7 @@ class ResolvConfManager:
     def remove(self) -> None:
         """Restore the original resolv.conf (symlink or contents).
 
-        Audit L-AUDIT-3: use atomic rename (or symlinkat + rename) so
+        Use atomic rename (or symlinkat + rename) so
         /etc/resolv.conf is never absent during teardown. The previous
         ``unlink → symlink`` sequence opened a microsecond window
         where libc resolvers from co-running processes would hit
@@ -247,7 +244,7 @@ class ResolvConfManager:
                 self._original_symlink_target is None
                 and self._original_contents is None
             ):
-                # Phase 1.5: nothing captured in-memory — prefer the persistent
+                # Nothing captured in-memory — prefer the persistent
                 # backup (a crash-restart manager that found a dsm-managed file).
                 self._recover_from_backup()
             if self._original_symlink_target is not None:
@@ -256,8 +253,6 @@ class ResolvConfManager:
                 atomic_symlink_restore(self._original_symlink_target)
                 restored = True
             elif self._original_contents is not None:
-                # atomic_write uses tmpfile → fchmod → fsync → rename;
-                # already atomic over both files AND symlinks.
                 atomic_write(
                     RESOLV_CONF,
                     self._original_contents,
@@ -278,14 +273,14 @@ class ResolvConfManager:
             log.error("failed to restore resolv.conf: %s", e)
         finally:
             self._applied = False
-            # B2: only drop the persistent backup and clear the captured
+            # Only drop the persistent backup and clear the captured
             # original AFTER a restore actually succeeded. If the restore
             # write raised, keep both so the crash-path cleanup (or a retry)
             # can still recover the true original instead of losing it.
             if restored:
                 self._original_contents = None
                 self._original_symlink_target = None
-                # Phase 1.5: the backup has served its purpose; drop it so the
+                # The backup has served its purpose; drop it so the
                 # next apply over a genuine file captures a fresh original.
                 try:
                     RESOLV_BACKUP.unlink(missing_ok=True)

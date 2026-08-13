@@ -66,8 +66,7 @@ class TestConfigDirPrecedence(unittest.TestCase):
             os.rmdir(other)
 
     def test_env_var_is_restored_in_teardown(self) -> None:
-        """Sanity test that our setUp/tearDown correctly isolates env state
-        across sub-tests — uses explicit try/finally as required."""
+        """Guard that setUp/tearDown restores DSM_CONFIG_DIR between tests."""
         prev = os.environ.get("DSM_CONFIG_DIR")
         os.environ["DSM_CONFIG_DIR"] = "/tmp/xxx"
         try:

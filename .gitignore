@@ -26,6 +26,6 @@ target/
 
 # Archived documentation (superseded by deploy/GUIDE.txt)
 backup/
-
+docs/
 # isolated worktrees (Claude hardening/UX tracks)
 .worktrees/

@@ -1,9 +1,4 @@
-"""Phase 2.8: envelope config knobs — defaults, range validators, type checks.
-
-Mirrors the test_config.py / test_config_ux.py conventions:
-- Construct Config(**_base(**overrides)) and assert or expect ValueError.
-- Never edit pre-existing test files.
-"""
+"""Envelope config knobs — defaults, range validators, type checks."""
 
 from __future__ import annotations
 

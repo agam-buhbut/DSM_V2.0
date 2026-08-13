@@ -16,6 +16,7 @@ import dns.message
 import dns.rcode
 import dns.rdatatype
 
+from dsm.net.dns import DnsResult
 from dsm.net.dns_proxy import LocalDNSProxy
 
 
@@ -41,10 +42,15 @@ class _CountingResolver:
         self.calls = 0
         self.closed = False
 
-    async def resolve(self, hostname: str) -> list[str]:
+    async def resolve_detailed(self, hostname: str) -> DnsResult:
         self.calls += 1
         await asyncio.sleep(self._sleep)
-        return list(self._addresses)
+        return DnsResult(
+            addresses=list(self._addresses),
+            ttl=60,
+            rcode=int(dns.rcode.NOERROR) if self._addresses else -1,
+            authoritative=bool(self._addresses),
+        )
 
     async def close(self) -> None:
         self.closed = True
@@ -58,7 +64,7 @@ class _RaisingResolver:
         self.calls = 0
         self.closed = False
 
-    async def resolve(self, hostname: str) -> list[str]:
+    async def resolve_detailed(self, hostname: str) -> DnsResult:
         self.calls += 1
         await asyncio.sleep(self._sleep)
         raise RuntimeError("stub-upstream-fail")
@@ -75,10 +81,15 @@ class _SlowResolver:
         self.calls = 0
         self.closed = False
 
-    async def resolve(self, hostname: str) -> list[str]:
+    async def resolve_detailed(self, hostname: str) -> DnsResult:
         self.calls += 1
         await asyncio.sleep(self._sleep)
-        return ["9.9.9.9"]
+        return DnsResult(
+            addresses=["9.9.9.9"],
+            ttl=60,
+            rcode=int(dns.rcode.NOERROR),
+            authoritative=True,
+        )
 
     async def close(self) -> None:
         self.closed = True
