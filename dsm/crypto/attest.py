@@ -266,6 +266,7 @@ def verify_attest_payload(
         raise AttestTimestampError(
             f"signed timestamp {signed_ts.isoformat()} is outside "
             f"±{allowed_clock_skew} of now {now.isoformat()}"
+            " — likely CLOCK SKEW: synchronize both peers' clocks (NTP)."
         )
 
     return leaf

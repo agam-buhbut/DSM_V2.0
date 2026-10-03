@@ -11,6 +11,7 @@ from cryptography.x509.oid import ExtendedKeyUsageOID
 from dsm.core import netaudit
 from dsm.core.config import Config
 from dsm.core.fsm import SessionFSM, State
+from dsm.core.preflight import check_clock_sync
 from dsm.core.protocol import ReassemblyBuffer
 from dsm.crypto.attest_store import AttestStore
 from dsm.crypto.auth_loader import (
@@ -160,6 +161,12 @@ async def run_client(
         except AuthMaterialsError as e:
             log.error("cert/identity consistency check failed: %s", e)
             return 1
+
+        # The handshake rejects attestation timestamps more than ~5 minutes
+        # off, so an unsynchronized clock fails with a confusing peer error.
+        _clock_warn = check_clock_sync()
+        if _clock_warn:
+            log.warning(_clock_warn)
 
         shaper = TrafficShaper(
             config.padding_min,

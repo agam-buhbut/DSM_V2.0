@@ -13,6 +13,7 @@ from cryptography.x509.oid import ExtendedKeyUsageOID
 from dsm.core import netaudit
 from dsm.core.config import Config
 from dsm.core.fsm import ProtocolError, SessionFSM, State
+from dsm.core.preflight import check_clock_sync
 from dsm.core.protocol import PacketType, ReassemblyBuffer
 from dsm.crypto.attest_store import AttestStore
 from dsm.crypto.auth_loader import (
@@ -605,6 +606,12 @@ async def run_server(
         tcp_ts = TcpTimestampsDisabler()
         tcp_ts.apply()
         stack.callback(tcp_ts.remove)
+
+        # The handshake rejects attestation timestamps more than ~5 minutes
+        # off, so an unsynchronized clock fails with a confusing peer error.
+        _clock_warn = check_clock_sync()
+        if _clock_warn:
+            log.warning(_clock_warn)
 
         # process_shutdown is set ONLY by the signal handlers (the whole
         # daemon is terminating). A session ending on its own (dead-peer
