@@ -59,7 +59,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install maturin black isort ruff pylint pyright \
-                      pytest pytest-asyncio pip-audit dnspython types-dnspython
+                      pytest pytest-asyncio pip-audit dnspython
 
       # Build the SOFT release wheel from the repo root: bundles the dsm/
       # package AND the tuncore extension into one wheel (DSM-004), then install
