@@ -7,7 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-_Nothing yet._
+### Security
+- A malformed or truncated TCP frame from an unauthenticated peer (oversized
+  length prefix, zero-length frame, or EOF mid-frame) no longer crashes the
+  server: the accept loop logs it and keeps serving, and the attempt's
+  listener is closed so bad frames cannot leak sockets.
+- The kill switch accepts ICMP only on the tunnel interface and the
+  pre-handshake ruleset accepts none, so the host no longer sends or answers
+  ICMP from its real address on the WAN.
+- UDP handshakes are validated concurrently (`max_inflight_handshakes`,
+  default 8, each attempt capped at 12 s), so one stalled bogus handshake
+  can no longer starve a legitimate client.
+- The CA certificate must have a P-384 key.
+
+### Fixed
+- UDP sessions no longer end within ~50 ms of the handshake: a send before
+  the server knows the client's address is dropped instead of shutting the
+  session down.
+- A wheel-only install can start: the nftables templates ship inside the
+  `dsm` package.
+- A DNS-proxy bind conflict on :53 (another resolver already listening) is
+  a fatal startup error with an actionable message instead of a retry loop.
+- `dsm init --install-unit` prints instructions instead of raising when
+  `deploy/dsm.service` is not available.
+- CI no longer tries to install the nonexistent `types-dnspython` package.
+
+### Added
+- `server_ip` may be a DNS hostname (e.g. DDNS for a home server); the
+  client resolves it once, before the kill switch goes up. The deploy guide
+  has a new section on running over the internet.
+- A startup warning when the system clock is not NTP-synchronized, and a
+  clock-skew hint on handshake freshness errors.
+- A wire-parser fuzz harness (`tests/fuzz/fuzz_parsers.py`) and parser
+  boundary tests.
+
+### Documentation
+- Corrected the default CN format (12 hex characters, bound to the role),
+  the server's nftables tables, the DNS-leak drill, the handshake retry
+  budget, and the `server_ip` and `allowed_cns_file` requirements.
+- Documented build and runtime packages (patchelf, t64 TSS2 names), NTP,
+  and installing a prebuilt wheel on a constrained client.
+- The README Quickstart states that no release has been published yet.
 
 ## [0.1.0] - 2026-06-12
 
@@ -18,7 +58,7 @@ Work taking DSM from an internal state to a public, MIT-licensed release.
 
 ### Security
 - Hardened the crypto glue and unauthenticated-input handling on the server
-  data path (malformed handshake messages no longer crash the daemon).
+  data path.
 - Closed network-integration gaps: kill-switch / fail-closed behavior on daemon
   failure paths, DNS proxy no longer acting as an open resolver, and safer
   restoration of host `resolv.conf`, IPv6, and sysctl state.

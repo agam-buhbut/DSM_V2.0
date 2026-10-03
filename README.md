@@ -8,6 +8,11 @@ Open-source, security and anonymity focused VPN for Linux. Single client-server 
 > Other distros: build from source (see `deploy/GUIDE.md` §1). No PyPI — DSM is
 > distributed via signed GitHub Releases.
 
+> **No release has been published yet.** There is no `v0.1.0` tag or GitHub
+> Release, and `install.sh` still carries a placeholder minisign public key, so
+> step 1 below does not work yet. Until the first signed release, build and
+> install from source (`deploy/GUIDE.md` §1), then continue with steps 2 and 3.
+
 ```sh
 # 1. Install (downloads + minisign-verifies the wheel, apt-installs the TPM
 #    runtime libs, creates /opt/dsm/venv, symlinks `dsm`). Add `--systemd`
@@ -29,10 +34,10 @@ sudo dsm init server --resume --signed-cert <signed.crt>
 sudo systemctl enable --now dsm
 ```
 
-**Evaluation without a TPM:** a clearly-named `+soft` evaluation wheel is also
-published. Install it with `install.sh --eval` (combine flags in any order,
-e.g. `-s -- --eval --systemd`). It provides **no hardware binding** — it is for
-evaluation only and must never be deployed in production.
+**Evaluation without a TPM:** releases will also carry a clearly-named `+soft`
+evaluation wheel, installed with `install.sh --eval` (combine flags in any
+order, e.g. `-s -- --eval --systemd`). It provides **no hardware binding** — it
+is for evaluation only and must never be deployed in production.
 
 ## Goal
 

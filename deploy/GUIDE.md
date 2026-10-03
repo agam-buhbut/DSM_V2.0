@@ -1828,7 +1828,7 @@ python3 -m dsm enroll --csr-out PATH             Provision identity +
 python3 -m dsm enroll --import CERT_PATH         Verify + persist a
                                                  CA-signed cert
 python3 -m dsm enroll --cn CN [--role ROLE]      Override the derived CN
-                                                 (default: dsm-<8 hex>-<role>)
+                                                 (default: dsm-<12 hex>-<role>)
 python3 -m dsm enroll --role {client,server}     Set the role suffix when
                                                  --cn is not given
 
