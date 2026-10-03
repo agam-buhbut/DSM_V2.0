@@ -618,7 +618,7 @@ The command writes:
 And prints:
 
 ```
-cn = dsm-<8 hex>-server
+cn = dsm-<12 hex>-server
 noise_static_pub = <hex>
 ```
 
@@ -851,16 +851,16 @@ $ ip rule                     # expect "10: not from all fwmark 0x1 lookup 100"
 $ ip route show table 100     # expect "default dev mtun0"
 ```
 
-Kill switch (4 tables on the server, 2 on the client):
+nftables tables (2 on the server, 2 on the client):
 
 ```sh
 $ sudo nft list tables | grep '^table inet dsm_'
 # Server-side, expect:
-#   table inet dsm_killswitch        (default-drop output/input + ICMP rate-limit)
-#   table inet dsm_dns_leak          (DNS/DoT/DoH/mDNS/LLMNR blocked off-tunnel)
 #   table inet dsm_server_ratelimit  (per-source-IP handshake limiter)
 #   table inet dsm_server_nat        (MASQUERADE for decrypted client traffic)
-# Client-side, expect dsm_killswitch + dsm_dns_leak only.
+# Client-side, expect:
+#   table inet dsm_killswitch        (default-drop output/input + ICMP rate-limit)
+#   table inet dsm_dns_leak          (DNS/DoT/DoH/mDNS/LLMNR blocked off-tunnel)
 ```
 
 DNS goes through the tunnel and resolves on the server via DoH:
@@ -928,8 +928,8 @@ refuse the cert too.
 ### 7c. Rotate the server identity
 
 Fresh enrollment generates a new Noise static, so the CN derivation
-`dsm-<sha256(noise_static)[:4 hex]>-server` ALWAYS produces a new
-CN. Plan accordingly.
+`dsm-<sha256(noise_static ‖ role)[:6 bytes / 12 hex]>-server` ALWAYS produces
+a new CN. Plan accordingly.
 
 ```sh
 $ sudo systemctl stop dsm
@@ -1226,11 +1226,12 @@ cellular operator's IP.
 9e.3 — DNS leak
 
 ```sh
-$ dig @8.8.8.8 example.com +time=3 +tries=1 || echo PASS-direct-timed-out
 $ dig @10.8.0.1 example.com +short
 ```
 
-PASS: direct query times out (kill switch); @10.8.0.1 returns A records.
+PASS: @10.8.0.1 returns A records (query goes via TUN, resolved on server).
+Real leak proof: the tcpdump step above shows no DNS packets exiting the WAN
+interface except to server:port — no direct DNS to external resolvers.
 
 9e.4 — IPv6 leak
 
@@ -1415,9 +1416,9 @@ prints "ok".
 - Firewall between you and the server dropping DF packets (less
   likely with default pmtu_discover=false).
 - On cellular: the link was down when the handshake started. Each
-  retry adds 5 s of timeout + (1, 2, 4) s of backoff — total budget
-  ~22 s. A longer outage exceeds the budget; restart the client once
-  the link is back up.
+  retry adds 5 s of timeout + (1, 2) s of backoff (3 attempts; the
+  third raises without sleeping) — total budget ~18 s. A longer outage
+  exceeds the budget; restart the client once the link is back up.
 
 ### Server log shows "handshake rejected (CNNotAllowedError): client CN '...' not in allowlist"
 

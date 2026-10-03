@@ -61,8 +61,8 @@ class EnrollError(Exception):
 def derive_default_cn(noise_static_pub: bytes, role: str) -> str:
     """Derive the default device CN from the Noise static pubkey + role.
 
-    Format: ``dsm-<8 hex>-<role>`` where the 8 hex come from
-    ``SHA-256(noise_static_pub)[:4]``. Deterministic, globally unique
+    Format: ``dsm-<12 hex>-<role>`` where the 12 hex come from
+    ``SHA-256(noise_static_pub ‖ role)[:6]``. Deterministic, globally unique
     without a name registry, and binds the human-readable name to the
     cryptographic identity.
     """

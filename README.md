@@ -292,9 +292,10 @@ the grace period. Checked before decrypt, updated after authentication.
   server while every other DoH destination is dropped.
 - VPN sockets marked with SO_MARK=0x1 so the ip-rule skips the TUN table
   and avoids routing loops
-- Resolution itself runs server-side: UDP:53 is intercepted off the data
-  path, resolved asynchronously (DoH, DoT, static hosts file, caching),
-  and the answer returned to the client inside the tunnel
+- Resolution itself runs server-side: a DNS proxy bound to UDP:53 on the
+  server's TUN address resolves each query asynchronously (DoH, DoT,
+  static hosts file, caching) and returns the answer to the client inside
+  the tunnel
 
 ## Threat Model
 
@@ -380,9 +381,10 @@ protection live in Rust behind PyO3.
 ### Parameters
 
 - mode: client | server
-- server_ip: literal IPv4/IPv6 address ONLY (hostnames are rejected;
-  the kill-switch nftables rules cannot resolve names. Run
-  `dig +short <host> | head -1` and put the resulting IP here)
+- server_ip: literal IPv4 address ONLY (hostnames and IPv6 are rejected;
+  the transport uses AF_INET and the kill-switch nftables rules cannot
+  resolve names. Run `dig +short A <host> | head -1` and put the result
+  here)
 - server_port, listen_port
 - key_file: path to Argon2id-wrapped X25519 Noise static key
 - cert_file: path to the device's CA-signed leaf cert (PEM or DER)
@@ -409,8 +411,9 @@ protection live in Rust behind PyO3.
   WARNING and revoked certs are accepted (intended for lab/dev only).
 - expected_server_cn: client only; subject CN we accept on the server cert
 - allowed_cns_file: server only; one allowed client subject CN per line,
-  root-owned, mode 0o600 (any group/world bit causes startup to refuse
-  to load the file)
+  no group/world access bits set, owned by the daemon's uid (any
+  group/world bit or uid mismatch causes startup to refuse to load the
+  file)
 - max_inflight_handshakes: server only; handshake attempts the UDP
   acceptor validates concurrently (default: 8, bounds 1-4096, warns above
   1024). One stalled attempt cannot block a legitimate client.
