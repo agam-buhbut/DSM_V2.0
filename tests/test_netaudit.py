@@ -170,6 +170,9 @@ class TestSchemaLock(unittest.TestCase):
         # DSM-030: emitted when a configured CRL has no nextUpdate, so its
         # freshness cannot be verified (fail-closed under crl_strict).
         "crl_no_nextupdate",
+        # Emitted when a CRL's crl_number is older than the last accepted one
+        # (rollback/replay); the daemon refuses to start.
+        "crl_rollback",
         # H-ANON-4: emitted when the client rebinds its UDP socket to a
         # fresh ephemeral port on rekey completion (breaks src-port
         # session fingerprinting).
