@@ -75,8 +75,15 @@ $ sudo apt update
 $ sudo apt install -y \
       build-essential pkg-config \
       python3 python3-venv python3-pip python3-dev \
+      patchelf \
       nftables iproute2 curl ca-certificates git xxd
 ```
+
+`patchelf` is required by maturin when building the default (TPM) wheel on a
+plain Debian/Ubuntu host: a bare `maturin build --release` detects the linked
+`libtss2` shared libraries and runs an auditwheel-style RPATH-rewrite repair
+step, which calls `patchelf`. Without `patchelf` installed, the build fails at
+that repair stage.
 
 ### 0c. Install the Rust toolchain (if you don't already have it)
 
@@ -124,10 +131,15 @@ stack. (Only the dev-soft-attest test build skips this — see §1.)
 - The TSS2 runtime libraries (Esys + the device TCTI):
 
   ```sh
-  $ sudo apt install -y libtss2-esys-3.0.2-0 libtss2-tcti-device0
+  $ sudo apt install -y libtss2-esys-3.0.2-0t64 libtss2-tcti-device0t64
   ```
 
-  (On some releases these are pulled in by `tpm2-tools`. The build host
+  (On Debian 13 "trixie" and Ubuntu 24.04+ the packages use the `t64`
+  suffix: `libtss2-esys-3.0.2-0t64` and `libtss2-tcti-device0t64`. On
+  older releases they may be named `libtss2-esys-3.0.2-0` and
+  `libtss2-tcti-device0` — try both if the `t64` names have no apt
+  candidate.
+  On some releases these are pulled in by `tpm2-tools`. The build host
   additionally needs `libtss2-dev` for headers + pkg-config — that is a
   BUILD dependency, added in §1 below, not a runtime one.)
 
@@ -161,6 +173,21 @@ $ tpm2_getrandom --hex 8         # prints 16 hex chars if the TPM works
 
 (`dsm enroll` runs its own preflight and fails with an actionable
 message if the TPM or the tss group is missing.)
+
+### 0f. Clock synchronization (NTP) — both client and server
+
+DSM handshakes include a freshness timestamp. If the two peers' clocks
+differ by more than ~5 minutes, the handshake fails with a freshness
+rejection error that names clock skew. The daemon also logs a WARNING at
+startup when the system clock is not NTP-synchronized.
+
+Ensure NTP is running on BOTH the client and the server BEFORE starting dsm:
+
+```sh
+$ sudo timedatectl set-ntp true
+$ timedatectl status | grep -E 'synchronized|NTP'
+# expect: "NTP service: active" and "System clock synchronized: yes"
+```
 
 ## 1. Build
 
@@ -222,7 +249,55 @@ $ unzip -l rust/tuncore/target/wheels/dsm-0.1.0-*.whl \
 # expect both a dsm/__main__.py line and a tuncore/...so line
 ```
 
+The wheel also ships the nftables ruleset templates inside the `dsm`
+package (`dsm/net/_templates/`). No manual copy of `nftables/*.conf`
+into site-packages is needed — a plain `pip install <wheel>` is
+sufficient for the daemon to start.
+
 You can `rm -rf /tmp/dsm-build-venv` at the end of section 1.
+
+### 1a.1 Constrained client: build once, copy the wheel
+
+A constrained client (small disk, no Rust toolchain, no `libtss2-dev`)
+does not need to build locally. Build the wheel ONCE on a capable host
+of the SAME distro, arch, and Python MINOR version, copy the `.whl` to
+the client, then `pip install` it there.
+
+On the BUILD host:
+
+```sh
+# Build as above (§1a), then copy the wheel to the client:
+$ scp rust/tuncore/target/wheels/dsm-0.1.0-*.whl user@client:/tmp/
+```
+
+On the CLIENT (after copying the wheel):
+
+```sh
+# Install only the runtime packages — no Rust toolchain, no libtss2-dev:
+$ sudo apt install -y \
+      python3 python3-pip \
+      libtss2-esys-3.0.2-0t64 libtss2-tcti-device0t64 \
+      nftables iproute2
+# python3-pip: Debian's ensurepip is disabled; install python3-pip via apt.
+# libtss2-*t64: the t64-suffixed names are correct on Debian 13+ / Ubuntu 24.04+.
+# On older releases use libtss2-esys-3.0.2-0 and libtss2-tcti-device0 instead.
+
+$ sudo /usr/bin/python3 -m pip install --break-system-packages \
+      /tmp/dsm-0.1.0-*.whl
+```
+
+Important caveats:
+- The wheel MUST be built on the SAME distro + arch + Python minor version
+  as the client. A wheel built on Debian 12 (Python 3.11, amd64) will
+  NOT install cleanly on Ubuntu 22.04 (Python 3.10) or on arm64.
+- A wheel built with the plain `maturin build --release` command above has
+  its `libtss2` libraries vendored in (RPATH-rewritten) by maturin's repair
+  step. The client still needs the runtime TSS2 packages above regardless,
+  because the TCTI device driver (`libtss2-tcti-device0t64`) opens
+  `/dev/tpmrm0` at runtime and is not vendored.
+- `python3-pip` must be installed on the client via `apt` — Debian's
+  system Python intentionally omits `ensurepip`, so `python3 -m pip`
+  fails without the apt-installed pip.
 
 ### 1b. Install the wheel into the system Python (pins runtime deps)
 
@@ -1488,6 +1563,31 @@ Server's upstream DoH/DoT provider failed or pin mismatch.
 Temporarily set `debug_dns = true` to log the plaintext qname (then
 flip it off). Re-check the SPKI pin against the provider's live cert
 (§3a.1).
+
+### Server log: "DNS proxy cannot bind \<tun-ip\>:53 — another resolver … is already bound there"
+
+A host resolver (`unbound`, `systemd-resolved`, or `dnsmasq`) is listening
+on the TUN address or on `0.0.0.0:53`, which blocks the dsm DNS proxy from
+binding port 53 on the TUN IP. The daemon now surfaces this as a specific
+actionable error (rather than a bare `OSError`).
+
+Remedies (pick one):
+
+1. Stop the conflicting service before starting dsm:
+
+   ```sh
+   $ sudo systemctl stop unbound           # or: systemd-resolved / dnsmasq
+   $ sudo systemctl disable unbound        # prevent it from restarting
+   ```
+
+2. If you need the host resolver for other purposes, change the TUN address
+   in config.toml so it no longer conflicts with the resolver's bind address.
+
+To identify which process holds :53:
+
+```sh
+$ sudo ss -ulnp | grep ':53 '
+```
 
 ### "DNS proxy listening on 10.8.0.1:53" but client can't resolve
 
