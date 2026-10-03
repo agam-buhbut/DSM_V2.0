@@ -209,6 +209,12 @@ async def _accept_one_session(
             consecutive_failures += 1
             if await _backoff_or_shutdown(consecutive_failures, process_shutdown):
                 break
+        except BaseException:
+            # Close this attempt's listener before propagating, so a flood of
+            # bad frames cannot leak one socket per attempt.
+            if config.transport == "tcp":
+                await transport_obj.aclose()
+            raise
 
     return None, None, transport_obj
 
@@ -628,16 +634,33 @@ async def run_server(
         # OUTER re-accept loop: accept one client, serve it to session-end,
         # then loop back and accept the next. Exits only on process_shutdown.
         while not process_shutdown.is_set():
-            session_keys, client_pub, transport_obj = await _accept_one_session(
-                config,
-                fsm,
-                keystore,
-                attest_store,
-                materials,
-                cn_allowlist,
-                transport_obj,
-                process_shutdown,
-            )
+            try:
+                session_keys, client_pub, transport_obj = await _accept_one_session(
+                    config,
+                    fsm,
+                    keystore,
+                    attest_store,
+                    materials,
+                    cn_allowlist,
+                    transport_obj,
+                    process_shutdown,
+                )
+            except Exception:
+                # Anything raised before authentication (e.g. a FramingError
+                # from a malformed length prefix) must not take the daemon
+                # down for every later client. Reset and start a fresh
+                # listener.
+                log.exception(
+                    "accept failed; recovering — daemon stays up for the next client"
+                )
+                _drive_fsm_to_idle(fsm)
+                if config.transport == "tcp" and transport_obj is not None:
+                    await transport_obj.aclose()
+                    transport_obj = None
+                if not process_shutdown.is_set():
+                    fsm.transition(State.CONNECTING)
+                continue
+
             if session_keys is None or client_pub is None or transport_obj is None:
                 # process_shutdown arrived while waiting for a handshake; the
                 # UDP transport unwinds with the outer stack. A held TCP

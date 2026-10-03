@@ -17,6 +17,14 @@ MAX_FRAME_SIZE = 65536
 LEN_PREFIX_SIZE = 4
 
 
+class FramingError(ValueError):
+    """A TCP frame violates the wire format.
+
+    Subclasses ValueError so existing ``except ValueError`` handlers still
+    match.
+    """
+
+
 class TCPTransport:
     """Non-blocking TCP transport with length-prefix framing."""
 
@@ -100,7 +108,7 @@ class TCPTransport:
         if self._writer is None:
             raise RuntimeError("not connected")
         if len(data) > MAX_FRAME_SIZE:
-            raise ValueError(f"frame too large: {len(data)}")
+            raise FramingError(f"frame too large: {len(data)}")
         frame = struct.pack("!I", len(data)) + data
         self._writer.write(frame)
         await self._writer.drain()
@@ -123,7 +131,7 @@ class TCPTransport:
                 len_buf = await reader.readexactly(LEN_PREFIX_SIZE)
                 (length,) = struct.unpack("!I", len_buf)
                 if length > MAX_FRAME_SIZE:
-                    raise ValueError(
+                    raise FramingError(
                         f"frame length {length} exceeds max {MAX_FRAME_SIZE}"
                     )
                 # Reject zero-length frames. They have no meaning
