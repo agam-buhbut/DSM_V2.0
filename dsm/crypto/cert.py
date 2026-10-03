@@ -31,6 +31,7 @@ from pathlib import Path
 from cryptography import x509
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.ec import (
     ECDSA,
     EllipticCurvePublicKey,
@@ -346,6 +347,12 @@ def validate_chain(
         raise CertChainError(
             f"unsupported CA pubkey type {type(ca_pub).__name__}; "
             "only EC CAs are supported"
+        )
+    # The offline CA (deploy/openssl-ca.cnf) is P-384; refuse any other curve.
+    if not isinstance(ca_pub.curve, ec.SECP384R1):
+        raise CertChainError(
+            f"CA public key is on curve {ca_pub.curve.name!r}; "
+            "only secp384r1 (P-384) CAs are accepted"
         )
     sig_alg = leaf.cert.signature_hash_algorithm
     if sig_alg is None:
