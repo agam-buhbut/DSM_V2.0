@@ -103,7 +103,6 @@ class PreHandshakeKillSwitch:
       * loopback
       * DHCP (so a roaming client can keep its lease)
       * the configured server IP + port (UDP and TCP)
-      * basic ICMP for path-MTU discovery (rate-limited)
     Everything else is dropped by the chain's default policy.
 
     Upgraded to the full :class:`NFTablesManager` ruleset (which also
