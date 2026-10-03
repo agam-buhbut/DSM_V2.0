@@ -26,6 +26,9 @@ from dsm.net._addresses import SERVER_TUN_IP
 from dsm.net.dns import DNSResolver
 from dsm.net.dns_proxy import LocalDNSProxy
 from dsm.net.forwarding import IPForwardingManager, MasqueradeManager
+from dsm.net.handshake_acceptor import (
+    _accept_until_winner,  # pyright: ignore[reportPrivateUsage]
+)
 from dsm.net.nftables import ServerRateLimitManager, TcpTimestampsDisabler
 from dsm.net.transport.tcp import TCPTransport
 from dsm.net.transport.udp import UDPTransport
@@ -636,16 +639,42 @@ async def run_server(
         # then loop back and accept the next. Exits only on process_shutdown.
         while not process_shutdown.is_set():
             try:
-                session_keys, client_pub, transport_obj = await _accept_one_session(
-                    config,
-                    fsm,
-                    keystore,
-                    attest_store,
-                    materials,
-                    cn_allowlist,
-                    transport_obj,
-                    process_shutdown,
-                )
+                if config.transport == "udp":
+                    # Validate handshakes concurrently so one stalled bogus
+                    # msg1 cannot starve a real client. The acceptor does no
+                    # per-attempt FSM churn: HANDSHAKING here, CONNECTING at
+                    # the loop tail. UDP binds one transport before this loop.
+                    assert isinstance(transport_obj, UDPTransport)
+                    fsm.transition(State.HANDSHAKING)
+                    (
+                        session_keys,
+                        client_pub,
+                        transport_obj,
+                    ) = await _accept_until_winner(
+                        config,
+                        keystore,
+                        attest_store,
+                        materials,
+                        cn_allowlist,
+                        transport_obj,
+                        process_shutdown,
+                        _backoff_or_shutdown,
+                    )
+                    if session_keys is None:
+                        # Shutdown during accept: leave HANDSHAKING so the
+                        # unwind below is clean.
+                        _drive_fsm_to_idle(fsm)
+                else:
+                    session_keys, client_pub, transport_obj = await _accept_one_session(
+                        config,
+                        fsm,
+                        keystore,
+                        attest_store,
+                        materials,
+                        cn_allowlist,
+                        transport_obj,
+                        process_shutdown,
+                    )
             except Exception:
                 # Anything raised before authentication (e.g. a FramingError
                 # from a malformed length prefix) must not take the daemon

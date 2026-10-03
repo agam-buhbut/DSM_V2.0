@@ -80,6 +80,14 @@ expected_server_cn = "dsm-1234abcd-server"
 # (or 0400) — any group/world bits are rejected at startup.
 # allowed_cns_file = "/opt/mtun/allowed_cns.txt"
 
+# Server only: peak number of handshake attempts the UDP acceptor validates
+# CONCURRENTLY (default 8, must be >= 1). The acceptor admits a single live
+# session but validates attempts in parallel under a per-attempt deadline, so
+# one stalled bogus msg1 cannot starve a legitimate client. The default is
+# ample for the single-client model; raise it only on a busy public endpoint
+# (each slot is a live NoiseResponder + a small per-peer inbox).
+# max_inflight_handshakes = 8
+
 # Server only: DNS providers + pinned SPKI SHA-256 (server resolves on behalf
 # of clients). Provider host MUST be an IP literal (a hostname dead-loops
 # through the TUN).

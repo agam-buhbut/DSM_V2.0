@@ -411,6 +411,9 @@ protection live in Rust behind PyO3.
 - allowed_cns_file: server only; one allowed client subject CN per line,
   root-owned, mode 0o600 (any group/world bit causes startup to refuse
   to load the file)
+- max_inflight_handshakes: server only; handshake attempts the UDP
+  acceptor validates concurrently (default: 8, bounds 1-4096, warns above
+  1024). One stalled attempt cannot block a legitimate client.
 - transport: udp | tcp (default: udp)
 - dns_providers: DoH/DoT URLs (server mode)
 - dns_provider_pins: SPKI SHA-256 pins per provider (server mode, required)

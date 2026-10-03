@@ -39,6 +39,11 @@ MIN_ROTATION_SECONDS = 60
 # applied to rotation_seconds (1 year ≈ 3.1e7 s).
 MAX_ROTATION_PACKETS = 1 << 31
 MAX_ROTATION_SECONDS = 365 * 24 * 3600
+# Bounds on max_inflight_handshakes. Each slot is a live NoiseResponder plus a
+# per-peer inbox, so an absurd pool size is a self-inflicted memory-exhaustion
+# risk: refuse it above the hard cap, warn above the soft threshold.
+MAX_INFLIGHT_HANDSHAKES = 4096
+WARN_INFLIGHT_HANDSHAKES = 1024
 # TUN MTU bounds. 576 is the IPv4 minimum path MTU (RFC 791). 1500 is
 # standard Ethernet. Two distinct overheads matter and must not be conflated:
 #   * Link overhead = IP(20) + UDP(8) = 28 B, charged against the LINK MTU
@@ -170,6 +175,10 @@ class Config:
     # `mtu` is already correct.
     auto_mtu: bool = False
     pmtu_check_interval_s: float = 30.0
+    # Server only: handshake attempts the UDP acceptor validates concurrently
+    # (dsm.net.handshake_acceptor), so one stalled bogus msg1 cannot starve a
+    # real client. Bounds the peak NoiseResponder count and CPU.
+    max_inflight_handshakes: int = 8
     config_dir: Path = field(default_factory=lambda: Path("/opt/mtun/"))
 
     def __post_init__(self) -> None:
@@ -198,6 +207,7 @@ def _validate_types(c: Config) -> None:
         ("mtu", c.mtu),
         ("envelope_latency_budget_ms", c.envelope_latency_budget_ms),
         ("envelope_ceiling_pps", c.envelope_ceiling_pps),
+        ("max_inflight_handshakes", c.max_inflight_handshakes),
     )
     for name, value in int_fields:
         if isinstance(
@@ -518,6 +528,26 @@ def _validate_mtu(c: Config) -> None:
         )
 
 
+def _validate_max_inflight_handshakes(c: Config) -> None:
+    if c.max_inflight_handshakes < 1:
+        raise ValueError(
+            f"max_inflight_handshakes must be >= 1, got {c.max_inflight_handshakes}"
+        )
+    if c.max_inflight_handshakes > MAX_INFLIGHT_HANDSHAKES:
+        raise ValueError(
+            f"max_inflight_handshakes too high: {c.max_inflight_handshakes} "
+            f"(max {MAX_INFLIGHT_HANDSHAKES} — each slot is a live NoiseResponder "
+            "+ per-peer inbox; a larger pool is a memory-exhaustion footgun)"
+        )
+    if c.max_inflight_handshakes > WARN_INFLIGHT_HANDSHAKES:
+        log.warning(
+            "max_inflight_handshakes=%d is very high; each slot is a live "
+            "NoiseResponder + per-peer inbox. Values in the low tens are "
+            "ample for the single-admitted-session model.",
+            c.max_inflight_handshakes,
+        )
+
+
 def _validate_pmtu_interval(c: Config) -> None:
     # auto_mtu polling interval. Must be strictly positive (zero would
     # tight-loop in asyncio.wait_for) and within an hour. The lower bound
@@ -566,6 +596,7 @@ _VALIDATORS = (
     _validate_mtu,
     _validate_pmtu_interval,
     _validate_auto_mtu,
+    _validate_max_inflight_handshakes,
 )
 
 

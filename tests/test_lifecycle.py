@@ -296,11 +296,16 @@ class ServerReAccept(unittest.IsolatedAsyncioTestCase):
 
     @staticmethod
     def _patches(
-        handshake_side_effect: object,
+        accept_side_effect: object,
         run_data_loops_impl: object,
         captured_shutdown: dict,
     ) -> list:
         """Build the patch context managers shared by both tests.
+
+        ``accept_side_effect`` stands in for ``dsm.server._accept_until_winner``
+        (the UDP acceptor): it returns the ``(session_keys, client_pub,
+        transport)`` triple the re-accept loop consumes, so the LOOP control
+        flow is exercised without the per-attempt demux machinery.
 
         ``captured_shutdown`` is populated with the ``process_shutdown``
         event that ``setup_signal_handlers`` is called with, so the
@@ -410,9 +415,16 @@ class ServerReAccept(unittest.IsolatedAsyncioTestCase):
             patch("dsm.server.make_send_fn", return_value=_noop_send),
             patch("dsm.server.UDPTransport", _FakeUDPTransport),
             patch("dsm.server.setup_signal_handlers", _capture_signal_handlers),
+            # Repoint at the UDP acceptor (the re-accept-loop integration point)
+            # rather than the inner `server_handshake`: `_accept_until_winner`
+            # drives a demux that needs real datagrams fed through the socket,
+            # which this host-mocked harness never supplies — patching it
+            # exercises the loop CONTROL FLOW (re-accept on session-end, break
+            # on process_shutdown) without the demux machinery, exactly as
+            # test_server_malformed_frame.py patches `_accept_one_session`.
             patch(
-                "dsm.crypto.handshake.server_handshake",
-                side_effect=handshake_side_effect,
+                "dsm.server._accept_until_winner",
+                side_effect=accept_side_effect,
             ),
             patch("dsm.session.run_data_loops", side_effect=run_data_loops_impl),
         ]
@@ -424,13 +436,16 @@ class ServerReAccept(unittest.IsolatedAsyncioTestCase):
         from dsm.server import run_server
 
         captured: dict = {}
-        handshake_calls = {"n": 0}
+        accept_calls = {"n": 0}
         run_loops_calls = {"n": 0}
 
-        async def _handshake(*_a: object, **_k: object) -> tuple[object, bytes]:
-            handshake_calls["n"] += 1
-            # Distinct per session — proves fresh session_keys each accept.
-            return object(), bytes([handshake_calls["n"]]) * 32
+        async def _accept(*args: object, **_k: object) -> tuple[object, bytes, object]:
+            accept_calls["n"] += 1
+            # _accept_until_winner returns (session_keys, client_pub,
+            # transport). Hand back the same UDP transport it was given
+            # (args[5]) so the loop proceeds into _run_one_session, and a
+            # distinct client_pub per session — proving fresh keys each accept.
+            return object(), bytes([accept_calls["n"]]) * 32, args[5]
 
         async def _run_data_loops(*args: object, **_k: object) -> None:
             run_loops_calls["n"] += 1
@@ -447,14 +462,14 @@ class ServerReAccept(unittest.IsolatedAsyncioTestCase):
             # loop free to transition IDLE → CONNECTING.
             _drive_fsm_to_idle(args[4])
 
-        with _ExitStackPatches(self._patches(_handshake, _run_data_loops, captured)):
+        with _ExitStackPatches(self._patches(_accept, _run_data_loops, captured)):
             rc = await run_server(_server_config())
 
         self.assertEqual(
-            handshake_calls["n"],
+            accept_calls["n"],
             2,
-            "server_handshake must be called twice — the server re-accepted a "
-            "second client after the first session ended (this is the Part C "
+            "_accept_until_winner must be called twice — the server re-accepted "
+            "a second client after the first session ended (this is the Part C "
             "behaviour; the pre-C code calls it exactly once)",
         )
         self.assertEqual(run_loops_calls["n"], 2)
@@ -466,12 +481,14 @@ class ServerReAccept(unittest.IsolatedAsyncioTestCase):
         from dsm.server import run_server
 
         captured: dict = {}
-        handshake_calls = {"n": 0}
+        accept_calls = {"n": 0}
         run_loops_calls = {"n": 0}
 
-        async def _handshake(*_a: object, **_k: object) -> tuple[object, bytes]:
-            handshake_calls["n"] += 1
-            return object(), b"\xaa" * 32
+        async def _accept(*args: object, **_k: object) -> tuple[object, bytes, object]:
+            accept_calls["n"] += 1
+            # Return (session_keys, client_pub, transport) — the same UDP
+            # transport it was handed (args[5]) so the session proceeds.
+            return object(), b"\xaa" * 32, args[5]
 
         async def _run_data_loops(*args: object, **_k: object) -> None:
             run_loops_calls["n"] += 1
@@ -479,11 +496,11 @@ class ServerReAccept(unittest.IsolatedAsyncioTestCase):
             captured["event"].set()
             _drive_fsm_to_idle(args[4])
 
-        with _ExitStackPatches(self._patches(_handshake, _run_data_loops, captured)):
+        with _ExitStackPatches(self._patches(_accept, _run_data_loops, captured)):
             rc = await run_server(_server_config())
 
         self.assertEqual(
-            handshake_calls["n"],
+            accept_calls["n"],
             1,
             "process_shutdown during the first session must NOT re-accept",
         )
