@@ -11,9 +11,9 @@ from __future__ import annotations
 import socket
 
 # Canonical fwmark for the whole VPN. tunnel.py re-exports this as FWMARK;
-# the nftables templates (nftables/*.conf: `meta mark 0x1`) and the ip-rule
-# (`ip rule not fwmark 0x1`) hard-code the same literal and MUST be kept in
-# sync with this value.
+# the nftables templates (dsm/net/_templates/*.conf: `meta mark 0x1`) and the
+# ip-rule (`ip rule not fwmark 0x1`) hard-code the same literal and MUST be
+# kept in sync with this value.
 SO_MARK_VALUE = 0x1
 
 

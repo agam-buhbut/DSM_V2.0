@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.resources as _res
 import ipaddress
 import logging
 import subprocess
@@ -12,11 +13,11 @@ from dsm.core._validators import validate_tun_name
 
 log = logging.getLogger(__name__)
 
-TEMPLATE_PATH = Path(__file__).parent.parent.parent / "nftables" / "nftables.conf"
-SERVER_TEMPLATE_PATH = Path(__file__).parent.parent.parent / "nftables" / "server.conf"
-PRE_HANDSHAKE_TEMPLATE_PATH = (
-    Path(__file__).parent.parent.parent / "nftables" / "pre_handshake.conf"
-)
+
+def _load_template(name: str) -> str:
+    return (_res.files("dsm.net._templates") / name).read_text(encoding="utf-8")
+
+
 TCP_TIMESTAMPS_PATH = Path("/proc/sys/net/ipv4/tcp_timestamps")
 
 
@@ -148,7 +149,7 @@ class PreHandshakeKillSwitch:
 
     def _render(self) -> str:
         ip_proto = _ip_proto(self._server_ip)
-        template = PRE_HANDSHAKE_TEMPLATE_PATH.read_text()
+        template = _load_template("pre_handshake.conf")
         return (
             template.replace("{SERVER_IP}", self._server_ip)
             .replace("{SERVER_PORT}", str(int(self._server_port)))
@@ -215,7 +216,7 @@ class NFTablesManager:
         # IPv4 servers.
         ip_proto = _ip_proto(self._server_ip)
         validate_tun_name(self._tun_name)
-        template = TEMPLATE_PATH.read_text()
+        template = _load_template("nftables.conf")
         return (
             template.replace("{SERVER_IP}", self._server_ip)
             .replace("{SERVER_PORT}", str(int(self._server_port)))
@@ -261,7 +262,7 @@ class ServerRateLimitManager:
         netaudit.emit("nft_remove", tables=["dsm_server_ratelimit"])
 
     def _render(self) -> str:
-        return SERVER_TEMPLATE_PATH.read_text().replace(
+        return _load_template("server.conf").replace(
             "{SERVER_PORT}",
             str(int(self._listen_port)),
         )

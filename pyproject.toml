@@ -187,6 +187,9 @@ module-name = "tuncore"
 # explicitly ships ONLY `dsm/` plus the standalone `tuncore` extension — the
 # test suite is never packaged.
 python-packages = ["dsm"]
+# The nftables templates are runtime package data; list them explicitly so the
+# wheel and sdist keep shipping them.
+include = ["dsm/net/_templates/*.conf"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -366,7 +366,18 @@ def _phase_b(role: str, args: argparse.Namespace) -> int:
 
 
 def _install_unit() -> None:
+    # deploy/dsm.service exists only in a source checkout; a wheel-only
+    # install gets instructions instead of a FileNotFoundError.
     src = Path(__file__).resolve().parent.parent / "deploy" / "dsm.service"
+    if not src.is_file():
+        print(
+            "dsm.service not found at the expected location.\n"
+            "Copy it manually from the DSM release tarball to "
+            "/etc/systemd/system/dsm.service, then run:\n"
+            "  sudo systemctl daemon-reload && sudo systemctl enable --now dsm",
+            file=sys.stderr,
+        )
+        return
     dst = Path("/etc/systemd/system/dsm.service")
     shutil.copyfile(src, dst)
     Path("/etc/dsm").mkdir(parents=True, exist_ok=True)

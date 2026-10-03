@@ -27,8 +27,8 @@ from dsm.net._addresses import TUN_PREFIX_LEN
 # VPN fwmark to prevent routing loops. Single source of truth lives in the
 # transport layer (_fwmark.SO_MARK_VALUE) so the SO_MARK set on the socket and
 # the ip-rule / nftables match here cannot drift apart. The nftables templates
-# (nftables/*.conf: `meta mark 0x1`) hard-code the same literal and MUST stay
-# in sync with this value.
+# (dsm/net/_templates/*.conf: `meta mark 0x1`) hard-code the same literal and
+# MUST stay in sync with this value.
 from dsm.net.transport._fwmark import SO_MARK_VALUE as FWMARK
 
 log = logging.getLogger(__name__)
