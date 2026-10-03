@@ -525,7 +525,9 @@ crl_file           = "/opt/mtun/dsm_ca.crl"   # required by default (crl_strict=
 # Server-only: one allowed client subject CN per line, mode 0o600.
 allowed_cns_file   = "/opt/mtun/allowed_cns.txt"
 
-transport          = "udp"              # "tcp" also supported
+transport          = "udp"              # UDP recommended; use "tcp" only as fallback on
+                                        # networks that block/mangle UDP (TCP-in-TCP
+                                        # causes throughput collapse on TCP traffic)
 mtu                = 1400
 pmtu_discover      = false              # set true on real-WAN deploys
 log_level          = "info"
@@ -951,6 +953,12 @@ client reconnects, otherwise it will refuse the cert with
 
 Stop both sides, edit /opt/mtun/config.toml, restart. The TUN device
 is rebuilt on startup; cert auth is transport-independent.
+
+UDP (`transport = "udp"`) is the recommended default. It avoids the
+TCP-in-TCP throughput collapse that TCP transport causes when the
+tunneled traffic is itself TCP. Switch to `transport = "tcp"` only as a
+fallback on networks that block or aggressively mangle UDP (e.g.,
+restrictive firewalls, some mobile carriers).
 
 ### 7e. Refresh the CRL (and revoke a cert)
 

@@ -97,6 +97,10 @@ expected_server_cn = "dsm-1234abcd-server"
 # debug_dns = false                          # true logs plaintext qnames (privacy off)
 
 # Network
+# UDP is the recommended default. It avoids the TCP-in-TCP throughput collapse
+# that TCP transport suffers when carrying TCP traffic inside a TCP tunnel.
+# Use transport = "tcp" only as a fallback on networks that block or aggressively
+# mangle UDP (e.g., restrictive corporate firewalls, some mobile carriers).
 transport = "udp"                            # "udp" | "tcp"
 tun_name = "mtun0"
 log_level = "warning"                        # "debug" | "info" | "warning" | "error"
