@@ -256,18 +256,15 @@ def make_send_fn(  # pylint: disable=unused-argument  # `liveness` kept for call
         if isinstance(transport, UDPTransport):
             addr = dest_addr()
             if addr is None:
-                # Destination addr not yet known (the server has no
-                # peer addr until the first authenticated client packet sets
-                # it via post_authenticate). Raising here escapes the detached
-                # SendScheduler task and silently kills it — stopping ALL
-                # egress incl. chaff with no shutdown signal. Mirror the
-                # seq/nonce-exhaustion paths: log, trigger shutdown, drop.
-                log.error(
+                # The server learns the peer addr from the first authenticated
+                # client packet, and the chaff scheduler starts sending before
+                # that. Drop this packet and keep the session: unlike seq/nonce
+                # exhaustion, this resolves itself. Raising here would kill the
+                # detached SendScheduler task instead.
+                log.debug(
                     "UDP send before destination addr known — "
-                    "dropping packet and triggering shutdown"
+                    "dropping packet (transient, not fatal)"
                 )
-                if shutdown is not None:
-                    shutdown.set()
                 return
             await transport.send(wire, addr)
         else:

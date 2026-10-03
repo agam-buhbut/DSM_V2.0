@@ -744,13 +744,14 @@ class ServerPeerRoaming(unittest.IsolatedAsyncioTestCase):
         shutdown.set()
         await asyncio.wait_for(task, timeout=5.0)
 
-    async def test_reply_before_any_auth_triggers_shutdown_not_misroute(
+    async def test_reply_before_any_auth_drops_not_misroute(
         self,
     ) -> None:
         """Before ANY authenticated packet, the committed addr is None. A send
         attempt in that window must hit make_send_fn's 'addr not yet known'
-        guard (shutdown + drop), NOT pick a stale/attacker addr. This pins the
-        fail-closed behavior the roaming learning relies on."""
+        guard, which DROPS the packet (NOT misroute to a stale/attacker addr)
+        and lets the session continue (no shutdown). ``transport.sent == []``
+        pins the no-misroute property the roaming learning relies on."""
         _client_keys, server_keys = _bootstrap_pair()
         shutdown = asyncio.Event()
         transport = _ScriptedUDPTransport([])
@@ -765,9 +766,9 @@ class ServerPeerRoaming(unittest.IsolatedAsyncioTestCase):
 
         await send_fn(b"\x00" * 16, 52)
 
-        self.assertTrue(
+        self.assertFalse(
             shutdown.is_set(),
-            "send before addr known must trigger shutdown, not misroute",
+            "send before addr known must drop-and-wait, not shut down",
         )
         self.assertEqual(transport.sent, [], "no datagram may leave with no dest")
 

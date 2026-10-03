@@ -2,7 +2,7 @@
 
 Covers DSM-001 (a loop's terminal exception must not orphan its siblings —
 it sets shutdown and the whole session tears down cleanly) and DSM-002 part A
-(a UDP send with no destination addr must trigger shutdown, not raise into the
+(a UDP send with no destination addr must drop the packet, not raise into the
 detached scheduler task).
 
 All collaborators are faked at the I/O boundary so the tests are deterministic
@@ -172,8 +172,12 @@ class DataLoopContainment(unittest.IsolatedAsyncioTestCase):
 
 
 class UdpSendNoAddr(unittest.IsolatedAsyncioTestCase):
-    async def test_udp_send_without_addr_triggers_shutdown_not_raise(self) -> None:
-        """DSM-002 part A: addr=None must shut down, not raise into the loop."""
+    async def test_udp_send_without_addr_drops_no_shutdown_no_raise(self) -> None:
+        """addr=None must DROP the chaff packet and continue — neither raise
+        (which would kill the detached scheduler task) NOR shut the session
+        down. Shutting down killed every UDP session on a fast LAN: the chaff
+        scheduler fires before the client's first authenticated packet commits
+        the peer addr."""
         shutdown = asyncio.Event()
         transport = UDPTransport()  # unbound; we never reach the actual send
         send_fn = make_send_fn(
@@ -190,7 +194,10 @@ class UdpSendNoAddr(unittest.IsolatedAsyncioTestCase):
         payload = b"hello"
         await send_fn(payload, OUTER_HEADER_SIZE + len(payload))
 
-        self.assertTrue(shutdown.is_set())
+        self.assertFalse(
+            shutdown.is_set(),
+            "addr=None must drop-and-wait, not shut the session down",
+        )
 
 
 if __name__ == "__main__":

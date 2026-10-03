@@ -383,8 +383,9 @@ async def _run_one_session(
         # Envelope-driven (mirrors the client). The shaper's paced
         # wire budget decides how many packets leave per poll; should_chaff
         # is now only a GATE that suppresses chaff-fill until client_addr is
-        # known — otherwise the direct chaff send would hit make_send_fn's
-        # "destination addr not yet known" path and trigger shutdown.
+        # known — otherwise each chaff packet would burn a sequence number
+        # only to be dropped by make_send_fn's "destination addr not yet
+        # known" path.
         def _chaff_allowed() -> bool:
             return client_addr[0] is not None
 
