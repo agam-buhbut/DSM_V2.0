@@ -14,7 +14,23 @@ crate-type = ["cdylib", "rlib"]
 # are mutually exclusive at compile time (see the `compile_error!` guard in
 # device_attest.rs), so a wheel carries exactly one. Build the dev/test soft
 # wheel explicitly with `--no-default-features --features dev-soft-attest`.
-default = ["tpm-attest"]
+default = ["tpm-attest", "python-bindings"]
+# The PyO3 extension-module binding (`src/python.rs`). On by default so the
+# Python wheel build is unchanged. Turn it OFF (`--no-default-features`) to
+# compile the pyo3-free crypto/packet core for cross-compilation (e.g. Android).
+python-bindings = ["dep:pyo3"]
+# The UniFFI binding (`src/ffi.rs`) — exposes the SAME pyo3-free core
+# primitives to a native Android (Kotlin) client over UniFFI (proc-macro /
+# library mode, no UDL). Optional + OFF by default so neither the Python wheel
+# nor the bare pyo3-free cross-compile pulls uniffi. Owner-approved new
+# dependency (Phase A, Task A3).
+uniffi-bindings = ["dep:uniffi"]
+# Host-only helper feature: builds the `uniffi-bindgen` CLI binary used to
+# generate the Kotlin bindings from the compiled `.so`. Split from
+# `uniffi-bindings` so the shipping Android cdylib build does NOT pull the
+# clap-based CLI dependency tree into the `.so` (and so `cargo ndk` does not
+# try to cross-compile the host-only binary for the Android target).
+uniffi-cli = ["uniffi-bindings", "uniffi/cli"]
 # Software ECDSA P-256 attestation backend. Dev/CI/test only — keys are
 # extractable from process memory. Replaced by `tpm-attest` (Linux, the
 # default) and the Android Keystore JNI backend (Android) for production.
@@ -28,7 +44,7 @@ dev-soft-attest = ["dep:p256", "dep:rcgen"]
 tpm-attest = ["dep:tss-esapi", "dep:p256"]
 
 [dependencies]
-pyo3 = { version = "0.24", features = ["extension-module"] }
+pyo3 = { version = "0.24", features = ["extension-module"], optional = true }
 snow = "0.9"
 aes-gcm = { version = "0.10", features = ["zeroize"] }
 hkdf = "0.12"
@@ -53,6 +69,12 @@ rcgen = { version = "0.13", default-features = false, features = ["pem", "crypto
 # pregenerated bindings for x86_64-linux and links the system tss2-esys via
 # pkg-config — no bindgen/libclang at build time.
 tss-esapi = { version = "7.7.0", optional = true }
+# UniFFI Kotlin/Swift binding generator (gated by `uniffi-bindings`). Used in
+# proc-macro / library mode — NO UDL file and NO build.rs scaffolding step.
+# Only compiled for the Android FFI build; the Python wheel and the default
+# build never see it. Owner-approved (Phase A, Task A3); re-run `cargo audit`
+# on any version bump.
+uniffi = { version = "0.29", optional = true }
 
 [dev-dependencies]
 # Phase-5 perf baseline: criterion drives the AEAD floor benchmark
@@ -63,6 +85,14 @@ criterion = "0.5"
 [[bench]]
 name = "aead"
 harness = false
+
+# Host-only `uniffi-bindgen` CLI (library mode). Gated by `uniffi-cli` so it is
+# built ONLY when explicitly requested for binding generation — never by the
+# Android cdylib cross-compile, the Python wheel, or the default build.
+[[bin]]
+name = "uniffi-bindgen"
+path = "uniffi-bindgen.rs"
+required-features = ["uniffi-cli"]
 
 [profile.release]
 opt-level = 3

@@ -150,6 +150,21 @@ class Config:
     # soft-attest backend ignores it. The Rust side does the real parse — this
     # validator only catches an obviously-wrong family prefix.
     attest_tpm_tcti: str | None = None
+    # ── Mobile (Android Keystore) attestation profile — OPT-IN, default OFF ──
+    # Consumed by the CA-admission / enrollment mobile path
+    # (dsm.crypto.attest_android), NOT the daemon runtime. When False (the
+    # default) the android-keystore profile is never attempted, so existing
+    # TPM-only deployments are byte-for-byte unchanged. When True, a mobile
+    # device's Android Key Attestation chain is verified against the pinned
+    # Google hardware-attestation root before its CSR is admitted by the CA.
+    allow_android_keystore_attest: bool = False
+    # Pinned Google hardware-attestation root (PEM). Required when
+    # allow_android_keystore_attest is True (enforced at verify time, not here).
+    android_attest_root_file: str | None = None
+    # Minimum hardware security level required of the attested key:
+    # "strongbox" (default; dedicated secure element) or "tee"
+    # (TrustedEnvironment). Anything below this is rejected.
+    android_attest_min_security_level: Literal["tee", "strongbox"] = "strongbox"
     # TUN device MTU in bytes. Must satisfy MIN_TUN_MTU <= mtu <= MAX_TUN_MTU.
     # The wire-level path MTU budget is checked against this at startup.
     mtu: int = DEFAULT_TUN_MTU
@@ -406,6 +421,27 @@ def _validate_attest_tpm_tcti(c: Config) -> None:
         )
 
 
+def _validate_android_attest(c: Config) -> None:
+    # Format-only, mirroring _validate_attest_tpm_tcti: the authoritative
+    # consumer is the CA-admission mobile path (dsm.crypto.attest_android),
+    # which fail-closes (refuses when enabled but the pinned root is missing).
+    # The daemon runtime never reads these fields, so a non-mobile deployment
+    # is unaffected. Here we only catch obvious typos at config-load time.
+    if c.android_attest_min_security_level not in ("tee", "strongbox"):
+        raise ValueError(
+            "android_attest_min_security_level must be 'tee' or 'strongbox', "
+            f"got {c.android_attest_min_security_level!r}"
+        )
+    if c.android_attest_root_file is not None:
+        if not c.android_attest_root_file:
+            raise ValueError("android_attest_root_file must not be empty")
+        if not Path(c.android_attest_root_file).is_absolute():
+            raise ValueError(
+                "android_attest_root_file must be absolute, got "
+                f"{c.android_attest_root_file!r}"
+            )
+
+
 def _validate_role_specific(c: Config) -> None:
     if c.mode == "client":
         if not c.expected_server_cn:
@@ -568,6 +604,7 @@ _VALIDATORS = (
     _validate_cert_paths,
     _validate_ca_root_sha256,
     _validate_attest_tpm_tcti,
+    _validate_android_attest,
     _validate_role_specific,
     _validate_padding,
     _validate_jitter,

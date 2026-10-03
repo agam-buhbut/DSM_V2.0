@@ -29,3 +29,18 @@ backup/
 
 # isolated worktrees (Claude hardening/UX tracks)
 .worktrees/
+
+# Android cross-compile output (built by cargo-ndk at build time)
+rust/tuncore/jniLibs/
+
+# Android app (Gradle) build artifacts + generated/native inputs
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/captures/
+android/.kotlin/
+# cargo-ndk output consumed by the app (regenerated at build time)
+android/app/src/main/jniLibs/
+# UniFFI-generated Kotlin bindings (regenerated from the compiled .so)
+android/app/src/main/java/uniffi/

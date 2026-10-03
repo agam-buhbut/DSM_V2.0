@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">DSM</string>
+    <string name="action_connect">Connect</string>
+    <string name="status_idle">Idle</string>
+    <string name="status_connecting">Connecting…</string>
+    <string name="status_consent_denied">VPN consent denied</string>
+    <string name="status_not_provisioned">Not provisioned — run enroll first</string>
+</resources>
