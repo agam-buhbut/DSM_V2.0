@@ -44,6 +44,7 @@ class _IdleTun:
 
 class _FakeSessionKeys:
     epoch = 0
+    send_epoch = 0
 
     def needs_rotation(self) -> bool:
         return False
