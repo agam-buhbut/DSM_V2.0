@@ -44,10 +44,11 @@ reference are in the top-level `README.md`.
   7.  Common operator tasks
   8.  Single-host loopback smoke test
   9.  Two-box demo across two real ISPs
-  10. Debugging by symptom
-  11. Uninstall
-  12. File placement reference
-  13. CLI reference
+  10. Running over the internet (remote client)
+  11. Debugging by symptom
+  12. Uninstall
+  13. File placement reference
+  14. CLI reference
 
 ## 0. Prerequisites
 
@@ -627,7 +628,7 @@ confusing stack trace later:
 $ python3 -c "import tomllib; tomllib.load(open('/opt/mtun/config.toml','rb')); print('ok')"
 ```
 
-Must print "ok". If you instead see TOMLDecodeError, see §10's TOML
+Must print "ok". If you instead see TOMLDecodeError, see §11's TOML
 triage list for fixes.
 
 ### 3a.1 Fetch the DoH provider's SPKI pin
@@ -1422,7 +1423,123 @@ unit.
 - With --debug-net enabled: the JSON event stream from
   `sudo journalctl -u dsm -o cat | grep dsm.netaudit > /tmp/demo.jsonl`
 
-## 10. Debugging by Symptom
+## 10. Running Over the Internet (Remote Client)
+
+The real-world deployment: the SERVER sits on your home network behind a
+consumer router, and the CLIENT is somewhere else entirely — cellular
+data, hotel/cafe Wi-Fi, any foreign network behind NAT. The server is
+reachable by a stable dynamic-DNS name; the client dials that name.
+
+Almost nothing new is required. The server already binds all interfaces
+(0.0.0.0), NAT keepalives hold the router mapping open, and the client
+adapts to small cellular MTUs by itself. You need exactly three things: a
+router port-forward, a DDNS name, and three client config lines.
+
+This is the minimal get-it-working recipe. For the full end-to-end
+acceptance procedure (30-minute soak, leak drills, MTU-adaptation checks)
+see §9.
+
+### 10a. Server (home network): port-forward the router
+
+The server binds `0.0.0.0:<listen_port>` already — NO server config change
+is needed. You only have to expose that port through your home router.
+
+1. Note the server's `listen_port` (default 51820) and its LAN IP:
+
+   ```sh
+   $ ip -4 addr show | grep -w inet        # e.g. 192.168.1.3
+   ```
+
+2. In the router's admin page, add a port-forward rule:
+
+   ```
+   WAN 51820/udp  →  192.168.1.3:51820     # <server-LAN-IP>:<listen_port>
+   ```
+
+   If you also plan to use the TCP fallback (§10d), add a second rule for
+   `51820/tcp` to the same LAN IP.
+
+(Optional: §9b shows a one-line `nc` UDP listener you can hit from a phone
+to confirm the forward works before involving dsm.)
+
+### 10b. Dynamic DNS: give the home IP a stable name
+
+Home ISPs hand out a public IP that changes without warning. A free
+dynamic-DNS provider (e.g. duckdns.org, no-ip.com) gives you a stable name
+like `my-dsm.duckdns.org` that always tracks your current home IP.
+
+- Register a name with the provider.
+- Keep it pointed at your home IP: enable the provider's DDNS client in the
+  router, OR run the provider's small updater script on the server.
+- Confirm it resolves to your home's public IP (run at home):
+
+  ```sh
+  $ dig +short my-dsm.duckdns.org         # should equal: curl -s https://ifconfig.co
+  ```
+
+### 10c. Client: dial the DDNS name
+
+In the CLIENT's /opt/mtun/config.toml, point `server_ip` at the DDNS name
+and turn on the cellular-friendly MTU knobs:
+
+```toml
+server_ip     = "my-dsm.duckdns.org"   # DDNS hostname (resolved once at startup)
+server_port   = 51820                  # = the server's forwarded listen_port
+auto_mtu      = true                   # adapt TUN MTU to the path
+pmtu_discover = true                   # required by auto_mtu
+```
+
+`server_ip` takes either the DDNS hostname or a literal IPv4. A literal
+avoids the single startup hostname lookup (privacy-max — see §10f); the
+hostname is the convenient choice for a home server on a changing IP.
+`auto_mtu` + `pmtu_discover` matter on cellular, where the path MTU is
+small and oversized packets are often silently black-holed — the client
+tracks the kernel PMTU and lowers the TUN MTU to fit (the "auto_mtu:
+lowered tun mtu ..." line in §5).
+
+### 10d. UDP-blocked networks (some cellular / captive Wi-Fi)
+
+A few networks block outbound UDP except on port 443. If the UDP handshake
+never completes (the client logs "handshake recv timed out" — see §11),
+switch BOTH ends to the TCP transport:
+
+```toml
+transport = "tcp"
+```
+
+and add the matching `51820/tcp` port-forward on the router (§10a). TCP
+rides the same port number and survives more captive/proxy networks, at the
+cost of some TCP-over-TCP overhead.
+
+### 10e. Test from a phone (cellular, off your home Wi-Fi)
+
+The point is reachability from a foreign network, so test from one:
+
+1. On the client, **turn Wi-Fi off** and use cellular data — you must NOT be
+   on the home LAN, or you would be testing the local path, not the internet
+   path.
+2. Bring the tunnel up (§5) and wait for `tunnel established`.
+3. Confirm traffic exits via the SERVER, not the cellular carrier:
+
+   ```sh
+   $ curl -s https://ifconfig.me        # must print the SERVER's home public IP
+   $ dig @10.8.0.1 example.com +short   # DNS resolves through the tunnel
+   ```
+
+   If `ifconfig.me` shows your home public IP and a browser loads pages, the
+   remote path is live.
+
+### 10f. Security / privacy note
+
+With a DDNS hostname the client makes ONE cleartext DNS A-lookup at startup
+(before the kill switch installs) to turn the name into an IP — that lookup
+reveals the *hostname* to the local network. It is NOT a trust anchor: the
+server is still authenticated by Noise + the cert/CN pin, so a spoofed or
+poisoned DNS answer makes the handshake fail CLOSED rather than redirecting
+you to an attacker. Set `server_ip` to a literal IPv4 if you want to avoid
+even that single lookup.
+
+## 11. Debugging by Symptom
 
 `log_level = "debug"` turns on per-packet-class log lines — useful while
 reproducing a bug. Switch back to "info" for steady state.
@@ -1654,7 +1771,7 @@ $ sudo /usr/bin/python3 -m pip install --break-system-packages \
       "$(ls $PWD/rust/tuncore/target/wheels/dsm-0.1.0-*.whl | tail -1)"
 ```
 
-## 11. Uninstall
+## 12. Uninstall
 
 ```sh
 $ sudo systemctl disable --now dsm
@@ -1678,7 +1795,7 @@ $ for iface in $(ls /sys/class/net); do
   done
 ```
 
-## 12. File Placement Reference
+## 13. File Placement Reference
 
 ```
 /opt/mtun/config.toml                 # main config (both modes)
@@ -1695,7 +1812,7 @@ $ for iface in $(ls /sys/class/net); do
 /etc/systemd/system/dsm.service       # (optional) systemd unit
 ```
 
-## 13. CLI Reference
+## 14. CLI Reference
 
 ```
 python3 -m dsm --mode {client,server}            Run the VPN

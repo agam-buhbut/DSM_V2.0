@@ -3,6 +3,7 @@ from __future__ import annotations
 import ipaddress
 import logging
 import os
+import re
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -57,6 +58,19 @@ WARN_INFLIGHT_HANDSHAKES = 1024
 MIN_TUN_MTU = 576
 MAX_TUN_MTU = 1500
 DEFAULT_TUN_MTU = 1400
+
+# A single DNS label (RFC 1123): 1-63 chars, letters/digits/hyphen, no
+# leading or trailing hyphen.
+_HOSTNAME_LABEL = re.compile(r"^(?!-)[A-Za-z0-9-]{1,63}(?<!-)$")
+
+
+def _is_valid_hostname(name: str) -> bool:
+    """True if ``name`` is a syntactically valid DNS hostname (RFC 1123)."""
+    if not name or len(name) > 253:
+        return False
+    host = name[:-1] if name.endswith(".") else name  # tolerate trailing dot
+    labels = host.split(".")
+    return bool(labels) and all(_HOSTNAME_LABEL.match(label) for label in labels)
 
 
 @dataclass(frozen=True, slots=True)
@@ -236,25 +250,26 @@ def _validate_mode(c: Config) -> None:
 
 
 def _validate_server_ip(c: Config) -> None:
-    # server_ip must be a literal IP — the kill-switch nftables rules
-    # reference it with `ip daddr <addr>` which does not accept hostnames.
-    # Auto-resolution would change behavior depending on which resolver is
-    # up at config-load time (and would happen before the kill switch is
-    # installed, leaking the lookup), so we require an explicit IP.
+    # A literal IPv4, or a hostname (e.g. DDNS for a home server on a dynamic
+    # IP) that the client resolves once, before the kill switch is installed
+    # (client._resolve_server_endpoint). That lookup leaves in the clear and is
+    # not a trust anchor: the server is authenticated by Noise + cert/CN, so a
+    # spoofed answer fails the handshake instead of redirecting the client.
     try:
         addr = ipaddress.ip_address(c.server_ip)
-    except ValueError as e:
-        raise ValueError(
-            f"server_ip must be a literal IP, got {c.server_ip!r}. "
-            f"Resolve your hostname first: `dig +short <host> | head -1`"
-        ) from e
-    # Reject IPv6 until a v6 data path exists.
-    # The transport binds AF_INET only, so an IPv6 endpoint passes this
-    # literal check but is unusable downstream — fail loudly at config load.
+    except ValueError:
+        if not _is_valid_hostname(c.server_ip):
+            raise ValueError(
+                f"server_ip must be a literal IPv4 address or a valid DNS "
+                f"hostname, got {c.server_ip!r}"
+            ) from None
+        return
+    # The transport binds AF_INET only, so an IPv6 endpoint would pass the
+    # literal check but be unusable downstream.
     if addr.version == 6:
         raise ValueError(
             f"IPv6 server_ip {c.server_ip!r} is not supported (AF_INET-only "
-            "transport; configure disables IPv6). Use an IPv4 server endpoint."
+            "transport). Use an IPv4 address or a hostname with an A record."
         )
 
 

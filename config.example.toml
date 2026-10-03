@@ -15,7 +15,18 @@
 # (server) CN allowlist or (client) expected_server_cn. See deploy/GUIDE.md.
 
 mode = "client"                              # "client" | "server"
-server_ip = "203.0.113.1"                    # Server public IPv4 literal (not a hostname, not IPv6)
+server_ip = "203.0.113.1"                    # Server endpoint: literal IPv4 OR a DNS/DDNS hostname (see below)
+# server_ip accepts EITHER:
+#   * a literal IPv4 — privacy-max: NO pre-tunnel DNS lookup happens; or
+#   * a DNS / DDNS hostname (e.g. "my-dsm.duckdns.org") for a home server on a
+#     dynamic IP. The client resolves it ONCE to a single IPv4 at startup,
+#     BEFORE the kill switch installs. That is one cleartext A-lookup that
+#     reveals the hostname to the local network (the destination IP is exposed
+#     at the kill switch anyway). It is NOT a trust anchor: the server is
+#     authenticated by Noise + the cert/CN pin, so a spoofed DNS answer fails
+#     the handshake CLOSED rather than redirecting you to an attacker. IPv6
+#     literals are unsupported (AF_INET-only transport) — use an A-record
+#     hostname instead. See "Running over the internet" in deploy/GUIDE.md.
 server_port = 51820                          # Server's service port
 listen_port = 0                              # client: 0 = ephemeral; server: real bind port
 
@@ -110,6 +121,17 @@ mtu = 1400
 # pmtu_discover = false                      # Enable IP_MTU_DISCOVER (sets DF bit)
 # auto_mtu = false                           # Track kernel PMTU + adjust TUN MTU; recommend true for cellular/roaming
 # pmtu_check_interval_s = 30.0               # auto_mtu poll cadence (seconds)
+#
+# Remote / over-the-internet client (server behind a home router; client on
+# cellular or foreign Wi-Fi): point server_ip at your DDNS hostname (above) and
+# turn BOTH of these ON — cellular path MTUs are small and oversized packets are
+# often silently black-holed, so the client must adapt:
+#   auto_mtu      = true
+#   pmtu_discover = true                     # required by auto_mtu
+# If a network blocks non-443 UDP (some cellular / captive portals only allow
+# UDP/443), fall back to transport = "tcp" (and also forward <port>/tcp on the
+# router). At mtu = 1400 the on-wire datagram is ~1468 B, already inside a
+# 1492-byte PPPoE path. See "Running over the internet" in deploy/GUIDE.md.
 
 # Structured JSON audit stream on the dsm.netaudit logger. May also be enabled
 # with --debug-net. Note: enabling it on a shared log host re-exposes some

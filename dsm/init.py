@@ -394,7 +394,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--resume", action="store_true")
     p.add_argument("--force", action="store_true")
     p.add_argument("--install-dir", default="/opt/mtun")
-    p.add_argument("--server-ip")
+    p.add_argument(
+        "--server-ip",
+        help=(
+            "server endpoint: a literal IPv4 address, or a DDNS hostname for a "
+            "home server on a dynamic IP (resolved once at client startup)"
+        ),
+    )
     p.add_argument("--server-port", type=int)
     p.add_argument("--ca-root")
     p.add_argument("--dns-provider")

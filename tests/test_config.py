@@ -118,8 +118,21 @@ class TestConfigValidation(unittest.TestCase):
             Config(**_base(mode="invalid"))
 
     def test_invalid_server_ip(self) -> None:
+        # Neither a valid IPv4 literal nor a valid RFC-1123 hostname
+        # (underscore is not a legal hostname character).
         with self.assertRaises(ValueError):
-            Config(**_base(server_ip="not-an-ip"))
+            Config(**_base(server_ip="bad_host"))
+
+    def test_hostname_server_ip_accepted(self) -> None:
+        # DDNS hostname for a home server on a dynamic IP — resolved to a
+        # literal IPv4 at client startup (client._resolve_server_endpoint).
+        c = Config(**_base(server_ip="home.duckdns.org"))
+        self.assertEqual(c.server_ip, "home.duckdns.org")
+
+    def test_ipv6_server_ip_rejected(self) -> None:
+        # AF_INET-only transport: an IPv6 literal is rejected at config load.
+        with self.assertRaises(ValueError):
+            Config(**_base(server_ip="::1"))
 
     def test_server_port_zero_rejected(self) -> None:
         # server_port is the public service port, must be a real port

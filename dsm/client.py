@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import logging
+import socket
 from contextlib import AsyncExitStack
 
 from cryptography.x509.oid import ExtendedKeyUsageOID
@@ -43,6 +45,37 @@ from dsm.traffic.scheduler import SendScheduler
 from dsm.traffic.shaper import TrafficShaper, make_chaff_packet
 
 log = logging.getLogger(__name__)
+
+
+async def _resolve_server_endpoint(server_ip: str, server_port: int) -> str:
+    """Resolve the configured server endpoint to a single literal IPv4.
+
+    An IPv4 literal is returned unchanged with no network I/O. A hostname gets
+    one A-record lookup: the trailing dot stops ``resolv.conf`` search-domain
+    expansion (so only the hostname itself leaks), and the timeout keeps a
+    slow resolver from stalling startup or the SIGTERM handler. Raises
+    ``OSError`` if the name does not resolve in time.
+    """
+    try:
+        ipaddress.IPv4Address(server_ip)
+        return server_ip
+    except ipaddress.AddressValueError:
+        pass
+    loop = asyncio.get_running_loop()
+    query = server_ip if server_ip.endswith(".") else server_ip + "."
+    try:
+        infos = await asyncio.wait_for(
+            loop.getaddrinfo(
+                query, server_port, family=socket.AF_INET, type=socket.SOCK_DGRAM
+            ),
+            timeout=10.0,
+        )
+    except TimeoutError as e:
+        raise OSError(f"timed out resolving server hostname {server_ip!r}") from e
+    if not infos:
+        raise OSError(f"could not resolve server hostname {server_ip!r}")
+    # An AF_INET sockaddr is (host, port); the host is already a str.
+    return str(infos[0][4][0])
 
 
 def _emit_handshake_failure(err: Exception) -> None:
@@ -105,6 +138,24 @@ async def run_client(
         shutdown = asyncio.Event()
         setup_signal_handlers(shutdown)
 
+        # The kill-switch rules need a literal address, so a hostname is
+        # resolved and pinned here, before the kill switch goes up. This one
+        # cleartext lookup is accepted; see config._validate_server_ip.
+        try:
+            server_ip = await _resolve_server_endpoint(
+                config.server_ip, config.server_port
+            )
+        except OSError as e:
+            log.error(
+                "could not resolve server endpoint %r: %s — refusing to "
+                "start (fail-closed)",
+                config.server_ip,
+                e,
+            )
+            return 1
+        if server_ip != config.server_ip:
+            log.info("resolved server hostname %s -> %s", config.server_ip, server_ip)
+
         # Pre-handshake kill switch: applied BEFORE the (possibly interactive)
         # passphrase read + key unlock below, so the host is fail-closed for
         # the ENTIRE startup window — not just from socket bind onward. A slow
@@ -113,7 +164,7 @@ async def run_client(
         # server endpoint; upgraded atomically to the full kill switch (which
         # also covers the TUN interface and DNS leaks) by NFTablesManager
         # .apply() below, once the TUN is up.
-        pre_killswitch = PreHandshakeKillSwitch(config.server_ip, config.server_port)
+        pre_killswitch = PreHandshakeKillSwitch(server_ip, config.server_port)
         try:
             pre_killswitch.apply()
         except OSError as e:
@@ -187,10 +238,10 @@ async def run_client(
             )
         else:
             transport = TCPTransport()
-            await transport.connect(config.server_ip, config.server_port)
+            await transport.connect(server_ip, config.server_port)
         stack.push_async_callback(transport.aclose)
 
-        server_addr = (config.server_ip, config.server_port)
+        server_addr = (server_ip, config.server_port)
 
         fsm.transition(State.CONNECTING)
         fsm.transition(State.HANDSHAKING)
@@ -279,7 +330,7 @@ async def run_client(
         tun.open()
         try:
             tun.configure(mtu=config.mtu)
-            nft = NFTablesManager(config.server_ip, config.server_port, config.tun_name)
+            nft = NFTablesManager(server_ip, config.server_port, config.tun_name)
             nft.apply()
             try:
                 resolv = ResolvConfManager(nameserver=SERVER_TUN_IP)

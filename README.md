@@ -381,10 +381,11 @@ protection live in Rust behind PyO3.
 ### Parameters
 
 - mode: client | server
-- server_ip: literal IPv4 address ONLY (hostnames and IPv6 are rejected;
-  the transport uses AF_INET and the kill-switch nftables rules cannot
-  resolve names. Run `dig +short A <host> | head -1` and put the result
-  here)
+- server_ip: a literal IPv4 address, or a DNS hostname (e.g. a DDNS name
+  for a home server) that the client resolves once at startup, before the
+  kill switch is installed. That one lookup is sent in the clear; use a
+  literal address to avoid it. IPv6 is rejected (the transport is
+  AF_INET-only).
 - server_port, listen_port
 - key_file: path to Argon2id-wrapped X25519 Noise static key
 - cert_file: path to the device's CA-signed leaf cert (PEM or DER)
