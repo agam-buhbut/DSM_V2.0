@@ -25,7 +25,7 @@ from dsm.crypto.cert_allowlist import CNAllowlist, CNAllowlistError
 from dsm.crypto.keystore import KeyStore
 from dsm.net._addresses import SERVER_TUN_IP
 from dsm.net.dns import DNSResolver
-from dsm.net.dns_proxy import LocalDNSProxy
+from dsm.net.dns_proxy import DNSProxyPortInUseError, LocalDNSProxy
 from dsm.net.forwarding import IPForwardingManager, MasqueradeManager
 from dsm.net.handshake_acceptor import (
     _accept_until_winner,  # pyright: ignore[reportPrivateUsage]
@@ -717,6 +717,16 @@ async def run_server(
                     transport_obj,
                     process_shutdown,
                 )
+            except DNSProxyPortInUseError as e:
+                # A host resolver holds :53. Retrying cannot fix that and would
+                # loop on the same bind error, so exit with a clear message.
+                log.error(
+                    "FATAL: DNS proxy port conflict — %s. "
+                    "Stop the host resolver or change the TUN address, "
+                    "then restart dsm.",
+                    e,
+                )
+                return 1
             except Exception:
                 # A per-session host-setup failure (TUN open/configure, DNS-proxy
                 # bind, forwarding sysctls) previously propagated out of this

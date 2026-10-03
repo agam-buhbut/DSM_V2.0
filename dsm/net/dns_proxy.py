@@ -13,6 +13,7 @@ instead of a timeout).
 from __future__ import annotations
 
 import asyncio
+import errno
 import ipaddress
 import logging
 import time
@@ -34,6 +35,10 @@ from dsm.net.dns import DNSResolver, DnsResult
 log = logging.getLogger(__name__)
 
 DEFAULT_CACHED_TTL = 60
+
+
+class DNSProxyPortInUseError(OSError):
+    """The DNS-proxy bind address is already held by another process."""
 
 
 class LocalDNSProxy:
@@ -102,11 +107,21 @@ class LocalDNSProxy:
 
     async def start(self) -> None:
         loop = asyncio.get_running_loop()
-        transport, _proto = await loop.create_datagram_endpoint(
-            lambda: _ProxyProtocol(self),
-            local_addr=(self._bind_ip, self._bind_port),
-            reuse_port=False,
-        )
+        try:
+            transport, _proto = await loop.create_datagram_endpoint(
+                lambda: _ProxyProtocol(self),
+                local_addr=(self._bind_ip, self._bind_port),
+                reuse_port=False,
+            )
+        except OSError as e:
+            if e.errno == errno.EADDRINUSE:
+                raise DNSProxyPortInUseError(
+                    f"DNS proxy cannot bind {self._bind_ip}:{self._bind_port} — "
+                    f"another resolver (unbound / systemd-resolved / dnsmasq) is "
+                    f"already bound there. Stop the host resolver, or change the "
+                    f"TUN address."
+                ) from e
+            raise
         self._transport = transport  # type: ignore[assignment]
         # M-NET-2: mark the DNS-proxy socket with SO_MARK so any reply
         # we send out chooses the route by the marked policy rather than
