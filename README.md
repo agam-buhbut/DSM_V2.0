@@ -290,11 +290,13 @@ a few fixed steps, called tiers. By default the tiers are 10, 50, 200 and
 800 packets per second, and the lowest one is the idle pace. Your real
 packets take free places in this flow, and fake packets (called chaff) fill
 the rest. A real packet takes the next free place; DSM adds no other wait.
-If even the top tier is full, real packets wait in a queue of up to 512
-packets; when the queue is full, the oldest packet is dropped. Control
-messages, such as the reply that confirms a key change or the check the
-server sends when your address changes, also take normal free places. Only
-the goodbye message at shutdown goes straight out.
+At every tier, real packets wait in a queue until a free place comes. The
+queue holds up to 512 packets; when it is full, the oldest packet is
+dropped. That can happen at any tier, for example when a big burst comes in
+before the pace has stepped up. Control messages, such as the reply that
+confirms a key change or the check the server sends when your address
+changes, also take normal free places. Only the goodbye message at shutdown
+goes straight out.
 
 **Going up and coming down.** Apart from decoys (below), DSM moves up a
 tier only when your real packets have waited too long: by default, a
@@ -344,7 +346,7 @@ traffic):
 | Connected all day, about 20 bursts of real use | about 6 GB a day |
 | Each decoy | about 0.2 GB (the climb, the busy stretch, the slow step-down and the wait before idle) |
 | After using the top tier | the top tier for 1 to 5 minutes, then a few minutes per lower tier, then 5 to 30 minutes at tier 1 (about 0.15 GB) |
-| Top speed | about 7 to 10 Mbit/s |
+| Top speed | about 3.6 to 5.4 Mbit/s at the default `mtu = 1400`: one DSM packet carries at most 1360 bytes, so each full-size packet is split in two. About 7 to 10 Mbit/s with `mtu` at 1360 or less |
 | When a burst starts | about 0.5 to 1.5 seconds of extra wait while the pace steps up |
 
 **What it hides** from someone watching the link between you and your
@@ -551,7 +553,9 @@ The config file is TOML, at `/opt/mtun/config.toml`.
   MTU, in seconds (default: 30, allowed (0, 3600]).
 - log_level: debug | info | warning | error (default: info). See Logging
   below.
-- padding_min, padding_max: padding range (default: 128-1400)
+- padding_min, padding_max: padding range (default: 128-1400). A narrow
+  range leaves fewer sizes, and a real packet too big for every size left
+  is sent at its exact size (see Padding above).
 - shaper_tiers_pps: the tier rates in packets per second, lowest first
   (default: [10, 50, 200, 800]; 2 to 8 entries, each 1 to 5000, each higher
   than the one before). The first one is the idle rate. It must be above

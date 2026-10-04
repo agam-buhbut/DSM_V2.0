@@ -1673,15 +1673,17 @@ or prctl(PR_SET_DUMPABLE) didn't stick. Usually one of:
   `auto_mtu = true` + `pmtu_discover = true` on the client.
 - The tier shaper adds wait by design. When a burst starts, packets
   wait about 0.5 to 1.5 seconds while the rate steps up, and with the
-  defaults the top tier caps speed at about 7 to 10 Mbit/s. For a
-  faster smoke test that hides less, lower `shaper_latency_budget_ms`
-  and raise `shaper_tiers_pps` in both configs. A lower budget needs a
-  faster first tier: it must stay above 4.25 divided by the budget in
-  seconds. On a slow link, lowering padding_max also cuts the padding
-  bytes. Do that for a quick test only, because it hides much less: a
-  real packet too big for the largest allowed size is sent at its exact
-  size, which no fake packet ever has, and that size shows how big the
-  packet really is.
+  defaults the top tier caps speed at about 3.6 to 5.4 Mbit/s. One DSM
+  packet carries at most 1360 bytes, so at the default `mtu = 1400` each
+  full-size packet is split in two; with `mtu` at 1360 or less the cap is
+  about 7 to 10 Mbit/s. For a faster smoke test that hides less, lower
+  `shaper_latency_budget_ms` and raise `shaper_tiers_pps` in both configs.
+  A lower budget needs a faster first tier: it must stay above 4.25
+  divided by the budget in seconds. On a slow link, lowering padding_max
+  also cuts the padding bytes. Do that for a quick test only, because it
+  hides much less: a real packet too big for the largest allowed size is
+  sent at its exact size, which no fake packet ever has, and that size
+  shows how big the packet really is.
 
 ### "rekey giving up after 9 retries — tearing down"
 

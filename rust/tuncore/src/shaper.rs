@@ -2,12 +2,13 @@
 //!
 //! Packets leave at a steady rate that only changes in a few fixed steps
 //! ("tiers"). Real packets take free slots; the caller fills the rest with
-//! chaff. The rate steps up only when real packets have waited past a random
-//! point inside the latency budget, and steps down slowly (holds of about
-//! 1-5 minutes, a usage check, an optional linger before idle). Decoys are
-//! fake backlogs: they climb to a target tier through the exact same step-up
-//! path, then hold a fake busy stretch. Each session draws its own secret
-//! timing values and draws them again now and then.
+//! chaff. Apart from decoys, the rate steps up only when real packets have
+//! waited past a random point inside the latency budget, and steps down
+//! slowly (holds of about 1-5 minutes, a usage check, an optional linger
+//! before idle). Decoys are fake backlogs: they climb to a target tier
+//! through the exact same step-up path, then hold a fake busy stretch. Each
+//! session draws its own secret timing values and draws them again now and
+//! then.
 //!
 //! Plain Rust with no Python types; the PyO3 wrapper lives in `lib.rs`.
 //! Secret values have no getters and never appear in `Debug` output.

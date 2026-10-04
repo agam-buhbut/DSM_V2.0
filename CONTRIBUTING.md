@@ -61,8 +61,10 @@ install, use `maturin build --release …` (the wheel lands under
 pytest tests/ -q
 ```
 
-Tests that need the `tuncore` extension are skipped (not failed) if it is
-not built, so build it first (see above) for full coverage.
+The suite needs the built `tuncore` extension, so build it first (see
+above). The size list lives in Rust, so `dsm.core.protocol`, and every test
+module that uses it, fails to import without it: pytest then stops with
+collection errors and runs no tests.
 
 ### Software-TPM lane (swtpm)
 

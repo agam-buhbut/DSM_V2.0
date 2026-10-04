@@ -300,7 +300,7 @@ class RecvLoopShutdownInterrupt(unittest.IsolatedAsyncioTestCase):
         Mirrors the minimal-context construction in
         test_data_path_integration.py::test_rekey_retry_scheduler_fires_on_timeout
         (a capturing-or-real send_fn, a SilentMockTun, an ESTABLISHED FSM,
-        and zero-jitter no-chaff scheduler).
+        and a no-chaff scheduler on the SendRightAway stand-in).
         """
         from dsm.core.fsm import SessionFSM, State
         from dsm.core.protocol import ReassemblyBuffer

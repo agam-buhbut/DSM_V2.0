@@ -108,8 +108,9 @@ jobs:
         # RUSTSEC-2026-0176 (OOB read in PyList/PyTuple `nth`/`nth_back`) and
         # RUSTSEC-2026-0177 (missing Sync bound on `PyCFunction::new_closure`)
         # both require pyo3 >= 0.29 (a breaking 0.24 -> 0.29 jump for the FFI
-        # crypto core). DSM uses NEITHER affected API: the FFI passes PyBytes,
-        # never PyList/PyTuple nth-iteration nor raw closures. Ignored here with
+        # crypto core). DSM uses NEITHER affected API: the FFI passes bytes,
+        # lists and tuples, but never iterates a PyList/PyTuple with
+        # nth/nth_back and never builds raw closures. Ignored here with
         # this justification; the pyo3 0.24 -> 0.29 upgrade is tracked as a
         # dedicated dependency-maintenance pass (with full FFI re-test).
         run: >

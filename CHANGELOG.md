@@ -43,8 +43,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stops at startup with a message that names the new keys.
 - **Breaking:** `jitter_ms_min` and `jitter_ms_max`. A config that still has
   them stops at startup with a clear message.
-- The send loop's mode without the tier shaper, so nothing can send
-  unshaped traffic by mistake.
+- The send loop's mode without the tier shaper, so the send loop cannot
+  send unshaped traffic by mistake.
 
 ### Security
 - A malformed or truncated TCP frame from an unauthenticated peer (oversized
