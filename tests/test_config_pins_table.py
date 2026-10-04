@@ -74,7 +74,8 @@ def test_setting_under_the_pins_table_is_refused(tmp_path: Path) -> None:
     assert str(excinfo.value) == (
         "dns_provider_pins has entries that are not in dns_providers: "
         "'shaper_tiers_pps'. If any of them is a setting, move it above the "
-        "[dns_provider_pins] section."
+        "[dns_provider_pins] section; otherwise add the provider to "
+        "dns_providers or remove the pin (names must match exactly)."
     )
 
 
@@ -137,14 +138,30 @@ def test_a_pin_for_every_listed_provider_is_accepted() -> None:
     assert set(config.dns_provider_pins) == {_PROVIDER, _OTHER_PROVIDER}
 
 
-def test_a_pin_for_a_provider_that_is_not_listed_is_refused() -> None:
-    # A typo in the pin's key leaves the provider unpinned and the pin unused.
-    pins = {_PROVIDER: [_PIN], _PROVIDER + "/": [_PIN]}
+def test_a_spare_pin_is_refused_with_a_hint_for_a_pin() -> None:
+    pins = {_PROVIDER: [_PIN], _OTHER_PROVIDER: [_PIN]}
 
     with pytest.raises(ValueError) as excinfo:
         Config(**_server(dns_provider_pins=pins))
 
-    assert f"'{_PROVIDER}/'" in str(excinfo.value)
+    message = str(excinfo.value)
+    assert f"'{_OTHER_PROVIDER}'" in message
+    assert "add the provider to dns_providers or remove the pin" in message
+    assert "names must match exactly" in message
+
+
+def test_a_mistyped_pin_name_is_named_not_reported_as_a_missing_pin() -> None:
+    # The provider has no pin under its own name, and the mistyped entry is
+    # not a provider. The message names the entry and says how to fix it.
+    pins = {_PROVIDER + "/": [_PIN]}
+
+    with pytest.raises(ValueError) as excinfo:
+        Config(**_server(dns_provider_pins=pins))
+
+    message = str(excinfo.value)
+    assert f"'{_PROVIDER}/'" in message
+    assert "names must match exactly" in message
+    assert "requires dns_provider_pins entry" not in message
 
 
 def test_pins_without_any_listed_provider_are_refused_in_client_mode() -> None:
