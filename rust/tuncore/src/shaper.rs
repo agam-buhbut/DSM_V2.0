@@ -26,6 +26,10 @@ pub const SIZE_CLASS_WEIGHTS: [u16; 11] = [20, 15, 12, 10, 8, 7, 6, 6, 5, 6, 5];
 pub const CHAFF_PERTURB_UP_P: f64 = 0.15;
 /// Chaff sizing: a draw from `CHAFF_PERTURB_UP_P` up to this moves it one down.
 pub const CHAFF_PERTURB_DOWN_P: f64 = 0.30;
+/// How far from zero a clock value (s) may be: one billion seconds, about
+/// 31 years of uptime. Far below where float rounding would stall the slot
+/// loop, even at the fastest allowed tier (5000 packets/s).
+pub const MAX_CLOCK_S: f64 = 1.0e9;
 
 const LARGEST_CLASS: u16 = SIZE_CLASSES[SIZE_CLASSES.len() - 1];
 /// Bytes a padded packet needs beyond its payload: outer header (20) +
@@ -113,7 +117,8 @@ impl ShaperConfig {
 }
 
 /// Why [`Shaper::new`] refused to start: a [`ShaperConfig`] rule was broken,
-/// or (`Clock`) the start time was not a finite number.
+/// or (`Clock`) the start time was not a finite number or was more than
+/// [`MAX_CLOCK_S`] from zero.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShaperError {
     Tiers,
@@ -134,7 +139,7 @@ impl fmt::Display for ShaperError {
             Self::DecoyInterval => "decoy_interval_s must be 0 (off) or 300-86400",
             Self::Linger => "linger_s must be (0, 0) (off) or 0 < min <= max <= 7200",
             Self::Padding => "padding_min must not exceed padding_max",
-            Self::Clock => "now must be a finite number of seconds",
+            Self::Clock => "now must be a number of seconds between minus and plus one billion",
         })
     }
 }
@@ -197,6 +202,12 @@ fn class_weight(class: u16) -> f64 {
         .map_or(1.0, |i| f64::from(SIZE_CLASS_WEIGHTS[i]))
 }
 
+/// A clock value the shaper can use: at most [`MAX_CLOCK_S`] from zero.
+/// NaN and both infinities fail this test too.
+fn clock_ok(now: f64) -> bool {
+    now.abs() <= MAX_CLOCK_S
+}
+
 /// The one class to use when the padding range holds no size class: the
 /// smallest class at or above `padding_min`, else the largest class.
 fn fallback_class(padding_min: u16) -> u16 {
@@ -245,15 +256,15 @@ impl<R> fmt::Debug for Shaper<R> {
 }
 
 impl<R: RngCore + CryptoRng> Shaper<R> {
-    /// Start a session at `now`: seconds on one monotonic clock. Use that
-    /// same clock for every later call.
+    /// Start a session at `now`: seconds on one monotonic clock, at most
+    /// [`MAX_CLOCK_S`] from zero. Use that same clock for every later call.
     ///
     /// # Errors
     /// Returns [`ShaperError`] when `cfg` breaks a config rule, or when `now`
-    /// is not a finite number.
+    /// is not a finite number or is more than [`MAX_CLOCK_S`] from zero.
     pub fn new(cfg: ShaperConfig, mut rng: R, now: f64) -> Result<Self, ShaperError> {
         cfg.validate()?;
-        if !now.is_finite() {
+        if !clock_ok(now) {
             return Err(ShaperError::Clock);
         }
         let mut seed = <StdRng as SeedableRng>::Seed::default();
@@ -294,14 +305,15 @@ impl<R: RngCore + CryptoRng> Shaper<R> {
     /// to poll again.
     ///
     /// `now` is seconds on the same monotonic clock as in `Shaper::new`. A
-    /// `now` that is earlier than the last poll's, or not a finite number,
-    /// counts as the last poll's time: no time passes.
+    /// `now` that is earlier than the last poll's, not a finite number, or
+    /// more than [`MAX_CLOCK_S`] from zero counts as the last poll's time:
+    /// no time passes.
     ///
     /// `queue_len` is the number of real packets waiting, `oldest_wait` how
     /// long (s) the oldest sendable one has waited (0 if none), and
     /// `real_sent` how many real packets the caller sent since the last poll.
     pub fn poll(&mut self, now: f64, queue_len: usize, oldest_wait: f64, real_sent: u32) -> Poll {
-        let now = if now.is_finite() {
+        let now = if clock_ok(now) {
             now.max(self.last_now)
         } else {
             self.last_now
@@ -918,6 +930,43 @@ mod tests {
             assert_eq!(s.tier, 0, "stepped up on a wait of {bad}");
             assert!(poll.next_wake.is_finite() && poll.next_wake >= now);
         }
+    }
+
+    /// A clock value more than `MAX_CLOCK_S` from zero (say nanoseconds
+    /// passed as seconds) is refused at the start and counts as no time
+    /// passing in a poll, so float rounding can never stall the slot loop.
+    #[test]
+    fn a_clock_value_beyond_the_bound_is_refused_or_ignored() {
+        for bad in [1.0e10, -1.0e10] {
+            let got = Shaper::new(cfg(), StdRng::seed_from_u64(0), bad);
+            assert!(matches!(got, Err(ShaperError::Clock)), "started at {bad}");
+        }
+        for edge in [MAX_CLOCK_S, -MAX_CLOCK_S] {
+            let got = Shaper::new(cfg(), StdRng::seed_from_u64(0), edge);
+            assert!(got.is_ok(), "refused a start at {edge}");
+        }
+        // A twin that never sees the bad polls must keep giving the same
+        // answers.
+        let mut s = shaper(cfg(), 53);
+        let mut twin = shaper(cfg(), 53);
+        let at = T0 + 1.0;
+        assert_eq!(s.poll(at, 0, 0.0, 0), twin.poll(at, 0, 0.0, 0));
+        for bad in [1.0e10, -1.0e10] {
+            let poll = s.poll(bad, 0, 0.0, 0);
+            assert_eq!(poll.slots_due, 0, "time passed at {bad}");
+            assert_eq!(
+                s.last_now.to_bits(),
+                at.to_bits(),
+                "the clock moved at {bad}"
+            );
+        }
+        let later = T0 + 2.0;
+        let got = s.poll(later, 0, 0.0, 0);
+        assert_eq!(got, twin.poll(later, 0, 0.0, 0));
+        assert!(
+            got.slots_due > 0 && got.next_wake > later,
+            "the shaper got stuck"
+        );
     }
 
     #[test]
