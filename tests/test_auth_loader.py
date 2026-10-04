@@ -148,6 +148,7 @@ class _MaterialsFixture:
             ca_root_sha256=ca_root_sha256,
             crl_file=crl_file,
             crl_strict=crl_strict,
+            config_dir=self.dir,
         )
 
     def cleanup(self) -> None:
