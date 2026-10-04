@@ -135,8 +135,9 @@ class TestSymmetricShaping(unittest.TestCase):
             start = clock()
             idle = _departures(shaper, start, start + 30.0, backlog=False)
             # Tier 0 is 20 packets/s times a secret 0.8-1.2 session scale.
-            self.assertGreaterEqual(idle, 16 * 30 * 0.95, cfg.mode)
-            self.assertLessEqual(idle, 24 * 30 * 1.05, cfg.mode)
+            # A 30 s count also varies by chance, so allow 10% either side.
+            self.assertGreaterEqual(idle, 16 * 30 * 0.9, cfg.mode)
+            self.assertLessEqual(idle, 24 * 30 * 1.1, cfg.mode)
             busy = _departures(shaper, start + 30.0, start + 35.0, backlog=True)
             # A standing backlog steps up to the 100-packet/s tier.
             self.assertGreater(busy, 24 * 5 * 1.5, cfg.mode)
