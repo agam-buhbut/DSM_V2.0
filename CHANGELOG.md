@@ -77,6 +77,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   example it is already in use), the server exits with a one-line error.
   Other accept errors are retried after the usual backoff.
 - CI no longer tries to install the nonexistent `types-dnspython` package.
+- Warnings that can fire once per packet (a full send or receive queue, a
+  failed send, an unexpected error in the send loop, a UDP socket error) no
+  longer flood the log: each is logged once, then at most once every 10
+  seconds with a count.
+- A huge number in `shaper_tiers_pps` or `shaper_linger_s` stops startup
+  with the usual one-line config error naming the key, not a traceback.
 
 ### Added
 - `server_ip` may be a DNS hostname (e.g. DDNS for a home server); the

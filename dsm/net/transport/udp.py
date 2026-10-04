@@ -254,16 +254,18 @@ class _UDPProtocol(asyncio.DatagramProtocol):
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._queue = queue
-        # When the peer is unreachable, every send comes back as an error, at
-        # the shaper's packet rate: log the first, then at most one line per
-        # 10 s with a count.
+        # Both can repeat once per packet (when the peer is unreachable, every
+        # send comes back as an error): log the first, then at most one line
+        # per 10 s with a count.
         self._error_log = RepeatLog(log, logging.ERROR, clock=clock)
+        self._drop_log = RepeatLog(log, logging.WARNING, clock=clock)
 
     def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
         try:
             self._queue.put_nowait((data, addr))
         except asyncio.QueueFull:
-            log.warning("recv queue full, dropping packet from %s", addr)
+            # No sender address: it would only add a peer's IP to the log.
+            self._drop_log.log("recv queue full, dropping incoming packet")
 
     def error_received(self, exc: Exception) -> None:
         self._error_log.log("UDP error: %s", exc)

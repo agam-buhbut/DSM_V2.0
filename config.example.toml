@@ -163,8 +163,8 @@ padding_max = 1400
 #     per lower tier, then 5-30 minutes at tier 1 (about 0.15 GB)
 #   * top speed (800 packets/s at the default top tier): about 3.6-5.4
 #     Mbit/s at the default mtu = 1400, because one DSM packet carries at most
-#     1360 bytes and each full-size packet is split in two; about 7-10 Mbit/s
-#     with mtu at 1360 or less
+#     1360 bytes and each full-size packet is split in two; up to about 7-10
+#     Mbit/s with mtu at 1360 (less for a smaller mtu)
 #   * when a burst starts: about 0.5-1.5 s of extra wait while it steps up
 #
 # Rates in packets per second, lowest first: 2-8 entries, each 1-5000, each

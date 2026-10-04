@@ -42,9 +42,14 @@ class RepeatLog:
         self._last_line: float | None = None
         self._skipped = 0
 
-    def log(self, msg: str, *args: object) -> None:
+    def log(self, msg: str, *args: object, exc_info: bool = False) -> None:
         """Log ``msg % args`` now, or count it if a line went out less than
-        ``interval_s`` ago."""
+        ``interval_s`` ago.
+
+        With ``exc_info``, a line about a single event carries the current
+        exception's traceback; a line with a count does not, so a repeating
+        error prints its traceback once.
+        """
         now = self._clock()
         last = self._last_line
         if last is not None and now - last < self._interval_s:
@@ -59,7 +64,7 @@ class RepeatLog:
                 now - last,
             )
         else:
-            self._logger.log(self._level, msg, *args)
+            self._logger.log(self._level, msg, *args, exc_info=exc_info)
         self._last_line = now
         self._skipped = 0
 

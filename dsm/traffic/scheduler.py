@@ -4,8 +4,9 @@ The tier shaper decides when packets leave. Each wake the loop polls the
 shaper, sends ``slots_due`` packets (queued real packets first, chaff for the
 rest) and sleeps until the shaper's ``next_wake``. Queuing a packet never
 wakes the loop early, so send times never move toward real-packet arrivals.
-A queued packet may take the very next slot. There is no mode without a
-shaper, so nothing can leave unshaped by mistake.
+A queued packet may take the very next slot. The send loop has no mode
+without a shaper, so it cannot send unshaped traffic by mistake (the
+SESSION_CLOSE at teardown goes out directly, by design).
 
 Packets queued at the same moment leave in the order they were queued.
 """
@@ -94,7 +95,7 @@ class SendScheduler:
         # A full queue and a failing send can repeat once per packet: log
         # the first, then at most one line per 10 s with a count.
         self._drop_log = RepeatLog(log, logging.WARNING, clock=clock)
-        self._failure_logs: dict[tuple[str, str], RepeatLog] = {}
+        self._failure_logs: dict[tuple[str, type[BaseException]], RepeatLog] = {}
 
     def enqueue(
         self,
@@ -142,29 +143,39 @@ class SendScheduler:
         """Await ``coro``, absorbing failures so the detached loop stays alive.
 
         Transport-level failures (network down, peer closed, socket closed
-        under us) are skipped and logged at WARNING: the first of each kind,
-        then at most one line per 10 s with a count. Any OTHER exception is
+        under us) are skipped and logged at WARNING. Any OTHER exception is
         logged at ERROR with a traceback and the loop CONTINUES: this detached
         task must stay alive so chaff and real egress keep flowing — a dead
         scheduler silently breaks the constant-traffic anonymity property with
-        no shutdown signal. Returns ``None`` when ``coro`` failed.
+        no shutdown signal. Both can repeat once per packet, so each kind of
+        failure logs its first one, then at most one line per 10 s with a
+        count (an unexpected error's traceback only on lines about a single
+        failure). Returns ``None`` when ``coro`` failed.
         """
         try:
             return await coro
         except (TimeoutError, ConnectionError, OSError) as e:
-            kind = (what, type(e).__name__)
-            if kind not in self._failure_logs:
-                self._failure_logs[kind] = RepeatLog(
-                    log, logging.WARNING, clock=self._clock
-                )
-            self._failure_logs[kind].log("%s failed: %s", *kind)
-        except Exception:
-            log.error(
+            self._failure_log(what, e, logging.WARNING).log(
+                "%s failed: %s", what, type(e).__name__
+            )
+        # The loop must survive any bug in a send (see above); the error is
+        # logged with its traceback, and repeats are counted.
+        except Exception as e:  # noqa: BLE001
+            self._failure_log(what, e, logging.ERROR).log(
                 "scheduler %s raised unexpectedly — keeping loop alive",
                 what,
                 exc_info=True,
             )
         return None
+
+    def _failure_log(self, what: str, error: BaseException, level: int) -> RepeatLog:
+        """The repeat log for one kind of failure: what failed, and the
+        error's class. A class always lands in the same except branch above,
+        so a kind always logs at the same level."""
+        kind = (what, type(error))
+        if kind not in self._failure_logs:
+            self._failure_logs[kind] = RepeatLog(log, level, clock=self._clock)
+        return self._failure_logs[kind]
 
     async def _send_one(self, pkt: _ScheduledPacket) -> None:
         """Send a single packet, keeping the detached loop alive on error."""

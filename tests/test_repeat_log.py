@@ -1,9 +1,10 @@
 """Events that can repeat once per packet log at most one line per 10 s.
 
 At the shaper's packet rate (8-12 packets/s at idle, up to ~960/s at the top
-tier) a full send queue, a failing send or a socket error would otherwise
-log one line per packet. Each logs the first event, then at most one line
-per 10 s with a count of the events in between. A fake clock drives time.
+tier) a full send or receive queue, a failing send, an unexpected error in
+the send loop or a socket error would otherwise log one line per packet.
+Each logs the first event, then at most one line per 10 s with a count of
+the events in between. A fake clock drives time.
 """
 
 from __future__ import annotations
@@ -170,6 +171,81 @@ async def test_udp_socket_errors_log_the_first_then_a_count(
     ]
 
 
+def test_a_traceback_goes_only_on_lines_for_a_single_event(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    clock = _FakeClock()
+    repeat = RepeatLog(logging.getLogger("dsm.test"), logging.ERROR, clock=clock)
+    with caplog.at_level(logging.ERROR, logger="dsm.test"):
+        for _ in range(3):
+            try:
+                raise RuntimeError("boom")
+            except RuntimeError:
+                repeat.log("loop raised", exc_info=True)
+        clock.now += REPEAT_LOG_INTERVAL_S
+        try:
+            raise RuntimeError("boom")
+        except RuntimeError:
+            repeat.log("loop raised", exc_info=True)
+    first, count_line = caplog.records
+    assert first.getMessage() == "loop raised"
+    assert first.exc_info is not None
+    assert count_line.getMessage() == "loop raised (2 more in the last 10 s)"
+    assert not count_line.exc_info
+
+
+async def test_an_unexpected_send_error_logs_one_traceback_then_a_count(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    clock = _FakeClock()
+    sched = SendScheduler(_never_send, shaper=_OneBigSlotBatch(), clock=clock)  # type: ignore[arg-type]
+    name = "dsm.traffic.scheduler"
+    with caplog.at_level(logging.ERROR, logger=name):
+        for _ in range(300):
+            assert await sched._keep_alive(_buggy(), "send") is None
+        # A different error class is a new kind: logged at once, with its
+        # own traceback.
+        assert await sched._keep_alive(_buggy_lookup(), "send") is None
+        clock.now += REPEAT_LOG_INTERVAL_S
+        assert await sched._keep_alive(_buggy(), "send") is None
+    records = [r for r in caplog.records if r.name == name]
+    assert [r.getMessage() for r in records] == [
+        "scheduler send raised unexpectedly — keeping loop alive",
+        "scheduler send raised unexpectedly — keeping loop alive",
+        "scheduler send raised unexpectedly — keeping loop alive"
+        " (299 more in the last 10 s)",
+    ]
+    assert all(r.levelno == logging.ERROR for r in records)
+    assert records[0].exc_info is not None
+    assert records[0].exc_info[0] is RuntimeError
+    assert records[1].exc_info is not None
+    assert records[1].exc_info[0] is LookupError
+    assert not records[2].exc_info
+
+
+async def test_a_full_receive_queue_logs_the_first_drop_then_a_count(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    clock = _FakeClock()
+    queue: asyncio.Queue[tuple[bytes, tuple[str, int]]] = asyncio.Queue(maxsize=1)
+    protocol = _UDPProtocol(queue, clock=clock)
+    name = "dsm.net.transport.udp"
+    peer = ("203.0.113.7", 40000)
+    with caplog.at_level(logging.WARNING, logger=name):
+        for _ in range(501):
+            protocol.datagram_received(b"packet", peer)
+        clock.now += REPEAT_LOG_INTERVAL_S
+        protocol.datagram_received(b"packet", peer)
+    lines = _messages(caplog, name)
+    assert lines == [
+        "recv queue full, dropping incoming packet",
+        "recv queue full, dropping incoming packet (499 more in the last 10 s)",
+    ]
+    # The peer's address is never logged.
+    assert not any(peer[0] in line for line in lines)
+    assert queue.qsize() == 1
+
+
 async def _never_send(data: bytes, target_size: int) -> None:
     raise AssertionError("nothing is sent in this test")
 
@@ -180,3 +256,11 @@ async def _refused() -> None:
 
 async def _timed_out() -> None:
     raise TimeoutError
+
+
+async def _buggy() -> None:
+    raise RuntimeError("a bug, not a network problem")
+
+
+async def _buggy_lookup() -> None:
+    raise LookupError("another bug")
