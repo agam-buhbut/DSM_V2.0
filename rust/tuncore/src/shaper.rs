@@ -112,7 +112,8 @@ impl ShaperConfig {
     }
 }
 
-/// Why a [`ShaperConfig`] was refused.
+/// Why [`Shaper::new`] refused to start: a [`ShaperConfig`] rule was broken,
+/// or (`Clock`) the start time was not a finite number.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShaperError {
     Tiers,
@@ -120,6 +121,7 @@ pub enum ShaperError {
     DecoyInterval,
     Linger,
     Padding,
+    Clock,
 }
 
 impl fmt::Display for ShaperError {
@@ -132,6 +134,7 @@ impl fmt::Display for ShaperError {
             Self::DecoyInterval => "decoy_interval_s must be 0 (off) or 300-86400",
             Self::Linger => "linger_s must be (0, 0) (off) or 0 < min <= max <= 7200",
             Self::Padding => "padding_min must not exceed padding_max",
+            Self::Clock => "now must be a finite number of seconds",
         })
     }
 }
@@ -242,12 +245,17 @@ impl<R> fmt::Debug for Shaper<R> {
 }
 
 impl<R: RngCore + CryptoRng> Shaper<R> {
-    /// Start a session at `now` (seconds on the caller's monotonic clock).
+    /// Start a session at `now`: seconds on one monotonic clock. Use that
+    /// same clock for every later call.
     ///
     /// # Errors
-    /// Returns [`ShaperError`] when `cfg` breaks a config rule.
+    /// Returns [`ShaperError`] when `cfg` breaks a config rule, or when `now`
+    /// is not a finite number.
     pub fn new(cfg: ShaperConfig, mut rng: R, now: f64) -> Result<Self, ShaperError> {
         cfg.validate()?;
+        if !now.is_finite() {
+            return Err(ShaperError::Clock);
+        }
         let mut seed = <StdRng as SeedableRng>::Seed::default();
         rng.fill_bytes(&mut seed);
         let secrets = Secrets::draw(&mut rng, cfg.decoy_interval_s);
@@ -285,11 +293,19 @@ impl<R: RngCore + CryptoRng> Shaper<R> {
     /// Advance the schedule to `now`; say how many packets leave and when
     /// to poll again.
     ///
+    /// `now` is seconds on the same monotonic clock as in `Shaper::new`. A
+    /// `now` that is earlier than the last poll's, or not a finite number,
+    /// counts as the last poll's time: no time passes.
+    ///
     /// `queue_len` is the number of real packets waiting, `oldest_wait` how
     /// long (s) the oldest sendable one has waited (0 if none), and
     /// `real_sent` how many real packets the caller sent since the last poll.
     pub fn poll(&mut self, now: f64, queue_len: usize, oldest_wait: f64, real_sent: u32) -> Poll {
-        let now = now.max(self.last_now);
+        let now = if now.is_finite() {
+            now.max(self.last_now)
+        } else {
+            self.last_now
+        };
         self.last_now = now;
         let oldest_wait = if oldest_wait.is_finite() {
             oldest_wait.max(0.0)
@@ -324,7 +340,8 @@ impl<R: RngCore + CryptoRng> Shaper<R> {
 
     /// Size class for a real packet with `payload_len` payload bytes: a draw
     /// from the fixed size mix, bumped up to the smallest class that fits.
-    /// If no class fits, the exact size needed (padding only grows packets).
+    /// If no class fits, the exact size needed (padding only grows packets),
+    /// capped at 65535, the most a `u16` holds.
     pub fn real_size_class(&mut self, payload_len: usize) -> u16 {
         let idx = self.sample_class_index();
         let need = payload_len.saturating_add(PACKET_OVERHEAD);
@@ -848,6 +865,54 @@ mod tests {
     }
 
     #[test]
+    fn a_bad_clock_or_wait_value_counts_as_no_time_passing() {
+        // A start time that is not a finite number is refused.
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let got = Shaper::new(cfg(), StdRng::seed_from_u64(0), bad);
+            assert!(matches!(got, Err(ShaperError::Clock)), "started at {bad}");
+        }
+        // A poll time that is not finite, or is earlier than the last poll's,
+        // counts as the last poll's time. A twin that never sees those calls
+        // must keep giving the same answers.
+        let mut s = shaper(cfg(), 51);
+        let mut twin = shaper(cfg(), 51);
+        let at = T0 + 1.0;
+        assert_eq!(s.poll(at, 0, 0.0, 0), twin.poll(at, 0, 0.0, 0));
+        for bad in [
+            f64::INFINITY,
+            f64::NAN,
+            f64::NEG_INFINITY,
+            T0 - 5.0,
+            at - 0.5,
+        ] {
+            let poll = s.poll(bad, 0, 0.0, 0);
+            assert_eq!(poll.slots_due, 0, "time passed at {bad}");
+            assert_eq!(
+                s.last_now.to_bits(),
+                at.to_bits(),
+                "the clock moved at {bad}"
+            );
+        }
+        let later = T0 + 2.0;
+        let got = s.poll(later, 0, 0.0, 0);
+        assert_eq!(got, twin.poll(later, 0, 0.0, 0));
+        assert!(
+            got.slots_due > 0 && got.next_wake > later,
+            "the shaper got stuck"
+        );
+        // A wait that is not a finite number counts as no wait: it must not
+        // step the rate up.
+        let mut s = shaper(cfg(), 52);
+        let mut now = T0;
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            now += 0.01;
+            let poll = s.poll(now, 5, bad, 0);
+            assert_eq!(s.tier, 0, "stepped up on a wait of {bad}");
+            assert!(poll.next_wake.is_finite() && poll.next_wake >= now);
+        }
+    }
+
+    #[test]
     fn step_up_happens_at_the_step_up_point_and_never_after_the_budget() {
         for seed in 0..50 {
             let mut s = shaper(cfg(), seed);
@@ -881,7 +946,7 @@ mod tests {
         for seed in 0..50 {
             // 0.001 s after the last departure the faster slot is still
             // ahead; at 0.2 s it is already behind.
-            for since_last in [0.001, 0.2] {
+            for (since_last, slot_passed) in [(0.001, false), (0.2, true)] {
                 let mut s = shaper(with(|c| c.tiers_pps = vec![1.0, 50.0]), seed);
                 let now = s.last_departure + since_last;
                 let before = s.next_departure;
@@ -892,6 +957,13 @@ mod tests {
                     "the step-up left the departure at {before}"
                 );
                 assert!(s.next_departure >= now, "the departure moved into the past");
+                if slot_passed {
+                    // The slot is already past: the packet goes at `now`.
+                    assert_eq!(s.next_departure.to_bits(), now.to_bits());
+                } else {
+                    // The slot is still ahead: the packet waits for it.
+                    assert!(s.next_departure > now, "the packet left at once");
+                }
             }
         }
     }
@@ -1198,6 +1270,35 @@ mod tests {
         assert_eq!(s.hold_until.to_bits(), (repick + 100.0).to_bits());
         assert_eq!(s.tier, 2);
         assert!((600.0..=2400.0).contains(&(s.next_repick - repick)));
+    }
+
+    #[test]
+    fn a_repick_retimes_the_next_decoy_and_keeps_linger_and_busy_ends() {
+        let mut s = shaper(
+            with(|c| {
+                c.decoy_interval_s = 300.0;
+                c.linger_s = (300.0, 600.0);
+            }),
+            57,
+        );
+        let repick = s.next_repick;
+        let (linger_end, busy_end) = (repick + 200.0, repick + 300.0);
+        // A decoy so far off that only a re-pick can bring it closer.
+        let old_decoy = repick + 1.0e6;
+        s.change_tier(1, T0);
+        s.linger_until = Some(linger_end);
+        s.busy_until = busy_end;
+        s.next_decoy = Some(old_decoy);
+        let before = s.secrets.tier_scale;
+        s.poll(repick, 0, 0.0, 0);
+        assert_ne!(s.secrets.tier_scale.to_bits(), before.to_bits());
+        let decoy = s.next_decoy.expect("decoys stay on");
+        assert!(
+            decoy > repick && decoy < old_decoy,
+            "the decoy was not re-timed"
+        );
+        assert_eq!(s.linger_until, Some(linger_end));
+        assert_eq!(s.busy_until.to_bits(), busy_end.to_bits());
     }
 
     fn histogram(draw: &mut dyn FnMut() -> u16, n: u32) -> Vec<(u16, f64)> {
