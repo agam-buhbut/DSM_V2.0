@@ -324,6 +324,20 @@ def _validate_dns(c: Config) -> None:
             "debugging and disable it in production."
         )
 
+    # In TOML every key after a [dns_provider_pins] header belongs to that
+    # table, and `dsm init` writes the table last. A setting added below it
+    # would land here and be silently ignored, so refuse it. This runs before
+    # the checks below because a misplaced `dns_providers` would otherwise
+    # surface as a misleading "server mode requires dns_providers".
+    stray = [key for key in c.dns_provider_pins if key not in c.dns_providers]
+    if stray:
+        names = ", ".join(repr(key) for key in stray)
+        raise ValueError(
+            f"dns_provider_pins has entries that are not in dns_providers: "
+            f"{names}. If any of them is a setting, move it above the "
+            f"[dns_provider_pins] section."
+        )
+
     if c.mode == "server" and not c.dns_providers:
         raise ValueError("server mode requires at least one dns_providers entry")
 
