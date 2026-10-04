@@ -542,7 +542,10 @@ The config file is TOML, at `/opt/mtun/config.toml`.
 - transport: udp | tcp (default: udp)
 - dns_providers: DoH/DoT URLs (server mode)
 - dns_provider_pins: SPKI SHA-256 pins for each provider (server mode,
-  required)
+  required). Every name in it must also be listed in dns_providers. TOML
+  reads every line below the `[dns_provider_pins]` header as part of this
+  table, so keep it last in config.toml and put all other settings above
+  it. A setting below it stops startup with a message that names it.
 - tun_name: TUN device name (default: mtun0)
 - mtu: TUN interface MTU in bytes (default: 1400, allowed 576-1500)
 - pmtu_discover: turn on kernel PMTUD (path MTU discovery) on the UDP socket
@@ -578,8 +581,10 @@ The config file is TOML, at `/opt/mtun/config.toml`.
   with a message that says to remove them.
 - rotation_packets, rotation_seconds: when keys change, by packet count or
   by seconds (default: 5000/600)
-- debug_dns: log DNS queries in plain text (default: false; logs are
-  redacted)
+- debug_dns: log DNS queries in plain text (default: false). Otherwise the
+  logs show `qname-tag=` and 16 hex characters in place of each name: a
+  keyed hash with a random key made at each start, so the same name keeps
+  its tag while DSM runs and gets a new one after a restart.
 - debug_net: write structured JSON events to the `dsm.netaudit` logger
   (handshake start/end, nft apply/remove, TUN configure/deconfigure, rekey,
   liveness, shutdown, auto_mtu_change, crl_missing, crl_stale). Default:

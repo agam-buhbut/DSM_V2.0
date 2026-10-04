@@ -621,6 +621,11 @@ dns_providers      = ["https://1.1.1.1/dns-query"]
 EOF
 ```
 
+Keep `[dns_provider_pins]` as the last section of config.toml. TOML reads
+every line below that header as a pin, so a setting added below it stops
+dsm at startup (`dns_provider_pins has entries that are not in
+dns_providers: ...`). Put new settings above the header.
+
 Validate the TOML before continuing — a missing quote produces a
 confusing stack trace later:
 
@@ -1693,12 +1698,52 @@ processed the INIT (network drop). If present, the ACK was dropped in
 the reverse direction. Session tears down on purpose; restart to
 re-handshake.
 
-### "DNS resolve failed for qname-sha256=<hex>"
+### "DNS resolve failed for qname-tag=<hex>"
 
 Server's upstream DoH/DoT provider failed or pin mismatch.
 Temporarily set `debug_dns = true` to log the plaintext qname (then
 flip it off). Re-check the SPKI pin against the provider's live cert
 (§3a.1).
+
+`qname-tag=<hex>` stands for the DNS name: 16 hex characters of a keyed
+hash, so a log reader cannot look the name up. The same name keeps the
+same tag while dsm runs. The key is new at every restart, so a tag from
+before a restart does not match tags after it. (Older versions logged
+`qname-sha256=<hex>`, a plain hash.)
+
+### Server log: "cannot listen on UDP port 51820: Address already in use; exiting"
+
+The server could not open its listen port at startup, so it exits with
+status 1. systemd starts it again after `RestartSec` (10 s in the unit
+file) and gives up after 5 failed starts in 10 minutes. With
+`transport = "tcp"` the same line says TCP. Another program holds the
+port. Find it, then stop it or change `listen_port` (and `server_port` on
+the clients):
+
+```sh
+$ sudo ss -ulnp | grep ':51820 '        # for TCP: sudo ss -tlnp
+```
+
+If the reason at the end of the line is "Permission denied" or "Operation
+not permitted", the daemon is missing a privilege (the unit file runs it
+as root with CAP_NET_ADMIN and CAP_NET_BIND_SERVICE). After you fix the
+cause, clear the start limit and start again:
+
+```sh
+$ sudo systemctl reset-failed dsm
+$ sudo systemctl start dsm
+```
+
+### "config: dns_provider_pins has entries that are not in dns_providers: ..."
+
+The names after the colon sit in the `[dns_provider_pins]` table but are not
+listed in `dns_providers`. Usually they are settings that were added below
+the `[dns_provider_pins]` header: TOML reads every line under a header as
+part of that table (`dsm init` writes the table last). Move those lines
+above the header. If a name is meant as a pin, it must match a
+`dns_providers` entry exactly: fix the spelling, add the provider to
+`dns_providers`, or remove the pin. dsm exits with status 2 before it
+starts anything.
 
 ### Server log: "DNS proxy cannot bind \<tun-ip\>:53 — another resolver … is already bound there"
 

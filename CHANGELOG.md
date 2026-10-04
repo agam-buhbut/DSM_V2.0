@@ -65,6 +65,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The cryptography dependency moves to 50.x (`>=50.0.0,<51`), which fixes
   CVE-2026-69247, CVE-2026-69248 and CVE-2026-69249. DSM does not use the
   affected APIs, but older versions failed the dependency audit.
+- DNS names in logs are now shown as `qname-tag=` and 16 hex characters of
+  a keyed hash (HMAC-SHA256) under a random key made at each start. They
+  used to be a plain SHA-256 prefix (`qname-sha256=`), which anyone with a
+  list of popular sites could reverse. The same name keeps its tag while
+  DSM runs and gets a new tag after a restart.
 
 ### Fixed
 - UDP sessions no longer end within ~50 ms of the handshake: a send before
@@ -79,6 +84,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - If the TCP listen port cannot be opened when the server starts (for
   example it is already in use), the server exits with a one-line error.
   Other accept errors are retried after the usual backoff.
+- If the UDP listen port cannot be bound when the server starts (for
+  example another program already holds it), the server exits with a
+  one-line error and status 1 instead of a Python traceback.
+- A setting written below the `[dns_provider_pins]` header was read as a
+  pin and silently ignored. Every `dns_provider_pins` name must now be
+  listed in `dns_providers`; otherwise DSM stops at startup with a message
+  that names the entries and says how to fix them.
 - CI no longer tries to install the nonexistent `types-dnspython` package.
 - Warnings that can fire once per packet (a full send or receive queue, a
   failed send, an unexpected error in the send loop, a UDP socket error) no
