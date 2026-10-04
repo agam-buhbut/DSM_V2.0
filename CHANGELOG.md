@@ -56,10 +56,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and installing a prebuilt wheel on a constrained client.
 - The README Quickstart states that no release has been published yet.
 
-## [0.1.0] - 2026-06-12
+## [0.1.0] - not released yet
 
-First public release. Pre-1.0: wire / sealed-blob / config formats may still
-evolve, so this carries no SemVer-stability promise yet.
+Planned as the first public release; it has not been tagged or published.
+Pre-1.0: wire / sealed-blob / config formats may still evolve, so this
+carries no SemVer-stability promise yet.
 
 Work taking DSM from an internal state to a public, MIT-licensed release.
 
@@ -99,6 +100,3 @@ Work taking DSM from an internal state to a public, MIT-licensed release.
   under OpenSSL (`nameConstraints` corrected; dead `[crl_ext]` removed).
 - CI and packaging work toward a reproducible install path and GitHub Releases
   distribution.
-
-[Unreleased]: https://github.com/agam-buhbut/DSM_V2.0/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/agam-buhbut/DSM_V2.0/releases/tag/v0.1.0
