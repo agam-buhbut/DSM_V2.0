@@ -21,6 +21,8 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, TypeVar
 
+from dsm.core.log import RepeatLog
+
 if TYPE_CHECKING:
     from dsm.traffic.shaper import TrafficShaper
 
@@ -89,6 +91,10 @@ class SendScheduler:
         # shaper's step-down check counts them).
         self._next_wake = 0.0
         self._real_sent = 0
+        # A full queue and a failing send can repeat once per packet: log
+        # the first, then at most one line per 10 s with a count.
+        self._drop_log = RepeatLog(log, logging.WARNING, clock=clock)
+        self._failure_logs: dict[tuple[str, str], RepeatLog] = {}
 
     def enqueue(
         self,
@@ -104,7 +110,7 @@ class SendScheduler:
         """
         if len(self._queue) >= self._max_queue_size:
             heapq.heappop(self._queue)  # drop oldest
-            log.warning("scheduler queue full, dropping oldest packet")
+            self._drop_log.log("scheduler queue full, dropping oldest packet")
         heapq.heappush(
             self._queue,
             _ScheduledPacket(
@@ -136,7 +142,8 @@ class SendScheduler:
         """Await ``coro``, absorbing failures so the detached loop stays alive.
 
         Transport-level failures (network down, peer closed, socket closed
-        under us) are logged at WARNING and skipped. Any OTHER exception is
+        under us) are skipped and logged at WARNING: the first of each kind,
+        then at most one line per 10 s with a count. Any OTHER exception is
         logged at ERROR with a traceback and the loop CONTINUES: this detached
         task must stay alive so chaff and real egress keep flowing — a dead
         scheduler silently breaks the constant-traffic anonymity property with
@@ -145,7 +152,12 @@ class SendScheduler:
         try:
             return await coro
         except (TimeoutError, ConnectionError, OSError) as e:
-            log.warning("%s failed: %s", what, type(e).__name__)
+            kind = (what, type(e).__name__)
+            if kind not in self._failure_logs:
+                self._failure_logs[kind] = RepeatLog(
+                    log, logging.WARNING, clock=self._clock
+                )
+            self._failure_logs[kind].log("%s failed: %s", *kind)
         except Exception:
             log.error(
                 "scheduler %s raised unexpectedly — keeping loop alive",

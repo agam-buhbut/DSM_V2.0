@@ -5,7 +5,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import socket
+import time
+from collections.abc import Callable
 
+from dsm.core.log import RepeatLog
 from dsm.net.transport._fwmark import apply_so_mark
 
 log = logging.getLogger(__name__)
@@ -244,8 +247,17 @@ class UDPTransport:
 
 
 class _UDPProtocol(asyncio.DatagramProtocol):
-    def __init__(self, queue: asyncio.Queue[tuple[bytes, tuple[str, int]]]) -> None:
+    def __init__(
+        self,
+        queue: asyncio.Queue[tuple[bytes, tuple[str, int]]],
+        *,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         self._queue = queue
+        # When the peer is unreachable, every send comes back as an error, at
+        # the shaper's packet rate: log the first, then at most one line per
+        # 10 s with a count.
+        self._error_log = RepeatLog(log, logging.ERROR, clock=clock)
 
     def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
         try:
@@ -254,7 +266,7 @@ class _UDPProtocol(asyncio.DatagramProtocol):
             log.warning("recv queue full, dropping packet from %s", addr)
 
     def error_received(self, exc: Exception) -> None:
-        log.error("UDP error: %s", exc)
+        self._error_log.log("UDP error: %s", exc)
 
     def connection_lost(self, exc: Exception | None) -> None:
         if exc:
