@@ -100,6 +100,15 @@ impl ShaperConfig {
         if !(BUDGET_S.0..=BUDGET_S.1).contains(&self.latency_budget_s) {
             return Err(ShaperError::LatencyBudget);
         }
+        // The longest gap at tier 0 must end before the earliest step-up
+        // point, or a lone real packet could step the rate up and so move
+        // the send times. As a rate: tier 0 must be above this minimum.
+        // dsm/core/config.py checks the same rule with the same arithmetic.
+        let min_tier0 =
+            (1.0 + GAP_SPREAD.1) / (TIER_SCALE.0 * STEP_UP_FRACTION.0 * self.latency_budget_s);
+        if tiers[0] <= min_tier0 {
+            return Err(ShaperError::IdleTooSlow);
+        }
         let d = self.decoy_interval_s;
         if !(d == 0.0 || (DECOY_INTERVAL_S.0..=DECOY_INTERVAL_S.1).contains(&d)) {
             return Err(ShaperError::DecoyInterval);
@@ -123,6 +132,8 @@ impl ShaperConfig {
 pub enum ShaperError {
     Tiers,
     LatencyBudget,
+    /// The first tier is too slow for the latency budget.
+    IdleTooSlow,
     DecoyInterval,
     Linger,
     Padding,
@@ -136,6 +147,10 @@ impl fmt::Display for ShaperError {
                 "tiers_pps must have 2-8 entries, each 1-5000 packets/s, strictly rising"
             }
             Self::LatencyBudget => "latency_budget_s must be 0.01-5.0",
+            Self::IdleTooSlow => {
+                "tiers_pps[0] is too slow for latency_budget_s: its longest gap must end \
+                 before the earliest step-up point"
+            }
             Self::DecoyInterval => "decoy_interval_s must be 0 (off) or 300-86400",
             Self::Linger => "linger_s must be (0, 0) (off) or 0 < min <= max <= 7200",
             Self::Padding => "padding_min must not exceed padding_max",
@@ -799,10 +814,21 @@ mod tests {
 
     #[test]
     fn accepts_the_edges_of_every_rule() {
+        // The 1 packet/s and 0.01 s edges get a partner value that meets the
+        // first-tier rule (above 4.25 / budget packets/s).
         let cases: [Edit; 8] = [
-            |c| c.tiers_pps = vec![1.0, 5000.0],
-            |c| c.tiers_pps = (1..=8).map(f64::from).collect(),
-            |c| c.latency_budget_s = 0.01,
+            |c| {
+                c.tiers_pps = vec![1.0, 5000.0];
+                c.latency_budget_s = 5.0;
+            },
+            |c| {
+                c.tiers_pps = (1..=8).map(f64::from).collect();
+                c.latency_budget_s = 5.0;
+            },
+            |c| {
+                c.latency_budget_s = 0.01;
+                c.tiers_pps = vec![430.0, 5000.0];
+            },
             |c| c.latency_budget_s = 5.0,
             |c| c.decoy_interval_s = 300.0,
             |c| c.decoy_interval_s = 86_400.0,
@@ -812,6 +838,42 @@ mod tests {
         for edit in cases {
             assert!(Shaper::new(with(edit), StdRng::seed_from_u64(0), T0).is_ok());
         }
+    }
+
+    /// The first tier must be fast enough that its longest gap ends before
+    /// the earliest step-up point: above 4.25 / budget packets/s with the
+    /// secret ranges in use (8.5 at 0.5 s, 425 at 0.01 s).
+    #[test]
+    fn the_first_tier_must_be_fast_enough_for_the_budget() {
+        let refused: [Edit; 3] = [
+            |c| c.tiers_pps = vec![8.4, 50.0],
+            // Exactly at the limit is refused too: it must be above.
+            |c| c.tiers_pps = vec![8.5, 50.0],
+            |c| {
+                c.latency_budget_s = 0.01;
+                c.tiers_pps = vec![420.0, 5000.0];
+            },
+        ];
+        for edit in refused {
+            let got = Shaper::new(with(edit), StdRng::seed_from_u64(0), T0);
+            assert!(matches!(got, Err(ShaperError::IdleTooSlow)));
+        }
+        let accepted: [Edit; 3] = [
+            |c| c.tiers_pps = vec![8.6, 50.0],
+            |c| {
+                c.latency_budget_s = 0.01;
+                c.tiers_pps = vec![430.0, 5000.0];
+            },
+            |c| {
+                c.latency_budget_s = 5.0;
+                c.tiers_pps = vec![1.0, 50.0];
+            },
+        ];
+        for edit in accepted {
+            assert!(Shaper::new(with(edit), StdRng::seed_from_u64(0), T0).is_ok());
+        }
+        // The default config (10 packets/s at 0.5 s) passes.
+        assert!(Shaper::new(cfg(), StdRng::seed_from_u64(0), T0).is_ok());
     }
 
     #[test]
@@ -1004,7 +1066,15 @@ mod tests {
             // 0.001 s after the last departure the faster slot is still
             // ahead; at 0.2 s it is already behind.
             for (since_last, slot_passed) in [(0.001, false), (0.2, true)] {
-                let mut s = shaper(with(|c| c.tiers_pps = vec![1.0, 50.0]), seed);
+                // A 1 packet/s first tier needs a long budget (first-tier
+                // rule); step_up() is called directly, so it changes nothing.
+                let mut s = shaper(
+                    with(|c| {
+                        c.tiers_pps = vec![1.0, 50.0];
+                        c.latency_budget_s = 5.0;
+                    }),
+                    seed,
+                );
                 let now = s.last_departure + since_last;
                 let before = s.next_departure;
                 s.step_up(now);

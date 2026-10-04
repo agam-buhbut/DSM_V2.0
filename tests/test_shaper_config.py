@@ -62,10 +62,15 @@ def test_defaults() -> None:
 @pytest.mark.parametrize(
     "overrides",
     [
-        {"shaper_tiers_pps": [1, 5000]},
-        {"shaper_tiers_pps": [1, 2, 3, 4, 5, 6, 7, 8]},
+        # The 1 packet/s and 10 ms edges get a partner value that meets the
+        # first-tier rule (above 4.25 / budget-in-seconds packets/s).
+        {"shaper_tiers_pps": [1, 5000], "shaper_latency_budget_ms": 5000},
+        {
+            "shaper_tiers_pps": [1, 2, 3, 4, 5, 6, 7, 8],
+            "shaper_latency_budget_ms": 5000,
+        },
         {"shaper_tiers_pps": [10.5, 50.25]},
-        {"shaper_latency_budget_ms": 10},
+        {"shaper_latency_budget_ms": 10, "shaper_tiers_pps": [430, 5000]},
         {"shaper_latency_budget_ms": 5000},
         {"shaper_decoy_interval_s": 0},
         {"shaper_decoy_interval_s": 300},
@@ -106,6 +111,49 @@ def test_valid_values_are_accepted(overrides: dict[str, Any]) -> None:
 def test_out_of_range_values_name_the_key(key: str, value: Any) -> None:
     with pytest.raises(ValueError, match=key):
         Config(**_base(**{key: value}))
+
+
+@pytest.mark.parametrize(
+    ("tier0", "budget_ms"),
+    [
+        (8.6, 500),  # just above 8.5 packets/s
+        (430, 10),  # just above 425
+        (1, 5000),  # above 0.85
+        (10, 500),  # the defaults
+    ],
+)
+def test_a_first_tier_fast_enough_for_the_budget_is_accepted(
+    tier0: float, budget_ms: int
+) -> None:
+    c = Config(
+        **_base(shaper_tiers_pps=[tier0, 5000], shaper_latency_budget_ms=budget_ms)
+    )
+    # The Rust core agrees: it builds a shaper from the same values.
+    TrafficShaper.from_config(c)
+
+
+@pytest.mark.parametrize(
+    ("tier0", "budget_ms", "minimum"),
+    [
+        (8.4, 500, "8.5"),  # just below
+        (8.5, 500, "8.5"),  # at the limit: the rate must be above it
+        (420, 10, "425"),
+        (10, 400, "10.625"),  # the default first tier needs at least 425 ms
+    ],
+)
+def test_a_first_tier_too_slow_for_the_budget_is_refused(
+    tier0: float, budget_ms: int, minimum: str
+) -> None:
+    with pytest.raises(ValueError) as caught:
+        Config(
+            **_base(shaper_tiers_pps=[tier0, 5000], shaper_latency_budget_ms=budget_ms)
+        )
+    message = str(caught.value)
+    assert f"shaper_tiers_pps[0] must be above {minimum} packets/s" in message
+    assert f"shaper_latency_budget_ms is {budget_ms}" in message
+    # The Rust core refuses the same values.
+    with pytest.raises(ValueError):
+        TrafficShaper(tiers_pps=[tier0, 5000], latency_budget_ms=budget_ms)
 
 
 @pytest.mark.parametrize(

@@ -75,6 +75,12 @@ MAX_SHAPER_LATENCY_BUDGET_MS = 5000
 MIN_DECOY_INTERVAL_S = 300.0
 MAX_DECOY_INTERVAL_S = 86400.0
 MAX_LINGER_S = 7200.0
+# The core's secret ranges that bound the gap at the first tier and the
+# step-up point (shaper.rs: GAP_SPREAD, TIER_SCALE, STEP_UP_FRACTION). The
+# first-tier rule in _validate_shaper uses them.
+_MAX_GAP_SPREAD = 0.7
+_MIN_TIER_SCALE = 0.8
+_MIN_STEP_UP_FRACTION = 0.5
 # Named in the startup error for a removed envelope_* key.
 SHAPER_KEYS = (
     "shaper_tiers_pps",
@@ -499,6 +505,17 @@ def _validate_shaper(c: Config) -> None:
         raise ValueError(
             f"shaper_latency_budget_ms must be {MIN_SHAPER_LATENCY_BUDGET_MS}-"
             f"{MAX_SHAPER_LATENCY_BUDGET_MS} ms, got {budget}"
+        )
+    # The longest gap at the first tier must end before the earliest step-up
+    # point, or a lone real packet could step the rate up and so move the
+    # send times. The Rust core checks the same rule with the same arithmetic.
+    min_tier0 = (1.0 + _MAX_GAP_SPREAD) / (
+        _MIN_TIER_SCALE * _MIN_STEP_UP_FRACTION * (budget / 1000.0)
+    )
+    if tiers[0] <= min_tier0:
+        raise ValueError(
+            f"shaper_tiers_pps[0] must be above {min_tier0:g} packets/s when "
+            f"shaper_latency_budget_ms is {budget}, got {tiers[0]:g}"
         )
     decoy = c.shaper_decoy_interval_s
     if not (decoy == 0 or MIN_DECOY_INTERVAL_S <= decoy <= MAX_DECOY_INTERVAL_S):
