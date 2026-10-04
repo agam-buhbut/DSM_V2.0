@@ -1497,6 +1497,14 @@ small and oversized packets are often silently black-holed — the client
 tracks the kernel PMTU and lowers the TUN MTU to fit (the "auto_mtu:
 lowered tun mtu ..." line in §5).
 
+Data use: the tier shaper sends fake packets and padding the whole time
+the tunnel is up, even when you are not using it. Connected all day with
+decoys on, this extra traffic alone is about 3 GB a day in each direction.
+Real use adds more of it: about 6 GB a day with about 20 bursts of use, on
+top of your real traffic. The settings that control it are
+`shaper_tiers_pps`, `shaper_latency_budget_ms`, `shaper_decoy_interval_s`
+and `shaper_linger_s`; `config.example.toml` lists the costs.
+
 ### 10d. UDP-blocked networks (some cellular / captive Wi-Fi)
 
 A few networks block outbound UDP except on port 443. If the UDP handshake
@@ -1670,7 +1678,10 @@ or prctl(PR_SET_DUMPABLE) didn't stick. Usually one of:
   and raise `shaper_tiers_pps` in both configs. A lower budget needs a
   faster first tier: it must stay above 4.25 divided by the budget in
   seconds. On a slow link, lowering padding_max also cuts the padding
-  bytes.
+  bytes. Do that for a quick test only, because it hides much less: a
+  real packet too big for the largest allowed size is sent at its exact
+  size, which no fake packet ever has, and that size shows how big the
+  packet really is.
 
 ### "rekey giving up after 9 retries — tearing down"
 

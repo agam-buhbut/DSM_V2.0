@@ -263,8 +263,11 @@ authentication.
 
 ### Padding
 
-- Every packet is padded to one of 11 sizes (size classes): 128, 256, 384,
-  512, 640, 768, 896, 1024, 1152, 1280 or 1400 bytes.
+- With the default settings, every packet is padded to one of 11 sizes
+  (size classes): 128, 256, 384, 512, 640, 768, 896, 1024, 1152, 1280 or
+  1400 bytes. `padding_min` and `padding_max` can narrow this list, and
+  `auto_mtu` drops sizes that are too big for the path. A real packet too
+  big for every size left is sent at its exact size.
 - The padding sits inside the encryption: it fills the encrypted part up to
   the size class. So no unauthenticated padding is left on the wire.
 - In TCP mode every frame is padded to the largest class (1400), so all
@@ -293,25 +296,28 @@ messages, such as the reply that confirms a key change or the check the
 server sends when your address changes, also take normal free places. Only
 the goodbye message at shutdown goes straight out.
 
-**Going up and coming down.** DSM moves up a tier only when your real
-packets have waited too long: by default, a random point between 0.25 and
-0.5 seconds. Now and then it jumps two tiers at once. It comes down slowly.
-After every change it does not come down for about 1 to 5 minutes (it can
-still go up). Then it steps down only if, over the last 5 to 15 seconds,
-you used less than about half of what the lower tier can carry. So coming
-down from the top takes several minutes per tier. Before it drops back to
-idle, it stays one step up for a while longer: 5 to 30 minutes by default.
-When that time is up, it checks your use again. If you are still using the
-link, it stays one step up, and the next drop to idle waits again.
+**Going up and coming down.** Apart from decoys (below), DSM moves up a
+tier only when your real packets have waited too long: by default, a
+random point between 0.25 and 0.5 seconds. Now and then it jumps two tiers
+at once. It comes down slowly. After every change it does not come down
+for about 1 to 5 minutes (it can still go up). Then it steps down only if,
+over the last 5 to 15 seconds, you used less than about half of what the
+lower tier can carry. So coming down from the top takes several minutes
+per tier. Before it drops back to idle, it stays one step up for a while
+longer: 5 to 30 minutes by default. When that time is up, it checks your
+use again. If you are still using the link, it stays one step up, and the
+next drop to idle waits again.
 
 **Fake busy periods.** Now and then DSM pretends to be busy. These "decoys"
 climb the way a real page load does. Each one picks a tier to reach: the
 top tier between half and four fifths of the time (each session picks how
 often), otherwise a lower one. It climbs there one step at a time, through
 exactly the same steps as real use. Then it stays busy for a while and
-comes down slowly, just like real use. So a watcher cannot tell which busy
-periods were real. By default a decoy comes about every 2 hours on average
-(each session picks its own average, between 1 and 4 hours).
+comes down slowly, just like real use. So a watcher cannot tell which
+short busy periods were real. A decoy's busy stretch lasts 1 to 6 minutes
+on average, so a much longer busy period is almost surely real. By default
+a decoy comes about every 2 hours on average (each session picks its own
+average, between 1 and 4 hours).
 
 **Secret numbers.** Every session secretly picks its own timing values:
 how fast each tier really is (within 20% of the set value), how uneven the
@@ -348,7 +354,7 @@ server:
 - short bursts that fit in the current tier;
 - when you stop: the slow step-down and the wait before idle blur it by
   minutes;
-- whether a busy period was real: decoys look the same.
+- whether a short busy period was real: decoys look the same.
 
 **What it does not hide:**
 
@@ -562,6 +568,8 @@ The config file is TOML, at `/opt/mtun/config.toml`.
   0 < min <= max <= 7200).
 - An old `envelope_*` key stops startup with a message that names these
   four keys.
+- The removed `jitter_ms_min` and `jitter_ms_max` keys also stop startup,
+  with a message that says to remove them.
 - rotation_packets, rotation_seconds: when keys change, by packet count or
   by seconds (default: 5000/600)
 - debug_dns: log DNS queries in plain text (default: false; logs are
@@ -644,6 +652,9 @@ Open items:
   and add remote attestation (TPM quotes). Then a peer can check that the
   key really lives in a TPM, not just that the signature is valid. Today's
   backend proves residency locally but produces no quote.
+- Header protection: encrypt the packet counter and key epoch at the start
+  of every packet, which are sent in the clear today. This changes the wire
+  format.
 - Phase 2B: a real-network demo on two physical Linux machines across two
   ISPs (a server on home Wi-Fi, a client on cellular). The steps are in
   `deploy/GUIDE.md` §9. Once the strace audit step there is done,

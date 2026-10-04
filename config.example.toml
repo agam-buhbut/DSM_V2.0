@@ -145,13 +145,13 @@ padding_max = 1400
 # Tier shaper
 # Packets leave at a steady rate that only changes in a few fixed steps
 # ("tiers"). Your real packets take free places in that flow; fake packets
-# (chaff) fill the rest. The rate goes up a step only when real packets have
-# waited too long, and comes down slowly: after each change it does not come
-# down for about 1 to 5 minutes (it can still go up). Now and then a fake
-# busy period (a "decoy") climbs and comes down the same way, like a page
-# load. Each session also picks its own secret timing values and changes
-# them every 10-40 minutes. All four keys are optional. Both ends ship the
-# same defaults; each end shapes only what it sends.
+# (chaff) fill the rest. Apart from decoys (below), the rate goes up a step
+# only when real packets have waited too long, and comes down slowly: after
+# each change it does not come down for about 1 to 5 minutes (it can still go
+# up). Now and then a fake busy period (a "decoy") climbs and comes down the
+# same way, like a page load. Each session also picks its own secret timing
+# values and changes them every 10-40 minutes. All four keys are optional.
+# Both ends ship the same defaults; each end shapes only what it sends.
 #
 # What it costs, per direction (padding only, not your real traffic):
 #   * connected all day, no use, decoys on: about 3 GB a day

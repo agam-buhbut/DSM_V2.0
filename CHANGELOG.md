@@ -11,8 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** traffic shaping now uses fixed rate steps ("tiers") instead
   of the adaptive envelope. Packets leave at a steady rate that only moves
   between a few set speeds. Your real packets take free places and fake
-  packets (chaff) fill the rest. The rate goes up only when real packets
-  have waited too long, and it comes down slowly, a few minutes per step.
+  packets (chaff) fill the rest. Apart from fake busy periods (below), the
+  rate goes up only when real packets have waited too long, and it comes
+  down slowly, a few minutes per step.
   Fake busy periods ("decoys") climb and come down like real use, and each
   session picks, and now and then changes, its own secret timing values.
   The timing and size decisions now run in the Rust core (`tuncore`), and
