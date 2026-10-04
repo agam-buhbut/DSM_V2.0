@@ -44,8 +44,6 @@ class TypedConfigErrors(unittest.TestCase):
             **_base(
                 padding_min=128,
                 padding_max=1400,
-                jitter_ms_min=1,
-                jitter_ms_max=100,
                 rotation_packets=5000,
                 rotation_seconds=600,
                 mtu=1400,

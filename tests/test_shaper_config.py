@@ -213,6 +213,17 @@ def test_every_envelope_key_is_named(tmp_path: Path) -> None:
     assert "envelope_rise_per_s" in message
 
 
+@pytest.mark.parametrize("key", ["jitter_ms_min", "jitter_ms_max"])
+def test_a_jitter_key_stops_startup_with_a_clear_message(
+    tmp_path: Path, key: str
+) -> None:
+    with pytest.raises(ConfigError) as caught:
+        _load(tmp_path, f"{key} = 1\n")
+    message = str(caught.value)
+    assert key in message
+    assert "no longer exist" in message
+
+
 def test_from_config_hands_the_keys_to_the_shaper() -> None:
     c = Config(
         **_base(

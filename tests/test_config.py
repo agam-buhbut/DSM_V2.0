@@ -182,10 +182,6 @@ class TestConfigValidation(unittest.TestCase):
         with self.assertRaises(ValueError):
             Config(**_base(padding_min=10))
 
-    def test_jitter_inverted(self) -> None:
-        with self.assertRaises(ValueError):
-            Config(**_base(jitter_ms_min=100, jitter_ms_max=10))
-
     def test_rotation_packets_too_low(self) -> None:
         with self.assertRaises(ValueError):
             Config(**_base(rotation_packets=50))
@@ -201,9 +197,6 @@ class TestConfigValidation(unittest.TestCase):
         self.assertEqual(c.log_level, "info")
         self.assertEqual(c.padding_min, 128)
         self.assertEqual(c.padding_max, 1400)
-        self.assertEqual(c.jitter_ms_min, 1)
-        # M-ANON-4: default bumped from 50 → 100 ms for wider reorder window.
-        self.assertEqual(c.jitter_ms_max, 100)
         self.assertEqual(c.mtu, 1400)
         self.assertFalse(c.pmtu_discover)
 

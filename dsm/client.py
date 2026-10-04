@@ -407,8 +407,6 @@ async def run_client(
         scheduler = SendScheduler(
             send_fn=send_packet,
             chaff_fn=lambda: make_chaff_packet(shaper, session_keys.epoch & 0x0F),
-            jitter_ms_min=config.jitter_ms_min,
-            jitter_ms_max=config.jitter_ms_max,
             shaper=shaper,
         )
         await scheduler.start()

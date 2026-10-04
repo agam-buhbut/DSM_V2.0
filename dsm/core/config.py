@@ -30,7 +30,6 @@ MIN_PORT = 1
 MAX_PORT = 65535
 MIN_PADDING = 64
 MAX_PADDING = 1500
-MAX_JITTER_MS = 1000
 MIN_ROTATION_PACKETS = 100
 MIN_ROTATION_SECONDS = 60
 # Upper bound on rotation_packets. The Rust nonce counter is u32 (per
@@ -88,6 +87,9 @@ SHAPER_KEYS = (
     "shaper_decoy_interval_s",
     "shaper_linger_s",
 )
+# Removed: the tier shaper decides when every packet leaves. An old config
+# that still sets them stops at startup with a clear message.
+_REMOVED_JITTER_KEYS = ("jitter_ms_min", "jitter_ms_max")
 
 # A single DNS label (RFC 1123): 1-63 chars, letters/digits/hyphen, no
 # leading or trailing hyphen.
@@ -151,11 +153,6 @@ class Config:
     log_level: Literal["debug", "info", "warning", "error"] = "info"
     padding_min: int = 128
     padding_max: int = 1400
-    jitter_ms_min: int = 1
-    # Random extra wait per packet, used only when the send loop runs
-    # without the tier shaper (tests). The daemon always runs the shaper,
-    # where a queued packet takes the next free slot instead.
-    jitter_ms_max: int = 100
     # Tier shaper. Packets leave at a steady rate that only changes in a few
     # fixed steps; see config.example.toml for what each key does and costs.
     shaper_tiers_pps: list[float] = field(
@@ -231,8 +228,6 @@ def _validate_types(c: Config) -> None:
         ("listen_port", c.listen_port),
         ("padding_min", c.padding_min),
         ("padding_max", c.padding_max),
-        ("jitter_ms_min", c.jitter_ms_min),
-        ("jitter_ms_max", c.jitter_ms_max),
         ("rotation_packets", c.rotation_packets),
         ("rotation_seconds", c.rotation_seconds),
         ("mtu", c.mtu),
@@ -461,14 +456,6 @@ def _validate_padding(c: Config) -> None:
         )
 
 
-def _validate_jitter(c: Config) -> None:
-    if not (0 <= c.jitter_ms_min <= c.jitter_ms_max <= MAX_JITTER_MS):
-        raise ValueError(
-            f"jitter_ms_min ({c.jitter_ms_min}) and jitter_ms_max ({c.jitter_ms_max}) "
-            f"must satisfy 0 <= min <= max <= {MAX_JITTER_MS}"
-        )
-
-
 def _number_list(name: str, value: object) -> list[float]:
     """Check a list-of-numbers key. TOML hands us untyped data, so a wrong
     type must become a readable ValueError, not a TypeError later on."""
@@ -649,7 +636,6 @@ _VALIDATORS = (
     _validate_attest_tpm_tcti,
     _validate_role_specific,
     _validate_padding,
-    _validate_jitter,
     _validate_shaper,
     _validate_rotation,
     _validate_log_level,
@@ -673,14 +659,22 @@ def _validate(c: Config) -> None:
 
 
 def _reject_removed_keys(raw: dict[str, object]) -> None:
-    """Stop with a clear message for keys of the removed adaptive envelope
-    (otherwise Config(**raw) fails with a cryptic TypeError)."""
+    """Stop with a clear message for keys that were removed (otherwise
+    Config(**raw) fails with a cryptic TypeError): the adaptive envelope's
+    envelope_* keys and the jitter keys."""
     old = sorted(key for key in raw if key.startswith("envelope_"))
     if old:
         raise ConfigError(
             f"config key(s) {', '.join(old)} no longer exist: the adaptive "
             f"envelope was replaced by the tier shaper. Remove them and use "
             f"{', '.join(SHAPER_KEYS)} instead (see config.example.toml)."
+        )
+    jitter = sorted(key for key in raw if key in _REMOVED_JITTER_KEYS)
+    if jitter:
+        raise ConfigError(
+            f"config key(s) {', '.join(jitter)} no longer exist: the tier "
+            f"shaper decides when every packet leaves, so there is no extra "
+            f"random wait to set. Remove them (see config.example.toml)."
         )
 
 

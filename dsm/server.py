@@ -432,8 +432,6 @@ async def _run_one_session(
             send_fn=send_packet,
             chaff_fn=lambda: make_chaff_packet(shaper, session_keys.epoch & 0x0F),
             should_chaff_fn=_chaff_allowed,
-            jitter_ms_min=config.jitter_ms_min,
-            jitter_ms_max=config.jitter_ms_max,
             shaper=shaper,
         )
         await server_scheduler.start()
