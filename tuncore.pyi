@@ -189,6 +189,40 @@ class BootstrapEphemeral:
     @property
     def is_live(self) -> bool: ...
 
+class Shaper:
+    """Tier shaper core for one session and one direction (Rust).
+
+    Decides when packets leave and how big they are. Each session draws its
+    own secret timing values from the OS RNG; nothing exposes them (no
+    getters, nothing in ``repr``). Config errors raise ``ValueError``.
+    """
+
+    def __init__(
+        self,
+        tiers_pps: list[float],
+        latency_budget_s: float,
+        decoy_interval_s: float,
+        linger_s: tuple[float, float],
+        padding_min: int,
+        padding_max: int,
+        now: float,
+    ) -> None: ...
+    def poll(
+        self, now: float, queue_len: int, oldest_wait: float, real_sent: int
+    ) -> tuple[int, float]:
+        """Advance to ``now``; return ``(slots_due, next_wake)``.
+
+        Send ``slots_due`` packets now (real first, chaff for the rest) and
+        poll again at ``next_wake``. ``real_sent`` counts the real packets
+        sent since the previous poll.
+        """
+        ...
+
+    def real_size_class(self, payload_len: int) -> int: ...
+    def chaff_size_class(self) -> int: ...
+    def set_size_class_ceiling(self, max_outer: int) -> None: ...
+    def active_classes(self) -> list[int]: ...
+
 def harden_process() -> None: ...
 def complete_bootstrap(
     ephemeral: BootstrapEphemeral,
@@ -218,3 +252,13 @@ HANDSHAKE_ATTEST_PAYLOAD_SIZE: int
 # backend (dev-soft-attest). The daemon refuses to start on it unless
 # config.allow_soft_attest is set.
 ATTEST_BACKEND_IS_SOFTWARE: bool
+
+# Padded outer packet sizes (bytes) and their draw weights. The Rust shaper
+# owns them; dsm.core.protocol re-exports them.
+SIZE_CLASSES: tuple[int, ...]
+SIZE_CLASS_WEIGHTS: tuple[int, ...]
+
+# Chaff size nudge: a draw below UP_P moves one class up, below DOWN_P one
+# class down.
+CHAFF_PERTURB_UP_P: float
+CHAFF_PERTURB_DOWN_P: float

@@ -50,9 +50,10 @@ pub mod session_keys;
 pub mod shaper;
 pub mod tpm_blob;
 
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyBytes, PyTuple};
+use rand::rngs::OsRng;
 
 // Raw key bytes never cross the FFI boundary for secret keys.
 // Python receives opaque handles and public keys only.
@@ -711,6 +712,65 @@ fn complete_bootstrap(
     })
 }
 
+/// Python-visible tier shaper (see `shaper.rs`), one per session and
+/// direction. Only the scheduling and sizing calls cross the FFI: there are
+/// no getters for the session's secret timing values, and the default
+/// `repr` shows none of them.
+#[pyclass(name = "Shaper")]
+struct PyShaper {
+    inner: shaper::Shaper<OsRng>,
+}
+
+#[pymethods]
+impl PyShaper {
+    /// Config errors raise `ValueError` (the Python config validator
+    /// reports the same rules first, with key names).
+    #[new]
+    fn new(
+        tiers_pps: Vec<f64>,
+        latency_budget_s: f64,
+        decoy_interval_s: f64,
+        linger_s: (f64, f64),
+        padding_min: u16,
+        padding_max: u16,
+        now: f64,
+    ) -> PyResult<Self> {
+        let cfg = shaper::ShaperConfig {
+            tiers_pps,
+            latency_budget_s,
+            decoy_interval_s,
+            linger_s,
+            padding_min,
+            padding_max,
+        };
+        let inner = shaper::Shaper::new(cfg, OsRng, now)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(Self { inner })
+    }
+
+    /// Returns `(slots_due, next_wake)`; see `shaper::Shaper::poll`.
+    fn poll(&mut self, now: f64, queue_len: usize, oldest_wait: f64, real_sent: u32) -> (u32, f64) {
+        let p = self.inner.poll(now, queue_len, oldest_wait, real_sent);
+        (p.slots_due, p.next_wake)
+    }
+
+    fn real_size_class(&mut self, payload_len: usize) -> u16 {
+        self.inner.real_size_class(payload_len)
+    }
+
+    fn chaff_size_class(&mut self) -> u16 {
+        self.inner.chaff_size_class()
+    }
+
+    fn set_size_class_ceiling(&mut self, max_outer: u16) {
+        self.inner.set_size_class_ceiling(max_outer);
+    }
+
+    fn active_classes(&self) -> Vec<u16> {
+        self.inner.active_classes().to_vec()
+    }
+}
+
 #[pymodule]
 fn tuncore(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyIdentityKeyPair>()?;
@@ -721,6 +781,7 @@ fn tuncore(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PySessionKeyManager>()?;
     m.add_class::<PyAttestKey>()?;
     m.add_class::<PyBootstrapEphemeral>()?;
+    m.add_class::<PyShaper>()?;
     m.add_function(wrap_pyfunction!(harden_process, m)?)?;
     m.add_function(wrap_pyfunction!(complete_bootstrap, m)?)?;
     m.add(
@@ -731,6 +792,16 @@ fn tuncore(m: &Bound<'_, PyModule>) -> PyResult<()> {
         "ATTEST_BACKEND_IS_SOFTWARE",
         device_attest::BACKEND_IS_SOFTWARE,
     )?;
+    // Single source of the size list for Python (dsm.core.protocol
+    // re-exports these). Built with PyTuple::new, not nth/nth_back
+    // iteration, so the cargo-audit ignore for RUSTSEC-2026-0176 still holds.
+    m.add("SIZE_CLASSES", PyTuple::new(m.py(), shaper::SIZE_CLASSES)?)?;
+    m.add(
+        "SIZE_CLASS_WEIGHTS",
+        PyTuple::new(m.py(), shaper::SIZE_CLASS_WEIGHTS)?,
+    )?;
+    m.add("CHAFF_PERTURB_UP_P", shaper::CHAFF_PERTURB_UP_P)?;
+    m.add("CHAFF_PERTURB_DOWN_P", shaper::CHAFF_PERTURB_DOWN_P)?;
     Ok(())
 }
 
