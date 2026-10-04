@@ -219,8 +219,6 @@ async def run_client(
         if _clock_warn:
             log.warning(_clock_warn)
 
-        shaper = TrafficShaper.from_config(config)
-
         if config.transport == "udp":
             transport = UDPTransport()
             await transport.bind(
@@ -399,6 +397,12 @@ async def run_client(
             liveness=liveness,
             shutdown=shutdown,
         )
+
+        # Build the shaper here, right before the send loop starts, as the
+        # server does. Its slots start when it is built: built before the
+        # handshake, the first poll would find every slot of the setup time
+        # due and send them all back to back.
+        shaper = TrafficShaper.from_config(config)
 
         # Shaper-driven: the tier shaper decides when packets leave (real
         # first, chaff in the other slots), so the wire rate follows the tier,
