@@ -27,7 +27,7 @@ import io
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from dsm.core.config import Config
 
@@ -118,12 +118,14 @@ class MainPropagatesExitCode(unittest.TestCase):
             patch.object(entry, "_load_config_or_exit", return_value=_client_config()),
             patch("dsm.core.log.configure"),
             patch("dsm.core.netaudit.configure"),
-            patch("dsm.client.run_client") as run_client_mock,
+            patch("dsm.client.run_client", new_callable=MagicMock) as run_client_mock,
             patch.object(entry.asyncio, "run", return_value=7) as run_mock,
         ):
-            # asyncio.run is mocked to return the sentinel directly; the
-            # un-awaited coroutine object is never executed, so close it to
-            # avoid a "coroutine was never awaited" warning.
+            # asyncio.run is mocked to return the sentinel directly, so
+            # nothing awaits what run_client returns. patch() would make an
+            # AsyncMock for this async function, and calling it creates a
+            # coroutine that is never awaited ("coroutine was never awaited"
+            # warning). A plain MagicMock creates none.
             run_client_mock.return_value = None
             with self.assertRaises(SystemExit) as cm:
                 entry.main()
