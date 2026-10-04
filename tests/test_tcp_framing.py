@@ -313,6 +313,7 @@ class RecvLoopShutdownInterrupt(unittest.IsolatedAsyncioTestCase):
         )
         from dsm.traffic.scheduler import SendScheduler
         from dsm.traffic.shaper import TrafficShaper, make_chaff_packet
+        from tests.send_right_away import SendRightAway
 
         fsm = SessionFSM()
         fsm.transition(State.CONNECTING)
@@ -330,8 +331,7 @@ class RecvLoopShutdownInterrupt(unittest.IsolatedAsyncioTestCase):
             send_fn=send_fn,
             chaff_fn=lambda: make_chaff_packet(shaper, keys.epoch & 0x0F),
             should_chaff_fn=lambda: False,
-            jitter_ms_min=0,
-            jitter_ms_max=0,
+            shaper=SendRightAway(),  # type: ignore[arg-type]
         )
         ctx = DataPathContext(
             tun=_SilentMockTun("server"),  # type: ignore[arg-type]

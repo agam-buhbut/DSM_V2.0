@@ -33,7 +33,6 @@ from dsm.core.protocol import (
     ReassemblyBuffer,
     fragment_ip_packet,
 )
-from dsm.core.rand import csprng_float
 from dsm.net.transport.tcp import TCPTransport
 from dsm.net.transport.udp import UDPTransport
 from dsm.net.tunnel import TunDevice
@@ -71,12 +70,6 @@ WIRE_OVERHEAD = 68
 # The outer DSM packet rides inside IP(20)+UDP(8), so a kernel path MTU
 # converts to a wire size-class ceiling by subtracting this.
 IP_UDP_OVERHEAD = 28
-
-# Per-fragment extra-delay window (seconds). It only matters when the
-# scheduler runs without the tier shaper (tests): there it spreads a packet's
-# fragments so they mix with other queued packets. With the shaper, the
-# fragments simply take the next free slots.
-FRAG_SPREAD_S = 0.05
 
 # auto-MTU adapter: how many consecutive same-or-higher path-MTU
 # observations are required before raising the TUN MTU back toward
@@ -1257,22 +1250,15 @@ async def tun_send_loop(ctx: DataPathContext) -> None:
         # Real packets join the scheduler queue and leave in the tier
         # shaper's free slots, so the wire rate follows the tier, not the
         # real traffic; the fragments of an oversized TUN packet simply
-        # take the next free slots. The per-fragment extra delay below
-        # (uniform in [0, FRAG_SPREAD_S) per position) only applies when
-        # the scheduler runs without a shaper: there it keeps the
-        # fragments from leaving as a recognizable "1 → N tightly-spaced
-        # packets" burst.
+        # take the next free slots.
         # Mark a real-data send so the keepalive loop's
         # 15s-idle check doesn't get bumped by chaff.
         ctx.liveness.last_real_send_time = time.monotonic()
-        for i, inner in enumerate(inners):
+        for inner in inners:
             padded, target_size = ctx.shaper.pad_packet(inner)
             # Real-packet sizes are no longer fed
             # back into any distribution. pad_packet draws the target class
             # from the FIXED published prior (the same one chaff uses) and
             # bumps up to fit the payload, so the real-traffic size histogram
             # cannot collapse onto one dominant class.
-            # i=0 gets no extra delay; later fragments shuffle within
-            # the per-position window.
-            extra = (i + csprng_float()) * FRAG_SPREAD_S if i > 0 else 0.0
-            ctx.scheduler.enqueue(padded, target_size, extra_delay=extra)
+            ctx.scheduler.enqueue(padded, target_size)

@@ -77,8 +77,6 @@ async def test_enqueue_does_not_wake_the_loop() -> None:
     shaper = _ScriptedShaper([(0, 0.3), (1, 30.0)])
     sched = SendScheduler(
         send_fn,
-        jitter_ms_min=0,
-        jitter_ms_max=0,
         shaper=shaper,  # type: ignore[arg-type]
     )
     await sched.start()
@@ -114,8 +112,6 @@ async def test_real_packets_go_first_chaff_fills_and_real_sent_is_reported() -> 
     sched = SendScheduler(
         send_fn,
         chaff_fn=chaff_fn,
-        jitter_ms_min=0,
-        jitter_ms_max=0,
         shaper=shaper,  # type: ignore[arg-type]
     )
     sched.enqueue(b"real-1", 128)
@@ -176,42 +172,20 @@ async def test_a_queued_packet_takes_the_next_slot_without_jitter() -> None:
         sent.append(data)
 
     shaper = _ScriptedShaper([(0, 0.1), (2, 30.0)])
-    # A large jitter range and extra delay must both be ignored in shaper mode.
     sched = SendScheduler(
         send_fn,
-        jitter_ms_min=500,
-        jitter_ms_max=500,
         shaper=shaper,  # type: ignore[arg-type]
     )
     await sched.start()
     try:
         await shaper.wait_for_polls(1)
         sched.enqueue(b"first", 128)
-        sched.enqueue(b"second", 128, extra_delay=5.0)
+        sched.enqueue(b"second", 128)
         await shaper.wait_for_polls(2)
         _, queue_len, oldest_wait, _ = shaper.polls[1]
         assert queue_len == 2
         assert oldest_wait < 0.5, "the packet was sendable at once"
         assert sent == [b"first", b"second"], "both left, in queue order"
-    finally:
-        await sched.stop()
-
-
-async def test_without_a_shaper_the_jitter_still_applies() -> None:
-    sent: list[float] = []
-    delivered = asyncio.Event()
-
-    async def send_fn(data: bytes, size: int) -> None:
-        sent.append(time.monotonic())
-        delivered.set()
-
-    sched = SendScheduler(send_fn, jitter_ms_min=200, jitter_ms_max=200)
-    await sched.start()
-    try:
-        queued_at = time.monotonic()
-        sched.enqueue(b"real", 128)
-        await asyncio.wait_for(delivered.wait(), timeout=3)
-        assert sent[0] >= queued_at + 0.2 - _EARLY_SLACK_S
     finally:
         await sched.stop()
 

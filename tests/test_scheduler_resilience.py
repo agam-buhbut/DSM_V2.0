@@ -11,6 +11,7 @@ import asyncio
 import unittest
 
 from dsm.traffic.scheduler import SendScheduler
+from tests.send_right_away import SendRightAway
 
 
 class SchedulerResilience(unittest.IsolatedAsyncioTestCase):
@@ -28,7 +29,7 @@ class SchedulerResilience(unittest.IsolatedAsyncioTestCase):
             calls.append(data)
             delivered.set()
 
-        sched = SendScheduler(send_fn, jitter_ms_min=1, jitter_ms_max=1)
+        sched = SendScheduler(send_fn, shaper=SendRightAway())  # type: ignore[arg-type]
         await sched.start()
         try:
             sched.enqueue(b"a", 128)
@@ -62,8 +63,7 @@ class SchedulerResilience(unittest.IsolatedAsyncioTestCase):
             send_fn,
             chaff_fn=chaff_fn,
             should_chaff_fn=lambda: chaff_on["v"],
-            jitter_ms_min=1,
-            jitter_ms_max=1,
+            shaper=SendRightAway(),  # type: ignore[arg-type]
         )
         await sched.start()
         try:

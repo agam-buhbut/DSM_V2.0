@@ -114,6 +114,7 @@ class TestDataPathRoundtrip(unittest.IsolatedAsyncioTestCase):
             make_enrolled_device,
             make_test_ca,
         )
+        from tests.send_right_away import SendRightAway
 
         server_transport = UDPTransport()
         server_port = await server_transport.bind("127.0.0.1", 0)
@@ -155,9 +156,9 @@ class TestDataPathRoundtrip(unittest.IsolatedAsyncioTestCase):
             timeout=30.0,
         )
 
-        # Build DataPathContexts using MockTuns. No scheduler chaff/jitter —
-        # we want deterministic test latency. Use minimum jitter 0,0 via a
-        # constrained shaper config.
+        # Build DataPathContexts using MockTuns. No scheduler chaff, and a
+        # stand-in shaper that sends right away — we want deterministic test
+        # latency.
 
         def _make_ctx(
             keys: tuncore.SessionKeyManager,
@@ -181,8 +182,7 @@ class TestDataPathRoundtrip(unittest.IsolatedAsyncioTestCase):
                 send_fn=send_fn,
                 chaff_fn=lambda: make_chaff_packet(shaper, keys.epoch & 0x0F),
                 should_chaff_fn=lambda: False,  # no chaff interference
-                jitter_ms_min=0,
-                jitter_ms_max=0,
+                shaper=SendRightAway(),  # type: ignore[arg-type]
             )
             shutdown = asyncio.Event()
             ctx = DataPathContext(
@@ -538,6 +538,7 @@ class TestDataPathRoundtrip(unittest.IsolatedAsyncioTestCase):
         )
         from dsm.traffic.scheduler import SendScheduler
         from dsm.traffic.shaper import TrafficShaper, make_chaff_packet
+        from tests.send_right_away import SendRightAway
 
         orig_timeout = session_mod.REKEY_ACK_TIMEOUT
         session_mod.REKEY_ACK_TIMEOUT = 0.05
@@ -571,8 +572,7 @@ class TestDataPathRoundtrip(unittest.IsolatedAsyncioTestCase):
             send_fn=capture_send,
             chaff_fn=lambda: make_chaff_packet(shaper, keys.epoch & 0x0F),
             should_chaff_fn=lambda: False,
-            jitter_ms_min=0,
-            jitter_ms_max=0,
+            shaper=SendRightAway(),  # type: ignore[arg-type]
         )
         shutdown = asyncio.Event()
         rekey = RekeyState()
