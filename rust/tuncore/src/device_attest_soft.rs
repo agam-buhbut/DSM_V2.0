@@ -227,7 +227,7 @@ mod tests {
     fn generate_produces_parseable_spki() {
         let key = SoftAttestKey::generate().expect("generate");
         let spki = key.public_spki_der().unwrap();
-        assert!(!spki.is_empty());
+        assert_ne!(spki, [] as [u8; 0]);
         VerifyingKey::from_public_key_der(spki).expect("parseable SPKI");
     }
 

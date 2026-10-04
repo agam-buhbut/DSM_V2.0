@@ -816,7 +816,7 @@ mod tests {
                 match result {
                     Ok(slice) => {
                         assert_eq!(slice.len(), expected_len);
-                        assert!(buf_len == HANDSHAKE_PAD_SIZE);
+                        assert_eq!(buf_len, HANDSHAKE_PAD_SIZE);
                         assert!(expected_len <= HANDSHAKE_PAD_SIZE);
                     }
                     Err(_) => {

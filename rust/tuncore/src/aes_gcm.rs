@@ -148,7 +148,7 @@ mod tests {
         let ct = key.encrypt(&nonce, b"", b"aad").unwrap();
         assert_eq!(ct.len(), 16); // tag only
         let pt = key.decrypt(&nonce, &ct, b"aad").unwrap();
-        assert!(pt.is_empty());
+        assert_eq!(pt, [] as [u8; 0]);
     }
 
     #[test]
