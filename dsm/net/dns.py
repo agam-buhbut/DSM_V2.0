@@ -7,9 +7,10 @@ No DNS traffic ever leaves the client machine directly.
 from __future__ import annotations
 
 import asyncio
-import hashlib
+import hmac
 import ipaddress
 import logging
+import secrets
 import struct
 import time
 from collections.abc import Awaitable, Callable, Iterable
@@ -68,17 +69,28 @@ class DnsResult:
     authoritative: bool
 
 
-def redact(hostname: str, debug: bool) -> str:
-    """Return ``hostname`` for logs, or an opaque sha256 pseudonym otherwise.
+# Key for redact(). It is made once, when this module is first imported, so it
+# is new on every run. It is never logged or saved.
+_REDACT_KEY = secrets.token_bytes(32)
 
-    When ``debug`` is False (the default) qnames are replaced with a
-    truncated sha256 so an operator tailing journald cannot reconstruct the
-    user's browsing history from pinning/fallthrough error logs.
+
+def redact(hostname: str, debug: bool) -> str:
+    """Return ``hostname`` for logs, or a short keyed tag otherwise.
+
+    When ``debug`` is False (the default) a qname is replaced with
+    ``qname-tag=`` and 16 hex characters of HMAC-SHA256 under a random key
+    that is new on every run. An operator tailing journald can tell that two
+    log lines are about the same name, but cannot read the name from a
+    pinning or fallthrough error log. A plain SHA-256 would not give that:
+    anyone with a list of popular sites could hash them all and look the tag
+    up. Without the key a guess cannot be checked, so the tag cannot be
+    reversed. Because the key changes on each run, the same name gets a
+    different tag after a restart.
     """
     if debug:
         return hostname
-    digest = hashlib.sha256(hostname.encode("utf-8", "replace")).hexdigest()[:16]
-    return f"qname-sha256={digest}"
+    tag = hmac.digest(_REDACT_KEY, hostname.encode("utf-8", "replace"), "sha256")
+    return f"qname-tag={tag.hex()[:16]}"
 
 
 class DNSResolver:
@@ -100,10 +112,10 @@ class DNSResolver:
         if not providers:
             raise ValueError("DNSResolver requires at least one provider")
         # debug_dns mirrors the LocalDNSProxy flag — when False (the
-        # default), qnames are replaced with an opaque sha256 prefix in
-        # WARNING/ERROR-level logs so an operator tailing journald cannot
-        # reconstruct the user's browsing history from pinning failures
-        # or fallthrough errors.
+        # default), qnames are replaced with a short keyed tag (see
+        # redact()) in WARNING/ERROR-level logs so an operator tailing
+        # journald cannot reconstruct the user's browsing history from
+        # pinning failures or fallthrough errors.
         self._debug_dns = debug_dns
         self._pins: dict[str, list[bytes]] = {}
         for provider in providers:

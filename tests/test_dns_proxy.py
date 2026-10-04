@@ -26,8 +26,14 @@ class _StubResolver:
 class TestQnameRedaction(unittest.TestCase):
     def test_redaction_is_stable_and_short(self) -> None:
         redacted = redact("example.com", False)
-        expected = hashlib.sha256(b"example.com").hexdigest()[:16]
-        self.assertEqual(redacted, f"qname-sha256={expected}")
+        # The same name gets the same tag within one run.
+        self.assertEqual(redacted, redact("example.com", False))
+        # Short: the prefix and 16 hex characters.
+        self.assertRegex(redacted, r"\Aqname-tag=[0-9a-f]{16}\Z")
+        # Not the plain SHA-256 prefix of the name, which anyone with a list
+        # of popular sites could reverse.
+        plain = hashlib.sha256(b"example.com").hexdigest()[:16]
+        self.assertNotIn(plain, redacted)
 
     def test_different_qnames_produce_different_hashes(self) -> None:
         self.assertNotEqual(redact("a.com", False), redact("b.com", False))
