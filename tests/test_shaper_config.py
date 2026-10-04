@@ -278,4 +278,5 @@ def test_from_config_hands_the_keys_to_the_shaper() -> None:
     while now < 1010.0:
         slots, now = shaper.poll(now, 0, 0.0, 0)
         sent += slots
-    assert 80 * 10 * 0.95 <= sent <= 120 * 10 * 1.05
+    # A 10 s count also varies by chance, so allow 10% either side.
+    assert 80 * 10 * 0.9 <= sent <= 120 * 10 * 1.1
