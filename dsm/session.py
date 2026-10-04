@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import hmac
 import logging
 import os
@@ -671,9 +672,10 @@ async def _handle_rekey_init(ctx: DataPathContext, inner: InnerPacket) -> None:
         remote_static_pub=ctx.remote_static_pub,
         # Route the REKEY_ACK, and the cached-ACK replay for a duplicate
         # INIT, through the shaper schedule so their wire timing matches
-        # the steady stream. Each takes the next free slot, far inside the
-        # initiator's 8 s ACK timeout.
-        paced_send=ctx.scheduler.enqueue,
+        # the steady stream. As control messages they go ahead of any
+        # queued data and take the next free slot, far inside the
+        # initiator's 8 s ACK timeout and our 5 s old-key grace window.
+        paced_send=functools.partial(ctx.scheduler.enqueue, control=True),
     )
 
 
@@ -741,7 +743,8 @@ async def _handle_path_challenge(ctx: DataPathContext, inner: InnerPacket) -> No
     that has just moved (NAT rebind / network change) IS at that new addr,
     receives the challenge, and echoes the 16-byte token straight back via
     the normal paced send path — so the legitimate roam completes. The
-    response rides the scheduler (same slots as any control packet); the
+    response rides the scheduler as a control message (a normal slot, ahead
+    of any queued data, well inside the server's 5 s pending timeout); the
     server matches the echoed token against its pending slot.
 
     An off-path attacker who spoofed a victim's source addr never receives
@@ -756,7 +759,7 @@ async def _handle_path_challenge(ctx: DataPathContext, inner: InnerPacket) -> No
     padded, target_size = _build_control_packet(
         ctx, PacketType.PATH_RESPONSE, payload=token
     )
-    ctx.scheduler.enqueue(padded, target_size)
+    ctx.scheduler.enqueue(padded, target_size, control=True)
 
 
 async def send_session_close(ctx: DataPathContext) -> None:
@@ -1181,8 +1184,9 @@ async def tun_send_loop(ctx: DataPathContext) -> None:
                     # Pace the REKEY_INIT onto the shaper schedule. The
                     # retransmit budget is gated on REKEY_ACK_TIMEOUT (ACK
                     # receipt), not send completion, so fire-and-forget enqueue
-                    # is safe — a paced INIT leaves in the next free slot.
-                    paced_send=ctx.scheduler.enqueue,
+                    # is safe: as a control message the INIT goes ahead of
+                    # any queued data and leaves in the next free slot.
+                    paced_send=functools.partial(ctx.scheduler.enqueue, control=True),
                 )
             except Exception:
                 # An exception out of initiate_rekey must not leave the
@@ -1227,10 +1231,10 @@ async def tun_send_loop(ctx: DataPathContext) -> None:
                     ctx.session_keys,
                     ctx.shaper,
                     ctx.send_fn,
-                    # Pace the retransmitted INIT (same shaper path
-                    # as the original; the next ACK timeout is the recovery
-                    # mechanism, so fire-and-forget is correct).
-                    paced_send=ctx.scheduler.enqueue,
+                    # Pace the retransmitted INIT (same shaper path and
+                    # control queue as the original; the next ACK timeout is
+                    # the recovery mechanism, so fire-and-forget is correct).
+                    paced_send=functools.partial(ctx.scheduler.enqueue, control=True),
                 )
                 ctx.rekey.last_init_sent_at = time.monotonic()
 

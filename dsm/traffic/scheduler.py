@@ -8,7 +8,11 @@ A queued packet may take the very next slot. The send loop has no mode
 without a shaper, so it cannot send unshaped traffic by mistake (the
 SESSION_CLOSE at teardown goes out directly, by design).
 
-Packets queued at the same moment leave in the order they were queued.
+Control messages (rekey packets, PATH_CHALLENGE, PATH_RESPONSE) wait in
+their own small queue, which is always sent first and which the data
+queue's drop-oldest never touches. They still take normal slots, so the wire
+looks the same. Within each queue, packets leave in the order they were
+queued.
 """
 
 from __future__ import annotations
@@ -32,17 +36,24 @@ log = logging.getLogger(__name__)
 _T = TypeVar("_T")
 _SendFn = Callable[[bytes, int], Awaitable[None]]
 
-# Bounded queue. Sized for low-RAM targets: 512 * ~1500B ≈ 768 KiB
-# worst-case. Drop policy is drop-oldest regardless of packet type,
-# which preserves anonymity (real/chaff indistinguishable on the wire,
-# so drop-oldest does not reveal traffic shape).
+# Bounded data queue. Sized for low-RAM targets: 512 * ~1500B ≈ 768 KiB
+# worst-case. Drop policy is drop-oldest, which preserves anonymity
+# (real/chaff indistinguishable on the wire, so drop-oldest does not reveal
+# traffic shape).
 MAX_QUEUE_SIZE = 512
+
+# Control messages have deadlines of a few seconds (a rekey, an address
+# check), so they must not wait behind, or be dropped with, a full data
+# queue. Only a few are ever queued at once; if more pile up, the oldest
+# control packet is dropped, as in the data queue.
+MAX_CONTROL_QUEUE_SIZE = 32
 
 
 @dataclass(order=True)
 class _ScheduledPacket:
-    send_time: float
-    # Tie-break: packets with the same send time leave in queue order.
+    # When the packet was queued; each queue sends its oldest first.
+    queued_at: float
+    # Tie-break: packets queued at the same moment leave in queue order.
     order: int
     data: bytes = field(compare=False)
     target_size: int = field(compare=False)
@@ -84,6 +95,8 @@ class SendScheduler:
         self._shaper = shaper
         self._clock = clock
         self._queue: list[_ScheduledPacket] = []
+        # Control messages: always sent before the data queue.
+        self._control: list[_ScheduledPacket] = []
         self._order = itertools.count()
         self._max_queue_size = MAX_QUEUE_SIZE
         self._running = False
@@ -95,6 +108,7 @@ class SendScheduler:
         # A full queue and a failing send can repeat once per packet: log
         # the first, then at most one line per 10 s with a count.
         self._drop_log = RepeatLog(log, logging.WARNING, clock=clock)
+        self._control_drop_log = RepeatLog(log, logging.WARNING, clock=clock)
         self._failure_logs: dict[tuple[str, type[BaseException]], RepeatLog] = {}
 
     def enqueue(
@@ -103,21 +117,32 @@ class SendScheduler:
         target_size: int,
         *,
         send_via: _SendFn | None = None,
+        control: bool = False,
     ) -> None:
         """Queue a packet. It may take the very next slot.
 
         ``send_via`` sends this one packet with a different function (the
         server's PATH_CHALLENGE to a candidate address) when its turn comes.
+
+        ``control`` marks a control message: it goes to the control queue,
+        which is sent before any data and which the data queue's drop-oldest
+        never touches.
         """
+        packet = _ScheduledPacket(
+            self._clock(), next(self._order), data, target_size, send_via
+        )
+        if control:
+            if len(self._control) >= MAX_CONTROL_QUEUE_SIZE:
+                heapq.heappop(self._control)  # drop oldest
+                self._control_drop_log.log(
+                    "control queue full, dropping oldest control packet"
+                )
+            heapq.heappush(self._control, packet)
+            return
         if len(self._queue) >= self._max_queue_size:
             heapq.heappop(self._queue)  # drop oldest
             self._drop_log.log("scheduler queue full, dropping oldest packet")
-        heapq.heappush(
-            self._queue,
-            _ScheduledPacket(
-                self._clock(), next(self._order), data, target_size, send_via
-            ),
-        )
+        heapq.heappush(self._queue, packet)
 
     async def start(self) -> None:
         self._running = True
@@ -185,28 +210,29 @@ class SendScheduler:
     async def _tick(self, now: float) -> None:
         """Fill exactly the slots that are due.
 
-        Queued packets go first, oldest first; chaff fills the remaining
-        slots. The count comes from the shaper, never from the queue, so the
-        wire rate follows the tier, not the real traffic.
+        Queued control messages go first, then queued data, each oldest
+        first; chaff fills the remaining slots. The count comes from the
+        shaper, never from the queues, so the wire rate follows the tier,
+        not the real traffic.
         """
-        oldest_wait = 0.0
-        if self._queue and self._queue[0].send_time <= now:
-            oldest_wait = now - self._queue[0].send_time
+        heads = [q[0].queued_at for q in (self._control, self._queue) if q]
+        oldest_wait = max(0.0, now - min(heads)) if heads else 0.0
         slots, self._next_wake = self._shaper.poll(
-            now, len(self._queue), oldest_wait, self._real_sent
+            now, len(self._control) + len(self._queue), oldest_wait, self._real_sent
         )
         self._real_sent = 0
         chaff_allowed = self._should_chaff_fn is None or self._should_chaff_fn()
         for _ in range(slots):
-            if self._queue and self._queue[0].send_time <= now:
-                await self._send_one(heapq.heappop(self._queue))
+            queue = self._control or self._queue
+            if queue:
+                await self._send_one(heapq.heappop(queue))
                 self._real_sent += 1
             elif self._chaff_fn is not None and chaff_allowed:
                 # Chaff fills the slot. Sent DIRECTLY (not via enqueue) so it
                 # never counts as real demand.
                 await self._send_chaff()
             else:
-                # No real packet due and chaff not allowed (e.g. the server
+                # Nothing queued and chaff not allowed (e.g. the server
                 # before the client addr is known): the slot stays empty.
                 break
 

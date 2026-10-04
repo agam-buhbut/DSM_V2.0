@@ -264,9 +264,10 @@ def _queue_path_challenge(
     """Queue a PATH_CHALLENGE for the pending candidate address.
 
     It leaves in a normal shaper slot like any packet, so it never shows up
-    as an off-beat packet. When its turn comes the scheduler sends it with
-    ``path_send`` to ``candidate``, not to the committed egress, which stays
-    untouched.
+    as an off-beat packet. As a control message it goes ahead of any queued
+    data, so it leaves well inside the 5 s pending timeout. When its turn
+    comes the scheduler sends it with ``path_send`` to ``candidate``, not to
+    the committed egress, which stays untouched.
     """
     # imported here: private helper, not part of dsm.session's public surface
     from dsm.session import _build_control_packet  # pyright: ignore[reportPrivateUsage]
@@ -278,7 +279,7 @@ def _queue_path_challenge(
     async def _to_candidate(data: bytes, size: int) -> None:
         await path_send(data, size, candidate)
 
-    ctx.scheduler.enqueue(padded, target_size, send_via=_to_candidate)
+    ctx.scheduler.enqueue(padded, target_size, send_via=_to_candidate, control=True)
 
 
 async def _run_one_session(

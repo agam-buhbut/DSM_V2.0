@@ -41,8 +41,9 @@ MAX_REKEY_RETRIES = 9
 
 SendFn = Callable[[bytes, int], Awaitable[None]]
 
-# A synchronous, fire-and-forget paced-enqueue callable — the same
-# ``SendScheduler.enqueue`` real data/chaff packets use.
+# A synchronous, fire-and-forget paced-enqueue callable. The data path
+# passes ``SendScheduler.enqueue`` with ``control=True``, so the packet waits
+# in the control queue, ahead of any queued data.
 # When supplied, control-plane REKEY_INIT/REKEY_ACK leave in the tier
 # shaper's next free slot instead of immediately via ``send_fn``, so their
 # wire timing is indistinguishable from the steady stream. ``enqueue`` only

@@ -295,8 +295,9 @@ queue holds up to 512 packets; when it is full, the oldest packet is
 dropped. That can happen at any tier, for example when a big burst comes in
 before the pace has stepped up. Control messages, such as the reply that
 confirms a key change or the check the server sends when your address
-changes, also take normal free places. Only the goodbye message at shutdown
-goes straight out.
+changes, also take normal free places. They wait in their own small queue
+that goes first, so a full queue of data never holds them up or drops them.
+Only the goodbye message at shutdown goes straight out.
 
 **Going up and coming down.** Apart from decoys (below), DSM moves up a
 tier only when your real packets have waited too long: by default, a
@@ -385,7 +386,8 @@ defaults, and each end shapes only what it sends.
 ### Timing
 
 - DSM adds no random wait of its own: a queued packet takes the next free
-  place in the flow, and queued packets leave oldest first.
+  place in the flow. Queued control messages leave first, then queued data,
+  each oldest first.
 - The old per-packet wait settings, `jitter_ms_min` and `jitter_ms_max`,
   were removed. A config that still has them stops at startup with a clear
   message.

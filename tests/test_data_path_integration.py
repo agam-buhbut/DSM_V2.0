@@ -602,9 +602,9 @@ class TestDataPathRoundtrip(unittest.IsolatedAsyncioTestCase):
         enqueued: list[tuple[bytes, int]] = []
         orig_enqueue = scheduler.enqueue
 
-        def _spy_enqueue(data: bytes, target_size: int) -> None:
+        def _spy_enqueue(data: bytes, target_size: int, **kwargs: object) -> None:
             enqueued.append((data, target_size))
-            orig_enqueue(data, target_size)
+            orig_enqueue(data, target_size, **kwargs)
 
         scheduler.enqueue = _spy_enqueue  # type: ignore[method-assign]
 

@@ -24,6 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   times do not drift toward your real traffic.
 - The resent key-change reply and the server's address check now take
   normal free places instead of going straight out.
+- Control messages (key changes and address checks) wait in their own small
+  queue that is sent before any data. A full data queue can no longer hold
+  them up for seconds or drop them, which could break a key change.
 - More cover traffic by default: about 3 GB a day per direction when
   connected all day with decoys on, about 6 GB with some real use.
   `config.example.toml` lists the costs.
