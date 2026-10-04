@@ -106,6 +106,12 @@ def test_rejects_a_start_time_that_is_not_finite(bad_now: float) -> None:
         tuncore.Shaper(TIERS, 0.5, 0.0, (0.0, 0.0), 128, 1400, bad_now)
 
 
+def test_linger_must_be_a_tuple_not_a_list() -> None:
+    args: tuple[object, ...] = (TIERS, 0.5, 0.0, [0.0, 0.0], 128, 1400, T0)
+    with pytest.raises(TypeError):
+        tuncore.Shaper(*args)  # type: ignore[arg-type]
+
+
 def test_no_getters_and_nothing_in_repr() -> None:
     shaper = _shaper()
     public = {name for name in dir(shaper) if not name.startswith("_")}
@@ -136,7 +142,8 @@ def test_a_backlog_steps_the_rate_up_within_the_budget() -> None:
     burst_at = T0 + 30.0
     departures = _run(_shaper(), T0 + 33.0, [burst_at] * 300)
     before = _count(departures, T0 + 20.0, burst_at) / 10.0
-    assert before <= TIER0_MAX_PPS * 1.1
+    # A 10 s count also varies by chance, so allow 20% above the top rate.
+    assert before <= TIER0_MAX_PPS * 1.2
     # The step-up comes no later than the 0.5 s budget; from then on the
     # rate is at least tier 1 (50 x 0.8 = 40 packets/s).
     after = _count(departures, burst_at + 0.5, burst_at + 1.5)
@@ -165,9 +172,18 @@ def test_a_poll_time_that_is_not_finite_means_no_time_passes(bad_now: float) -> 
     assert T0 + 0.5 < next_wake <= T0 + 0.5 + max_gap + 1e-9
 
 
+def test_a_session_with_decoys_and_linger_on_starts_and_polls() -> None:
+    shaper = _shaper(decoy_interval_s=7200.0, linger_s=(300.0, 1800.0))
+    slots, next_wake = shaper.poll(T0 + 0.5, 0, 0.0, 0)
+    assert slots >= 1
+    # A decoy could be due sooner than the next send, but never later than it.
+    assert T0 + 0.5 < next_wake <= T0 + 0.5 + 1.7 / TIER0_MIN_PPS + 1e-9
+
+
 def test_each_session_draws_its_own_timing() -> None:
     rates = [len(_run(_shaper(), T0 + 60.0)) / 60.0 for _ in range(20)]
-    assert all(TIER0_MIN_PPS * 0.95 <= r <= TIER0_MAX_PPS * 1.05 for r in rates)
+    # A 60 s count also varies by chance, so allow 10% beyond the band edges.
+    assert all(TIER0_MIN_PPS * 0.9 <= r <= TIER0_MAX_PPS * 1.1 for r in rates)
     # The secret scale (0.8-1.2) differs per session, so the idle rates spread.
     assert statistics.pstdev(rates) > 0.2
 

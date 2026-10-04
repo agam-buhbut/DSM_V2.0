@@ -194,7 +194,8 @@ class Shaper:
 
     Decides when packets leave and how big they are. Each session draws its
     own secret timing values from the OS RNG; nothing exposes them (no
-    getters, nothing in ``repr``). Config errors raise ``ValueError``.
+    getters, nothing in ``repr``). Config errors raise ``ValueError``. An
+    integer outside the range a call takes raises ``OverflowError``.
     """
 
     def __init__(
@@ -220,7 +221,10 @@ class Shaper:
 
     def real_size_class(self, payload_len: int) -> int: ...
     def chaff_size_class(self) -> int: ...
-    def set_size_class_ceiling(self, max_outer: int) -> None: ...
+    def set_size_class_ceiling(self, max_outer: int) -> None:
+        """Use only size classes up to ``max_outer`` bytes (0 to 65535)."""
+        ...
+
     def active_classes(self) -> list[int]: ...
 
 def harden_process() -> None: ...
@@ -258,7 +262,7 @@ ATTEST_BACKEND_IS_SOFTWARE: bool
 SIZE_CLASSES: tuple[int, ...]
 SIZE_CLASS_WEIGHTS: tuple[int, ...]
 
-# Chaff size nudge: a draw below UP_P moves one class up, below DOWN_P one
-# class down.
+# Chaff size nudge: a draw below UP_P moves one class up. A draw from UP_P up
+# to just below DOWN_P moves one class down.
 CHAFF_PERTURB_UP_P: float
 CHAFF_PERTURB_DOWN_P: float
