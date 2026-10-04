@@ -195,3 +195,8 @@ include = ["dsm/net/_templates/*.conf"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# Event loop scope of async fixtures. Left unset, pytest-asyncio uses each
+# fixture's own scope and warns (shown with python -X dev) that the default
+# will become "function". The suite has no async fixtures, so this changes
+# nothing today.
+asyncio_default_fixture_loop_scope = "function"
