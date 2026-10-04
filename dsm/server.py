@@ -642,10 +642,22 @@ async def run_server(
         transport_obj: UDPTransport | TCPTransport | None
         if config.transport == "udp":
             transport_obj = UDPTransport()
-            await transport_obj.bind(
-                local_port=config.listen_port,
-                pmtu_discover=config.pmtu_discover,
-            )
+            try:
+                await transport_obj.bind(
+                    local_port=config.listen_port,
+                    pmtu_discover=config.pmtu_discover,
+                )
+            except OSError as e:
+                # Like a TCP listener that cannot open: retrying cannot fix
+                # it, so log one line and exit, and let systemd restart us
+                # after its delay.
+                reason = os.strerror(e.errno) if e.errno else str(e)
+                log.error(
+                    "cannot listen on UDP port %d: %s; exiting",
+                    config.listen_port,
+                    reason,
+                )
+                return 1
             stack.push_async_callback(transport_obj.aclose)
             log.info("server listening on UDP port %d", config.listen_port)
         else:
