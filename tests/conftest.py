@@ -93,6 +93,25 @@ _SWTPM_READINESS_TIMEOUT_S = 5.0
 _SWTPM_POLL_S = 0.02
 
 
+def _free_port_pair() -> int:
+    """Pick a loopback port P such that P and P+1 are both bindable now.
+
+    swtpm listens on P and on P+1 (control channel) without SO_REUSEADDR, so
+    P+1 must also be free: Linux hands out odd ports for bind(0) and even ones
+    for connect(), so P+1 is often a recent client port still in TIME_WAIT.
+    """
+    while True:
+        port = _free_port()
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            probe.bind(("127.0.0.1", port + 1))
+        except OSError:
+            continue
+        finally:
+            probe.close()
+        return port
+
+
 def _free_port() -> int:
     """Pick a free loopback TCP port. swtpm also claims port+1 for its control
     channel; the small race window between release and re-bind is tolerated as
@@ -143,7 +162,7 @@ def swtpm_tcti(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
         _teardown(None)
         pytest.skip("swtpm_setup failed to author TPM state")
 
-    port = _free_port()
+    port = _free_port_pair()
     ctrl = port + 1
     proc = subprocess.Popen(
         [
