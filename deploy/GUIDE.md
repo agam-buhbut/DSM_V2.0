@@ -1579,8 +1579,8 @@ Must be quoted   — mode, transport, log_level, server_ip,
                    tun_name
 Bare (no quotes) — server_port, listen_port, mtu, padding_*,
                    shaper_*, rotation_*, pmtu_discover,
-                   pmtu_check_interval_s, debug_dns, debug_net,
-                   auto_mtu, crl_strict
+                   pmtu_check_interval_s, max_inflight_handshakes,
+                   debug_dns, debug_net, auto_mtu, crl_strict
 ```
 
 Concrete: `server_ip = 10.0.0.5` trips at col 17 because tomllib
