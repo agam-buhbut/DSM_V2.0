@@ -35,10 +35,11 @@ dsm = "dsm.__main__:main"
 
 [tool.black]
 line-length = 88
-# Pin the target to the supported runtime range (requires-python >=3.11; CI
-# runs 3.11/3.12). Without this, black 26.x defaults to a newer target than
-# the interpreter running it and skips its AST-equivalence safety check.
-target-version = ["py311", "py312", "py313"]
+# Name only the oldest supported Python (requires-python >=3.11). Black warns
+# "cannot parse code formatted for Python 3.x" when any listed target is newer
+# than the interpreter running it, and CI runs 3.11 and 3.12. With no target at
+# all, black reads requires-python and aims at the newer versions too.
+target-version = ["py311"]
 
 [tool.isort]
 profile = "black"
