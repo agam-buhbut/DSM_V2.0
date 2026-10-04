@@ -163,7 +163,10 @@ padding_max = 1400
 #   * when a burst starts: about 0.5-1.5 s of extra wait while it steps up
 #
 # Rates in packets per second, lowest first: 2-8 entries, each 1-5000, each
-# higher than the one before. The first one is the idle rate.
+# higher than the one before. The first one is the idle rate. It must be
+# above 4.25 divided by the latency budget (below) in seconds: above 8.5 with
+# the default 500 ms. Otherwise DSM refuses the config at startup, because a
+# slower first tier would let light traffic change the send times.
 # shaper_tiers_pps = [10, 50, 200, 800]
 #
 # How long a real packet may wait before the rate steps up, in milliseconds

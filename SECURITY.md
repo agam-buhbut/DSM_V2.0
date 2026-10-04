@@ -73,10 +73,15 @@ closed as known:
   recognizable traffic pattern before cover traffic is active, allowing an
   observer to identify that DSM is in use. Masking pre-key traffic is
   post-v1 research.
-- **TCP traffic-analysis caveat.** DSM's adaptive-envelope shaping bounds, but
-  does not perfectly eliminate, traffic-analysis signal during active periods.
-  The anonymity claim is scoped accordingly; perfect indistinguishability under
-  a global passive adversary is not promised.
+- **Traffic-analysis limits.** DSM's tier shaper sends packets at a steady
+  rate that only changes in a few fixed steps, so a watcher sees which step
+  you are on, not your real traffic. It does not hide everything: the step
+  itself shows roughly how much you send; the packet counter at the start of
+  every packet is not encrypted and links your traffic across port changes;
+  someone who watches both your connection and your server's internet side
+  can line up your real busy periods; and in TCP mode the TCP connection
+  itself stays visible. Perfect hiding from someone who can watch the whole
+  internet is not promised.
 
 These are described in the project's threat-model documentation. If you believe
 a property is materially worse than documented — or that one of these can be

@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Breaking:** traffic shaping now uses fixed rate steps ("tiers") instead
+  of the adaptive envelope. Packets leave at a steady rate that only moves
+  between a few set speeds. Your real packets take free places and fake
+  packets (chaff) fill the rest. The rate goes up only when real packets
+  have waited too long, and it comes down slowly, a few minutes per step.
+  Fake busy periods ("decoys") climb and come down like real use, and each
+  session picks, and now and then changes, its own secret timing values.
+  The timing and size decisions now run in the Rust core (`tuncore`), and
+  the size list lives there too. So `dsm.core.protocol`, and every module
+  that uses it, no longer loads without the built extension.
+- A queued packet now takes the next free place, with no random extra wait.
+- The send loop no longer wakes up early when a packet is queued, so send
+  times do not drift toward your real traffic.
+- The resent key-change reply and the server's address check now take
+  normal free places instead of going straight out.
+- More cover traffic by default: about 3 GB a day per direction when
+  connected all day with decoys on, about 6 GB with some real use.
+  `config.example.toml` lists the costs.
+- The first tier must be fast enough for the latency budget:
+  `shaper_tiers_pps[0]` must be above 4.25 divided by the budget in seconds
+  (above 8.5 packets per second at the default 500 ms). DSM refuses a
+  slower first tier at startup, because it would let light traffic change
+  the send times.
+- Before dropping to idle, the rate waits at tier 1 (`shaper_linger_s`,
+  5 to 30 minutes by default). If the link is still in use when that wait
+  ends, the rate stays at tier 1 instead of dropping to idle.
+
+### Removed
+- **Breaking:** the six `envelope_*` config keys. Use `shaper_tiers_pps`,
+  `shaper_latency_budget_ms`, `shaper_decoy_interval_s` and
+  `shaper_linger_s` instead. A config that still has an `envelope_*` key
+  stops at startup with a message that names the new keys.
+- **Breaking:** `jitter_ms_min` and `jitter_ms_max`. A config that still has
+  them stops at startup with a clear message.
+- The send loop's mode without the tier shaper, so nothing can send
+  unshaped traffic by mistake.
+
 ### Security
 - A malformed or truncated TCP frame from an unauthenticated peer (oversized
   length prefix, zero-length frame, or EOF mid-frame) no longer crashes the
@@ -81,9 +119,10 @@ Work taking DSM from an internal state to a public, MIT-licensed release.
   silently-dropped kill switch.
 
 ### Traffic shaping / anonymity
-- Reworked traffic shaping toward an adaptive-envelope model: real packets are
-  smoothed into a slowly varying rate envelope with chaff filling to the
-  envelope, replacing the previous static-rate approach.
+- Reworked traffic shaping toward an adaptive-envelope model: real packets
+  were smoothed into a slowly changing rate, with chaff filling up to it,
+  replacing the earlier fixed-rate approach. The tier shaper has since
+  replaced this model (see Unreleased).
 - Scoped the anonymity claims to match the implemented behavior and documented
   the known accepted v1 risks (boot/handshake fingerprint, active-period
   traffic-analysis caveat).

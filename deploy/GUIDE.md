@@ -1565,7 +1565,7 @@ Must be quoted   — mode, transport, log_level, server_ip,
                    expected_server_cn, allowed_cns_file,
                    tun_name
 Bare (no quotes) — server_port, listen_port, mtu, padding_*,
-                   jitter_*, rotation_*, pmtu_discover,
+                   shaper_*, rotation_*, pmtu_discover,
                    pmtu_check_interval_s, debug_dns, debug_net,
                    auto_mtu, crl_strict
 ```
@@ -1663,8 +1663,14 @@ or prctl(PR_SET_DUMPABLE) didn't stick. Usually one of:
   `"configured tun mtu=1400 exceeds usable inner NNN"`
   Lower `mtu` in both configs until the warning is gone, OR set
   `auto_mtu = true` + `pmtu_discover = true` on the client.
-- Chaff + jitter adds latency by design. For a faster-but-less-
-  anonymized smoke test, lower padding_max and jitter_ms_max to 5.
+- The tier shaper adds wait by design. When a burst starts, packets
+  wait about 0.5 to 1.5 seconds while the rate steps up, and with the
+  defaults the top tier caps speed at about 7 to 10 Mbit/s. For a
+  faster smoke test that hides less, lower `shaper_latency_budget_ms`
+  and raise `shaper_tiers_pps` in both configs. A lower budget needs a
+  faster first tier: it must stay above 4.25 divided by the budget in
+  seconds. On a slow link, lowering padding_max also cuts the padding
+  bytes.
 
 ### "rekey giving up after 9 retries — tearing down"
 
