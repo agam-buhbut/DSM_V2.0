@@ -22,7 +22,7 @@
       "reportAttributeAccessIssue": "none",
       "reportArgumentType": "none",
       "reportInvalidTypeForm": "none",
-      "reportPossiblyUnbound": "none",
+      "reportPossiblyUnboundVariable": "none",
       "reportUntypedBaseClass": "none",
       "reportGeneralTypeIssues": "none",
       "reportUnusedImport": "none",
