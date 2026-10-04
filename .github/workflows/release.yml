@@ -129,7 +129,7 @@ jobs:
       #
       # --only-binary=:all: forbids any sdist (the installer is --no-index, so a
       # source dist could not build on the target anyway). --require-hashes pins
-      # the resolved set to the committed requirements.lock (137 hashed pins,
+      # the resolved set to the committed requirements.lock (147 hashed pins,
       # generated with --generate-hashes): the vendored wheelhouse is EXACTLY the
       # locked runtime closure (cryptography -> cffi -> pycparser; dnspython is
       # pure-Python), so a compromised index cannot substitute an unpinned dep.

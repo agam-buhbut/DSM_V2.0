@@ -78,7 +78,7 @@ jobs:
           # dist/ first (this is a build step; PyPI is allowed for staging only),
           # then install --no-index so --find-links resolves cryptography/dnspython
           # (and their transitive deps) from the local wheelhouse, never the net.
-          pip download --dest dist "cryptography>=46.0.7,<49" "dnspython>=2.6,<3.0"
+          pip download --dest dist "cryptography>=50.0.0,<51" "dnspython>=2.6,<3.0"
           pip install --no-index --find-links dist dsm
 
       # Python gates, in CLAUDE.md order.
@@ -186,7 +186,7 @@ jobs:
           maturin build --release --no-default-features --features tpm-attest --out dist-tpm
           # Same wheelhouse model as the soft lane: stage runtime deps from PyPI
           # into dist-tpm/ so the --no-index DSM install resolves them locally.
-          pip download --dest dist-tpm "cryptography>=46.0.7,<49" "dnspython>=2.6,<3.0"
+          pip download --dest dist-tpm "cryptography>=50.0.0,<51" "dnspython>=2.6,<3.0"
           pip install --no-index --find-links dist-tpm dsm
 
       # clippy on the real backend (this runner has the TSS2 headers).

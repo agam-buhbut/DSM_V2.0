@@ -304,7 +304,7 @@ Important caveats:
 
 Installing the dsm wheel ALSO installs its runtime dependencies at the
 versions pinned in pyproject.toml ([project].dependencies:
-cryptography>=46.0.7,<49 and dnspython>=2.6,<3.0). Do NOT install
+cryptography>=50.0.0,<51 and dnspython>=2.6,<3.0). Do NOT install
 `dnspython cryptography` unpinned by hand — let the wheel's metadata
 pin them so a surprise major release can't be pulled in:
 
@@ -320,7 +320,7 @@ see these packages.
 
 For a fully reproducible, exactly-pinned install (recommended for
 production), the repo ships requirements.lock (a uv-compiled pin set:
-cryptography==48.0.0, dnspython==2.8.0, plus their transitive deps).
+cryptography==50.0.2, dnspython==2.8.0, plus their transitive deps).
 Pre-install those exact versions, then add the wheel without letting
 pip re-resolve the transitive set:
 

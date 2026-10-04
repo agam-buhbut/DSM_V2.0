@@ -19,6 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   default 8, each attempt capped at 12 s), so one stalled bogus handshake
   can no longer starve a legitimate client.
 - The CA certificate must have a P-384 key.
+- The cryptography dependency moves to 50.x (`>=50.0.0,<51`), which fixes
+  CVE-2026-69247, CVE-2026-69248 and CVE-2026-69249. DSM does not use the
+  affected APIs, but older versions failed the dependency audit.
 
 ### Fixed
 - UDP sessions no longer end within ~50 ms of the handshake: a send before
