@@ -99,12 +99,11 @@ expected_server_cn = "dsm-1234abcd-server"
 # (each slot is a live NoiseResponder + a small per-peer inbox).
 # max_inflight_handshakes = 8
 
-# Server only: DNS providers + pinned SPKI SHA-256 (server resolves on behalf
-# of clients). Provider host MUST be an IP literal (a hostname dead-loops
-# through the TUN).
+# Server only: DNS providers (the server resolves on behalf of clients). The
+# provider host MUST be an IP literal (a hostname dead-loops through the TUN).
+# Each provider needs a pinned SPKI SHA-256 in the [dns_provider_pins] table,
+# which is at the very END of this file and must stay there.
 # dns_providers = ["https://1.1.1.1/dns-query"]
-# [dns_provider_pins]
-# "https://1.1.1.1/dns-query" = ["<64-char hex SPKI SHA-256>"]
 # debug_dns = false                          # true logs plaintext qnames (privacy off)
 
 # Network
@@ -190,3 +189,13 @@ padding_max = 1400
 # Key rotation
 rotation_packets = 5000                      # Rotate after N packets
 rotation_seconds = 600                       # Rotate after N seconds (10 min)
+
+# Server only: the pinned SPKI SHA-256 of each provider in dns_providers (64
+# hex characters; a list, so you can pin a current key and a next one). Every
+# name here must match a dns_providers entry exactly.
+#
+# KEEP THIS TABLE LAST. In TOML every line below a [table] header belongs to
+# that table, so a setting added below it would be read as a pin, and DSM
+# would stop at startup. Put any new setting ABOVE this block.
+# [dns_provider_pins]
+# "https://1.1.1.1/dns-query" = ["<64-char hex SPKI SHA-256>"]
