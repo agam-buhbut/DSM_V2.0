@@ -33,6 +33,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a fatal startup error with an actionable message instead of a retry loop.
 - `dsm init --install-unit` prints instructions instead of raising when
   `deploy/dsm.service` is not available.
+- If the TCP listen port cannot be opened when the server starts (for
+  example it is already in use), the server exits with a one-line error.
+  Other accept errors are retried after the usual backoff.
 - CI no longer tries to install the nonexistent `types-dnspython` package.
 
 ### Added

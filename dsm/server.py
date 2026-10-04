@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -62,6 +63,10 @@ _HANDSHAKE_RETRY_BACKOFF_MAX = 5.0  # seconds
 _HANDSHAKE_RETRY_BACKOFF_JITTER = 0.5  # ±this fraction of base
 
 log = logging.getLogger(__name__)
+
+
+class ListenError(Exception):
+    """The TCP listening socket could not be opened (e.g. the port is in use)."""
 
 
 def _emit_handshake_failure(err: Exception) -> None:
@@ -144,6 +149,9 @@ async def _accept_one_session(
         the caller can break the outer loop and unwind cleanly. ``transport``
         is the (possibly re-created, for TCP) transport that the handshake
         succeeded on.
+
+    Raises:
+        ListenError: the TCP listener could not be opened.
     """
     from dsm.crypto.handshake import (
         CertAuthError,
@@ -161,7 +169,14 @@ async def _accept_one_session(
             if transport_obj is not None:
                 await transport_obj.aclose()
             transport_obj = TCPTransport()
-            await transport_obj.listen(port=config.listen_port)
+            try:
+                await transport_obj.listen(port=config.listen_port)
+            except OSError as e:
+                await transport_obj.aclose()
+                reason = os.strerror(e.errno) if e.errno else str(e)
+                raise ListenError(
+                    f"cannot listen on TCP port {config.listen_port}: {reason}"
+                ) from e
             log.info("server listening on TCP port %d", config.listen_port)
 
         fsm.transition(State.HANDSHAKING)
@@ -644,6 +659,8 @@ async def run_server(
 
         # OUTER re-accept loop: accept one client, serve it to session-end,
         # then loop back and accept the next. Exits only on process_shutdown.
+        accept_failures = 0
+        served = False
         while not process_shutdown.is_set():
             try:
                 if config.transport == "udp":
@@ -682,18 +699,25 @@ async def run_server(
                         transport_obj,
                         process_shutdown,
                     )
-            except Exception:
-                # Anything raised before authentication (e.g. a FramingError
-                # from a malformed length prefix) must not take the daemon
-                # down for every later client. Reset and start a fresh
-                # listener.
-                log.exception(
-                    "accept failed; recovering — daemon stays up for the next client"
-                )
+            except Exception as e:
+                if isinstance(e, ListenError) and not served:
+                    # Nothing has been served yet, so the listener cannot work
+                    # at all (e.g. the port is taken). Exit and let systemd
+                    # restart us after its delay instead of retrying here.
+                    log.error("%s; exiting", e)
+                    return 1
+                # Anything else raised before authentication (e.g. a
+                # FramingError from a malformed length prefix) must not take
+                # the daemon down for every later client. Reset, wait the
+                # usual jittered backoff so a repeating error cannot spin,
+                # then accept again on a fresh listener.
+                log.exception("accept failed; retrying after a backoff")
                 _drive_fsm_to_idle(fsm)
                 if config.transport == "tcp" and transport_obj is not None:
                     await transport_obj.aclose()
                     transport_obj = None
+                accept_failures += 1
+                await _backoff_or_shutdown(accept_failures, process_shutdown)
                 if not process_shutdown.is_set():
                     fsm.transition(State.CONNECTING)
                 continue
@@ -707,6 +731,8 @@ async def run_server(
                     await transport_obj.aclose()
                 break
 
+            accept_failures = 0
+            served = True
             try:
                 await _run_one_session(
                     config,
