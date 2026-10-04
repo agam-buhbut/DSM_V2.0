@@ -1,7 +1,9 @@
 """Kill-switch ICMP gating.
 
 Verifies that every ICMP accept rule in the rendered kill-switch templates
-is gated to the TUN interface so real-IP ICMP cannot escape the WAN.
+is gated to the TUN interface so real-IP ICMP cannot escape the WAN. The
+one exception is inbound "fragmentation needed" (type 3 code 4), which
+path-MTU discovery on the outer path needs.
 
 Regression: unqualified
     meta l4proto icmp limit rate 2/second accept
@@ -18,6 +20,7 @@ from dsm.net.nftables import NFTablesManager, PreHandshakeKillSwitch
 _SERVER_IP = "203.0.113.5"
 _PORT = 51820
 _TUN = "mtun0"
+_FRAG_NEEDED = "icmp type destination-unreachable icmp code frag-needed accept"
 
 
 # --------------------------------------------------------------------------- #
@@ -51,18 +54,71 @@ def test_no_unqualified_icmp_accept_full_killswitch_icmpv6() -> None:
             ), f"unqualified ICMPv6 accept: {s}"
 
 
-def test_pre_handshake_has_no_icmp_accept() -> None:
+def test_pre_handshake_has_no_general_icmp_accept() -> None:
     """Pre-handshake ruleset must have zero 'l4proto icmp … accept' lines.
 
     There is no TUN device during the handshake window so there's nowhere to
-    gate ICMP to — delete the lines entirely so off-link ICMP falls through
-    to 'counter drop'. Loopback ICMP works via 'oif "lo" accept'.
+    gate ICMP to, so off-link ICMP falls through to 'counter drop' (apart
+    from "fragmentation needed", checked below). Loopback ICMP works via
+    'oif "lo" accept'.
     """
     rules = PreHandshakeKillSwitch(_SERVER_IP, _PORT)._render()
     assert not any(
         "l4proto icmp" in line and line.strip().endswith("accept")
         for line in rules.splitlines()
     ), "pre-handshake ruleset must not contain any 'l4proto icmp … accept' rule"
+
+
+# --------------------------------------------------------------------------- #
+# "Fragmentation needed" is the only ICMP accepted off the tunnel
+# --------------------------------------------------------------------------- #
+
+
+def _chains(rules: str) -> dict[str, list[str]]:
+    """Map each chain name to its stripped rule lines."""
+    chains: dict[str, list[str]] = {}
+    current = None
+    for line in rules.splitlines():
+        s = line.strip()
+        if s.startswith("chain "):
+            current = s.split()[1]
+            chains[current] = []
+        elif s == "}":
+            current = None
+        elif current is not None and s and not s.startswith("#"):
+            chains[current].append(s)
+    return chains
+
+
+def _off_tunnel_icmp_accepts(rules: str) -> list[str]:
+    return [
+        s
+        for s in (line.strip() for line in rules.splitlines())
+        if "icmp" in s
+        and s.endswith("accept")
+        and f'oif "{_TUN}"' not in s
+        and f'iif "{_TUN}"' not in s
+    ]
+
+
+def test_full_killswitch_accepts_frag_needed_on_input_only() -> None:
+    chains = _chains(NFTablesManager(_SERVER_IP, _PORT, _TUN)._render())
+    assert chains["input"].count(_FRAG_NEEDED) == 1
+    assert _FRAG_NEEDED not in chains["output"]
+
+
+def test_pre_handshake_accepts_frag_needed_on_input_only() -> None:
+    chains = _chains(PreHandshakeKillSwitch(_SERVER_IP, _PORT)._render())
+    assert chains["input"].count(_FRAG_NEEDED) == 1
+    assert _FRAG_NEEDED not in chains["output"]
+
+
+def test_frag_needed_is_the_only_off_tunnel_icmp_accept() -> None:
+    for rules in (
+        NFTablesManager(_SERVER_IP, _PORT, _TUN)._render(),
+        PreHandshakeKillSwitch(_SERVER_IP, _PORT)._render(),
+    ):
+        assert _off_tunnel_icmp_accepts(rules) == [_FRAG_NEEDED]
 
 
 # --------------------------------------------------------------------------- #

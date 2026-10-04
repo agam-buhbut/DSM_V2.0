@@ -12,9 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   length prefix, zero-length frame, or EOF mid-frame) no longer crashes the
   server: the accept loop logs it and keeps serving, and the attempt's
   listener is closed so bad frames cannot leak sockets.
-- The kill switch accepts ICMP only on the tunnel interface and the
-  pre-handshake ruleset accepts none, so the host no longer sends or answers
-  ICMP from its real address on the WAN.
+- The kill switch accepts ICMP only on the tunnel interface, so the host no
+  longer sends or answers ICMP from its real address on the WAN. The one
+  exception, in both the full and the pre-handshake rulesets, is inbound
+  "fragmentation needed", which path-MTU discovery needs.
 - UDP handshakes are validated concurrently (`max_inflight_handshakes`,
   default 8, each attempt capped at 12 s), so one stalled bogus handshake
   can no longer starve a legitimate client.
