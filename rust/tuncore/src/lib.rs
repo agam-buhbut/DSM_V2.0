@@ -47,6 +47,7 @@ pub mod replay_window;
 pub mod secure_memory;
 pub mod secure_noise;
 pub mod session_keys;
+pub mod shaper;
 pub mod tpm_blob;
 
 use pyo3::exceptions::PyRuntimeError;

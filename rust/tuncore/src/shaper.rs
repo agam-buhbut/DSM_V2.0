@@ -1,0 +1,1379 @@
+//! Tier shaper core: decides WHEN packets leave and HOW BIG they are.
+//!
+//! Packets leave at a steady rate that only changes in a few fixed steps
+//! ("tiers"). Real packets take free slots; the caller fills the rest with
+//! chaff. The rate steps up only when real packets have waited past a random
+//! point inside the latency budget, and steps down slowly (holds of about
+//! 1-5 minutes, a usage check, an optional linger before idle). Decoys are
+//! fake backlogs: they climb to a target tier through the exact same step-up
+//! path, then hold a fake busy stretch. Each session draws its own secret
+//! timing values and draws them again now and then.
+//!
+//! Plain Rust with no Python types; the PyO3 wrapper lives in `lib.rs`.
+//! Secret values have no getters and never appear in `Debug` output.
+
+use std::collections::VecDeque;
+use std::fmt;
+
+use rand::rngs::StdRng;
+use rand::{CryptoRng, Rng, RngCore, SeedableRng};
+
+/// Padded outer packet sizes in bytes: the fixed, published size list.
+pub const SIZE_CLASSES: [u16; 11] = [128, 256, 384, 512, 640, 768, 896, 1024, 1152, 1280, 1400];
+/// Draw weights for [`SIZE_CLASSES`], same order (smaller packets likelier).
+pub const SIZE_CLASS_WEIGHTS: [u16; 11] = [20, 15, 12, 10, 8, 7, 6, 6, 5, 6, 5];
+/// Chaff sizing: a draw below this moves the class one up.
+pub const CHAFF_PERTURB_UP_P: f64 = 0.15;
+/// Chaff sizing: a draw from `CHAFF_PERTURB_UP_P` up to this moves it one down.
+pub const CHAFF_PERTURB_DOWN_P: f64 = 0.30;
+
+const LARGEST_CLASS: u16 = SIZE_CLASSES[SIZE_CLASSES.len() - 1];
+/// Bytes a padded packet needs beyond its payload: outer header (20) +
+/// GCM tag (16) + inner header (4). Mirrors `dsm.core.protocol`.
+const PACKET_OVERHEAD: usize = 40;
+
+/// A poll more than this many seconds behind the schedule is a stall: the
+/// missed slots are skipped instead of sent as a burst.
+const STALL_RESET_S: f64 = 1.0;
+/// Secret values are drawn again after a uniform wait in this range (s).
+const REPICK_S: (f64, f64) = (600.0, 2400.0);
+/// The step-up point is a fresh fraction of the latency budget per step.
+const STEP_UP_FRACTION: (f64, f64) = (0.5, 1.0);
+/// Real-sent counts closer together than this (s) share one log entry.
+const USAGE_BUCKET_S: f64 = 0.1;
+/// Slack for the step-up comparison. A real backlog's start is recomputed
+/// as `now - oldest_wait` at every poll, so float rounding can put the
+/// step-up time a hair after the wake meant for it; without slack that
+/// would re-poll at the same instant.
+const STEP_UP_SLACK_S: f64 = 1e-6;
+
+// Secret value ranges.
+const TIER_SCALE: (f64, f64) = (0.8, 1.2);
+const GAP_SPREAD: (f64, f64) = (0.3, 0.7);
+const OVERSHOOT_P: (f64, f64) = (0.2, 0.5);
+const HOLD_MIN_S: (f64, f64) = (45.0, 75.0);
+const HOLD_MAX_S: (f64, f64) = (240.0, 360.0);
+const DECOY_TOP_P: (f64, f64) = (0.5, 0.8);
+const LOOKBACK_S: (f64, f64) = (5.0, 15.0);
+const USAGE_LIMIT: (f64, f64) = (0.35, 0.65);
+/// log2 of the decoy-mean factor: x0.5 to x2.0, centred on x1.0.
+const DECOY_MEAN_LOG2: (f64, f64) = (-1.0, 1.0);
+const BUSY_MEAN_S: (f64, f64) = (60.0, 360.0);
+
+// Config rules (the same limits dsm/core/config.py enforces).
+const TIER_COUNT: (usize, usize) = (2, 8);
+const TIER_PPS: (f64, f64) = (1.0, 5000.0);
+const BUDGET_S: (f64, f64) = (0.01, 5.0);
+const DECOY_INTERVAL_S: (f64, f64) = (300.0, 86_400.0);
+const MAX_LINGER_S: f64 = 7200.0;
+
+/// Public shaper settings, taken from the config file. Not secret.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ShaperConfig {
+    /// Tier rates in packets per second: 2 to 8 entries, strictly rising.
+    pub tiers_pps: Vec<f64>,
+    /// How long a real packet may wait before the rate steps up (s).
+    pub latency_budget_s: f64,
+    /// Average time between decoys (s); 0 turns decoys off.
+    pub decoy_interval_s: f64,
+    /// Range for the stay at tier 1 before idle (s); (0, 0) turns it off.
+    pub linger_s: (f64, f64),
+    /// Smallest padded size a packet may get (bytes).
+    pub padding_min: u16,
+    /// Largest padded size a packet may get (bytes).
+    pub padding_max: u16,
+}
+
+impl ShaperConfig {
+    fn validate(&self) -> Result<(), ShaperError> {
+        let tiers = &self.tiers_pps;
+        let count_ok = (TIER_COUNT.0..=TIER_COUNT.1).contains(&tiers.len());
+        let values_ok = tiers.iter().all(|t| (TIER_PPS.0..=TIER_PPS.1).contains(t));
+        let rising = tiers.windows(2).all(|w| w[0] < w[1]);
+        if !(count_ok && values_ok && rising) {
+            return Err(ShaperError::Tiers);
+        }
+        if !(BUDGET_S.0..=BUDGET_S.1).contains(&self.latency_budget_s) {
+            return Err(ShaperError::LatencyBudget);
+        }
+        let d = self.decoy_interval_s;
+        if !(d == 0.0 || (DECOY_INTERVAL_S.0..=DECOY_INTERVAL_S.1).contains(&d)) {
+            return Err(ShaperError::DecoyInterval);
+        }
+        let (lo, hi) = self.linger_s;
+        let off = lo == 0.0 && hi == 0.0;
+        if !(off || (lo > 0.0 && lo <= hi && hi <= MAX_LINGER_S)) {
+            return Err(ShaperError::Linger);
+        }
+        if self.padding_min > self.padding_max {
+            return Err(ShaperError::Padding);
+        }
+        Ok(())
+    }
+}
+
+/// Why a [`ShaperConfig`] was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShaperError {
+    Tiers,
+    LatencyBudget,
+    DecoyInterval,
+    Linger,
+    Padding,
+}
+
+impl fmt::Display for ShaperError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Tiers => {
+                "tiers_pps must have 2-8 entries, each 1-5000 packets/s, strictly rising"
+            }
+            Self::LatencyBudget => "latency_budget_s must be 0.01-5.0",
+            Self::DecoyInterval => "decoy_interval_s must be 0 (off) or 300-86400",
+            Self::Linger => "linger_s must be (0, 0) (off) or 0 < min <= max <= 7200",
+            Self::Padding => "padding_min must not exceed padding_max",
+        })
+    }
+}
+
+impl std::error::Error for ShaperError {}
+
+/// What the caller should do now.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Poll {
+    /// Packets to send now: real ones first, chaff for the rest.
+    pub slots_due: u32,
+    /// When to poll again, on the same clock as `now`.
+    pub next_wake: f64,
+}
+
+/// Per-session secret timing values. No getters, no `Debug`.
+struct Secrets {
+    tier_scale: f64,
+    gap_spread: f64,
+    overshoot_p: f64,
+    hold_min_s: f64,
+    hold_max_s: f64,
+    decoy_top_p: f64,
+    lookback_s: f64,
+    usage_limit: f64,
+    decoy_mean_s: f64,
+    busy_mean_s: f64,
+}
+
+impl Secrets {
+    fn draw<R: Rng + ?Sized>(rng: &mut R, decoy_interval_s: f64) -> Self {
+        Self {
+            tier_scale: uniform(rng, TIER_SCALE),
+            gap_spread: uniform(rng, GAP_SPREAD),
+            overshoot_p: uniform(rng, OVERSHOOT_P),
+            hold_min_s: uniform(rng, HOLD_MIN_S),
+            hold_max_s: uniform(rng, HOLD_MAX_S),
+            decoy_top_p: uniform(rng, DECOY_TOP_P),
+            lookback_s: uniform(rng, LOOKBACK_S),
+            usage_limit: uniform(rng, USAGE_LIMIT),
+            decoy_mean_s: decoy_interval_s * uniform(rng, DECOY_MEAN_LOG2).exp2(),
+            busy_mean_s: uniform(rng, BUSY_MEAN_S),
+        }
+    }
+}
+
+fn uniform<R: Rng + ?Sized>(rng: &mut R, (lo, hi): (f64, f64)) -> f64 {
+    lo + (hi - lo) * rng.gen::<f64>()
+}
+
+/// Exponential wait with the given mean: `-mean * ln(u)` with `u` in (0, 1].
+fn exponential<R: Rng + ?Sized>(rng: &mut R, mean: f64) -> f64 {
+    -mean * (1.0 - rng.gen::<f64>()).ln()
+}
+
+fn class_weight(class: u16) -> f64 {
+    SIZE_CLASSES
+        .iter()
+        .position(|&c| c == class)
+        .map_or(1.0, |i| f64::from(SIZE_CLASS_WEIGHTS[i]))
+}
+
+/// The one class to use when the padding range holds no size class: the
+/// smallest class at or above `padding_min`, else the largest class.
+fn fallback_class(padding_min: u16) -> u16 {
+    SIZE_CLASSES
+        .iter()
+        .copied()
+        .find(|&c| c >= padding_min)
+        .unwrap_or(LARGEST_CLASS)
+}
+
+/// Tier shaper for one session and one direction.
+pub struct Shaper<R> {
+    cfg: ShaperConfig,
+    /// Timing and secret draws.
+    rng: R,
+    /// Size draws, seeded once from `rng`. A separate stream so that sizing
+    /// real packets never shifts the timing draws: traffic that fits the
+    /// current tier must leave departure times exactly as they were.
+    size_rng: StdRng,
+    secrets: Secrets,
+    tier: usize,
+    last_now: f64,
+    last_departure: f64,
+    next_departure: f64,
+    hold_until: f64,
+    linger_until: Option<f64>,
+    step_up_after: f64,
+    last_step_up: f64,
+    /// Tier a climbing decoy is heading for, and when its fake backlog began.
+    decoy_target: Option<usize>,
+    decoy_since: f64,
+    busy_until: f64,
+    next_decoy: Option<f64>,
+    next_repick: f64,
+    /// (time, real packets sent) for the step-down usage check.
+    real_log: VecDeque<(f64, u32)>,
+    active: Vec<u16>,
+    cumulative: Vec<f64>,
+}
+
+impl<R> fmt::Debug for Shaper<R> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Deliberately opaque: timing state and secrets never reach logs.
+        f.debug_struct("Shaper").finish_non_exhaustive()
+    }
+}
+
+impl<R: RngCore + CryptoRng> Shaper<R> {
+    /// Start a session at `now` (seconds on the caller's monotonic clock).
+    ///
+    /// # Errors
+    /// Returns [`ShaperError`] when `cfg` breaks a config rule.
+    pub fn new(cfg: ShaperConfig, mut rng: R, now: f64) -> Result<Self, ShaperError> {
+        cfg.validate()?;
+        let mut seed = <StdRng as SeedableRng>::Seed::default();
+        rng.fill_bytes(&mut seed);
+        let secrets = Secrets::draw(&mut rng, cfg.decoy_interval_s);
+        let padding_max = cfg.padding_max;
+        let mut shaper = Self {
+            cfg,
+            rng,
+            size_rng: StdRng::from_seed(seed),
+            secrets,
+            tier: 0,
+            last_now: now,
+            last_departure: now,
+            next_departure: now,
+            hold_until: now,
+            linger_until: None,
+            step_up_after: 0.0,
+            last_step_up: f64::NEG_INFINITY,
+            decoy_target: None,
+            decoy_since: now,
+            busy_until: f64::NEG_INFINITY,
+            next_decoy: None,
+            next_repick: now,
+            real_log: VecDeque::new(),
+            active: Vec::new(),
+            cumulative: Vec::new(),
+        };
+        shaper.next_departure = now + shaper.draw_gap();
+        shaper.step_up_after = shaper.draw_step_up_point();
+        shaper.next_repick = now + uniform(&mut shaper.rng, REPICK_S);
+        shaper.next_decoy = shaper.draw_next_decoy(now);
+        shaper.rebuild_classes(padding_max);
+        Ok(shaper)
+    }
+
+    /// Advance the schedule to `now`; say how many packets leave and when
+    /// to poll again.
+    ///
+    /// `queue_len` is the number of real packets waiting, `oldest_wait` how
+    /// long (s) the oldest sendable one has waited (0 if none), and
+    /// `real_sent` how many real packets the caller sent since the last poll.
+    pub fn poll(&mut self, now: f64, queue_len: usize, oldest_wait: f64, real_sent: u32) -> Poll {
+        let now = now.max(self.last_now);
+        self.last_now = now;
+        let oldest_wait = if oldest_wait.is_finite() {
+            oldest_wait.max(0.0)
+        } else {
+            0.0
+        };
+        self.record_real_sent(now, real_sent);
+        if now >= self.next_repick {
+            self.repick(now);
+        }
+        if now - self.next_departure > STALL_RESET_S {
+            // Stalled: skip the missed slots and restart from now.
+            self.next_departure = now;
+        }
+        if self.next_decoy.is_some_and(|t| now >= t) {
+            self.start_decoy(now);
+        }
+        if self
+            .step_up_at(now, queue_len, oldest_wait)
+            .is_some_and(|at| now + STEP_UP_SLACK_S >= at)
+        {
+            self.step_up(now);
+        }
+        self.end_decoy_climb(now);
+        self.maybe_step_down(now);
+        let slots_due = self.take_due_slots(now);
+        Poll {
+            slots_due,
+            next_wake: self.next_wake(now, queue_len, oldest_wait),
+        }
+    }
+
+    /// Size class for a real packet with `payload_len` payload bytes: a draw
+    /// from the fixed size mix, bumped up to the smallest class that fits.
+    /// If no class fits, the exact size needed (padding only grows packets).
+    pub fn real_size_class(&mut self, payload_len: usize) -> u16 {
+        let idx = self.sample_class_index();
+        let need = payload_len.saturating_add(PACKET_OVERHEAD);
+        self.active[idx..]
+            .iter()
+            .copied()
+            .find(|&c| usize::from(c) >= need)
+            .unwrap_or_else(|| u16::try_from(need).unwrap_or(u16::MAX))
+    }
+
+    /// Size class for a chaff packet: a draw from the fixed size mix, then
+    /// moved one class up or down with the published chances (clamped).
+    pub fn chaff_size_class(&mut self) -> u16 {
+        let mut idx = self.sample_class_index();
+        let r: f64 = self.size_rng.gen();
+        if r < CHAFF_PERTURB_UP_P {
+            if idx + 1 < self.active.len() {
+                idx += 1;
+            }
+        } else if r < CHAFF_PERTURB_DOWN_P && idx > 0 {
+            idx -= 1;
+        }
+        self.active[idx]
+    }
+
+    /// Use only classes up to `max_outer` bytes (never above `padding_max`).
+    /// At least one class always stays usable.
+    pub fn set_size_class_ceiling(&mut self, max_outer: u16) {
+        self.rebuild_classes(max_outer);
+    }
+
+    /// The size classes in use now. Public information, not a secret.
+    pub fn active_classes(&self) -> &[u16] {
+        &self.active
+    }
+
+    fn top(&self) -> usize {
+        self.cfg.tiers_pps.len() - 1
+    }
+
+    fn rate_of(&self, tier: usize) -> f64 {
+        self.cfg.tiers_pps[tier] * self.secrets.tier_scale
+    }
+
+    /// Gap to the next departure at the current tier.
+    fn draw_gap(&mut self) -> f64 {
+        let w = self.secrets.gap_spread;
+        uniform(&mut self.rng, (1.0 - w, 1.0 + w)) / self.rate_of(self.tier)
+    }
+
+    fn draw_step_up_point(&mut self) -> f64 {
+        uniform(&mut self.rng, STEP_UP_FRACTION) * self.cfg.latency_budget_s
+    }
+
+    fn draw_next_decoy(&mut self, now: f64) -> Option<f64> {
+        if self.cfg.decoy_interval_s > 0.0 {
+            Some(now + exponential(&mut self.rng, self.secrets.decoy_mean_s))
+        } else {
+            None
+        }
+    }
+
+    /// When the backlog reaches the step-up point, or `None` without one.
+    /// The backlog starts at the oldest real packet's arrival or at a
+    /// climbing decoy's start, whichever is earlier; the point counts from
+    /// the later of that start and the last step-up. The result is an
+    /// absolute time, so a decoy climbs at the same instants however often
+    /// the caller polls.
+    fn step_up_at(&self, now: f64, queue_len: usize, oldest_wait: f64) -> Option<f64> {
+        let real = (queue_len > 0).then_some(now - oldest_wait);
+        let decoy = self.decoy_target.map(|_| self.decoy_since);
+        let start = match (real, decoy) {
+            (Some(r), Some(d)) => r.min(d),
+            (Some(r), None) => r,
+            (None, Some(d)) => d,
+            (None, None) => return None,
+        };
+        Some(start.max(self.last_step_up) + self.step_up_after)
+    }
+
+    /// Every tier change starts a hold of random length.
+    fn change_tier(&mut self, tier: usize, now: f64) {
+        self.tier = tier;
+        let hold = (self.secrets.hold_min_s, self.secrets.hold_max_s);
+        self.hold_until = now + uniform(&mut self.rng, hold);
+    }
+
+    /// Up one tier, or two with the secret overshoot chance, capped at the
+    /// top. Real backlogs and decoys both come through here.
+    fn step_up(&mut self, now: f64) {
+        let top = self.top();
+        if self.tier >= top {
+            return;
+        }
+        let steps = if self.rng.gen::<f64>() < self.secrets.overshoot_p {
+            2
+        } else {
+            1
+        };
+        self.change_tier((self.tier + steps).min(top), now);
+        self.linger_until = None;
+        self.last_step_up = now;
+        self.step_up_after = self.draw_step_up_point();
+        // The faster rate may let the next packet leave sooner, but never in
+        // the past: no burst at the step.
+        let candidate = self.last_departure + self.draw_gap();
+        if candidate < self.next_departure {
+            self.next_departure = candidate.max(now);
+        }
+    }
+
+    /// A decoy: a fake backlog that climbs like a real page load. It picks a
+    /// target tier (the top with the secret chance, otherwise a random tier
+    /// from 1 to the one below the top) and climbs there one step-up point at
+    /// a time through the normal step-up path. One decoy at a time, and none
+    /// starts at the top tier.
+    fn start_decoy(&mut self, now: f64) {
+        let top = self.top();
+        if self.tier < top && self.decoy_target.is_none() {
+            let target = if top == 1 || self.rng.gen::<f64>() < self.secrets.decoy_top_p {
+                top
+            } else {
+                self.rng.gen_range(1..top)
+            };
+            self.decoy_target = Some(target);
+            self.decoy_since = now;
+        }
+        self.next_decoy = self.draw_next_decoy(now);
+    }
+
+    /// Once a climbing decoy has reached its target, its fake busy stretch
+    /// starts; after that, the normal step-down and linger take over.
+    fn end_decoy_climb(&mut self, now: f64) {
+        if self.decoy_target.is_some_and(|target| self.tier >= target) {
+            self.decoy_target = None;
+            let busy = exponential(&mut self.rng, self.secrets.busy_mean_s);
+            self.busy_until = self.busy_until.max(now + busy);
+        }
+    }
+
+    /// At a hold end: step down if recent real use is low, else hold again.
+    /// A step from tier 1 to idle lingers at tier 1 first.
+    fn maybe_step_down(&mut self, now: f64) {
+        if let Some(end) = self.linger_until {
+            if now >= end {
+                self.linger_until = None;
+                self.change_tier(0, now);
+            }
+            return;
+        }
+        if self.tier == 0 || now < self.hold_until {
+            return;
+        }
+        if self.usage_is_low(now) {
+            if self.tier == 1 && self.cfg.linger_s.1 > 0.0 {
+                let linger = uniform(&mut self.rng, self.cfg.linger_s);
+                self.linger_until = Some(now + linger);
+            } else {
+                self.change_tier(self.tier - 1, now);
+            }
+        } else {
+            // Still in use: hold again at the same tier.
+            self.change_tier(self.tier, now);
+        }
+    }
+
+    /// usage = real sent in the look-back window / (window x lower tier rate).
+    fn usage_is_low(&self, now: f64) -> bool {
+        if self.decoy_target.is_some() || now < self.busy_until {
+            // A decoy climb or busy stretch: usage counts as high.
+            return false;
+        }
+        let window = self.secrets.lookback_s;
+        let sent = self
+            .real_log
+            .iter()
+            .filter(|(t, _)| now - *t <= window)
+            .fold(0_u32, |acc, (_, n)| acc.saturating_add(*n));
+        f64::from(sent) < self.secrets.usage_limit * window * self.rate_of(self.tier - 1)
+    }
+
+    fn record_real_sent(&mut self, now: f64, n: u32) {
+        if n > 0 {
+            match self.real_log.back_mut() {
+                Some((t, count)) if now - *t < USAGE_BUCKET_S => {
+                    *count = count.saturating_add(n);
+                }
+                _ => self.real_log.push_back((now, n)),
+            }
+        }
+        while self
+            .real_log
+            .front()
+            .is_some_and(|(t, _)| now - *t > LOOKBACK_S.1)
+        {
+            self.real_log.pop_front();
+        }
+    }
+
+    /// Draw all secret values again. A running hold, linger or busy stretch
+    /// keeps its end time; the next decoy is re-timed with the new mean
+    /// (exponential waits are memoryless, so this does not bias the rate).
+    fn repick(&mut self, now: f64) {
+        self.secrets = Secrets::draw(&mut self.rng, self.cfg.decoy_interval_s);
+        self.next_repick = now + uniform(&mut self.rng, REPICK_S);
+        self.next_decoy = self.draw_next_decoy(now);
+    }
+
+    fn take_due_slots(&mut self, now: f64) -> u32 {
+        let mut slots = 0_u32;
+        while self.next_departure <= now {
+            slots = slots.saturating_add(1);
+            self.last_departure = self.next_departure;
+            self.next_departure += self.draw_gap();
+        }
+        slots
+    }
+
+    fn next_wake(&self, now: f64, queue_len: usize, oldest_wait: f64) -> f64 {
+        let mut wake = self.next_departure.min(self.next_repick);
+        if let Some(t) = self.next_decoy {
+            wake = wake.min(t);
+        }
+        if let Some(t) = self.linger_until {
+            wake = wake.min(t);
+        } else if self.tier > 0 {
+            wake = wake.min(self.hold_until);
+        }
+        // At the top tier a backlog cannot step up, so it must not set a
+        // wake either (that would poll in a tight loop).
+        let step = self
+            .step_up_at(now, queue_len, oldest_wait)
+            .filter(|_| self.tier < self.top());
+        if let Some(at) = step {
+            wake = wake.min(at.max(now));
+        }
+        wake
+    }
+
+    fn rebuild_classes(&mut self, ceiling: u16) {
+        let lo = self.cfg.padding_min;
+        let hi = ceiling.min(self.cfg.padding_max);
+        self.active = SIZE_CLASSES
+            .iter()
+            .copied()
+            .filter(|&c| lo <= c && c <= hi)
+            .collect();
+        if self.active.is_empty() {
+            self.active = vec![fallback_class(lo)];
+        }
+        let weights: Vec<f64> = self.active.iter().map(|&c| class_weight(c)).collect();
+        let total: f64 = weights.iter().sum();
+        let mut running = 0.0;
+        self.cumulative = weights
+            .iter()
+            .map(|w| {
+                running += w / total;
+                running
+            })
+            .collect();
+    }
+
+    fn sample_class_index(&mut self) -> usize {
+        let r: f64 = self.size_rng.gen();
+        self.cumulative
+            .iter()
+            .position(|&cum| r < cum)
+            .unwrap_or(self.active.len() - 1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const T0: f64 = 1000.0;
+
+    fn cfg() -> ShaperConfig {
+        ShaperConfig {
+            tiers_pps: vec![10.0, 50.0, 200.0, 800.0],
+            latency_budget_s: 0.5,
+            decoy_interval_s: 0.0,
+            linger_s: (0.0, 0.0),
+            padding_min: 128,
+            padding_max: 1400,
+        }
+    }
+
+    type Edit = fn(&mut ShaperConfig);
+
+    /// The test config with one change applied.
+    fn with(edit: Edit) -> ShaperConfig {
+        let mut c = cfg();
+        edit(&mut c);
+        c
+    }
+
+    fn shaper(cfg: ShaperConfig, seed: u64) -> Shaper<StdRng> {
+        Shaper::new(cfg, StdRng::seed_from_u64(seed), T0).expect("test config is valid")
+    }
+
+    fn count(n: usize) -> f64 {
+        f64::from(u32::try_from(n).expect("test counts fit in u32"))
+    }
+
+    /// One packet on the wire, with the state that drew the gap after it.
+    #[derive(Clone, Copy, Debug)]
+    struct Departure {
+        at: f64,
+        tier: usize,
+        scale: f64,
+        spread: f64,
+        real: bool,
+    }
+
+    #[derive(Debug, Default)]
+    struct Trace {
+        departures: Vec<Departure>,
+        /// Seconds each real packet waited from arrival to departure.
+        waits: Vec<f64>,
+        /// (time, new tier) at every tier change.
+        tier_changes: Vec<(f64, usize)>,
+    }
+
+    impl Trace {
+        fn times(&self) -> Vec<f64> {
+            self.departures.iter().map(|d| d.at).collect()
+        }
+
+        fn real_count(&self) -> usize {
+            self.departures.iter().filter(|d| d.real).count()
+        }
+    }
+
+    /// Drive `s` the way the scheduler does: poll at each `next_wake`, send
+    /// real packets first and chaff for the rest, size every packet.
+    /// `arrivals` are real-packet arrival times, ascending.
+    fn simulate(s: &mut Shaper<StdRng>, start: f64, arrivals: &[f64], end: f64) -> Trace {
+        let mut trace = Trace::default();
+        let mut queue: VecDeque<f64> = VecDeque::new();
+        let mut next_arrival = 0;
+        let mut real_sent = 0_u32;
+        let mut tier = s.tier;
+        let mut now = start;
+        while now <= end {
+            while next_arrival < arrivals.len() && arrivals[next_arrival] <= now {
+                queue.push_back(arrivals[next_arrival]);
+                next_arrival += 1;
+            }
+            let oldest_wait = queue.front().map_or(0.0, |&t| now - t);
+            let poll = s.poll(now, queue.len(), oldest_wait, real_sent);
+            real_sent = 0;
+            if s.tier != tier {
+                tier = s.tier;
+                trace.tier_changes.push((now, tier));
+            }
+            for _ in 0..poll.slots_due {
+                let real = if let Some(arrived) = queue.pop_front() {
+                    trace.waits.push(now - arrived);
+                    real_sent += 1;
+                    s.real_size_class(100);
+                    true
+                } else {
+                    s.chaff_size_class();
+                    false
+                };
+                trace.departures.push(Departure {
+                    at: now,
+                    tier: s.tier,
+                    scale: s.secrets.tier_scale,
+                    spread: s.secrets.gap_spread,
+                    real,
+                });
+            }
+            assert!(poll.next_wake >= now, "next_wake must not go back in time");
+            now = poll.next_wake;
+        }
+        trace
+    }
+
+    /// Every gap between two departures at the same tier, with the same
+    /// secrets and no tier change between them, lies in the tier's band.
+    fn assert_gaps_follow_tiers(trace: &Trace, tiers: &[f64]) {
+        let mut checked = 0;
+        for pair in trace.departures.windows(2) {
+            let (a, b) = (pair[0], pair[1]);
+            let changed = trace
+                .tier_changes
+                .iter()
+                .any(|&(t, _)| t > a.at && t <= b.at);
+            if changed || a.tier != b.tier || a.scale.to_bits() != b.scale.to_bits() {
+                continue;
+            }
+            let rate = tiers[a.tier] * a.scale;
+            let gap = b.at - a.at;
+            let (lo, hi) = ((1.0 - a.spread) / rate, (1.0 + a.spread) / rate);
+            assert!(
+                gap >= lo - 1e-9 && gap <= hi + 1e-9,
+                "gap {gap} outside [{lo}, {hi}] at tier {}",
+                a.tier
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "no gaps were checked");
+    }
+
+    #[test]
+    fn rejects_configs_that_break_the_rules() {
+        let cases: [(Edit, ShaperError); 16] = [
+            (|c| c.tiers_pps = vec![10.0], ShaperError::Tiers),
+            (|c| c.tiers_pps = vec![10.0; 9], ShaperError::Tiers),
+            (|c| c.tiers_pps = vec![10.0, 10.0], ShaperError::Tiers),
+            (|c| c.tiers_pps = vec![50.0, 10.0], ShaperError::Tiers),
+            (|c| c.tiers_pps = vec![0.5, 10.0], ShaperError::Tiers),
+            (|c| c.tiers_pps = vec![10.0, 5001.0], ShaperError::Tiers),
+            (|c| c.tiers_pps = vec![10.0, f64::NAN], ShaperError::Tiers),
+            (|c| c.latency_budget_s = 0.009, ShaperError::LatencyBudget),
+            (|c| c.latency_budget_s = 5.01, ShaperError::LatencyBudget),
+            (|c| c.decoy_interval_s = 299.0, ShaperError::DecoyInterval),
+            (
+                |c| c.decoy_interval_s = 86_401.0,
+                ShaperError::DecoyInterval,
+            ),
+            (|c| c.decoy_interval_s = -1.0, ShaperError::DecoyInterval),
+            (|c| c.linger_s = (0.0, 10.0), ShaperError::Linger),
+            (|c| c.linger_s = (10.0, 5.0), ShaperError::Linger),
+            (|c| c.linger_s = (10.0, 7201.0), ShaperError::Linger),
+            (|c| c.padding_min = 1401, ShaperError::Padding),
+        ];
+        for (edit, want) in cases {
+            let got = Shaper::new(with(edit), StdRng::seed_from_u64(0), T0);
+            assert!(matches!(got, Err(e) if e == want), "expected {want:?}");
+        }
+    }
+
+    #[test]
+    fn accepts_the_edges_of_every_rule() {
+        let cases: [Edit; 8] = [
+            |c| c.tiers_pps = vec![1.0, 5000.0],
+            |c| c.tiers_pps = (1..=8).map(f64::from).collect(),
+            |c| c.latency_budget_s = 0.01,
+            |c| c.latency_budget_s = 5.0,
+            |c| c.decoy_interval_s = 300.0,
+            |c| c.decoy_interval_s = 86_400.0,
+            |c| c.linger_s = (7200.0, 7200.0),
+            |c| c.padding_min = 1400,
+        ];
+        for edit in cases {
+            assert!(Shaper::new(with(edit), StdRng::seed_from_u64(0), T0).is_ok());
+        }
+    }
+
+    #[test]
+    fn debug_output_shows_no_values() {
+        let s = shaper(cfg(), 1);
+        assert_eq!(format!("{s:?}"), "Shaper { .. }");
+    }
+
+    /// KEY: traffic that fits in the current tier does not change send times.
+    /// Same seed with and without that traffic gives identical departures.
+    #[test]
+    fn fitting_traffic_does_not_move_departures() {
+        let end = T0 + 600.0;
+        // About one packet a second: each leaves at the next slot (gaps are
+        // at most 0.2125 s at tier 0), long before the earliest step-up point
+        // (0.25 s at the 0.5 s budget).
+        let arrivals: Vec<f64> = (0..560_u32)
+            .map(|i| T0 + 0.5 + f64::from(i) * 1.05)
+            .collect();
+        let quiet = simulate(&mut shaper(cfg(), 7), T0, &[], end);
+        let busy = simulate(&mut shaper(cfg(), 7), T0, &arrivals, end);
+        assert!(busy.real_count() >= 550, "the traffic was carried");
+        assert!(
+            busy.waits.iter().all(|&w| w < 0.25),
+            "every packet left before the earliest step-up point"
+        );
+        assert!(quiet.tier_changes.is_empty() && busy.tier_changes.is_empty());
+        assert_eq!(busy.times(), quiet.times());
+    }
+
+    /// KEY, across decoys, holds, step-downs and linger: still identical.
+    #[test]
+    fn fitting_traffic_does_not_move_departures_across_decoys() {
+        let edit: Edit = |c| {
+            c.decoy_interval_s = 300.0;
+            c.linger_s = (300.0, 600.0);
+        };
+        let end = T0 + 2.0 * 3600.0;
+        let arrivals: Vec<f64> = (0..3500_u32)
+            .map(|i| T0 + 0.5 + f64::from(i) * 2.0)
+            .collect();
+        let quiet = simulate(&mut shaper(with(edit), 11), T0, &[], end);
+        let busy = simulate(&mut shaper(with(edit), 11), T0, &arrivals, end);
+        assert!(quiet.tier_changes.len() >= 4, "decoys ran");
+        assert_eq!(busy.real_count(), arrivals.len());
+        assert_eq!(busy.tier_changes, quiet.tier_changes);
+        assert_eq!(busy.times(), quiet.times());
+    }
+
+    #[test]
+    fn idle_rate_matches_tier_zero_and_gaps_stay_in_range() {
+        let mut s = shaper(cfg(), 3);
+        let rate = 10.0 * s.secrets.tier_scale;
+        // 500 s: before the first secret re-pick (at least 600 s away).
+        let trace = simulate(&mut s, T0, &[], T0 + 500.0);
+        let measured = count(trace.departures.len()) / 500.0;
+        assert!(
+            (measured - rate).abs() < rate * 0.05,
+            "rate {measured} vs {rate}"
+        );
+        assert_gaps_follow_tiers(&trace, &cfg().tiers_pps);
+    }
+
+    #[test]
+    fn a_stall_skips_missed_slots_instead_of_bursting() {
+        let mut s = shaper(cfg(), 31);
+        s.poll(T0 + 0.5, 0, 0.0, 0);
+        let after = s.poll(T0 + 10.5, 0, 0.0, 0);
+        assert_eq!(after.slots_due, 1);
+        assert!(after.next_wake > T0 + 10.5);
+    }
+
+    #[test]
+    fn step_up_happens_at_the_step_up_point_and_never_after_the_budget() {
+        for seed in 0..50 {
+            let mut s = shaper(cfg(), seed);
+            let point = s.step_up_after;
+            assert!((0.25..=0.5).contains(&point));
+            let burst_at = T0 + 10.0;
+            let trace = simulate(&mut s, T0, &[burst_at; 300], T0 + 14.0);
+            let (first, tier) = trace.tier_changes[0];
+            assert!(tier >= 1);
+            assert!(
+                (first - (burst_at + point)).abs() < 1e-9,
+                "stepped at {first}"
+            );
+            assert!(first - burst_at <= 0.5 + 1e-9, "stepped after the budget");
+            // Still backed up: each next step comes after a fresh point.
+            for pair in trace.tier_changes.windows(2) {
+                let spacing = pair[1].0 - pair[0].0;
+                assert!(
+                    (0.25 - 1e-9..=0.5 + 1e-9).contains(&spacing),
+                    "spacing {spacing}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_step_up_moves_the_next_departure_earlier_but_not_into_the_past() {
+        // Tier 0 at 1 packet/s puts the next packet at least 0.25 s away;
+        // every tier 1 gap is at most 0.0425 s. So the step-up must pull the
+        // departure in, whatever the session's secrets.
+        for seed in 0..50 {
+            // 0.001 s after the last departure the faster slot is still
+            // ahead; at 0.2 s it is already behind.
+            for since_last in [0.001, 0.2] {
+                let mut s = shaper(with(|c| c.tiers_pps = vec![1.0, 50.0]), seed);
+                let now = s.last_departure + since_last;
+                let before = s.next_departure;
+                s.step_up(now);
+                assert_eq!(s.tier, 1);
+                assert!(
+                    s.next_departure < before,
+                    "the step-up left the departure at {before}"
+                );
+                assert!(s.next_departure >= now, "the departure moved into the past");
+            }
+        }
+    }
+
+    #[test]
+    fn overshoot_rate_matches_the_session_secret() {
+        let mut s = shaper(cfg(), 5);
+        let p = s.secrets.overshoot_p;
+        let trials = 20_000_u32;
+        let mut double = 0_u32;
+        for _ in 0..trials {
+            s.tier = 0;
+            s.step_up(T0);
+            if s.tier == 2 {
+                double += 1;
+            }
+        }
+        let rate = f64::from(double) / f64::from(trials);
+        assert!((rate - p).abs() < 0.02, "overshoot {rate} vs secret {p}");
+    }
+
+    #[test]
+    fn a_backlog_at_the_top_tier_does_not_poll_in_a_tight_loop() {
+        let mut s = shaper(cfg(), 41);
+        s.change_tier(3, T0);
+        let poll = s.poll(T0 + 0.01, 500, 30.0, 0);
+        assert_eq!(s.tier, 3);
+        assert!(poll.next_wake > T0 + 0.01);
+    }
+
+    #[test]
+    fn no_step_down_during_a_hold_then_one_tier_down_when_usage_is_low() {
+        let mut s = shaper(cfg(), 9);
+        s.change_tier(2, T0);
+        let hold_end = s.hold_until;
+        let len = hold_end - T0;
+        assert!(len >= s.secrets.hold_min_s && len <= s.secrets.hold_max_s);
+        simulate(&mut s, T0, &[], hold_end - 0.01);
+        assert_eq!(s.tier, 2, "stepped down during the hold");
+        s.poll(hold_end + 0.001, 0, 0.0, 0);
+        assert_eq!(s.tier, 1);
+        assert!(s.hold_until > hold_end, "the step down started a new hold");
+    }
+
+    #[test]
+    fn hold_end_keeps_the_tier_while_usage_is_high() {
+        let mut s = shaper(cfg(), 13);
+        s.change_tier(2, T0);
+        let hold_end = s.hold_until;
+        // 100 real packets/s against a lower tier of at most 60 packets/s:
+        // usage stays above any secret limit (at most 0.65).
+        let mut t = T0;
+        while t < hold_end + 0.05 {
+            t += 0.1;
+            s.poll(t, 0, 0.0, 10);
+        }
+        assert_eq!(s.tier, 2);
+        assert!(
+            s.hold_until > hold_end,
+            "a new hold started at the same tier"
+        );
+    }
+
+    #[test]
+    fn dropping_to_idle_lingers_at_tier_one_first() {
+        let mut s = shaper(with(|c| c.linger_s = (300.0, 600.0)), 17);
+        s.change_tier(1, T0);
+        let at = s.hold_until + 0.001;
+        s.poll(at, 0, 0.0, 0);
+        assert_eq!(s.tier, 1);
+        let end = s.linger_until.expect("lingering");
+        assert!((300.0..=600.0).contains(&(end - at)));
+        s.poll(end - 0.001, 0, 0.0, 0);
+        assert_eq!(s.tier, 1);
+        s.poll(end + 0.001, 0, 0.0, 0);
+        assert_eq!(s.tier, 0);
+    }
+
+    #[test]
+    fn a_step_up_during_linger_cancels_it_and_the_next_drop_lingers_again() {
+        let mut s = shaper(with(|c| c.linger_s = (300.0, 600.0)), 19);
+        s.change_tier(1, T0);
+        let at = s.hold_until + 0.001;
+        s.poll(at, 0, 0.0, 0);
+        assert!(s.linger_until.is_some());
+        s.step_up(at + 1.0);
+        assert!(s.tier >= 2);
+        assert!(s.linger_until.is_none());
+        s.change_tier(1, at + 2.0);
+        s.poll(s.hold_until + 0.001, 0, 0.0, 0);
+        assert_eq!(s.tier, 1);
+        assert!(
+            s.linger_until.is_some(),
+            "the next return to idle lingers again"
+        );
+    }
+
+    #[test]
+    fn linger_off_drops_straight_to_idle() {
+        let mut s = shaper(cfg(), 21);
+        s.change_tier(1, T0);
+        s.poll(s.hold_until + 0.001, 0, 0.0, 0);
+        assert_eq!(s.tier, 0);
+        assert!(s.linger_until.is_none());
+    }
+
+    #[test]
+    fn a_decoy_climbs_then_holds_while_busy() {
+        let mut s = shaper(with(|c| c.decoy_interval_s = 300.0), 23);
+        let due = s.next_decoy.expect("decoys are on");
+        s.poll(due, 0, 0.0, 0);
+        // A decoy is a fake backlog: nothing moves before its first point.
+        assert_eq!(s.tier, 0);
+        let target = s.decoy_target.expect("climbing");
+        assert!((1..=3).contains(&target));
+        assert!(s.next_decoy.expect("re-armed") > due);
+        // No further decoys or re-picks (a re-pick re-times the next decoy).
+        s.next_decoy = None;
+        s.next_repick = f64::INFINITY;
+        simulate(&mut s, due, &[], due + 3.0);
+        assert!(s.decoy_target.is_none(), "the climb ended");
+        assert!(s.tier >= target);
+        assert!(s.busy_until > due);
+        // While busy, hold ends keep the tier even with zero real use.
+        let tier = s.tier;
+        s.busy_until = due + 2000.0;
+        let mut hold_ends = 0;
+        while s.hold_until < s.busy_until {
+            s.poll(s.hold_until + 0.001, 0, 0.0, 0);
+            assert_eq!(s.tier, tier, "stepped down during the busy stretch");
+            hold_ends += 1;
+        }
+        assert!(hold_ends >= 3);
+        // After the busy stretch, the next hold end steps down one tier.
+        s.poll(s.hold_until + 0.001, 0, 0.0, 0);
+        assert_eq!(s.tier, tier - 1);
+    }
+
+    #[test]
+    fn a_decoy_climbs_one_step_up_point_at_a_time_to_its_target() {
+        for seed in 0..30 {
+            let mut s = shaper(with(|c| c.decoy_interval_s = 300.0), seed);
+            // Aim every decoy at the top tier.
+            s.secrets.decoy_top_p = 1.0;
+            s.next_repick = f64::INFINITY;
+            let due = T0 + 10.0;
+            s.next_decoy = Some(due);
+            let first_point = s.step_up_after;
+            let trace = simulate(&mut s, T0, &[], due + 3.0);
+            let changes = &trace.tier_changes;
+            assert!(
+                (changes[0].0 - (due + first_point)).abs() < 1e-9,
+                "the first step comes one step-up point after the start"
+            );
+            let mut tier = 0;
+            for &(_, next) in changes {
+                assert!(next == tier + 1 || next == tier + 2, "one tier, or two");
+                tier = next;
+            }
+            assert_eq!(tier, 3, "reached the target");
+            for pair in changes.windows(2) {
+                let spacing = pair[1].0 - pair[0].0;
+                assert!(
+                    (0.25 - 1e-9..=0.5 + 1e-9).contains(&spacing),
+                    "spacing {spacing}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn decoys_reach_the_top_about_as_often_as_the_session_chance() {
+        let mut s = shaper(with(|c| c.decoy_interval_s = 300.0), 31);
+        s.next_repick = f64::INFINITY;
+        let p = s.secrets.decoy_top_p;
+        let o = s.secrets.overshoot_p;
+        let trials = 20_000_u32;
+        let (mut aimed, mut reached) = (0_u32, 0_u32);
+        let mut t = T0;
+        for _ in 0..trials {
+            t += 10.0;
+            s.change_tier(0, t);
+            s.next_decoy = Some(t);
+            s.poll(t, 0, 0.0, 0);
+            if s.decoy_target == Some(3) {
+                aimed += 1;
+            }
+            while s.decoy_target.is_some() {
+                let at = s.decoy_since.max(s.last_step_up) + s.step_up_after;
+                s.poll(at, 0, 0.0, 0);
+            }
+            if s.tier == 3 {
+                reached += 1;
+            }
+        }
+        let aimed = f64::from(aimed) / f64::from(trials);
+        let reached = f64::from(reached) / f64::from(trials);
+        assert!((aimed - p).abs() < 0.02, "aimed at the top {aimed} vs {p}");
+        // A decoy aimed at tier 2 can overshoot to the top: from tier 1 a
+        // double step lands on 3. With targets 1 and 2 equally likely, that
+        // adds (1 - p) / 2 * (1 - o) * o.
+        let want = p + (1.0 - p) / 2.0 * (1.0 - o) * o;
+        assert!(
+            (reached - want).abs() < 0.02,
+            "reached the top {reached} vs {want}"
+        );
+    }
+
+    #[test]
+    fn a_decoy_steps_up_exactly_like_a_real_backlog() {
+        let edit: Edit = |c| c.decoy_interval_s = 300.0;
+        let mut decoy = shaper(with(edit), 29);
+        let mut real = shaper(with(edit), 29);
+        let at = T0 + 5.0;
+        decoy.next_decoy = Some(at);
+        real.next_decoy = None;
+        let point = real.step_up_after;
+        assert_eq!(decoy.step_up_after.to_bits(), point.to_bits());
+        let decoy_trace = simulate(&mut decoy, T0, &[], at + 1.0);
+        let real_trace = simulate(&mut real, T0, &[at; 200], at + 1.0);
+        let (decoy_first, _) = decoy_trace.tier_changes[0];
+        let (real_first, _) = real_trace.tier_changes[0];
+        assert!((decoy_first - (at + point)).abs() < 1e-9);
+        assert!((real_first - (at + point)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn decoys_never_start_at_the_top_tier() {
+        let mut s = shaper(with(|c| c.decoy_interval_s = 300.0), 27);
+        s.change_tier(3, T0);
+        let hold_end = s.hold_until;
+        let due = T0 + 1.0;
+        s.next_decoy = Some(due);
+        s.poll(due, 0, 0.0, 0);
+        assert_eq!(s.tier, 3);
+        assert!(s.decoy_target.is_none());
+        assert_eq!(s.hold_until.to_bits(), hold_end.to_bits());
+        assert!(s.busy_until < due);
+        assert!(s.next_decoy.expect("re-armed") > due);
+    }
+
+    /// With two tiers no tier lies between idle and the top, so there is
+    /// nothing to pick from: a decoy always aims at tier 1 and climbs there.
+    #[test]
+    fn a_decoy_with_two_tiers_aims_at_tier_one_and_reaches_it() {
+        for seed in 0..30 {
+            let mut s = shaper(
+                with(|c| {
+                    c.tiers_pps = vec![10.0, 50.0];
+                    c.decoy_interval_s = 300.0;
+                }),
+                seed,
+            );
+            // A re-pick would re-time the decoy.
+            s.next_repick = f64::INFINITY;
+            let due = s.next_decoy.expect("decoys are on");
+            let first_point = s.step_up_after;
+            s.poll(due, 0, 0.0, 0);
+            assert_eq!(s.decoy_target, Some(1), "seed {seed}");
+            assert_eq!(s.tier, 0, "nothing moves before the first point");
+            let trace = simulate(&mut s, due, &[], due + 3.0);
+            assert_eq!(trace.tier_changes.len(), 1, "one step reaches the top");
+            let (at, tier) = trace.tier_changes[0];
+            assert_eq!(tier, 1);
+            assert!((at - (due + first_point)).abs() < 1e-9, "stepped at {at}");
+            assert!(s.decoy_target.is_none(), "the climb ended");
+            assert!(s.busy_until > due);
+        }
+    }
+
+    #[test]
+    fn secrets_differ_per_session_and_stay_in_range() {
+        let mut scales = Vec::new();
+        for seed in 0..200 {
+            let s = shaper(with(|c| c.decoy_interval_s = 7200.0), seed);
+            let k = &s.secrets;
+            assert!((0.8..=1.2).contains(&k.tier_scale));
+            assert!((0.3..=0.7).contains(&k.gap_spread));
+            assert!((0.2..=0.5).contains(&k.overshoot_p));
+            assert!((45.0..=75.0).contains(&k.hold_min_s));
+            assert!((240.0..=360.0).contains(&k.hold_max_s));
+            assert!((0.5..=0.8).contains(&k.decoy_top_p));
+            assert!((5.0..=15.0).contains(&k.lookback_s));
+            assert!((0.35..=0.65).contains(&k.usage_limit));
+            assert!((3600.0..=14_400.0).contains(&k.decoy_mean_s));
+            assert!((60.0..=360.0).contains(&k.busy_mean_s));
+            scales.push(k.tier_scale.to_bits());
+        }
+        scales.sort_unstable();
+        scales.dedup();
+        assert_eq!(scales.len(), 200, "two sessions drew the same scale");
+    }
+
+    #[test]
+    fn secrets_change_during_the_session_and_running_holds_keep_their_end() {
+        let mut s = shaper(cfg(), 33);
+        let repick = s.next_repick;
+        assert!((600.0..=2400.0).contains(&(repick - T0)));
+        let before = s.secrets.tier_scale;
+        s.change_tier(2, T0);
+        s.hold_until = repick + 100.0;
+        s.poll(repick, 0, 0.0, 0);
+        assert_ne!(s.secrets.tier_scale.to_bits(), before.to_bits());
+        assert_eq!(s.hold_until.to_bits(), (repick + 100.0).to_bits());
+        assert_eq!(s.tier, 2);
+        assert!((600.0..=2400.0).contains(&(s.next_repick - repick)));
+    }
+
+    fn histogram(draw: &mut dyn FnMut() -> u16, n: u32) -> Vec<(u16, f64)> {
+        let mut counts = [0_u32; SIZE_CLASSES.len()];
+        for _ in 0..n {
+            let c = draw();
+            let i = SIZE_CLASSES
+                .iter()
+                .position(|&x| x == c)
+                .expect("a size class");
+            counts[i] += 1;
+        }
+        SIZE_CLASSES
+            .iter()
+            .zip(counts)
+            .map(|(&c, k)| (c, f64::from(k) / f64::from(n)))
+            .collect()
+    }
+
+    fn published_mix() -> Vec<f64> {
+        let total: f64 = SIZE_CLASS_WEIGHTS.iter().map(|&w| f64::from(w)).sum();
+        SIZE_CLASS_WEIGHTS
+            .iter()
+            .map(|&w| f64::from(w) / total)
+            .collect()
+    }
+
+    #[test]
+    fn real_sizes_follow_the_fixed_mix() {
+        let mut s = shaper(cfg(), 43);
+        let hist = histogram(&mut || s.real_size_class(4), 50_000);
+        for ((class, got), want) in hist.into_iter().zip(published_mix()) {
+            assert!((got - want).abs() < 0.02, "class {class}: {got} vs {want}");
+        }
+    }
+
+    #[test]
+    fn chaff_sizes_follow_the_perturbed_mix() {
+        let base = published_mix();
+        let n = base.len();
+        let up = CHAFF_PERTURB_UP_P;
+        let down = CHAFF_PERTURB_DOWN_P - CHAFF_PERTURB_UP_P;
+        let mut want = vec![0.0; n];
+        for (i, p) in base.iter().enumerate() {
+            want[i] += (1.0 - up - down) * p;
+            want[(i + 1).min(n - 1)] += up * p;
+            want[i.saturating_sub(1)] += down * p;
+        }
+        let mut s = shaper(cfg(), 47);
+        let hist = histogram(&mut || s.chaff_size_class(), 50_000);
+        for ((class, got), want) in hist.into_iter().zip(want) {
+            assert!((got - want).abs() < 0.02, "class {class}: {got} vs {want}");
+        }
+    }
+
+    #[test]
+    fn real_size_bumps_up_to_fit_and_never_below_the_payload() {
+        let mut s = shaper(cfg(), 53);
+        for _ in 0..500 {
+            assert_eq!(s.real_size_class(1360), 1400);
+            assert_eq!(
+                s.real_size_class(1361),
+                1401,
+                "exact size when no class fits"
+            );
+        }
+        for payload in [0_usize, 1, 100, 300, 700, 1100] {
+            for _ in 0..200 {
+                let class = usize::from(s.real_size_class(payload));
+                assert!(class >= payload + PACKET_OVERHEAD);
+            }
+        }
+    }
+
+    #[test]
+    fn padding_range_and_ceiling_limit_the_classes() {
+        let mut s = shaper(
+            with(|c| {
+                c.padding_min = 256;
+                c.padding_max = 1024;
+            }),
+            59,
+        );
+        assert_eq!(s.active_classes(), &[256, 384, 512, 640, 768, 896, 1024]);
+        s.set_size_class_ceiling(512);
+        assert_eq!(s.active_classes(), &[256, 384, 512]);
+        for _ in 0..2000 {
+            assert!(s.chaff_size_class() <= 512);
+            assert!(s.real_size_class(1) <= 512);
+        }
+        s.set_size_class_ceiling(2000);
+        assert_eq!(
+            s.active_classes().last(),
+            Some(&1024),
+            "never above padding_max"
+        );
+        s.set_size_class_ceiling(1);
+        assert_eq!(
+            s.active_classes(),
+            &[256],
+            "keeps the smallest usable class"
+        );
+        let high = shaper(
+            with(|c| {
+                c.padding_min = 1450;
+                c.padding_max = 1500;
+            }),
+            61,
+        );
+        assert_eq!(
+            high.active_classes(),
+            &[1400],
+            "falls back to the largest class"
+        );
+    }
+
+    /// Trace check: idle, short bursts, a long download and a steady
+    /// game-like stream. Within a tier the wire never follows real traffic:
+    /// every gap stays in its tier's band, so only tier changes show.
+    #[test]
+    fn trace_check_the_wire_follows_tiers_not_traffic() {
+        let tiers = cfg().tiers_pps;
+        let bursts: Vec<f64> = (0..10_u32)
+            .flat_map(|b| {
+                (0..20_u32).map(move |i| T0 + 5.0 + f64::from(b) * 30.0 + f64::from(i) * 0.001)
+            })
+            .collect();
+        let download: Vec<f64> = (0..72_000_u32)
+            .map(|i| T0 + 10.0 + f64::from(i) / 600.0)
+            .collect();
+        let game: Vec<f64> = (0..7200_u32)
+            .map(|i| T0 + 10.0 + f64::from(i) / 30.0)
+            .collect();
+        let patterns: [(&str, &[f64]); 4] = [
+            ("idle", &[]),
+            ("short bursts", &bursts),
+            ("long download", &download),
+            ("steady game", &game),
+        ];
+        for (seed, (name, arrivals)) in (100_u64..).zip(patterns) {
+            let mut s = shaper(cfg(), seed);
+            let trace = simulate(&mut s, T0, arrivals, T0 + 300.0);
+            assert_gaps_follow_tiers(&trace, &tiers);
+            let longest = trace
+                .departures
+                .windows(2)
+                .map(|p| p[1].at - p[0].at)
+                .fold(0.0_f64, f64::max);
+            assert!(
+                longest <= 1.7 / (10.0 * 0.8) + 1e-9,
+                "{name}: the wire went quiet"
+            );
+            match name {
+                "idle" => assert!(trace.tier_changes.is_empty()),
+                "long download" => {
+                    assert!(
+                        trace.tier_changes.iter().any(|&(_, t)| t == 3),
+                        "reached the top tier"
+                    );
+                }
+                "steady game" => {
+                    // One climb at the start, at most one settle afterwards.
+                    let late = trace
+                        .tier_changes
+                        .iter()
+                        .filter(|&&(t, _)| t > T0 + 40.0 && t < T0 + 250.0)
+                        .count();
+                    assert!(late <= 1, "{name}: the tier flapped {late} times");
+                    assert!(trace
+                        .departures
+                        .iter()
+                        .filter(|d| d.at > T0 + 40.0 && d.at < T0 + 250.0)
+                        .all(|d| d.tier >= 1));
+                }
+                _ => {}
+            }
+        }
+    }
+}
