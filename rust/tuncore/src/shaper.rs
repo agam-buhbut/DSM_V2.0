@@ -483,12 +483,20 @@ impl<R: RngCore + CryptoRng> Shaper<R> {
     }
 
     /// At a hold end: step down if recent real use is low, else hold again.
-    /// A step from tier 1 to idle lingers at tier 1 first.
+    /// A step from tier 1 to idle lingers at tier 1 first. The linger end
+    /// runs the same usage check: while the link is still in use, or a decoy
+    /// is climbing or busy, it holds at tier 1 again, and the next return to
+    /// idle lingers again.
     fn maybe_step_down(&mut self, now: f64) {
         if let Some(end) = self.linger_until {
             if now >= end {
                 self.linger_until = None;
-                self.change_tier(0, now);
+                if self.usage_is_low(now) {
+                    self.change_tier(0, now);
+                } else {
+                    // Still in use: hold again at tier 1, where linger runs.
+                    self.change_tier(self.tier, now);
+                }
             }
             return;
         }
@@ -1068,6 +1076,100 @@ mod tests {
         s.poll(s.hold_until + 0.001, 0, 0.0, 0);
         assert_eq!(s.tier, 0);
         assert!(s.linger_until.is_none());
+    }
+
+    /// The linger end runs the usage check: a link still in use keeps tier 1,
+    /// even at the top of a two-tier config, where a backlog cannot step up.
+    #[test]
+    fn linger_end_keeps_tier_one_while_the_link_is_in_use() {
+        for seed in 0..20 {
+            let mut s = shaper(
+                with(|c| {
+                    c.tiers_pps = vec![10.0, 50.0];
+                    c.linger_s = (300.0, 600.0);
+                }),
+                seed,
+            );
+            s.change_tier(1, T0);
+            let at = s.hold_until + 0.001;
+            s.poll(at, 0, 0.0, 0);
+            let end = s.linger_until.expect("lingering");
+            // 30 real packets a second against a tier 0 of at most 12 a
+            // second: usage stays above any secret limit (at most 0.65).
+            let mut t = at;
+            while t < end + 1.0 {
+                t += 0.1;
+                s.poll(t, 0, 0.0, 3);
+            }
+            assert_eq!(s.tier, 1, "seed {seed}: dropped to idle while in use");
+            assert!(s.linger_until.is_none());
+            assert!(s.hold_until > end, "seed {seed}: no new hold at tier 1");
+            // Once the traffic stops, the next return to idle lingers again.
+            s.poll(s.hold_until + 0.001, 0, 0.0, 0);
+            assert_eq!(s.tier, 1);
+            assert!(s.linger_until.is_some(), "seed {seed}: no second linger");
+        }
+    }
+
+    /// A decoy that starts during linger is not cut off by the linger end: it
+    /// climbs from tier 1 to its target and runs its busy stretch.
+    #[test]
+    fn a_decoy_that_starts_during_linger_is_not_cut_off() {
+        for seed in 0..20 {
+            let mut s = shaper(
+                with(|c| {
+                    c.decoy_interval_s = 300.0;
+                    c.linger_s = (300.0, 600.0);
+                }),
+                seed,
+            );
+            // Aim the decoy at the top tier, so it has steps to climb. A
+            // re-pick would re-time it, and no decoy may start early.
+            s.secrets.decoy_top_p = 1.0;
+            s.next_repick = f64::INFINITY;
+            s.next_decoy = None;
+            s.change_tier(1, T0);
+            let at = s.hold_until + 0.001;
+            s.poll(at, 0, 0.0, 0);
+            let end = s.linger_until.expect("lingering");
+            // The decoy starts 0.1 s before the linger end. Its first step-up
+            // point is at least 0.25 s later, so the end comes first.
+            s.next_decoy = Some(end - 0.1);
+            s.poll(end - 0.1, 0, 0.0, 0);
+            assert_eq!(s.decoy_target, Some(3), "seed {seed}");
+            s.next_decoy = None;
+            s.poll(end + 0.001, 0, 0.0, 0);
+            assert_eq!(s.tier, 1, "seed {seed}: the linger end cut the decoy off");
+            assert!(s.linger_until.is_none());
+            simulate(&mut s, end + 0.001, &[], end + 5.0);
+            assert!(
+                s.decoy_target.is_none(),
+                "seed {seed}: the climb never ended"
+            );
+            assert_eq!(s.tier, 3, "seed {seed}: the decoy missed its target");
+            assert!(s.busy_until > end + 0.001, "seed {seed}: no busy stretch");
+        }
+    }
+
+    /// Light real traffic at the linger end still drops to idle.
+    #[test]
+    fn linger_end_with_light_traffic_still_drops_to_idle() {
+        for seed in 0..20 {
+            let mut s = shaper(with(|c| c.linger_s = (300.0, 600.0)), seed);
+            s.change_tier(1, T0);
+            let at = s.hold_until + 0.001;
+            s.poll(at, 0, 0.0, 0);
+            let end = s.linger_until.expect("lingering");
+            // One real packet a second against a tier 0 of at least 8 a
+            // second: usage stays below any secret limit (at least 0.35).
+            let mut t = at;
+            while t < end + 1.0 {
+                t += 1.0;
+                s.poll(t, 0, 0.0, 1);
+            }
+            assert_eq!(s.tier, 0, "seed {seed}: light traffic kept tier 1");
+            assert!(s.linger_until.is_none());
+        }
     }
 
     #[test]
