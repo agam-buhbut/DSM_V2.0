@@ -141,46 +141,48 @@ mtu = 1400
 # Traffic shaping
 padding_min = 128
 padding_max = 1400
+# jitter_ms_min / jitter_ms_max: a random extra wait per packet, in ms. The
+# tier shaper (always on in the daemon) ignores them: a queued packet takes
+# the next free slot. They only matter without the shaper (tests).
 jitter_ms_min = 1
-# jitter_ms_max widens the packet-reorder window for anonymity. 100 is the
-# M-ANON-4 default; lower values trade anonymity for interactive latency.
 jitter_ms_max = 100
 
-# Adaptive-envelope shaping knobs
-# These are all optional; leaving them unset uses the defaults below.
-# The defaults form a coherent anonymity profile — operators who don't need
-# to tune leave them commented out.
+# Tier shaper
+# Packets leave at a steady rate that only changes in a few fixed steps
+# ("tiers"). Your real packets take free places in that flow; fake packets
+# (chaff) fill the rest. The rate goes up a step only when real packets have
+# waited too long, and comes down slowly: after each change it does not come
+# down for about 1 to 5 minutes (it can still go up). Now and then a fake
+# busy period (a "decoy") climbs and comes down the same way, like a page
+# load. Each session also picks its own secret timing values and changes
+# them every 10-40 minutes. All four keys are optional. Both ends ship the
+# same defaults; each end shapes only what it sends.
 #
-# Idle overhead ≈ floor_pps × ~900 B/pkt; expect ~0.5–2 kB/s idle.
-# Burst-tail overhead: the envelope decays for ~fall_half_life_s seconds after
-# a burst ends, continuing to emit chaff at the elevated rate.
+# What it costs, per direction (padding only, not your real traffic):
+#   * connected all day, no use, decoys on: about 3 GB a day
+#   * connected all day with about 20 bursts of real use: about 6 GB a day
+#   * each decoy: about 0.2 GB (climb, busy stretch, slow step-down, linger)
+#   * after using the top tier: the top for 1-5 minutes, then a few minutes
+#     per lower tier, then 5-30 minutes at tier 1 (about 0.15 GB)
+#   * top speed: about 7-10 Mbit/s (800 packets/s at the default top tier)
+#   * when a burst starts: about 0.5-1.5 s of extra wait while it steps up
 #
-# Per-packet latency budget. A real packet is never delayed more than this
-# many milliseconds waiting for the envelope to rise. Lower = less hiding;
-# higher = more hiding but head-of-line latency under burst. The default
-# 1000ms (1s) gives the x2/s rise a full second to absorb a burst before
-# the budget override fires, hiding burst onset more strongly; lower it
-# toward ~250ms if interactive traffic feels laggy under load.
-# envelope_latency_budget_ms = 1000
+# Rates in packets per second, lowest first: 2-8 entries, each 1-5000, each
+# higher than the one before. The first one is the idle rate.
+# shaper_tiers_pps = [10, 50, 200, 800]
 #
-# Multiplicative per-second rise cap (must be > 1.0). 2.0 means the envelope
-# can at most double per second during a burst — smears onset across ~2–4 s.
-# envelope_rise_per_s = 2.0
+# How long a real packet may wait before the rate steps up, in milliseconds
+# (10-5000). Lower means less waiting but steps that are easier to see.
+# shaper_latency_budget_ms = 500
 #
-# Exponential-decay half-life (seconds) when idle. Sets how long the
-# post-burst chaff tail lasts before returning to the floor rate.
-# envelope_fall_half_life_s = 4.0
+# Average time between decoys, in seconds: 0 turns them off, otherwise
+# 300-86400. Each session secretly uses between half and twice this value.
+# shaper_decoy_interval_s = 7200
 #
-# Soft wire-rate ceiling (packets/sec). Normal chaff-fill never exceeds this;
-# only the latency-budget override may temporarily pierce it. 600 pps ×
-# ~1400 B ≈ 6.7 MB/s — this caps chaff overhead, not real throughput.
-# envelope_ceiling_pps = 600
-#
-# Per-session randomized idle floor bounds (packets/sec). The actual floor is
-# drawn uniformly from [min, max] at session start and held fixed for the
-# session lifetime, removing the exact-1-pps constant DSM baseline.
-# envelope_idle_floor_min_pps = 0.5
-# envelope_idle_floor_max_pps = 2.0
+# Before going idle, stay at tier 1 for a random time in this range
+# (seconds). This blurs when you stopped. [0, 0] turns it off; otherwise
+# 0 < first <= second <= 7200.
+# shaper_linger_s = [300, 1800]
 
 # Key rotation
 rotation_packets = 5000                      # Rotate after N packets

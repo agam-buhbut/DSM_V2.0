@@ -219,16 +219,7 @@ async def run_client(
         if _clock_warn:
             log.warning(_clock_warn)
 
-        shaper = TrafficShaper(
-            config.padding_min,
-            config.padding_max,
-            envelope_idle_floor_min_pps=config.envelope_idle_floor_min_pps,
-            envelope_idle_floor_max_pps=config.envelope_idle_floor_max_pps,
-            envelope_ceiling_pps=config.envelope_ceiling_pps,
-            envelope_rise_per_s=config.envelope_rise_per_s,
-            envelope_fall_half_life_s=config.envelope_fall_half_life_s,
-            envelope_latency_budget_ms=config.envelope_latency_budget_ms,
-        )
+        shaper = TrafficShaper.from_config(config)
 
         if config.transport == "udp":
             transport = UDPTransport()
@@ -409,10 +400,10 @@ async def run_client(
             shutdown=shutdown,
         )
 
-        # Envelope-driven. The shaper's paced wire budget
-        # (release_budget) decides how many packets (real first, chaff fill)
-        # leave per poll, so the wire rate is independent of real volume.
-        # should_chaff_fn is intentionally omitted (envelope mode).
+        # Shaper-driven: the tier shaper decides when packets leave (real
+        # first, chaff in the other slots), so the wire rate follows the tier,
+        # not the real traffic. No should_chaff_fn: the client always knows
+        # its destination, so chaff may fill every free slot.
         scheduler = SendScheduler(
             send_fn=send_packet,
             chaff_fn=lambda: make_chaff_packet(shaper, session_keys.epoch & 0x0F),

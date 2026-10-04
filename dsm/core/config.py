@@ -5,9 +5,10 @@ import logging
 import os
 import re
 import tomllib
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 from urllib.parse import urlparse
 
 from dsm.core._validators import DSM_TUN_NAME_RE as _TUN_NAME_PATTERN
@@ -58,6 +59,29 @@ WARN_INFLIGHT_HANDSHAKES = 1024
 MIN_TUN_MTU = 576
 MAX_TUN_MTU = 1500
 DEFAULT_TUN_MTU = 1400
+
+# Tier shaper defaults and limits. dsm.traffic.shaper uses the same defaults,
+# and the Rust core (rust/tuncore/src/shaper.rs) checks the same limits.
+DEFAULT_SHAPER_TIERS_PPS: tuple[float, ...] = (10.0, 50.0, 200.0, 800.0)
+DEFAULT_SHAPER_LATENCY_BUDGET_MS = 500
+DEFAULT_SHAPER_DECOY_INTERVAL_S = 7200.0
+DEFAULT_SHAPER_LINGER_S: tuple[float, float] = (300.0, 1800.0)
+MIN_SHAPER_TIERS = 2
+MAX_SHAPER_TIERS = 8
+MIN_TIER_PPS = 1.0
+MAX_TIER_PPS = 5000.0
+MIN_SHAPER_LATENCY_BUDGET_MS = 10
+MAX_SHAPER_LATENCY_BUDGET_MS = 5000
+MIN_DECOY_INTERVAL_S = 300.0
+MAX_DECOY_INTERVAL_S = 86400.0
+MAX_LINGER_S = 7200.0
+# Named in the startup error for a removed envelope_* key.
+SHAPER_KEYS = (
+    "shaper_tiers_pps",
+    "shaper_latency_budget_ms",
+    "shaper_decoy_interval_s",
+    "shaper_linger_s",
+)
 
 # A single DNS label (RFC 1123): 1-63 chars, letters/digits/hyphen, no
 # leading or trailing hyphen.
@@ -122,33 +146,20 @@ class Config:
     padding_min: int = 128
     padding_max: int = 1400
     jitter_ms_min: int = 1
-    # Wider jitter span covers more
-    # consecutive packets at line rate (10 Mbps × 100 ms = 12 packets)
-    # without adding visible latency to interactive traffic. Operators
-    # who care about sub-50 ms RTT for VoIP/gaming can configure
-    # lower; everyone else benefits from the larger reorder window.
+    # Random extra wait per packet, used only when the send loop runs
+    # without the tier shaper (tests). The daemon always runs the shaper,
+    # where a queued packet takes the next free slot instead.
     jitter_ms_max: int = 100
-    # Adaptive-envelope traffic-shaping knobs.
-    # All fields are optional (backward-compatible). The defaults form a
-    # coherent envelope profile; see config.example.toml for per-knob notes.
-    # Per-packet latency budget: a real packet is never delayed more than this
-    # many milliseconds waiting for the envelope to rise.
-    envelope_latency_budget_ms: int = 1000
-    # Multiplicative per-second rise cap. Must be > 1.0 (otherwise the
-    # envelope cannot rise at all). Value 2.0 means the envelope can at most
-    # double per second when draining a real-traffic burst.
-    envelope_rise_per_s: float = 2.0
-    # Exponential-decay half-life (seconds) when no real traffic is queued.
-    # Controls how long the post-burst chaff tail lasts.
-    envelope_fall_half_life_s: float = 4.0
-    # Soft ceiling on wire rate (packets/sec). Normal chaff-fill never
-    # exceeds this; only the latency-budget override may pierce it temporarily.
-    envelope_ceiling_pps: int = 600
-    # Per-session randomized idle floor bounds (packets/sec). The actual floor
-    # is drawn uniformly from [min, max] at shaper construction and fixed for
-    # the session lifetime, removing the exact-1-pps constant DSM baseline.
-    envelope_idle_floor_min_pps: float = 0.5
-    envelope_idle_floor_max_pps: float = 2.0
+    # Tier shaper. Packets leave at a steady rate that only changes in a few
+    # fixed steps; see config.example.toml for what each key does and costs.
+    shaper_tiers_pps: list[float] = field(
+        default_factory=lambda: list(DEFAULT_SHAPER_TIERS_PPS)
+    )
+    shaper_latency_budget_ms: int = DEFAULT_SHAPER_LATENCY_BUDGET_MS
+    shaper_decoy_interval_s: float = DEFAULT_SHAPER_DECOY_INTERVAL_S
+    shaper_linger_s: list[float] = field(
+        default_factory=lambda: list(DEFAULT_SHAPER_LINGER_S)
+    )
     rotation_packets: int = 5000
     rotation_seconds: int = 600
     debug_dns: bool = False
@@ -219,8 +230,7 @@ def _validate_types(c: Config) -> None:
         ("rotation_packets", c.rotation_packets),
         ("rotation_seconds", c.rotation_seconds),
         ("mtu", c.mtu),
-        ("envelope_latency_budget_ms", c.envelope_latency_budget_ms),
-        ("envelope_ceiling_pps", c.envelope_ceiling_pps),
+        ("shaper_latency_budget_ms", c.shaper_latency_budget_ms),
         ("max_inflight_handshakes", c.max_inflight_handshakes),
     )
     for name, value in int_fields:
@@ -232,10 +242,7 @@ def _validate_types(c: Config) -> None:
             raise ValueError(f"{name} must be an integer, got {type(value).__name__}")
     float_fields = (
         ("pmtu_check_interval_s", c.pmtu_check_interval_s),
-        ("envelope_rise_per_s", c.envelope_rise_per_s),
-        ("envelope_fall_half_life_s", c.envelope_fall_half_life_s),
-        ("envelope_idle_floor_min_pps", c.envelope_idle_floor_min_pps),
-        ("envelope_idle_floor_max_pps", c.envelope_idle_floor_max_pps),
+        ("shaper_decoy_interval_s", c.shaper_decoy_interval_s),
     )
     for name, value in float_fields:
         if not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
@@ -456,35 +463,57 @@ def _validate_jitter(c: Config) -> None:
         )
 
 
-def _validate_envelope(c: Config) -> None:
-    if not (10 <= c.envelope_latency_budget_ms <= 5000):
+def _number_list(name: str, value: object) -> list[float]:
+    """Check a list-of-numbers key. TOML hands us untyped data, so a wrong
+    type must become a readable ValueError, not a TypeError later on."""
+    if not isinstance(value, (list, tuple)):
         raise ValueError(
-            f"envelope_latency_budget_ms must be 10–5000 ms, "
-            f"got {c.envelope_latency_budget_ms}"
+            f"{name} must be a list of numbers, got {type(value).__name__}"
         )
-    if not (1.0 < c.envelope_rise_per_s <= 100.0):
+    out: list[float] = []
+    for item in cast(Sequence[object], value):
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            raise ValueError(
+                f"{name} entries must be numbers, got {type(item).__name__}"
+            )
+        out.append(float(item))
+    return out
+
+
+def _validate_shaper(c: Config) -> None:
+    tiers = _number_list("shaper_tiers_pps", c.shaper_tiers_pps)
+    if not (MIN_SHAPER_TIERS <= len(tiers) <= MAX_SHAPER_TIERS):
         raise ValueError(
-            f"envelope_rise_per_s must be > 1.0 and <= 100.0 "
-            f"(must be able to rise), got {c.envelope_rise_per_s}"
+            f"shaper_tiers_pps must have {MIN_SHAPER_TIERS}-{MAX_SHAPER_TIERS} "
+            f"entries, got {len(tiers)}"
         )
-    if not (0.0 < c.envelope_fall_half_life_s <= 60.0):
+    if not all(MIN_TIER_PPS <= t <= MAX_TIER_PPS for t in tiers):
         raise ValueError(
-            f"envelope_fall_half_life_s must be in (0, 60] s, "
-            f"got {c.envelope_fall_half_life_s}"
+            f"shaper_tiers_pps entries must be {MIN_TIER_PPS:g}-{MAX_TIER_PPS:g} "
+            f"packets/s, got {tiers}"
         )
-    if not (
-        0.0 < c.envelope_idle_floor_min_pps <= c.envelope_idle_floor_max_pps <= 1000.0
-    ):
+    if any(b <= a for a, b in zip(tiers, tiers[1:])):
+        raise ValueError(f"shaper_tiers_pps must be strictly rising, got {tiers}")
+    budget = c.shaper_latency_budget_ms
+    if not (MIN_SHAPER_LATENCY_BUDGET_MS <= budget <= MAX_SHAPER_LATENCY_BUDGET_MS):
         raise ValueError(
-            f"envelope_idle_floor_min_pps ({c.envelope_idle_floor_min_pps}) and "
-            f"envelope_idle_floor_max_pps ({c.envelope_idle_floor_max_pps}) must "
-            f"satisfy 0 < min <= max <= 1000"
+            f"shaper_latency_budget_ms must be {MIN_SHAPER_LATENCY_BUDGET_MS}-"
+            f"{MAX_SHAPER_LATENCY_BUDGET_MS} ms, got {budget}"
         )
-    if not (c.envelope_idle_floor_max_pps <= c.envelope_ceiling_pps <= 100000):
+    decoy = c.shaper_decoy_interval_s
+    if not (decoy == 0 or MIN_DECOY_INTERVAL_S <= decoy <= MAX_DECOY_INTERVAL_S):
         raise ValueError(
-            f"envelope_ceiling_pps must be >= envelope_idle_floor_max_pps "
-            f"({c.envelope_idle_floor_max_pps}) and <= 100000, "
-            f"got {c.envelope_ceiling_pps}"
+            f"shaper_decoy_interval_s must be 0 (off) or "
+            f"{MIN_DECOY_INTERVAL_S:g}-{MAX_DECOY_INTERVAL_S:g} s, got {decoy}"
+        )
+    linger = _number_list("shaper_linger_s", c.shaper_linger_s)
+    if len(linger) != 2:
+        raise ValueError(f"shaper_linger_s must be [min, max], got {linger}")
+    lo, hi = linger[0], linger[1]
+    if not ((lo == 0 and hi == 0) or 0 < lo <= hi <= MAX_LINGER_S):
+        raise ValueError(
+            f"shaper_linger_s must be [0, 0] (off) or "
+            f"0 < min <= max <= {MAX_LINGER_S:g}, got {linger}"
         )
 
 
@@ -604,7 +633,7 @@ _VALIDATORS = (
     _validate_role_specific,
     _validate_padding,
     _validate_jitter,
-    _validate_envelope,
+    _validate_shaper,
     _validate_rotation,
     _validate_log_level,
     _validate_tun_name,
@@ -624,6 +653,18 @@ def _validate(c: Config) -> None:
     """
     for validator in _VALIDATORS:
         validator(c)
+
+
+def _reject_removed_keys(raw: dict[str, object]) -> None:
+    """Stop with a clear message for keys of the removed adaptive envelope
+    (otherwise Config(**raw) fails with a cryptic TypeError)."""
+    old = sorted(key for key in raw if key.startswith("envelope_"))
+    if old:
+        raise ConfigError(
+            f"config key(s) {', '.join(old)} no longer exist: the adaptive "
+            f"envelope was replaced by the tier shaper. Remove them and use "
+            f"{', '.join(SHAPER_KEYS)} instead (see config.example.toml)."
+        )
 
 
 def load(path: Path | None = None) -> Config:
@@ -653,5 +694,6 @@ def load(path: Path | None = None) -> Config:
         config_dir = Path(p).parent
     with open(p, "rb") as f:
         raw = tomllib.load(f)
+    _reject_removed_keys(raw)
     raw.setdefault("config_dir", config_dir)
     return Config(**raw)

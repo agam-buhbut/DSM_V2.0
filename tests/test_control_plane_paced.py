@@ -1,12 +1,12 @@
-"""Task 2.6 (Fork 7 = YES): control-plane packets ride the paced envelope.
+"""Task 2.6 (Fork 7 = YES): control-plane packets ride the paced shaper queue.
 
 Rekey REKEY_INIT / REKEY_ACK during normal operation are routed through the
 SAME paced scheduler.enqueue path that real data/chaff packets use, so their
-wire timing matches the steady enveloped stream (no control-plane timing
-fingerprint). Two carve-outs are preserved:
+wire timing matches the steady shaped stream (no control-plane timing
+fingerprint). The DUPLICATE-INIT cached-ACK replay is paced too (tier shaper
+design §4.10): a slot is far inside the initiator's 8 s ACK timeout. One
+carve-out is preserved:
 
-  * the DUPLICATE-INIT cached-ACK replay keeps the bounded DIRECT ``send_fn``
-    (it must be observable within 5 s — the lost-ACK recovery, Task 1.1);
   * the TEARDOWN SESSION_CLOSE keeps the bounded DIRECT ``send_fn`` (the
     scheduler is about to be stopped, so a paced enqueue might never flush).
 
@@ -151,7 +151,7 @@ def _responder() -> tuncore.SessionKeyManager:
 
 @unittest.skipUnless(_HAS_TUNCORE, "tuncore extension not built")
 class AckRoutingThroughEnvelope(unittest.IsolatedAsyncioTestCase):
-    """Normal REKEY_ACK is paced; the duplicate-INIT cached-ACK replay is direct."""
+    """Normal REKEY_ACK is paced, and so is the duplicate-INIT cached-ACK replay."""
 
     async def test_normal_ack_routes_through_paced_send(self) -> None:
         keys = _responder()
@@ -185,7 +185,7 @@ class AckRoutingThroughEnvelope(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(sched.enqueued), 1, "normal ACK must be paced")
         self.assertEqual(direct, [], "normal ACK must NOT use direct send_fn")
 
-    async def test_duplicate_init_cached_ack_replay_uses_direct_send(self) -> None:
+    async def test_duplicate_init_cached_ack_replay_is_paced(self) -> None:
         keys = _responder()
         fsm = _established_fsm()
         shaper = TrafficShaper(128, 1400)
@@ -214,8 +214,7 @@ class AckRoutingThroughEnvelope(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(direct, [])
 
         # Duplicate INIT (the client's first ACK was lost) → cached-ACK replay.
-        # This MUST take the bounded DIRECT path so it is observable within 5 s
-        # (Task 1.1 lost-ACK recovery), NOT the paced enqueue.
+        # It takes a shaper slot like any packet (tier shaper design §4.10).
         await handle_rekey_init(
             payload,
             keys,
@@ -230,10 +229,10 @@ class AckRoutingThroughEnvelope(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             len(sched.enqueued),
-            paced_after_first,
-            "cached-ACK replay must NOT be paced (bounded direct send only)",
+            paced_after_first + 1,
+            "cached-ACK replay must be paced",
         )
-        self.assertEqual(len(direct), 1, "cached-ACK replay must use direct send_fn")
+        self.assertEqual(direct, [], "cached-ACK replay must NOT use direct send_fn")
 
 
 class TeardownSessionCloseStaysDirect(unittest.IsolatedAsyncioTestCase):

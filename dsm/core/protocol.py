@@ -18,6 +18,8 @@ import time
 from dataclasses import dataclass, field
 from enum import IntEnum
 
+import tuncore
+
 log = logging.getLogger(__name__)
 
 # Outer header: 8 (seq) + 12 (nonce) = 20 bytes
@@ -29,17 +31,11 @@ GCM_TAG_SIZE = 16
 # Maximum inner payload size (MTU-based practical limit)
 MAX_INNER_PAYLOAD = 1500
 
-# Packet size classes for padding (bytes) — more classes reduce fingerprinting
-SIZE_CLASSES = (128, 256, 384, 512, 640, 768, 896, 1024, 1152, 1280, 1400)
-
-# Sampling weights for SIZE_CLASSES — approximate a typical web-traffic
-# size distribution (smaller packets more likely). Length MUST equal
-# len(SIZE_CLASSES); the assertion below catches drift at module load
-# time rather than at first use.
-SIZE_CLASS_WEIGHTS: tuple[int, ...] = (20, 15, 12, 10, 8, 7, 6, 6, 5, 6, 5)
-assert len(SIZE_CLASS_WEIGHTS) == len(
-    SIZE_CLASSES
-), "SIZE_CLASS_WEIGHTS and SIZE_CLASSES must align"
+# Packet size classes for padding (bytes) and their draw weights (a typical
+# web-traffic mix: smaller packets likelier). The Rust shaper core owns the
+# one copy; these names re-export it for the rest of dsm.
+SIZE_CLASSES: tuple[int, ...] = tuncore.SIZE_CLASSES
+SIZE_CLASS_WEIGHTS: tuple[int, ...] = tuncore.SIZE_CLASS_WEIGHTS
 
 # Module-level Struct instances — avoid per-packet format-string parsing on
 # the hot path. `pack_into` writes into a caller-owned buffer, saving an

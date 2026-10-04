@@ -8,7 +8,8 @@ by size or timing distribution.
 These tests do not boot the transport layer. They construct client-side
 and server-side TrafficShaper instances with matching parameters and
 assert that the *primitives used by both ends* (pad_packet, make_chaff_padded)
-emit output drawn from the same size-class support set.
+emit output drawn from the same size-class support set, and that both ends
+build their shaper from the same config keys (TrafficShaper.from_config).
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import unittest
 
+from dsm.core.config import Config
 from dsm.core.protocol import SIZE_CLASSES, InnerPacket, PacketType
 from dsm.traffic.shaper import TrafficShaper, make_chaff_packet
 
@@ -44,6 +46,21 @@ def _sizes_from_many_packets(shaper: TrafficShaper, trials: int) -> set[int]:
         _, target = shaper.pad_packet(inner)
         sizes.add(target)
     return sizes
+
+
+def _departures(
+    shaper: TrafficShaper, start: float, end: float, *, backlog: bool
+) -> int:
+    """Poll ``shaper`` from ``start`` to ``end`` at each next_wake and count
+    the slots. With ``backlog`` a large real queue has waited since
+    ``start``."""
+    count = 0
+    now = start
+    while now < end:
+        queue_len, oldest_wait = (100, now - start) if backlog else (0, 0.0)
+        slots, now = shaper.poll(now, queue_len, oldest_wait, 0)
+        count += slots
+    return count
 
 
 class TestSymmetricShaping(unittest.TestCase):
@@ -83,58 +100,46 @@ class TestSymmetricShaping(unittest.TestCase):
 
         asyncio.run(_run())
 
-    def test_both_ends_pace_identically_under_same_envelope_config(self) -> None:
-        """Client and server shapers driven by the same envelope config must
-        release the SAME per-tick wire budget given the same queue input.
-
-        The wire rate is paced by the envelope (update_envelope /
-        release_budget), so direction symmetry now means: identical config +
-        identical queue history => identical release schedule. A divergence
-        here would let a passive observer tell client→server from
-        server→client by the chaff/real cadence rather than by size.
-
-        Driven by an injected deterministic clock and a fixed idle floor
-        (min == max) so the only per-session randomness is removed and the
-        pacing math is fully reproducible across both ends.
+    def test_both_ends_build_the_same_tier_ladder_from_config(self) -> None:
+        """Client and server both build their shaper with
+        TrafficShaper.from_config, so the same config gives both ends the same
+        tiers. Each session's secret timing values differ by design, so exact
+        schedules cannot match; instead both ends must idle inside the same
+        first-tier band and both must step up under the same backlog.
         """
-
-        def _make(clock: _Clock) -> TrafficShaper:
-            return TrafficShaper(
-                PADDING_MIN,
-                PADDING_MAX,
-                clock=clock,
-                envelope_idle_floor_min_pps=1.0,
-                envelope_idle_floor_max_pps=1.0,
-                envelope_ceiling_pps=100.0,
-                envelope_rise_per_s=2.0,
-                envelope_fall_half_life_s=4.0,
-                envelope_latency_budget_ms=1000,
-            )
-
-        client_clk, server_clk = _Clock(), _Clock()
-        client, server = _make(client_clk), _make(server_clk)
-
-        # Same queue history on both ends over ~3s: idle, then a sustained
-        # backlog whose oldest packet breaches the 1s budget (forcing the
-        # override on both ends), then idle again. The window is long enough
-        # that the 1pps floor alone releases several packets, so the schedule
-        # is non-trivial. Record each end's per-tick release budget.
-        depths = [0] * 50 + [200] * 150 + [0] * 100
-        ages = [0.0] * 50 + [1.5] * 150 + [0.0] * 100
-        client_budget: list[int] = []
-        server_budget: list[int] = []
-        for depth, age in zip(depths, ages):
-            client_clk.advance(0.01)
-            server_clk.advance(0.01)
-            client.update_envelope(client_clk(), depth, age)
-            server.update_envelope(server_clk(), depth, age)
-            client_budget.append(client.release_budget(client_clk()))
-            server_budget.append(server.release_budget(server_clk()))
-
-        self.assertEqual(client_budget, server_budget)
-        # Sanity: the run actually drove releases (not a trivially-equal
-        # all-zero schedule).
-        self.assertGreater(sum(client_budget), 0)
+        shared = {
+            "server_ip": "10.0.0.1",
+            "server_port": 51820,
+            "listen_port": 51821,
+            "key_file": "/tmp/test.key",
+            "cert_file": "/tmp/test.crt",
+            "ca_root_file": "/tmp/test-ca.pem",
+            "attest_key_file": "/tmp/test-attest.key",
+            "shaper_tiers_pps": [20, 100],
+            "shaper_decoy_interval_s": 0,
+            "shaper_linger_s": [0, 0],
+        }
+        client_cfg = Config(
+            mode="client", expected_server_cn="dsm-test-server", **shared
+        )
+        server_cfg = Config(
+            mode="server",
+            dns_providers=["https://1.1.1.1/dns-query"],
+            dns_provider_pins={"https://1.1.1.1/dns-query": ["a" * 64]},
+            allowed_cns_file="/tmp/test-allowed-cns.txt",
+            **shared,
+        )
+        for cfg in (client_cfg, server_cfg):
+            clock = _Clock()
+            shaper = TrafficShaper.from_config(cfg, clock=clock)
+            start = clock()
+            idle = _departures(shaper, start, start + 30.0, backlog=False)
+            # Tier 0 is 20 packets/s times a secret 0.8-1.2 session scale.
+            self.assertGreaterEqual(idle, 16 * 30 * 0.95, cfg.mode)
+            self.assertLessEqual(idle, 24 * 30 * 1.05, cfg.mode)
+            busy = _departures(shaper, start + 30.0, start + 35.0, backlog=True)
+            # A standing backlog steps up to the 100-packet/s tier.
+            self.assertGreater(busy, 24 * 5 * 1.5, cfg.mode)
 
 
 if __name__ == "__main__":

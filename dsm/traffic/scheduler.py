@@ -1,14 +1,26 @@
-"""Jittered packet send scheduler.
+"""Packet send scheduler.
 
-Maintains a priority queue of pending packets, each with a scheduled
-send time = enqueue_time + jitter. Pops the next packet when its time
-arrives. Generates chaff when the queue is empty and the shaper says so.
+Two modes:
+
+* Shaper mode (a ``shaper`` is given; client and server use this): the tier
+  shaper decides when packets leave. Each wake the loop polls the shaper,
+  sends ``slots_due`` packets (queued real packets first, chaff for the rest)
+  and sleeps until the shaper's ``next_wake``. Queuing a packet never wakes
+  the loop early, so send times never move toward real-packet arrivals. A
+  queued packet may take the very next slot: no jitter, no extra delay.
+* Legacy mode (no shaper; kept for the integration and resilience tests):
+  each packet gets a random jitter delay (plus any ``extra_delay``); the loop
+  drains every packet whose send time has come, polls the chaff callback,
+  and wakes early when a packet is queued.
+
+Packets queued at the same moment leave in the order they were queued.
 """
 
 from __future__ import annotations
 
 import asyncio
 import heapq
+import itertools
 import logging
 import time
 from collections.abc import Awaitable, Callable
@@ -23,6 +35,7 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 _T = TypeVar("_T")
+_SendFn = Callable[[bytes, int], Awaitable[None]]
 
 # Bounded queue. Sized for low-RAM targets: 512 * ~1500B ≈ 768 KiB
 # worst-case. Drop policy is drop-oldest regardless of packet type,
@@ -30,8 +43,8 @@ _T = TypeVar("_T")
 # so drop-oldest does not reveal traffic shape).
 MAX_QUEUE_SIZE = 512
 
-# Inter-tick poll jitter for the send loop. A fixed 50 ms cadence would
-# fingerprint the scheduler on the wire; randomising the wake-up to
+# Legacy-mode poll jitter. A fixed 50 ms cadence would fingerprint the
+# scheduler on the wire; randomising the wake-up to
 # ``_POLL_JITTER_MIN .. _POLL_JITTER_MIN + _POLL_JITTER_RANGE`` (i.e.
 # 30-70 ms) breaks that signal without materially affecting throughput.
 _POLL_JITTER_MIN = 0.03
@@ -41,8 +54,13 @@ _POLL_JITTER_RANGE = 0.04
 @dataclass(order=True)
 class _ScheduledPacket:
     send_time: float
+    # Tie-break: packets with the same send time leave in queue order.
+    order: int
     data: bytes = field(compare=False)
     target_size: int = field(compare=False)
+    # Per-packet sender (a PATH_CHALLENGE to a candidate address); None
+    # means the scheduler's own send_fn.
+    send_via: _SendFn | None = field(default=None, compare=False)
 
 
 class SendScheduler:
@@ -50,7 +68,7 @@ class SendScheduler:
 
     def __init__(
         self,
-        send_fn: Callable[[bytes, int], Awaitable[None]],
+        send_fn: _SendFn,
         chaff_fn: Callable[[], Awaitable[tuple[bytes, int]]] | None = None,
         should_chaff_fn: Callable[[], bool] | None = None,
         jitter_ms_min: int = 1,
@@ -64,18 +82,19 @@ class SendScheduler:
             send_fn: async callable(data, target_size) to transmit a packet
             chaff_fn: async callable() -> (chaff_data, target_size)
             should_chaff_fn: callable() -> bool. In legacy mode it is the
-                additive-Poisson chaff decision. In envelope mode it acts as a
-                GATE on the chaff-fill (e.g. the server suppresses chaff until
-                the client addr is known); the envelope budget still governs
-                the count when the gate is open.
-            jitter_ms_min/max: jitter range in milliseconds
-            shaper: when provided, the loop is ENVELOPE-DRIVEN — each poll it
-                asks the shaper for the per-tick wire budget and emits exactly
-                that many packets (real queue first, chaff fills the rest),
-                making the wire rate independent of real-traffic volume. When
-                ``None`` the loop keeps the legacy "drain all due + poll chaff"
-                behavior (kept for the integration/resilience tests).
-            clock: injectable monotonic clock for deterministic pacing tests.
+                chaff decision. In shaper mode it is a GATE on filling free
+                slots with chaff (the server keeps it closed until the client
+                addr is known); a slot with no real packet and a closed gate
+                stays empty.
+            jitter_ms_min/max: jitter range in milliseconds (legacy mode
+                only; in shaper mode a queued packet takes the next slot)
+            shaper: when provided, the loop is SHAPER-DRIVEN: each wake it
+                asks the shaper how many slots are due, sends that many
+                packets (real first, chaff for the rest) and sleeps until the
+                shaper's next wake. When ``None`` the loop keeps the legacy
+                "drain all due + poll chaff" behavior.
+            clock: injectable monotonic clock; in shaper mode it must be the
+                clock the shaper was built with.
         """
         self._send_fn = send_fn
         self._chaff_fn = chaff_fn
@@ -85,10 +104,15 @@ class SendScheduler:
         self._shaper = shaper
         self._clock = clock
         self._queue: list[_ScheduledPacket] = []
+        self._order = itertools.count()
         self._max_queue_size = MAX_QUEUE_SIZE
         self._running = False
         self._task: asyncio.Task[None] | None = None
         self._event = asyncio.Event()
+        # Shaper mode: when to poll next, and real packets sent since the
+        # last poll (the shaper's step-down check counts them).
+        self._next_wake = 0.0
+        self._real_sent = 0
 
     def enqueue(
         self,
@@ -96,25 +120,39 @@ class SendScheduler:
         target_size: int,
         *,
         extra_delay: float = 0.0,
+        send_via: _SendFn | None = None,
     ) -> None:
-        """Enqueue a packet with random jitter delay.
+        """Queue a packet.
 
-        ``extra_delay`` (default 0) is added to the per-packet jitter
-        before scheduling. Used by the fragment send path to spread out
-        the N fragments of an oversized TUN packet across multiple
-        jitter windows — otherwise all N fragments arrive within
-        jitter_max (~50 ms) of each other, producing a recognizable
-        "1 → N tightly-spaced packets" traffic-analysis signature.
+        Shaper mode: the packet may take the very next slot; ``extra_delay``
+        and the jitter range are ignored, because the slot schedule already
+        decides timing.
+
+        Legacy mode: the packet waits a random jitter delay plus
+        ``extra_delay`` (the fragment send path uses it to spread the N
+        fragments of an oversized TUN packet, so they don't leave as a
+        recognizable "1 → N tightly-spaced packets" burst).
+
+        ``send_via`` sends this one packet with a different function (the
+        server's PATH_CHALLENGE to a candidate address) when its turn comes.
         """
         if len(self._queue) >= self._max_queue_size:
             heapq.heappop(self._queue)  # drop oldest
             log.warning("scheduler queue full, dropping oldest packet")
-        jitter = self._jitter_min + csprng_float() * (
-            self._jitter_max - self._jitter_min
+        send_time = self._clock()
+        if self._shaper is None:
+            jitter = self._jitter_min + csprng_float() * (
+                self._jitter_max - self._jitter_min
+            )
+            send_time += jitter + max(0.0, extra_delay)
+        heapq.heappush(
+            self._queue,
+            _ScheduledPacket(send_time, next(self._order), data, target_size, send_via),
         )
-        send_time = self._clock() + jitter + max(0.0, extra_delay)
-        heapq.heappush(self._queue, _ScheduledPacket(send_time, data, target_size))
-        self._event.set()
+        # Only the legacy loop wakes early for a new packet. In shaper mode
+        # waking here would pull send times toward real arrivals.
+        if self._shaper is None:
+            self._event.set()
 
     async def start(self) -> None:
         self._running = True
@@ -138,7 +176,7 @@ class SendScheduler:
             self._event.clear()
             now = self._clock()
             if self._shaper is not None:
-                await self._envelope_tick(now, self._shaper)
+                await self._shaper_tick(now, self._shaper)
             else:
                 await self._legacy_tick(now)
             await self._sleep_until_next()
@@ -167,7 +205,8 @@ class SendScheduler:
 
     async def _send_one(self, pkt: _ScheduledPacket) -> None:
         """Send a single packet, keeping the detached loop alive on error."""
-        await self._keep_alive(self._send_fn(pkt.data, pkt.target_size), "send")
+        send = pkt.send_via if pkt.send_via is not None else self._send_fn
+        await self._keep_alive(send(pkt.data, pkt.target_size), "send")
 
     async def _legacy_tick(self, now: float) -> None:
         """Additive-Poisson path: drain all due packets, then poll chaff."""
@@ -179,33 +218,32 @@ class SendScheduler:
         if self._chaff_fn and self._should_chaff_fn and self._should_chaff_fn():
             await self._emit_chaff()
 
-    async def _envelope_tick(self, now: float, shaper: TrafficShaper) -> None:
-        """Envelope-driven path: emit exactly the shaper's per-tick budget.
+    async def _shaper_tick(self, now: float, shaper: TrafficShaper) -> None:
+        """Shaper-driven path: fill exactly the slots that are due.
 
-        Real queued packets (whose jitter ``send_time`` has arrived) drain
-        first; chaff fills the remaining budget. The envelope governs the
-        COUNT (decoupling the wire rate from real volume); the per-packet
-        jitter still governs intra-tick ordering — a packet never leaves
-        before its jitter ``send_time``.
+        Queued packets go first, oldest first; chaff fills the remaining
+        slots. The count comes from the shaper, never from the queue, so the
+        wire rate follows the tier, not the real traffic.
         """
-        oldest_age = 0.0
+        oldest_wait = 0.0
         if self._queue and self._queue[0].send_time <= now:
-            oldest_age = max(0.0, now - self._queue[0].send_time)
-        shaper.update_envelope(now, len(self._queue), oldest_age)
-        budget = shaper.release_budget(now)
+            oldest_wait = now - self._queue[0].send_time
+        slots, self._next_wake = shaper.poll(
+            now, len(self._queue), oldest_wait, self._real_sent
+        )
+        self._real_sent = 0
         chaff_allowed = self._should_chaff_fn is None or self._should_chaff_fn()
-        for _ in range(budget):
+        for _ in range(slots):
             if self._queue and self._queue[0].send_time <= now:
                 await self._send_one(heapq.heappop(self._queue))
+                self._real_sent += 1
             elif self._chaff_fn is not None and chaff_allowed:
-                # Chaff fills the remaining budget. Send it DIRECTLY (not via
-                # enqueue) so it does not inflate the queue depth that drives
-                # the envelope — chaff is the fill, never the demand signal.
+                # Chaff fills the slot. Sent DIRECTLY (not via enqueue) so it
+                # never counts as real demand.
                 await self._send_chaff_direct()
             else:
-                # No real packet due and chaff not available/allowed this
-                # tick: leave the budget slot unfilled (e.g. server before the
-                # client addr is known — see server.py's chaff gate).
+                # No real packet due and chaff not allowed (e.g. the server
+                # before the client addr is known): the slot stays empty.
                 break
 
     async def _emit_chaff(self) -> None:
@@ -221,10 +259,10 @@ class SendScheduler:
             self.enqueue(chaff_data, chaff_size)
 
     async def _send_chaff_direct(self) -> None:
-        """Envelope path: generate one chaff packet and send it immediately.
+        """Shaper path: generate one chaff packet and send it immediately.
 
-        Bypasses the jittered queue so chaff (the fill) is never counted as
-        real demand by the envelope. Keeps the loop alive on a chaff_fn error.
+        Bypasses the queue so chaff (the fill) is never counted as real
+        demand. Keeps the loop alive on a chaff_fn error.
         """
         if self._chaff_fn is None:
             return
@@ -232,22 +270,23 @@ class SendScheduler:
         if result is None:
             return
         chaff_data, chaff_size = result
-        await self._send_one(_ScheduledPacket(0.0, chaff_data, chaff_size))
+        await self._keep_alive(self._send_fn(chaff_data, chaff_size), "send")
 
     async def _sleep_until_next(self) -> None:
-        """Sleep until the next queued packet or a jittered poll interval.
+        """Sleep until the next wake.
 
-        Jitter prevents a fixed 50 ms cadence from fingerprinting the
-        scheduler; the per-poll cadence also paces the envelope's release.
+        Shaper mode sleeps until the shaper's ``next_wake`` and nothing else
+        shortens that sleep. Legacy mode waits for the next queued packet, a
+        jittered poll interval, or an enqueue, whichever comes first.
         """
+        if self._shaper is not None:
+            await asyncio.sleep(max(0.0, self._next_wake - self._clock()))
+            return
         poll_jitter = _POLL_JITTER_MIN + csprng_float() * _POLL_JITTER_RANGE
-        if self._queue and self._shaper is None:
+        if self._queue:
             wait_time = max(0.0, self._queue[0].send_time - self._clock())
             wait_time = min(wait_time, poll_jitter)
         else:
-            # Envelope mode polls on the jittered cadence regardless of queue
-            # depth: the release budget — not a packet's send_time — decides
-            # how many leave, so we must wake every poll to advance pacing.
             wait_time = poll_jitter
 
         try:

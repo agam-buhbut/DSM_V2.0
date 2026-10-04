@@ -72,8 +72,10 @@ WIRE_OVERHEAD = 68
 # converts to a wire size-class ceiling by subtracting this.
 IP_UDP_OVERHEAD = 28
 
-# Per-fragment extra-delay window (seconds). Comfortably larger than the
-# scheduler's max jitter so fragments interleave with other queued packets.
+# Per-fragment extra-delay window (seconds). It only matters when the
+# scheduler runs without the tier shaper (tests): there it spreads a packet's
+# fragments so they mix with other queued packets. With the shaper, the
+# fragments simply take the next free slots.
 FRAG_SPREAD_S = 0.05
 
 # auto-MTU adapter: how many consecutive same-or-higher path-MTU
@@ -284,8 +286,9 @@ def make_addr_send_fn(
     egress closure returns — this resolves the destination from the
     ``addr`` argument passed at call time. It exists solely for the
     return-routability PATH_CHALLENGE: that probe must go to the UNCOMMITTED
-    pending candidate WITHOUT routing through the scheduler (which always
-    targets the committed egress) and WITHOUT mutating the committed egress.
+    pending candidate (the scheduler sends it in a normal slot through this
+    closure instead of its own send function) and WITHOUT mutating the
+    committed egress.
 
     The AEAD/seq/nonce framing is byte-identical to ``make_send_fn`` — only
     the destination resolution differs — so the probe is indistinguishable on
@@ -671,10 +674,10 @@ async def _handle_rekey_init(ctx: DataPathContext, inner: InnerPacket) -> None:
         rekey_state=ctx.rekey,
         local_static_pub=ctx.local_static_pub,
         remote_static_pub=ctx.remote_static_pub,
-        # Route the (normal) REKEY_ACK through the paced envelope so
-        # its wire timing matches the steady stream. The duplicate-INIT
-        # cached-ACK replay inside handle_rekey_init keeps the bounded direct
-        # send_fn (lost-ACK recovery must stay observable within 5 s).
+        # Route the REKEY_ACK, and the cached-ACK replay for a duplicate
+        # INIT, through the shaper schedule so their wire timing matches
+        # the steady stream. Each takes the next free slot, far inside the
+        # initiator's 8 s ACK timeout.
         paced_send=ctx.scheduler.enqueue,
     )
 
@@ -743,7 +746,7 @@ async def _handle_path_challenge(ctx: DataPathContext, inner: InnerPacket) -> No
     that has just moved (NAT rebind / network change) IS at that new addr,
     receives the challenge, and echoes the 16-byte token straight back via
     the normal paced send path — so the legitimate roam completes. The
-    response rides the scheduler (same envelope as any control packet); the
+    response rides the scheduler (same slots as any control packet); the
     server matches the echoed token against its pending slot.
 
     An off-path attacker who spoofed a victim's source addr never receives
@@ -811,7 +814,8 @@ async def liveness_loop(ctx: DataPathContext) -> None:
 
     The check cadence is ``LIVENESS_CHECK_INTERVAL`` — well below both
     ``KEEPALIVE_SEND_INTERVAL`` and ``DEAD_PEER_TIMEOUT`` so there is slack
-    for the scheduler's jitter and for a single missed keepalive round.
+    for the wait until the keepalive's send slot and for a single missed
+    keepalive round.
     """
     while not ctx.shutdown.is_set():
         try:
@@ -1179,10 +1183,10 @@ async def tun_send_loop(ctx: DataPathContext) -> None:
                     ctx.shaper,
                     ctx.send_fn,
                     ctx.rekey.last_time,
-                    # Pace the REKEY_INIT onto the envelope. The
+                    # Pace the REKEY_INIT onto the shaper schedule. The
                     # retransmit budget is gated on REKEY_ACK_TIMEOUT (ACK
                     # receipt), not send completion, so fire-and-forget enqueue
-                    # is safe — a paced INIT leaves within one latency budget.
+                    # is safe — a paced INIT leaves in the next free slot.
                     paced_send=ctx.scheduler.enqueue,
                 )
             except Exception:
@@ -1228,7 +1232,7 @@ async def tun_send_loop(ctx: DataPathContext) -> None:
                     ctx.session_keys,
                     ctx.shaper,
                     ctx.send_fn,
-                    # Pace the retransmitted INIT (same envelope path
+                    # Pace the retransmitted INIT (same shaper path
                     # as the original; the next ACK timeout is the recovery
                     # mechanism, so fire-and-forget is correct).
                     paced_send=ctx.scheduler.enqueue,
@@ -1250,21 +1254,14 @@ async def tun_send_loop(ctx: DataPathContext) -> None:
             log.warning("dropping oversized TUN packet (%d bytes): %s", len(pkt), e)
             continue
 
-        # The adaptive envelope (TrafficShaper.update_envelope /
-        # release_budget, driven by the scheduler) smooths burst onset by
-        # PACING the queue — real packets enter the same paced queue and the
-        # envelope governs when they leave (within the latency budget).
-        # Spread out fragments across multiple jitter windows
-        # so an oversized TUN packet doesn't produce a recognizable
-        # "1 → N tightly-spaced packets" wire signature. Per-fragment
-        # extra delay is uniformly distributed in [0, FRAG_SPREAD_S);
-        # FRAG_SPREAD_S = 0.05 (50 ms) is comfortably larger than the
-        # scheduler's max jitter (50 ms by default) so the fragments
-        # are temporally interleaved with other queued packets rather
-        # than emerging back-to-back. Total worst-case spread for 16
-        # fragments is ~16 * 50 = 800 ms — meaningful but acceptable
-        # for the rare oversized packet path; bulk transfers that
-        # routinely fragment should configure a larger inner MTU.
+        # Real packets join the scheduler queue and leave in the tier
+        # shaper's free slots, so the wire rate follows the tier, not the
+        # real traffic; the fragments of an oversized TUN packet simply
+        # take the next free slots. The per-fragment extra delay below
+        # (uniform in [0, FRAG_SPREAD_S) per position) only applies when
+        # the scheduler runs without a shaper: there it keeps the
+        # fragments from leaving as a recognizable "1 → N tightly-spaced
+        # packets" burst.
         # Mark a real-data send so the keepalive loop's
         # 15s-idle check doesn't get bumped by chaff.
         ctx.liveness.last_real_send_time = time.monotonic()

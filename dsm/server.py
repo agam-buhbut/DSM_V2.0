@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from collections.abc import Awaitable, Callable
 from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -254,6 +255,32 @@ def _drive_fsm_to_idle(fsm: SessionFSM) -> None:
         )
 
 
+def _queue_path_challenge(
+    ctx: DataPathContext,
+    path_send: Callable[[bytes, int, tuple[str, int]], Awaitable[None]],
+    candidate: tuple[str, int],
+    token: bytes,
+) -> None:
+    """Queue a PATH_CHALLENGE for the pending candidate address.
+
+    It leaves in a normal shaper slot like any packet, so it never shows up
+    as an off-beat packet. When its turn comes the scheduler sends it with
+    ``path_send`` to ``candidate``, not to the committed egress, which stays
+    untouched.
+    """
+    # imported here: private helper, not part of dsm.session's public surface
+    from dsm.session import _build_control_packet  # pyright: ignore[reportPrivateUsage]
+
+    padded, target_size = _build_control_packet(
+        ctx, PacketType.PATH_CHALLENGE, payload=token
+    )
+
+    async def _to_candidate(data: bytes, size: int) -> None:
+        await path_send(data, size, candidate)
+
+    ctx.scheduler.enqueue(padded, target_size, send_via=_to_candidate)
+
+
 async def _run_one_session(
     config: Config,
     fsm: SessionFSM,
@@ -343,16 +370,7 @@ async def _run_one_session(
         # Fresh per-session protocol state. A re-accepted client gets a clean
         # SequenceCounter / ReplayWindow / epoch — never reuse the previous
         # session's instances.
-        shaper = TrafficShaper(
-            config.padding_min,
-            config.padding_max,
-            envelope_idle_floor_min_pps=config.envelope_idle_floor_min_pps,
-            envelope_idle_floor_max_pps=config.envelope_idle_floor_max_pps,
-            envelope_ceiling_pps=config.envelope_ceiling_pps,
-            envelope_rise_per_s=config.envelope_rise_per_s,
-            envelope_fall_half_life_s=config.envelope_fall_half_life_s,
-            envelope_latency_budget_ms=config.envelope_latency_budget_ms,
-        )
+        shaper = TrafficShaper.from_config(config)
         replay = tuncore.ReplayWindow()
         seq = SequenceCounter()
         rekey = RekeyState()
@@ -399,12 +417,11 @@ async def _run_one_session(
             shutdown=session_shutdown,
         )
 
-        # Envelope-driven (mirrors the client). The shaper's paced
-        # wire budget decides how many packets leave per poll; should_chaff
-        # is now only a GATE that suppresses chaff-fill until client_addr is
-        # known — otherwise each chaff packet would burn a sequence number
-        # only to be dropped by make_send_fn's "destination addr not yet
-        # known" path.
+        # Shaper-driven (mirrors the client): the tier shaper decides when
+        # packets leave. should_chaff is only a GATE that keeps free slots
+        # empty until client_addr is known — otherwise each chaff packet would
+        # burn a sequence number only to be dropped by make_send_fn's
+        # "destination addr not yet known" path.
         def _chaff_allowed() -> bool:
             return client_addr[0] is not None
 
@@ -451,26 +468,6 @@ async def _run_one_session(
         path_validation = PathValidationState()
         path_send = make_addr_send_fn(session_keys, transport, seq)
 
-        async def _send_challenge(candidate: tuple[str, int], token: bytes) -> None:
-            # The challenge goes DIRECTLY to the pending candidate — NOT through
-            # the scheduler (which always targets the committed egress) and
-            # WITHOUT touching the committed egress. Bounded so a wedged/unroutable
-            # candidate (e.g. the spoofed victim) cannot pin the recv loop.
-            # imported here: private helper, not part of dsm.session's public surface
-            from dsm.session import (
-                _build_control_packet,  # pyright: ignore[reportPrivateUsage]
-            )
-
-            padded, target_size = _build_control_packet(
-                ctx, PacketType.PATH_CHALLENGE, payload=token
-            )
-            try:
-                await asyncio.wait_for(
-                    path_send(padded, target_size, candidate), timeout=5.0
-                )
-            except (TimeoutError, OSError) as e:
-                log.debug("PATH_CHALLENGE send to %s failed: %s", candidate, e)
-
         async def _post_authenticate(addr: tuple[str, int], inner: object) -> None:
             from dsm.core.protocol import InnerPacket
 
@@ -501,7 +498,7 @@ async def _run_one_session(
             # (rate-limited) probe it. Egress stays on the committed real client.
             token = path_validation.should_challenge(addr)
             if token is not None:
-                await _send_challenge(addr, token)
+                _queue_path_challenge(ctx, path_send, addr, token)
 
         from dsm.session import run_data_loops
 

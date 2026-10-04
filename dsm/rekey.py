@@ -43,10 +43,10 @@ SendFn = Callable[[bytes, int], Awaitable[None]]
 
 # A synchronous, fire-and-forget paced-enqueue callable — the same
 # ``SendScheduler.enqueue`` real data/chaff packets use.
-# When supplied, control-plane REKEY_INIT/REKEY_ACK are released at the
-# envelope rate (≤ one latency budget late) instead of leaving immediately
-# via ``send_fn``, so their wire timing is indistinguishable from the steady
-# stream. ``enqueue`` only *queues*; the retransmit logic is gated on
+# When supplied, control-plane REKEY_INIT/REKEY_ACK leave in the tier
+# shaper's next free slot instead of immediately via ``send_fn``, so their
+# wire timing is indistinguishable from the steady stream. ``enqueue`` only
+# *queues*; the retransmit logic is gated on
 # ACK-receipt timeout (REKEY_ACK_TIMEOUT), not on send completion, so
 # fire-and-forget is safe (see the module docstring of session.py and the
 # retry scheduler in tun_send_loop).
@@ -69,11 +69,10 @@ async def _send_rekey_packet(
 
     When ``paced_send`` is supplied the padded packet is handed
     to the paced scheduler queue (fire-and-forget) instead of the bounded
-    direct ``send_fn``, so it leaves at the envelope rate. The padding is
+    direct ``send_fn``, so it leaves in a shaper slot. The padding is
     identical either way — the wire packet is the same size class / AEAD
     shape as a real data packet, only its release timing differs. When
-    ``paced_send`` is None the direct-await path is used, which keeps the
-    duplicate-ACK retransmit bounded.
+    ``paced_send`` is None the bounded direct-await path is used.
     """
     inner = InnerPacket(
         ptype=ptype,
@@ -115,10 +114,10 @@ async def initiate_rekey(
     Returns ``(last_rekey_time, None, None)`` if the rekey was skipped.
 
     When ``paced_send`` is supplied the REKEY_INIT rides the
-    paced envelope (fire-and-forget enqueue) instead of the bounded direct
+    shaper schedule (fire-and-forget enqueue) instead of the bounded direct
     ``send_fn``. This is safe because the retransmit budget is driven by
     REKEY_ACK_TIMEOUT (ACK *receipt*), not by send completion — a paced
-    INIT leaves within ~one latency budget, far inside the 8 s window.
+    INIT leaves in the next free slot, far inside the 8 s window.
     """
     if fsm.state != State.ESTABLISHED:
         log.warning("cannot initiate rekey in state %s", fsm.state.name)
@@ -159,7 +158,7 @@ async def resend_rekey_init(
     cannot see a byte-identical retransmit.
 
     When ``paced_send`` is supplied the retransmit also rides
-    the paced envelope (same justification as ``initiate_rekey`` — the
+    the shaper schedule (same justification as ``initiate_rekey`` — the
     next ACK-timeout retry is the recovery mechanism, not send completion).
     """
     await _send_rekey_packet(
@@ -276,8 +275,20 @@ async def handle_rekey_init(
             "duplicate REKEY_INIT for epoch %d — re-sending cached ACK",
             new_epoch,
         )
-        # Bound the await so a stuck TCP send (peer backpressure)
-        # can't pin the recv loop for arbitrary time.
+        if paced_send is not None:
+            # The replay takes the next free slot like any packet, so it
+            # never shows up as an off-beat packet on the wire.
+            await _send_rekey_packet(
+                PacketType.REKEY_ACK,
+                cached_ack_payload,
+                session_keys,
+                shaper,
+                send_fn,
+                paced_send=paced_send,
+            )
+            return last_rekey_time, cached_ack_epoch, cached_ack_payload
+        # Direct path: bound the await so a stuck TCP send (peer
+        # backpressure) can't pin the recv loop for arbitrary time.
         try:
             await asyncio.wait_for(
                 _send_rekey_packet(
@@ -327,8 +338,8 @@ async def handle_rekey_init(
     # Send ACK under old keys (session_keys epoch not yet rotated).
     ack_payload = struct.pack("!I", prepared_epoch) + bytes(our_ephemeral_pub)
     # Pace the ACK so its wire timing matches the steady stream.
-    # The packet is BUILT now (old-epoch nibble) but LEAVES later at the
-    # envelope rate. Two safety properties keep this correct across the
+    # The packet is BUILT now (old-epoch nibble) but LEAVES later in a
+    # shaper slot. Two safety properties keep this correct across the
     # immediately-following apply_rotation_responder():
     #   * the receiver EXEMPTS REKEY_ACK from the epoch-nibble check
     #     (decrypt_packet), so a NEW nibble restamped at send
