@@ -85,10 +85,10 @@ class LivenessState:
     not flagged dead before the first packet arrives.
 
     ``last_real_send_time`` tracks real-data sends only, so the
-    KEEPALIVE-trigger doesn't get bumped by chaff. With the
-    Poisson-rate chaff model always firing, an "any-send idle > 15s"
-    check would mean KEEPALIVE was effectively never sent — silently
-    making the typed-keepalive path dead code rather than the intended
+    KEEPALIVE-trigger doesn't get bumped by chaff. Chaff fills every
+    free send slot, so an "any-send idle > 15s" check would mean
+    KEEPALIVE was effectively never sent — silently making the
+    typed-keepalive path dead code rather than the intended
     fixed-cadence ping.
     """
 
@@ -299,7 +299,8 @@ def make_addr_send_fn(
             # graceful-drop rationale as the encrypt() guard below — this
             # closure has no shutdown handle, but the shared data-path send
             # hits the same exhaustion and drives teardown; drop the probe
-            # rather than letting the traceback escape the recv loop.
+            # with a clear log line rather than letting the traceback reach
+            # the scheduler loop that sends it.
             log.error("sequence counter exhausted on path-challenge send: %s", e)
             return
         if len(data) >= 2:
@@ -316,7 +317,8 @@ def make_addr_send_fn(
             # closure has no shutdown handle, but it shares session_keys and
             # the seq counter with the data-path send, so that path hits the
             # same exhaustion and drives teardown; here we just log and drop
-            # the probe rather than letting the traceback escape the recv loop.
+            # the probe rather than letting the traceback reach the scheduler
+            # loop that sends it.
             log.error("AEAD nonce exhausted on path-challenge send: %s", e)
             return
         outer = OuterPacket(seq=n, nonce=nonce, ciphertext=ct)
@@ -834,7 +836,7 @@ async def liveness_loop(ctx: DataPathContext) -> None:
             return
 
         # Trigger on real-data idleness, not all-send idleness.
-        # With Poisson-rate chaff always firing, an any-send timestamp
+        # Chaff fills every free send slot, so an any-send timestamp
         # would never go stale and KEEPALIVE would never fire. Tracking
         # last_real_send_time separately gives KEEPALIVE its intended
         # fixed-cadence diagnostic value.

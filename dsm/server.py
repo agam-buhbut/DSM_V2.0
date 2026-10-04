@@ -110,7 +110,7 @@ async def _backoff_or_shutdown(
         _HANDSHAKE_RETRY_BACKOFF_BASE * (2 ** min(consecutive_failures - 1, 4)),
         _HANDSHAKE_RETRY_BACKOFF_MAX,
     )
-    # Use the same CSPRNG-backed helper the shaper uses for jitter, then
+    # Draw the jitter from the CSPRNG-backed helper in dsm.core.rand, then
     # clamp. Imported lazily to avoid a top-level dependency on
     # dsm.core.rand from server.py.
     from dsm.core.rand import csprng_float
