@@ -469,7 +469,11 @@ def _number_list(name: str, value: object) -> list[float]:
             raise ValueError(
                 f"{name} entries must be numbers, got {type(item).__name__}"
             )
-        out.append(float(item))
+        try:
+            out.append(float(item))
+        except OverflowError as e:
+            # TOML integers can have any size; float() refuses one this big.
+            raise ValueError(f"{name} has a number that is far too large") from e
     return out
 
 

@@ -179,6 +179,41 @@ def test_wrong_types_raise_a_readable_value_error(
     assert kind in str(caught.value)
 
 
+# TOML integers can have any size, but a float cannot hold one this big.
+_HUGE = 10**400
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("shaper_tiers_pps", [10, _HUGE]),
+        ("shaper_tiers_pps", [-_HUGE, 10]),
+        ("shaper_linger_s", [300, _HUGE]),
+    ],
+)
+def test_a_huge_integer_raises_a_value_error_naming_the_key(
+    key: str, value: list[int]
+) -> None:
+    with pytest.raises(ValueError, match=key):
+        Config(**_base(**{key: value}))
+
+
+def test_a_huge_integer_in_the_file_stops_startup_without_a_traceback(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from dsm.__main__ import _load_config_or_exit
+
+    path = tmp_path / "config.toml"
+    path.write_text(_CLIENT_TOML + f"shaper_tiers_pps = [10, {'9' * 400}]\n")
+    os.chmod(path, 0o600)
+    with pytest.raises(SystemExit) as caught:
+        _load_config_or_exit(path)
+    assert caught.value.code == 2
+    err = capsys.readouterr().err
+    assert err.startswith("config: shaper_tiers_pps")
+    assert "Traceback" not in err
+
+
 def test_load_reads_the_new_keys(tmp_path: Path) -> None:
     c = _load(
         tmp_path,
