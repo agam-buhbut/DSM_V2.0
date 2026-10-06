@@ -259,6 +259,16 @@ def _validate_types(c: Config) -> None:
             f"dns_provider_pins must be a table (a [dns_provider_pins] "
             f"section), got {type(c.dns_provider_pins).__name__}"
         )
+    # A string here would be read letter by letter further on.
+    if not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
+        c.dns_providers, list
+    ) or not all(
+        isinstance(p, str)  # pyright: ignore[reportUnnecessaryIsInstance]
+        for p in c.dns_providers
+    ):
+        raise ValueError(
+            'dns_providers must be a list of strings, e.g. ["https://1.1.1.1/dns-query"]'
+        )
 
 
 def _validate_mode(c: Config) -> None:
@@ -382,6 +392,17 @@ def _validate_dns(c: Config) -> None:
                     f"IP (a hostname provider dead-loops through the TUN)."
                 ) from e
         pins = c.dns_provider_pins.get(provider)
+        # A string here would be read letter by letter below.
+        if not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
+            pins, (list, type(None))
+        ) or not all(
+            isinstance(p, str)  # pyright: ignore[reportUnnecessaryIsInstance]
+            for p in pins or []
+        ):
+            raise ValueError(
+                f"dns_provider_pins[{provider!r}] must be a list of hash strings, "
+                f'e.g. ["<64 hex chars>"]'
+            )
         if not pins:
             raise ValueError(
                 f"dns_provider {provider!r} requires dns_provider_pins entry with "

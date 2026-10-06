@@ -83,6 +83,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   DSM runs and gets a new tag after a restart.
 
 ### Fixed
+- `dns_providers` or a pin value written as a single string instead of a
+  list is now a clear config error, not a confusing error about single
+  letters.
 - `dns_provider_pins` written as a plain value (a string or list) instead
   of a `[dns_provider_pins]` section is now a clear config error naming the
   key, not a crash at server start.
