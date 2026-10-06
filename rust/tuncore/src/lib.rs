@@ -802,6 +802,11 @@ fn tuncore(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?;
     m.add("CHAFF_PERTURB_UP_P", shaper::CHAFF_PERTURB_UP_P)?;
     m.add("CHAFF_PERTURB_DOWN_P", shaper::CHAFF_PERTURB_DOWN_P)?;
+    // Read by a Python test that checks it stays above the rekey retry plan.
+    m.add(
+        "REKEY_PEER_CONFIRM_LIMIT_SECS",
+        session_keys::PEER_CONFIRM_LIMIT_SECS,
+    )?;
     Ok(())
 }
 

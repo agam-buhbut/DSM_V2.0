@@ -57,8 +57,9 @@ class _ScheduledPacket:
     order: int
     data: bytes = field(compare=False)
     target_size: int = field(compare=False)
-    # Per-packet sender (a PATH_CHALLENGE to a candidate address); None
-    # means the scheduler's own send_fn.
+    # Per-packet sender (a PATH_CHALLENGE to a candidate address, or a
+    # REKEY_INIT that notes its send time); None means the scheduler's own
+    # send_fn.
     send_via: _SendFn | None = field(default=None, compare=False)
 
 

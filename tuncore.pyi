@@ -266,3 +266,7 @@ SIZE_CLASS_WEIGHTS: tuple[int, ...]
 # to just below DOWN_P moves one class down.
 CHAFF_PERTURB_UP_P: float
 CHAFF_PERTURB_DOWN_P: float
+
+# Longest time a rekey responder keeps the old keys while it waits for the
+# peer to use the new ones (session_keys.rs PEER_CONFIRM_LIMIT_SECS).
+REKEY_PEER_CONFIRM_LIMIT_SECS: int

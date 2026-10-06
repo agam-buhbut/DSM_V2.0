@@ -129,13 +129,20 @@ SESSION_CLOSE packet.
   one-time key exchange). If its reply is lost, msg3 and bootstrap_init are
   resent together, as a pair, until a timeout.
 - Key-change retries: if the REKEY_ACK (the reply that confirms a key
-  change) does not arrive within REKEY_ACK_TIMEOUT=8s, the side that started
-  the change resends the same REKEY_INIT. It does this up to
-  MAX_REKEY_RETRIES=9 times, then gives up. The total retry window
-  (8s × 9 = 72s) is longer than the 60s rekey rate limit on purpose. That
-  gives a responder that is still inside its own rate-limit window time to
-  accept a later resend. The responder keeps the last ACK payload, so a
-  duplicate INIT gets the same ACK again without a second key change.
+  change) does not arrive, the side that started the change resends the
+  same REKEY_INIT: first after 1.5 s, then 2.5 s later, then every
+  REKEY_ACK_TIMEOUT=8s, up to MAX_REKEY_RETRIES=10 times, then it gives up.
+  The wait starts when the INIT really leaves, not when it is queued. The
+  last resend comes 68 s after the first INIT, longer than the 60s rekey
+  rate limit on purpose. That gives a responder that is still inside its
+  own rate-limit window time to accept a later resend. The responder keeps
+  the last ACK payload, so a duplicate INIT gets the same ACK again without
+  a second key change.
+- The responder keeps its old keys (it still sends with the old key and
+  still reads the old one) until the first packet under the new keys
+  arrives, which shows the other side got the ACK. So a lost ACK is fixed
+  by a resend instead of breaking the session. If no such packet comes
+  within 75 s, it switches to the new keys anyway.
 - DSM does not resend lost data packets. It relies on the protocol inside
   the tunnel, or on TCP.
 

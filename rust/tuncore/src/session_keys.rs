@@ -21,7 +21,21 @@ pub const ROTATION_TIME_BASE_SECS: u64 = 600; // 10 minutes
 /// set small bases — making them rotate every packet. Proportional
 /// jitter keeps the operator's intent intact across the full range.
 const ROTATION_JITTER_PCT: u64 = 20;
+/// How long an old recv key stays usable for late packets once the new
+/// keys are known to work on both sides.
 const GRACE_PERIOD_SECS: u64 = 5;
+
+/// Longest time the responder keeps the old keys while it waits for the
+/// first packet sent under the new keys. That packet proves the initiator
+/// got REKEY_ACK. If the ACK was lost, the initiator resends REKEY_INIT
+/// under the old keys and the responder must still be able to read it and
+/// answer with the cached ACK, so this limit must be longer than the
+/// initiator's whole retry plan (`REKEY_RETRY_BUDGET` from
+/// `REKEY_ACK_TIMEOUT`, `REKEY_EARLY_RETRY_DELAYS` and `MAX_REKEY_RETRIES`
+/// in dsm/rekey.py, 68 s today). A Python test checks this. After the
+/// limit the responder gives up waiting: it swaps to the new send key and
+/// drops the old recv key.
+pub const PEER_CONFIRM_LIMIT_SECS: u64 = 75;
 
 /// Cap on operator-supplied rotation bases. The defaults are 5_000 packets
 /// and 600 s; the cap leaves several orders of magnitude of headroom while
@@ -128,23 +142,29 @@ pub struct SessionKeyManager {
     recv: DirectionKeys,
     replay: ReplayWindow,
 
-    /// Previous epoch recv key kept during grace period after rotation.
+    /// Previous epoch recv key, kept after a rotation so late packets
+    /// under the old key can still be read.
     prev_recv: Option<DirectionKeys>,
     prev_replay: Option<ReplayWindow>,
+    /// When set, `prev_recv` is dropped `GRACE_PERIOD_SECS` after this.
+    /// `None` while `prev_recv` is held open for an unconfirmed responder
+    /// rotation (see `pending_new_send`).
     grace_start: Option<Instant>,
 
-    /// H-BUG-2/3: pending NEW send key for the deferred-send-swap
-    /// flow used on the responder side. The responder applies the
-    /// recv swap immediately (so it can decrypt the rest of the
-    /// client's old-epoch packets via prev_recv backward-grace AND
-    /// new-epoch packets via the swapped recv) but keeps sending under
-    /// the OLD send key until grace expires. This gives the client
-    /// time to receive REKEY_ACK and apply its own rotation before any
-    /// server NEW-epoch packets arrive, eliminating the up-to-1-RTT
-    /// data-loss window. `tick()` performs the actual send swap once
-    /// `send_swap_at + GRACE_PERIOD_SECS` has passed.
+    /// H-BUG-2/3: the NEW send key on the responder side, parked until
+    /// the peer proves it has the new keys. The responder swaps its recv
+    /// key at once (new-key packets are read with `recv`, old-key ones
+    /// with `prev_recv`) but keeps sending under the OLD key, because the
+    /// initiator can only read new-key packets after it gets REKEY_ACK.
+    /// The ACK can be lost, so the responder waits for the first packet
+    /// that decrypts under the new recv key (only a peer that has the ACK
+    /// can send one). Then it swaps to the new send key and starts the
+    /// short grace for `prev_recv`. Until then `prev_recv` stays open, so
+    /// a resent REKEY_INIT under the old key is still read and answered
+    /// with the cached ACK under the old send key. `awaiting_peer_since`
+    /// bounds the wait to `PEER_CONFIRM_LIMIT_SECS`.
     pending_new_send: Option<DirectionKeys>,
-    send_swap_at: Option<Instant>,
+    awaiting_peer_since: Option<Instant>,
 
     packets_sent: u64,
     epoch_start: Instant,
@@ -312,7 +332,7 @@ impl SessionKeyManager {
             prev_replay: None,
             grace_start: None,
             pending_new_send: None,
-            send_swap_at: None,
+            awaiting_peer_since: None,
             packets_sent: 0,
             epoch_start: Instant::now(),
             packet_threshold: randomized_threshold(packet_base),
@@ -400,21 +420,32 @@ impl SessionKeyManager {
             };
             try_decrypt_dir(&prev.key, prev_replay, nonce, ciphertext, aad, seq)
         } else {
-            try_decrypt_dir(
+            let result = try_decrypt_dir(
                 &self.recv.key,
                 &mut self.replay,
                 nonce,
                 ciphertext,
                 aad,
                 seq,
-            )
+            );
+            if result.is_ok() {
+                // A packet under the new recv key proves the peer has the
+                // new keys, so a parked send swap can happen now.
+                self.confirm_peer_has_new_keys();
+            }
+            result
         }
     }
 
     /// Check if key rotation is needed.
+    ///
+    /// Never true while a responder rotation is still waiting for the
+    /// peer to use the new keys: starting another one before the last one
+    /// is confirmed could leave the two sides two epochs apart.
     pub fn needs_rotation(&self) -> bool {
-        self.packets_sent >= self.packet_threshold
-            || self.epoch_start.elapsed() >= self.time_threshold
+        self.pending_new_send.is_none()
+            && (self.packets_sent >= self.packet_threshold
+                || self.epoch_start.elapsed() >= self.time_threshold)
     }
 
     /// Initiate key rotation: generate an ephemeral keypair for the new epoch.
@@ -516,12 +547,10 @@ impl SessionKeyManager {
     /// `prepare_rotation_responder` and swap the session keys in.
     ///
     /// H-BUG-2/3: responder uses the deferred-send-swap variant.
-    /// The recv-key swap is immediate (so prev_recv backward-grace
-    /// catches any in-flight OLD-key packets from the client) but
-    /// `send` stays on the OLD key for GRACE_PERIOD_SECS — giving the
-    /// client time to receive REKEY_ACK and apply its own rotation
-    /// before any responder NEW-key packets arrive. The NEW send is
-    /// held in `pending_new_send` and promoted by `tick()`.
+    /// The recv-key swap is immediate, but `send` stays on the OLD key
+    /// and `prev_recv` stays open until the first packet under the new
+    /// recv key arrives (or `PEER_CONFIRM_LIMIT_SECS` passes). See
+    /// `pending_new_send`.
     pub fn apply_rotation_responder(
         &mut self,
         pending: ResponderPending,
@@ -546,9 +575,10 @@ impl SessionKeyManager {
 
     /// Shared apply-rotation body with optional deferred send-key swap.
     /// When `defer_send=true` (responder), the new send key is parked in
-    /// `pending_new_send` and `send` keeps the OLD key; `tick()` swaps it
-    /// in once grace expires. When `defer_send=false` (initiator), the
-    /// swap is immediate.
+    /// `pending_new_send`, `send` keeps the OLD key and `prev_recv` has no
+    /// grace timer yet; the swap happens when the peer is confirmed (or at
+    /// the hard limit). When `defer_send=false` (initiator), the swap is
+    /// immediate and the grace timer starts now.
     fn apply_rotation_with_grace(
         &mut self,
         new_send_key: LockedKey32,
@@ -559,20 +589,29 @@ impl SessionKeyManager {
         let new_recv = DirectionKeys::new(new_recv_key, new_epoch);
         let new_send = DirectionKeys::new(new_send_key, new_epoch);
 
+        // A still-parked send key from the last rotation: this new
+        // rotation means the peer moved past that epoch, so use it now.
+        // Leaving it parked would let a later promotion put an older key
+        // back over the one set below.
+        self.promote_pending_send();
+
         let old_recv = std::mem::replace(&mut self.recv, new_recv);
         let old_replay = std::mem::take(&mut self.replay);
 
+        // Replacing prev_recv drops (and zeroizes) the older key, as before.
         self.prev_recv = Some(old_recv);
         self.prev_replay = Some(old_replay);
-        self.grace_start = Some(Instant::now());
 
+        let now = Instant::now();
         if defer_send {
-            // Park NEW send for grace; KEEP self.send on the OLD key.
-            // tick() will promote when grace expires.
+            // Keep sending under the OLD key and keep prev_recv open (no
+            // grace timer) until the peer is confirmed.
             self.pending_new_send = Some(new_send);
-            self.send_swap_at = Some(Instant::now());
+            self.awaiting_peer_since = Some(now);
+            self.grace_start = None;
         } else {
             self.send = new_send;
+            self.grace_start = Some(now);
         }
 
         self.epoch = new_epoch;
@@ -592,8 +631,27 @@ impl SessionKeyManager {
         self.pending_new_send.is_some()
     }
 
+    /// Move a parked send key into `send` and stop waiting for the peer.
+    /// The old send key is dropped (and zeroized) here.
+    fn promote_pending_send(&mut self) {
+        if let Some(new_send) = self.pending_new_send.take() {
+            self.send = new_send;
+        }
+        self.awaiting_peer_since = None;
+    }
+
+    /// The peer sent a packet under our current recv key. If a responder
+    /// rotation was waiting on that, swap the send key now and start the
+    /// short grace for the old recv key.
+    fn confirm_peer_has_new_keys(&mut self) {
+        if self.pending_new_send.is_some() {
+            self.promote_pending_send();
+            self.grace_start = Some(Instant::now());
+        }
+    }
+
     /// Call periodically to clean up expired grace period keys and to
-    /// promote a deferred send-key swap (H-BUG-2/3).
+    /// enforce the hard limit on a deferred send-key swap (H-BUG-2/3).
     ///
     /// L-AUDIT-2: call site (`decrypt`) wraps in `py.allow_threads` so
     /// the ~10ns branch asymmetry between grace-active and grace-
@@ -610,21 +668,20 @@ impl SessionKeyManager {
             .grace_start
             .map(|start| now.saturating_duration_since(start).as_secs() >= GRACE_PERIOD_SECS)
             .unwrap_or(false);
-        let send_swap_due = self
-            .send_swap_at
-            .map(|at| now.saturating_duration_since(at).as_secs() >= GRACE_PERIOD_SECS)
+        let peer_wait_expired = self
+            .awaiting_peer_since
+            .map(|at| now.saturating_duration_since(at).as_secs() >= PEER_CONFIRM_LIMIT_SECS)
             .unwrap_or(false);
 
-        if grace_expired {
+        if peer_wait_expired {
+            // The peer never used the new keys: give up waiting, swap to
+            // the new send key and drop the old recv key.
+            self.promote_pending_send();
+        }
+        if grace_expired || peer_wait_expired {
             self.prev_recv = None;
             self.prev_replay = None;
             self.grace_start = None;
-        }
-        if send_swap_due {
-            if let Some(new_send) = self.pending_new_send.take() {
-                self.send = new_send;
-            }
-            self.send_swap_at = None;
         }
     }
 
@@ -639,8 +696,19 @@ impl SessionKeyManager {
         self.send.nonce_gen.epoch()
     }
 
+    /// True while the previous epoch's recv key is still usable.
     pub fn has_grace_period(&self) -> bool {
-        self.grace_start.is_some()
+        self.prev_recv.is_some()
+    }
+
+    /// Test helper: move every stored timestamp `by` into the past, as if
+    /// that much time had passed.
+    #[cfg(test)]
+    fn age_for_test(&mut self, by: Duration) {
+        let back = |t: Instant| t.checked_sub(by).expect("clock too close to boot");
+        self.grace_start = self.grace_start.map(back);
+        self.awaiting_peer_since = self.awaiting_peer_since.map(back);
+        self.epoch_start = back(self.epoch_start);
     }
 }
 
@@ -1149,5 +1217,198 @@ mod tests {
         assert!(server
             .decrypt(&bad_nonce, &bad_ct, bad_aad, 999, false)
             .is_err());
+    }
+    /// Send one packet from `from` to `to` and report whether `to` could
+    /// read it, trying the current recv key first and then the old one,
+    /// like `try_decrypt_with_fallback` in lib.rs.
+    fn delivers(
+        from: &mut SessionKeyManager,
+        to: &mut SessionKeyManager,
+        seq: u64,
+        msg: &[u8],
+    ) -> bool {
+        let aad = seq.to_be_bytes();
+        let (nonce, ct, _) = from.encrypt(msg, &aad).unwrap();
+        to.decrypt(&nonce, &ct, &aad, seq, false)
+            .or_else(|_| to.decrypt(&nonce, &ct, &aad, seq, true))
+            .is_ok_and(|pt| pt == msg)
+    }
+
+    /// Responder applies a rotation; returns (init, responder ephemeral
+    /// pub) so the test can later complete the initiator side, as if the
+    /// REKEY_ACK arrived.
+    fn responder_applies(
+        client: &SessionKeyManager,
+        server: &mut SessionKeyManager,
+    ) -> (RotationInit, [u8; 32]) {
+        let init = client.initiate_rotation().unwrap();
+        let pending = server
+            .prepare_rotation_responder(&init.ephemeral_pub, init.new_epoch)
+            .unwrap();
+        let server_pub = pending.our_pub;
+        server.apply_rotation_responder(pending).unwrap();
+        (init, server_pub)
+    }
+
+    /// The REKEY_ACK is lost and the initiator's resent INIT only arrives
+    /// long after the old 5 s grace. The responder must still read the old
+    /// key INIT and answer under the old send key; once the initiator has
+    /// the ACK and sends under the new key, both sides talk on new keys.
+    #[test]
+    fn lost_ack_then_late_retry_recovers() {
+        let (mut client, mut server) = make_paired_managers();
+        let old_epoch = client.epoch();
+        let (init, server_pub) = responder_applies(&client, &mut server);
+
+        // ACK lost. Time passes well beyond GRACE_PERIOD_SECS but inside
+        // the initiator's retry plan.
+        server.age_for_test(Duration::from_secs(50));
+        server.tick();
+        assert!(server.has_grace_period(), "old recv key must stay open");
+        assert_eq!(server.send_epoch(), old_epoch, "send must stay on old key");
+
+        // Resent INIT (old key) reaches the server; the cached ACK goes
+        // back under the old send key and the client can read it.
+        assert!(delivers(&mut client, &mut server, 10, b"resent INIT"));
+        assert!(delivers(&mut server, &mut client, 10, b"cached ACK"));
+
+        client
+            .complete_rotation_initiator(init, &server_pub)
+            .unwrap();
+        assert!(delivers(&mut client, &mut server, 11, b"first new-key"));
+        assert_eq!(server.send_epoch(), old_epoch + 1);
+        assert!(delivers(&mut server, &mut client, 11, b"server new-key"));
+    }
+
+    /// The first packet under the new recv key swaps the send key at once
+    /// and starts the short grace; the old recv key goes after
+    /// GRACE_PERIOD_SECS.
+    #[test]
+    fn first_new_key_packet_triggers_send_swap() {
+        let (mut client, mut server) = make_paired_managers();
+        let old_epoch = client.epoch();
+        let (init, server_pub) = responder_applies(&client, &mut server);
+
+        // An old-key packet does not count as proof.
+        assert!(delivers(&mut client, &mut server, 1, b"old-key data"));
+        assert!(server.has_pending_send_swap());
+
+        client
+            .complete_rotation_initiator(init, &server_pub)
+            .unwrap();
+        assert!(delivers(&mut client, &mut server, 2, b"new-key data"));
+        assert!(!server.has_pending_send_swap());
+        assert_eq!(server.send_epoch(), old_epoch + 1);
+        assert!(server.has_grace_period(), "late old-key packets still read");
+
+        server.age_for_test(Duration::from_secs(GRACE_PERIOD_SECS - 1));
+        server.tick();
+        assert!(server.has_grace_period());
+        server.age_for_test(Duration::from_secs(1));
+        server.tick();
+        assert!(!server.has_grace_period());
+    }
+
+    /// If the peer never sends under the new keys, the responder stops
+    /// waiting at PEER_CONFIRM_LIMIT_SECS: new send key, old recv key gone.
+    #[test]
+    fn peer_confirm_limit_falls_back_to_swap_and_drop() {
+        let (mut client, mut server) = make_paired_managers();
+        let old_epoch = client.epoch();
+        let _ = responder_applies(&client, &mut server);
+
+        server.age_for_test(Duration::from_secs(PEER_CONFIRM_LIMIT_SECS - 1));
+        server.tick();
+        assert!(server.has_pending_send_swap());
+        assert!(server.has_grace_period());
+
+        server.age_for_test(Duration::from_secs(1));
+        server.tick();
+        assert!(!server.has_pending_send_swap());
+        assert!(!server.has_grace_period());
+        assert_eq!(server.send_epoch(), old_epoch + 1);
+        assert!(!delivers(&mut client, &mut server, 1, b"old-key data"));
+    }
+
+    /// Normal case, no loss: both sides end on the new keys and the old
+    /// recv keys are dropped after the grace.
+    #[test]
+    fn normal_rotation_path_unchanged() {
+        let (mut client, mut server) = make_paired_managers();
+        let new_epoch = client.epoch() + 1;
+        let (init, server_pub) = responder_applies(&client, &mut server);
+        client
+            .complete_rotation_initiator(init, &server_pub)
+            .unwrap();
+
+        assert!(delivers(&mut client, &mut server, 1, b"c2s"));
+        assert!(delivers(&mut server, &mut client, 1, b"s2c"));
+        assert_eq!(client.send_epoch(), new_epoch);
+        assert_eq!(server.send_epoch(), new_epoch);
+
+        for keys in [&mut client, &mut server] {
+            keys.age_for_test(Duration::from_secs(GRACE_PERIOD_SECS));
+            keys.tick();
+            assert!(!keys.has_grace_period());
+        }
+        assert!(delivers(&mut client, &mut server, 2, b"c2s later"));
+        assert!(delivers(&mut server, &mut client, 2, b"s2c later"));
+    }
+
+    /// No new rotation starts while the last one waits for the peer.
+    #[test]
+    fn no_rotation_due_while_waiting_for_peer() {
+        let mut send_bytes = [0u8; 32];
+        let mut recv_bytes = [0u8; 32];
+        OsRng.fill_bytes(&mut send_bytes);
+        OsRng.fill_bytes(&mut recv_bytes);
+        let client = SessionKeyManager::new(
+            LockedKey32::from_array(send_bytes).unwrap(),
+            LockedKey32::from_array(recv_bytes).unwrap(),
+            1,
+            None,
+            None,
+        )
+        .unwrap();
+        // Rotation due after 1 or 2 packets.
+        let mut server = SessionKeyManager::new(
+            LockedKey32::from_array(recv_bytes).unwrap(),
+            LockedKey32::from_array(send_bytes).unwrap(),
+            1,
+            Some(1),
+            None,
+        )
+        .unwrap();
+        let _ = responder_applies(&client, &mut server);
+        for seq in 1..=3u64 {
+            server.encrypt(b"x", &seq.to_be_bytes()).unwrap();
+        }
+        assert!(!server.needs_rotation());
+
+        server.age_for_test(Duration::from_secs(PEER_CONFIRM_LIMIT_SECS));
+        server.tick();
+        assert!(server.needs_rotation());
+    }
+
+    /// A second responder rotation before the first was confirmed uses the
+    /// first one's parked send key, so a stale key can never come back.
+    #[test]
+    fn second_rotation_promotes_parked_send_key() {
+        let (mut client, mut server) = make_paired_managers();
+        let start = client.epoch();
+        let (init, server_pub) = responder_applies(&client, &mut server);
+        client
+            .complete_rotation_initiator(init, &server_pub)
+            .unwrap();
+        let (init2, server_pub2) = responder_applies(&client, &mut server);
+        assert_eq!(server.send_epoch(), start + 1);
+        assert!(delivers(&mut server, &mut client, 1, b"epoch+1 data"));
+
+        client
+            .complete_rotation_initiator(init2, &server_pub2)
+            .unwrap();
+        assert!(delivers(&mut client, &mut server, 1, b"epoch+2 data"));
+        assert_eq!(server.send_epoch(), start + 2);
+        assert!(delivers(&mut server, &mut client, 2, b"epoch+2 reply"));
     }
 }

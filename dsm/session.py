@@ -40,10 +40,12 @@ from dsm.net.tunnel import TunDevice
 from dsm.rekey import (
     MAX_REKEY_RETRIES,
     REKEY_ACK_TIMEOUT,
+    PacedSend,
     SendFn,
     handle_rekey_ack,
     handle_rekey_init,
     initiate_rekey,
+    rekey_retry_delay,
     resend_rekey_init,
 )
 from dsm.traffic.scheduler import SendScheduler
@@ -573,7 +575,8 @@ class RekeyState:
         rebuild + retransmit an identical INIT on ACK timeout without
         re-deriving the rotation.
       * ``last_init_sent_at``: monotonic time of the last INIT send
-        (original or retry). Used by the retry scheduler.
+        (original or retry): set when it is queued, then moved to when the
+        scheduler really sends it. Used by the retry scheduler.
       * ``retries_used``: count of retransmits attempted for the
         current INIT; capped at ``MAX_REKEY_RETRIES``.
     """
@@ -1152,6 +1155,20 @@ async def auto_mtu_loop(
             rises_observed = 0
 
 
+def _paced_rekey_init(ctx: DataPathContext) -> PacedSend:
+    """Queue a REKEY_INIT as a control packet and note when it really
+    leaves, so the ACK wait starts at send time, not queue time."""
+
+    async def send_and_stamp(data: bytes, target_size: int) -> None:
+        await ctx.send_fn(data, target_size)
+        if ctx.rekey.in_progress:
+            ctx.rekey.last_init_sent_at = time.monotonic()
+
+    return functools.partial(
+        ctx.scheduler.enqueue, control=True, send_via=send_and_stamp
+    )
+
+
 async def tun_send_loop(ctx: DataPathContext) -> None:
     """Read from TUN, fragment if needed, pad, enqueue for sending.
 
@@ -1186,7 +1203,7 @@ async def tun_send_loop(ctx: DataPathContext) -> None:
                     # receipt), not send completion, so fire-and-forget enqueue
                     # is safe: as a control message the INIT goes ahead of
                     # any queued data and leaves in the next free slot.
-                    paced_send=functools.partial(ctx.scheduler.enqueue, control=True),
+                    paced_send=_paced_rekey_init(ctx),
                 )
             except Exception:
                 # An exception out of initiate_rekey must not leave the
@@ -1203,7 +1220,8 @@ async def tun_send_loop(ctx: DataPathContext) -> None:
                 ctx.rekey.retries_used = 0
 
         # Rekey retry scheduler: if we're still waiting on REKEY_ACK after
-        # REKEY_ACK_TIMEOUT, retransmit the same INIT. After MAX_REKEY_RETRIES
+        # the retry delay (short for the first retries, then
+        # REKEY_ACK_TIMEOUT), retransmit the same INIT. After MAX_REKEY_RETRIES
         # exhausted, tear down — the session is dead in a way we can't recover
         # from (either network partition or peer is gone).
         if (
@@ -1212,7 +1230,9 @@ async def tun_send_loop(ctx: DataPathContext) -> None:
             and ctx.rekey.last_init_sent_at is not None
         ):
             since_sent = time.monotonic() - ctx.rekey.last_init_sent_at
-            if since_sent >= REKEY_ACK_TIMEOUT:
+            # REKEY_ACK_TIMEOUT is read from this module at call time.
+            delay = rekey_retry_delay(ctx.rekey.retries_used, REKEY_ACK_TIMEOUT)
+            if since_sent >= delay:
                 if ctx.rekey.retries_used >= MAX_REKEY_RETRIES:
                     log.error(
                         "rekey giving up after %d retries — tearing down",
@@ -1234,7 +1254,7 @@ async def tun_send_loop(ctx: DataPathContext) -> None:
                     # Pace the retransmitted INIT (same shaper path and
                     # control queue as the original; the next ACK timeout is
                     # the recovery mechanism, so fire-and-forget is correct).
-                    paced_send=functools.partial(ctx.scheduler.enqueue, control=True),
+                    paced_send=_paced_rekey_init(ctx),
                 )
                 ctx.rekey.last_init_sent_at = time.monotonic()
 

@@ -23,20 +23,41 @@ log = logging.getLogger(__name__)
 REKEY_PAYLOAD_SIZE = 36  # 4 (epoch) + 32 (ephemeral pub)
 MIN_REKEY_INTERVAL = 60  # seconds — minimum time between rekey operations
 
-# Retry budget for a lost REKEY_ACK. The initiator resends the SAME
-# REKEY_INIT (same ephemeral, same new_epoch) up to MAX_REKEY_RETRIES
-# times, each separated by REKEY_ACK_TIMEOUT, before giving up and
-# tearing down the session.
+# Retry plan for a lost REKEY_ACK. The initiator resends the SAME
+# REKEY_INIT (same ephemeral, same new_epoch) until the ACK comes or it
+# runs out of retries, then tears the session down.
 #
-# Total retry window MUST exceed MIN_REKEY_INTERVAL (60s) so that a
-# responder that just completed a rekey and is silently rate-limiting
-# our INIT (because its 60s window hasn't elapsed) still has time to
-# accept us on a later retransmit. Previous values (5s × 3 = 15s) gave
-# up well before the responder's rate-limit window cleared, causing
-# spurious teardowns under tight-budget configs.
-# 8s × 9 = 72s comfortably crosses the 60s threshold.
+# The first two retries come soon: a lost packet is most often a single
+# drop, and a round trip here is the shaper wait each way (up to about
+# 0.5 s) plus the network RTT, so 1.5 s and then 2.5 s more is enough to
+# tell "lost" from "slow". After that the retries wait REKEY_ACK_TIMEOUT
+# each, so a long outage does not flood the link.
+#
+# The time to the LAST retry (REKEY_RETRY_BUDGET) MUST exceed
+# MIN_REKEY_INTERVAL (60s) so that a responder that just completed a rekey
+# and is silently rate-limiting our INIT (because its 60s window hasn't
+# elapsed) still gets a later retry it can accept.
+# 1.5 + 2.5 + 8 x 8 = 68s. The responder keeps its old keys for
+# PEER_CONFIRM_LIMIT_SECS (session_keys.rs, 75s) so it can still answer
+# the last retry; a test checks that limit stays above this budget.
 REKEY_ACK_TIMEOUT = 8.0
-MAX_REKEY_RETRIES = 9
+REKEY_EARLY_RETRY_DELAYS = (1.5, 2.5)
+MAX_REKEY_RETRIES = 10
+
+
+def rekey_retry_delay(
+    retries_used: int, ack_timeout: float = REKEY_ACK_TIMEOUT
+) -> float:
+    """Seconds to wait for the ACK after the INIT that ``retries_used``
+    retries have been sent before. The early delays never exceed
+    ``ack_timeout``."""
+    if retries_used < len(REKEY_EARLY_RETRY_DELAYS):
+        return min(REKEY_EARLY_RETRY_DELAYS[retries_used], ack_timeout)
+    return ack_timeout
+
+
+# Time from the first INIT to the last retry.
+REKEY_RETRY_BUDGET = sum(rekey_retry_delay(i) for i in range(MAX_REKEY_RETRIES))
 
 
 SendFn = Callable[[bytes, int], Awaitable[None]]
@@ -345,9 +366,10 @@ async def handle_rekey_init(
     #   * the receiver EXEMPTS REKEY_ACK from the epoch-nibble check
     #     (decrypt_packet), so a NEW nibble restamped at send
     #     time by make_send_fn does not drop it; and
-    #   * the responder DEFERS its send-key swap for the grace window
-    #     (session_keys.rs), so the paced ACK still encrypts
-    #     under the OLD send key the pre-rotation initiator can decrypt.
+    #   * the responder DEFERS its send-key swap until the initiator sends
+    #     under the new keys (session_keys.rs), so the paced ACK, and any
+    #     cached-ACK resend, still encrypts under the OLD send key the
+    #     pre-rotation initiator can decrypt.
     # enqueue is fire-and-forget: no TimeoutError self-heal is needed
     # because the scheduler — not this recv-loop frame — owns delivery
     # and cannot pin the recv loop on a wedged transport (it drops oldest).

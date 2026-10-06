@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- A lost key-change reply (REKEY_ACK) no longer breaks the session: the
+  side that answers keeps its old keys until the other side uses the new
+  ones (at most 75 s), so a resent request can still be answered.
+- A lost key-change request is now resent after 1.5 s and 2.5 s, then every
+  8 s (10 resends), counted from when it really goes out.
 - **Breaking:** traffic shaping now uses fixed rate steps ("tiers") instead
   of the adaptive envelope. Packets leave at a steady rate that only moves
   between a few set speeds. Your real packets take free places and fake
