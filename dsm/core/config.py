@@ -52,12 +52,13 @@ WARN_INFLIGHT_HANDSHAKES = 1024
 #   * Size-class overhead = outer header(20) + GCM tag(16) + inner header(4)
 #     = 40 B, charged against the 1400-byte top SIZE_CLASS.
 # So a full TUN packet of N bytes becomes an N+40 outer packet, which becomes
-# an N+40+28 wire datagram. DEFAULT_TUN_MTU 1400 leaves slack for VPN-in-VPN
-# / PPPoE paths; auto_mtu lowers it (and the shaper ceiling) on constrained
-# links (Phase 1.7).
+# an N+40+28 wire datagram. DEFAULT_TUN_MTU 1360 (= 1400 - 40) is the largest
+# that fits one outer packet, so a full TUN packet is never split in two; it
+# also leaves slack for VPN-in-VPN / PPPoE paths; auto_mtu lowers it (and the
+# shaper ceiling) on constrained links (Phase 1.7).
 MIN_TUN_MTU = 576
 MAX_TUN_MTU = 1500
-DEFAULT_TUN_MTU = 1400
+DEFAULT_TUN_MTU = 1360
 
 # Tier shaper defaults and limits. dsm.traffic.shaper uses the same defaults,
 # and the Rust core (rust/tuncore/src/shaper.rs) checks the same limits.
@@ -587,7 +588,7 @@ def _validate_mtu(c: Config) -> None:
     # on PPPoE / VPN-in-VPN paths where the link MTU is below 1500.
     if c.mtu > 1400:
         log.warning(
-            "configured tun mtu=%d is above the safe default 1400; "
+            "configured tun mtu=%d is above 1400; "
             "wire packets will be ~%d B which may exceed link MTU on "
             "PPPoE/tunnel-in-tunnel paths. Lower to 1380 if ping works "
             "but throughput stalls.",

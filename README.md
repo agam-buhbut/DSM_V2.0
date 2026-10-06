@@ -347,7 +347,7 @@ traffic):
 | Connected all day, about 20 bursts of real use | about 6 GB a day |
 | Each decoy | about 0.2 GB (the climb, the busy stretch, the slow step-down and the wait before idle) |
 | After using the top tier | the top tier for 1 to 5 minutes, then a few minutes per lower tier, then 5 to 30 minutes at tier 1 (about 0.15 GB) |
-| Top speed | about 3.6 to 5.4 Mbit/s at the default `mtu = 1400`: one DSM packet carries at most 1360 bytes, so each full-size packet is split in two. Up to about 7 to 10 Mbit/s with `mtu` at 1360 (less for a smaller `mtu`) |
+| Top speed | about 7 to 10 Mbit/s at the default `mtu = 1360` (less for a smaller `mtu`). One DSM packet carries at most 1360 bytes, so with a larger `mtu` each full-size packet is split in two, which halves it to about 3.6 to 5.4 Mbit/s |
 | When a burst starts | about 0.5 to 1.5 seconds of extra wait while the pace steps up |
 
 **What it hides** from someone watching the link between you and your

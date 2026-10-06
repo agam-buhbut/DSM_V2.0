@@ -604,7 +604,7 @@ allowed_cns_file   = "/opt/mtun/allowed_cns.txt"
 transport          = "udp"              # UDP recommended; use "tcp" only as fallback on
                                         # networks that block/mangle UDP (TCP-in-TCP
                                         # causes throughput collapse on TCP traffic)
-mtu                = 1400
+mtu                = 1360
 pmtu_discover      = false              # set true on real-WAN deploys
 log_level          = "info"
 
@@ -1271,11 +1271,11 @@ PMTU drifts on Wi-Fi <-> LTE handovers). Recommended config snippet:
 
 ```toml
 # Server side (stable home Wi-Fi):
-mtu = 1400
+mtu = 1360
 pmtu_discover = false
 auto_mtu = false                     # static MTU is fine
 # Client side (cellular):
-mtu = 1400
+mtu = 1360
 pmtu_discover = true                 # REQUIRED for auto_mtu
 auto_mtu = true                      # adapts to PMTU drops
 ```
@@ -1678,10 +1678,10 @@ or prctl(PR_SET_DUMPABLE) didn't stick. Usually one of:
   `auto_mtu = true` + `pmtu_discover = true` on the client.
 - The tier shaper adds wait by design. When a burst starts, packets
   wait about 0.5 to 1.5 seconds while the rate steps up, and with the
-  defaults the top tier caps speed at about 3.6 to 5.4 Mbit/s. One DSM
-  packet carries at most 1360 bytes, so at the default `mtu = 1400` each
-  full-size packet is split in two; with `mtu` at 1360 the cap is up to
-  about 7 to 10 Mbit/s (less for a smaller `mtu`). For a faster smoke
+  defaults the top tier caps speed at about 7 to 10 Mbit/s (less for a
+  smaller `mtu`). One DSM packet carries at most 1360 bytes, so with `mtu`
+  above 1360 each full-size packet is split in two and the cap halves to
+  about 3.6 to 5.4 Mbit/s. For a faster smoke
   test that hides less, lower `shaper_latency_budget_ms` and raise
   `shaper_tiers_pps` in both configs. A lower budget needs a faster first
   tier: it must stay above 4.25 divided by the budget in seconds. On a

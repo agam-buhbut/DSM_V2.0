@@ -19,6 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The timing and size decisions now run in the Rust core (`tuncore`), and
   the size list lives there too. So `dsm.core.protocol`, and every module
   that uses it, no longer loads without the built extension.
+- The default `mtu` is now 1360 (was 1400). One DSM packet carries at most
+  1360 bytes, so at 1400 every full-size packet was split in two, which
+  halved top speed. Configs that set `mtu = 1400` keep the old behavior.
 - A second DSM on a UDP port that is already in use now fails at start with
   a clear error. Before, both could share the port and each got only some
   of the packets, so sessions broke with no error.

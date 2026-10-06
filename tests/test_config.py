@@ -197,7 +197,7 @@ class TestConfigValidation(unittest.TestCase):
         self.assertEqual(c.log_level, "info")
         self.assertEqual(c.padding_min, 128)
         self.assertEqual(c.padding_max, 1400)
-        self.assertEqual(c.mtu, 1400)
+        self.assertEqual(c.mtu, 1360)
         self.assertFalse(c.pmtu_discover)
 
     def test_mtu_too_small(self) -> None:

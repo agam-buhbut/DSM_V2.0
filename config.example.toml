@@ -115,8 +115,9 @@ transport = "udp"                            # "udp" | "tcp"
 tun_name = "mtun0"
 log_level = "warning"                        # "debug" | "info" | "warning" | "error"
 
-# TUN MTU. Default 1400 leaves slack for VPN-in-VPN / PPPoE paths.
-mtu = 1400
+# TUN MTU. Default 1360: the largest that fits in one DSM packet, so no
+# packet is split in two. It also leaves slack for VPN-in-VPN / PPPoE paths.
+mtu = 1360
 # pmtu_discover = false                      # Enable IP_MTU_DISCOVER (sets DF bit)
 # auto_mtu = false                           # Track kernel PMTU + adjust TUN MTU; recommend true for cellular/roaming
 # pmtu_check_interval_s = 30.0               # auto_mtu poll cadence (seconds)
@@ -131,7 +132,7 @@ mtu = 1400
 # UDP/443), fall back to transport = "tcp" (and also forward <port>/tcp on the
 # router). One DSM packet is at most 1400 B, so the largest on-wire datagram
 # is 1428 B with the UDP and IP headers, already inside a 1492-byte PPPoE
-# path. At mtu = 1400 a full-size packet is split in two to fit. See "Running
+# path. Above mtu = 1360 a full-size packet is split in two to fit. See "Running
 # over the internet" in deploy/GUIDE.md.
 
 # Structured JSON audit stream on the dsm.netaudit logger. May also be enabled
@@ -160,10 +161,9 @@ padding_max = 1400
 #   * each decoy: about 0.2 GB (climb, busy stretch, slow step-down, linger)
 #   * after using the top tier: the top for 1-5 minutes, then a few minutes
 #     per lower tier, then 5-30 minutes at tier 1 (about 0.15 GB)
-#   * top speed (800 packets/s at the default top tier): about 3.6-5.4
-#     Mbit/s at the default mtu = 1400, because one DSM packet carries at most
-#     1360 bytes and each full-size packet is split in two; up to about 7-10
-#     Mbit/s with mtu at 1360 (less for a smaller mtu)
+#   * top speed (800 packets/s at the default top tier): about 7-10 Mbit/s
+#     at the default mtu = 1360 (less for a smaller mtu). Above 1360 each
+#     full-size packet is split in two, which halves it to about 3.6-5.4
 #   * when a burst starts: about 0.5-1.5 s of extra wait while it steps up
 #
 # Rates in packets per second, lowest first: 2-8 entries, each 1-5000, each
