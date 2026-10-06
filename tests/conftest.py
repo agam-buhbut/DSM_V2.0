@@ -199,3 +199,35 @@ def swtpm_tcti(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
         yield tcti
     finally:
         _teardown(proc)
+
+
+@pytest.fixture(autouse=True)
+def isolate_src_valid_mark(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Keep client tests off the host's real src_valid_mark state.
+
+    Points ``SrcValidMarkEnabler.STATE_PATH`` and the sysctl knob for its
+    key at files in a fresh temp dir (not the test's own ``tmp_path``), so a
+    test run as root never writes ``/run/dsm`` or ``/proc/sys``. Other
+    sysctl keys keep the real translator. Tests that patch these themselves
+    (e.g. ``fake_proc`` in test_rp_filter_strict.py) still win, as their
+    patch is applied later.
+    """
+    from dsm.core import sysctl
+    from dsm.net.tunnel import SrcValidMarkEnabler
+
+    root = tmp_path_factory.mktemp("svm-isolated")
+    knob = root / "src_valid_mark"
+    knob.write_text("0\n")
+    real_sysctl_path = sysctl.sysctl_path
+
+    def fake_sysctl_path(key: str) -> Path:
+        return knob if key == SrcValidMarkEnabler.KEY else real_sysctl_path(key)
+
+    monkeypatch.setattr(sysctl, "sysctl_path", fake_sysctl_path)
+    monkeypatch.setattr(
+        SrcValidMarkEnabler,
+        "STATE_PATH",
+        root / "run" / "dsm" / "src_valid_mark.orig",
+    )
