@@ -56,7 +56,9 @@ def rekey_retry_delay(
     return ack_timeout
 
 
-# Time from the first INIT to the last retry.
+# Time from the first INIT to the last retry. Computed from this module's
+# REKEY_ACK_TIMEOUT; session.py passes its own copy of the same value
+# (kept separate only so tests can patch it).
 REKEY_RETRY_BUDGET = sum(rekey_retry_delay(i) for i in range(MAX_REKEY_RETRIES))
 
 
@@ -329,8 +331,8 @@ async def handle_rekey_init(
     if _is_rate_limited(last_rekey_time):
         # WARNING, not DEBUG: a stalled rekey must be visible in journald before
         # the initiator hits its
-        # extended retry budget. The initiator's MAX_REKEY_RETRIES *
-        # REKEY_ACK_TIMEOUT is now > MIN_REKEY_INTERVAL so eventually
+        # extended retry budget. The initiator's total retry time
+        # (REKEY_RETRY_BUDGET) is longer than MIN_REKEY_INTERVAL, so eventually
         # one of the retries lands after our rate-limit clears and the
         # rekey completes; the WARNING flags the transient stall.
         log.warning(

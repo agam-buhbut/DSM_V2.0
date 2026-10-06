@@ -40,6 +40,7 @@ from dsm.net.tunnel import TunDevice
 from dsm.rekey import (
     MAX_REKEY_RETRIES,
     REKEY_ACK_TIMEOUT,
+    REKEY_EARLY_RETRY_DELAYS,
     PacedSend,
     SendFn,
     handle_rekey_ack,
@@ -677,7 +678,8 @@ async def _handle_rekey_init(ctx: DataPathContext, inner: InnerPacket) -> None:
         # INIT, through the shaper schedule so their wire timing matches
         # the steady stream. As control messages they go ahead of any
         # queued data and take the next free slot, far inside the
-        # initiator's 8 s ACK timeout and our 5 s old-key grace window.
+        # initiator's first retry (1.5 s) and long before the 75 s limit
+        # after which we stop waiting for the peer to confirm the new keys.
         paced_send=functools.partial(ctx.scheduler.enqueue, control=True),
     )
 
@@ -1241,7 +1243,14 @@ async def tun_send_loop(ctx: DataPathContext) -> None:
                     ctx.shutdown.set()
                     return
                 ctx.rekey.retries_used += 1
-                log.warning(
+                # The early retries are quick on purpose and often just
+                # mean a slow link, so only the later ones are a warning.
+                retry_log = (
+                    log.info
+                    if ctx.rekey.retries_used <= len(REKEY_EARLY_RETRY_DELAYS)
+                    else log.warning
+                )
+                retry_log(
                     "rekey ACK timeout — retransmitting INIT (attempt %d/%d)",
                     ctx.rekey.retries_used,
                     MAX_REKEY_RETRIES,

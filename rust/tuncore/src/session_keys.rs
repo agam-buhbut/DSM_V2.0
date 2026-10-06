@@ -705,7 +705,9 @@ impl SessionKeyManager {
     /// that much time had passed.
     #[cfg(test)]
     fn age_for_test(&mut self, by: Duration) {
-        let back = |t: Instant| t.checked_sub(by).expect("clock too close to boot");
+        // On a machine that booted less than `by` ago the clock cannot go back
+        // that far; keep the time as it is instead of panicking.
+        let back = |t: Instant| t.checked_sub(by).unwrap_or(t);
         self.grace_start = self.grace_start.map(back);
         self.awaiting_peer_since = self.awaiting_peer_since.map(back);
         self.epoch_start = back(self.epoch_start);
@@ -1333,7 +1335,7 @@ mod tests {
     /// Normal case, no loss: both sides end on the new keys and the old
     /// recv keys are dropped after the grace.
     #[test]
-    fn normal_rotation_path_unchanged() {
+    fn normal_rotation_ends_on_new_keys() {
         let (mut client, mut server) = make_paired_managers();
         let new_epoch = client.epoch() + 1;
         let (init, server_pub) = responder_applies(&client, &mut server);
