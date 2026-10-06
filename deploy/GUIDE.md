@@ -1697,9 +1697,26 @@ On hosts with strict reverse-path filtering (`rp_filter=1`, often set in
 and then got no replies: the kernel threw the server's answers away. The
 client now handles this by itself, the same way wg-quick does. While
 connected it sets `net.ipv4.conf.all.src_valid_mark=1` and adds two small
-rules to the kill-switch table that tag DSM's own replies. You do not need
-to loosen `rp_filter`. On exit it puts `src_valid_mark` back to what it
-was, and `dsm cleanup` does the same after a crash.
+chains (three rules) to the kill-switch table. They tag only the replies
+from your DSM server (its IP and port). You do not need to loosen
+`rp_filter`.
+
+On a clean exit the client puts `src_valid_mark` back to the value it found
+at start. It also saves the old value in `/run/dsm/src_valid_mark.orig`.
+If the client crashes, run `sudo dsm cleanup`: it puts the saved value back
+and then deletes the file. (The server's systemd unit runs `dsm cleanup`
+on every stop; a client you start by hand does not, so run it yourself.)
+If a file from a crash is still there when the client starts, the client
+keeps it and logs a warning. Run `sudo dsm cleanup` after that run to get
+the value from before the crash back.
+
+`src_valid_mark` is one setting for the whole machine, not just for DSM.
+While DSM is connected, the kernel's address check also uses the marks
+that other programs put on packets (other VPNs, policy-routing rules).
+Packets with no mark are checked as before. If you start another VPN that
+needs the setting on (wg-quick turns it on) while DSM is up, DSM turns it
+back to the old value when it exits. Restart that VPN, or set
+`src_valid_mark=1` again yourself.
 
 To check while connected:
 

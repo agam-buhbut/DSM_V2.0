@@ -81,39 +81,72 @@ def _killswitch() -> str:
 # --------------------------------------------------------------------------- #
 
 
+_SAVE = (
+    f"meta mark {_MARK} ip daddr {_SERVER_IP} meta l4proto {{ tcp, udp }} "
+    f"th dport {_PORT} ct mark set meta mark"
+)
+_RESTORE = (
+    f"ip saddr {_SERVER_IP} meta l4proto {{ tcp, udp }} th sport {_PORT} "
+    f"ct direction reply ct mark {_MARK} meta mark set ct mark"
+)
+_RESTORE_PMTU = (
+    "icmp type destination-unreachable icmp code frag-needed "
+    f"ct original ip daddr {_SERVER_IP} ct original proto-dst {_PORT} "
+    f"ct mark {_MARK} meta mark set ct mark"
+)
+
+
 def test_mark_save_chain_copies_socket_mark_into_conntrack() -> None:
     lines = _chain_lines(_killswitch(), "mark_save")
     assert lines[0] == "type filter hook output priority mangle; policy accept;"
-    assert f"meta mark {_MARK} ct mark set meta mark" in lines
-    # Only marked (DSM) packets: every rule matches the DSM mark first.
-    assert all(s.startswith(f"meta mark {_MARK} ") for s in lines[1:])
+    # Only marked packets to the current server's IP and port.
+    assert lines[1:] == [_SAVE]
 
 
 def test_mark_restore_chain_copies_mark_back_before_routing() -> None:
     lines = _chain_lines(_killswitch(), "mark_restore")
     # prerouting at mangle (-150): after conntrack (-200), before routing.
     assert lines[0] == "type filter hook prerouting priority mangle; policy accept;"
-    rules = lines[1:]
-    assert f"meta l4proto {{ tcp, udp }} ct mark {_MARK} meta mark set ct mark" in (
-        rules
+    # Replies from the current server only, plus its frag-needed errors.
+    assert lines[1:] == [_RESTORE, _RESTORE_PMTU]
+
+
+def test_every_mark_rule_names_the_server_ip_and_port() -> None:
+    body = _killswitch()
+    rules = _chain_lines(body, "mark_save")[1:] + _chain_lines(body, "mark_restore")[1:]
+    assert rules
+    for s in rules:
+        assert _SERVER_IP in s, s
+        assert str(_PORT) in s, s
+        assert f"ct mark {_MARK}" in s or f"meta mark {_MARK}" in s, s
+
+
+def test_mark_rules_follow_a_different_server() -> None:
+    body = _table_body(
+        NFTablesManager("198.51.100.9", 4433, _TUN)._render(), "dsm_killswitch"
     )
-    # Every restore rule is scoped to flows carrying the DSM ct mark.
-    assert rules and all(f"ct mark {_MARK} meta mark set ct mark" in s for s in rules)
+    rules = _chain_lines(body, "mark_save")[1:] + _chain_lines(body, "mark_restore")[1:]
+    for s in rules:
+        assert "198.51.100.9" in s and "4433" in s, s
+        assert _SERVER_IP not in s and str(_PORT) not in s, s
+
+
+def test_mark_restore_only_on_reply_direction() -> None:
+    # An entry the far side opened (original direction inbound) never gets
+    # the mark back, even if its ct mark is 0x1.
+    restore = _chain_lines(_killswitch(), "mark_restore")[1]
+    assert "ct direction reply" in restore
 
 
 def test_mark_restore_keeps_path_mtu_but_never_marks_redirects() -> None:
     rules = _chain_lines(_killswitch(), "mark_restore")[1:]
-    assert (
-        "icmp type destination-unreachable icmp code frag-needed "
-        f"ct mark {_MARK} meta mark set ct mark"
-    ) in rules
+    assert _RESTORE_PMTU in rules
     # A restored mark would let a "related" ICMP redirect through the input
     # chain's `ct state established,related meta mark` accept, ahead of the
     # explicit redirect drop. Only tcp/udp and frag-needed get a mark.
     for s in rules:
         assert "redirect" not in s
         assert "l4proto icmp " not in s
-        assert s.startswith(("meta l4proto { tcp, udp } ", "icmp type "))
 
 
 def test_mark_chains_never_drop_or_accept() -> None:
@@ -128,8 +161,9 @@ def test_mark_comes_from_the_single_fwmark_source() -> None:
         body = _table_body(
             NFTablesManager(_SERVER_IP, _PORT, _TUN)._render(), "dsm_killswitch"
         )
-    assert "meta mark 0x2a ct mark set meta mark" in body
-    assert "ct mark 0x2a meta mark set ct mark" in body
+    assert "meta mark 0x2a ip daddr" in body
+    assert "ct mark set meta mark" in body
+    assert body.count("ct mark 0x2a meta mark set ct mark") == 2
     assert "{FWMARK}" not in body
 
 
@@ -234,6 +268,64 @@ def test_stale_state_from_a_crash_is_kept_for_cleanup(fake_proc: Any) -> None:
     assert state.read_text().strip() == "0"
 
 
+def test_stale_state_is_not_overwritten_on_start(fake_proc: Any) -> None:
+    from dsm.net.tunnel import SrcValidMarkEnabler
+
+    fake_path, state = fake_proc
+    # Earlier crash saved "1"; since then the knob was set to 0 by hand.
+    knob = _seed(fake_path, "0")
+    state.parent.mkdir(parents=True)
+    state.write_text("1\n")
+
+    svm = SrcValidMarkEnabler()
+    svm.apply()
+    assert knob.read_text().strip() == "1"
+    # The crash-saved value is kept, not replaced by the current "0".
+    assert state.read_text().strip() == "1"
+    svm.remove()
+    # Clean exit restores what this run saw; the old file stays for cleanup.
+    assert knob.read_text().strip() == "0"
+    assert state.read_text().strip() == "1"
+
+
+def test_failed_restore_keeps_the_saved_value(fake_proc: Any) -> None:
+    from dsm.net.tunnel import SrcValidMarkEnabler
+
+    fake_path, state = fake_proc
+    knob = _seed(fake_path, "0")
+
+    svm = SrcValidMarkEnabler()
+    svm.apply()
+    assert knob.read_text().strip() == "1"
+
+    real_write_text = Path.write_text
+
+    def deny_knob(self: Path, *a: Any, **k: Any) -> int:
+        if self == knob:
+            raise PermissionError("read-only /proc")
+        return real_write_text(self, *a, **k)
+
+    with patch.object(Path, "write_text", deny_knob):
+        svm.remove()
+    assert knob.read_text().strip() == "1"
+    # Restore failed: keep the file so `dsm cleanup` can try again.
+    assert state.read_text().strip() == "0"
+
+
+def test_remove_twice_is_safe(fake_proc: Any) -> None:
+    from dsm.net.tunnel import SrcValidMarkEnabler
+
+    fake_path, state = fake_proc
+    knob = _seed(fake_path, "0")
+
+    svm = SrcValidMarkEnabler()
+    svm.apply()
+    svm.remove()
+    svm.remove()
+    assert knob.read_text().strip() == "0"
+    assert not state.exists()
+
+
 def test_src_valid_mark_unreadable_does_not_raise(fake_proc: Any) -> None:
     from dsm.net.tunnel import SrcValidMarkEnabler
 
@@ -269,14 +361,15 @@ def test_src_valid_mark_write_failure_drops_state_file(fake_proc: Any) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def _run_cleanup(state: Path) -> list[str]:
+def _run_cleanup(state: Path, *, sysctl_rc: int = 0) -> list[str]:
     from dsm.net.tunnel import SrcValidMarkEnabler
 
     runs: list[str] = []
 
     def fake_run(cmd: list[str], *_a: object, **_k: object) -> object:
         runs.append(" ".join(cmd))
-        return subprocess.CompletedProcess(args=cmd, returncode=0)
+        rc = sysctl_rc if cmd[0] == "sysctl" else 0
+        return subprocess.CompletedProcess(args=cmd, returncode=rc)
 
     with (
         patch.object(cleanup.subprocess, "run", fake_run),
@@ -294,6 +387,42 @@ def test_cleanup_restores_saved_src_valid_mark(tmp_path: Path) -> None:
     runs = _run_cleanup(state)
     assert f"sysctl -w {_KEY}=0" in runs
     assert not state.exists()
+
+
+def test_cleanup_restores_saved_value_one(tmp_path: Path) -> None:
+    state = tmp_path / "src_valid_mark.orig"
+    state.write_text("1\n")
+    runs = _run_cleanup(state)
+    assert f"sysctl -w {_KEY}=1" in runs
+    assert not state.exists()
+
+
+def test_cleanup_keeps_state_when_restore_fails(tmp_path: Path) -> None:
+    state = tmp_path / "src_valid_mark.orig"
+    state.write_text("0\n")
+    runs = _run_cleanup(state, sysctl_rc=1)
+    assert f"sysctl -w {_KEY}=0" in runs
+    # Not restored, so the saved value stays for the next try.
+    assert state.read_text().strip() == "0"
+
+
+def test_cleanup_keeps_state_when_sysctl_missing(tmp_path: Path) -> None:
+    from dsm.net.tunnel import SrcValidMarkEnabler
+
+    state = tmp_path / "src_valid_mark.orig"
+    state.write_text("0\n")
+
+    def no_binary(cmd: list[str], *_a: object, **_k: object) -> object:
+        raise FileNotFoundError(cmd[0])
+
+    with (
+        patch.object(cleanup.subprocess, "run", no_binary),
+        patch.object(SrcValidMarkEnabler, "STATE_PATH", state),
+        patch.object(cleanup, "RESOLV_CONF", tmp_path / "resolv.conf"),
+        patch.object(cleanup, "RESOLV_BACKUP", tmp_path / "resolv.orig"),
+    ):
+        cleanup.cleanup_host_state()
+    assert state.read_text().strip() == "0"
 
 
 def test_cleanup_without_state_leaves_src_valid_mark(tmp_path: Path) -> None:

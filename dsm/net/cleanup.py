@@ -22,8 +22,9 @@ have, and the precise restore still happens whenever the clean teardown runs.
 The client's ``net.ipv4.conf.all.src_valid_mark`` is the exception: its
 prior value IS saved to disk (``SrcValidMarkEnabler.STATE_PATH``) and is
 restored exactly. Forcing a default of 0 would break other tools that need
-it on (wg-quick sets it to 1), and this runs on every stop, not only after
-a crash.
+it on (wg-quick sets it to 1), and under the systemd unit this runs on every
+stop, not only after a crash. A client run by hand has no ExecStopPost, so
+there ``dsm cleanup`` must be run by hand after a crash.
 """
 
 from __future__ import annotations
@@ -120,7 +121,22 @@ def _restore_src_valid_mark() -> None:
         return
     # The value goes into a sysctl command line: accept only 0 or 1.
     if saved in ("0", "1"):
-        _best_effort(["sysctl", "-w", f"{SrcValidMarkEnabler.KEY}={saved}"])
+        cmd = ["sysctl", "-w", f"{SrcValidMarkEnabler.KEY}={saved}"]
+        try:
+            result = subprocess.run(cmd, capture_output=True, timeout=5, check=False)
+            ok = result.returncode == 0
+        except (FileNotFoundError, subprocess.SubprocessError) as e:
+            log.debug("cleanup cmd %s: %s", " ".join(cmd), type(e).__name__)
+            ok = False
+        if not ok:
+            # Keep the file so a later `dsm cleanup` can try again.
+            log.warning(
+                "could not restore %s=%s; kept %s",
+                SrcValidMarkEnabler.KEY,
+                saved,
+                path,
+            )
+            return
     else:
         log.warning("ignoring bad value in %s", path)
     try:

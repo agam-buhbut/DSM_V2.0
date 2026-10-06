@@ -73,8 +73,16 @@ class SrcValidMarkEnabler:
     switch's ``mark_restore`` chain puts DSM's mark back on those replies;
     this sysctl makes the reverse-path check use it. Same as wg-quick.
 
+    The setting is host-wide: while it is on, the reverse-path check uses
+    the mark of ANY incoming packet that something marked (other VPNs,
+    policy-routing rules), not only DSM's. Unmarked traffic is checked as
+    before. A clean exit puts back the value seen at start, even if another
+    tool (e.g. wg-quick) turned it on in the meantime.
+
     The prior value is written to :attr:`STATE_PATH` before the change, so
-    ``dsm cleanup`` (``dsm.net.cleanup``) can put it back after a crash.
+    ``dsm cleanup`` (``dsm.net.cleanup``) can put it back after a crash. A
+    file already there was left by a crashed run and holds the value from
+    before that crash, so it is kept, not overwritten.
     """
 
     KEY = "net.ipv4.conf.all.src_valid_mark"
@@ -86,8 +94,17 @@ class SrcValidMarkEnabler:
         # crashed run is not ours to drop: it holds the operator's value,
         # which ``dsm cleanup`` still has to put back.
         self._state_saved = False
+        self._prior: str | None = None
 
     def apply(self) -> None:
+        if self.STATE_PATH.exists():
+            log.warning(
+                "%s was left by an earlier run that did not exit cleanly; "
+                "keeping it. Run `dsm cleanup` after this run to put back "
+                "the %s value from before that run.",
+                self.STATE_PATH,
+                self.KEY,
+            )
         try:
             current = sysctl.sysctl_path(self.KEY).read_text().strip()
         except OSError as e:
@@ -96,12 +113,32 @@ class SrcValidMarkEnabler:
         if current == "1":
             return
         # Save first: a crash right after the write must still be undoable.
-        self._save_state(current)
+        if not self.STATE_PATH.exists():
+            self._save_state(current)
         if self._sysctl.set(self.KEY, "1") is None:
             self._drop_state()
+        else:
+            self._prior = current
 
     def remove(self) -> None:
         self._sysctl.restore_all()
+        if self._prior is None:
+            self._drop_state()
+            return
+        try:
+            now = sysctl.sysctl_path(self.KEY).read_text().strip()
+        except OSError:
+            now = None
+        if now != self._prior:
+            # Keep the saved value so `dsm cleanup` can try again.
+            log.warning(
+                "%s not restored to %s; kept %s for `dsm cleanup`",
+                self.KEY,
+                self._prior,
+                self.STATE_PATH,
+            )
+            return
+        self._prior = None
         self._drop_state()
 
     def _save_state(self, value: str) -> None:
