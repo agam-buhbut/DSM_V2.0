@@ -32,7 +32,7 @@ from dsm.net.nftables import (
 from dsm.net.resolv_conf import ResolvConfManager
 from dsm.net.transport.tcp import TCPTransport
 from dsm.net.transport.udp import UDPTransport
-from dsm.net.tunnel import TunDevice
+from dsm.net.tunnel import SrcValidMarkEnabler, TunDevice
 from dsm.session import (
     DataPathContext,
     LivenessState,
@@ -300,7 +300,7 @@ async def run_client(
         # Host-mutating resources.
         #
         # Apply order is fixed by dependency:
-        #   tcp_ts → tun → nft → resolv
+        #   tcp_ts → src_valid_mark → tun → nft → resolv
         # (nft references tun's name; resolv goes last so the kill switch
         # is already up when the new resolver becomes visible.)
         #
@@ -312,9 +312,9 @@ async def run_client(
         # switch is gone by then, that traffic leaks. If it is still up,
         # nftables drops it.
         #
-        # Desired unwind: resolv → tun → nft → tcp_ts
+        # Desired unwind: resolv → tun → nft → src_valid_mark → tcp_ts
         # Reverse of that (= AsyncExitStack registration order):
-        #         tcp_ts, nft, tun, resolv
+        #         tcp_ts, src_valid_mark, nft, tun, resolv
         # which is NOT the apply order. We use an explicit try/except
         # block to keep partial-failure safety: if any apply between tun
         # and resolv fails, we manually unwind what was already applied
@@ -323,6 +323,14 @@ async def run_client(
         tcp_ts = TcpTimestampsDisabler()
         tcp_ts.apply()
         stack.callback(tcp_ts.remove)
+
+        # Lets strict rp_filter hosts accept the server's replies once the
+        # not-fwmark ip rule is in (see SrcValidMarkEnabler). On before
+        # tun.configure adds that rule; registered here so it is restored
+        # only after tun.close has removed the rule again.
+        src_valid_mark = SrcValidMarkEnabler()
+        src_valid_mark.apply()
+        stack.callback(src_valid_mark.remove)
 
         # TUN must be opened/configured before nftables (kill-switch rules
         # reference TUN by name). Apply tun + nft + resolv in that order

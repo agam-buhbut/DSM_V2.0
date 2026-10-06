@@ -1690,6 +1690,28 @@ or prctl(PR_SET_DUMPABLE) didn't stick. Usually one of:
   the largest allowed size is sent at its exact size, which no fake packet
   ever has, and that size shows how big the packet really is.
 
+### Tunnel up but nothing comes back (hardened host)
+
+On hosts with strict reverse-path filtering (`rp_filter=1`, often set in
+`/etc/sysctl.d` on hardened systems), older clients finished the handshake
+and then got no replies: the kernel threw the server's answers away. The
+client now handles this by itself, the same way wg-quick does. While
+connected it sets `net.ipv4.conf.all.src_valid_mark=1` and adds two small
+rules to the kill-switch table that tag DSM's own replies. You do not need
+to loosen `rp_filter`. On exit it puts `src_valid_mark` back to what it
+was, and `dsm cleanup` does the same after a crash.
+
+To check while connected:
+
+```sh
+$ sysctl net.ipv4.conf.all.rp_filter net.ipv4.conf.all.src_valid_mark
+$ sudo nft list chain inet dsm_killswitch mark_restore
+```
+
+If `src_valid_mark` stays 0, look in the client log for
+`could not set net.ipv4.conf.all.src_valid_mark` (the service may lack
+permission to write it).
+
 ### "rekey giving up after 9 retries — tearing down"
 
 REKEY_ACK never reached the initiator. Check the peer log for

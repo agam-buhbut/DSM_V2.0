@@ -83,6 +83,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   DSM runs and gets a new tag after a restart.
 
 ### Fixed
+- The client now works on hosts with strict reverse-path filtering
+  (`rp_filter=1`, common on hardened systems). Before, the handshake
+  worked but no replies came back.
 - `dns_providers` or a pin value written as a single string instead of a
   list is now a clear config error, not a confusing error about single
   letters.

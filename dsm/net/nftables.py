@@ -10,6 +10,7 @@ from pathlib import Path
 
 from dsm.core import netaudit
 from dsm.core._validators import validate_tun_name
+from dsm.net.transport._fwmark import SO_MARK_VALUE as FWMARK
 
 log = logging.getLogger(__name__)
 
@@ -223,6 +224,7 @@ class NFTablesManager:
             .replace("{SERVER_PORT}", str(int(self._server_port)))
             .replace("{TUN_NAME}", self._tun_name)
             .replace("{IP_PROTO}", ip_proto)
+            .replace("{FWMARK}", f"{int(FWMARK):#x}")
         )
 
 

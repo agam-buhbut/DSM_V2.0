@@ -18,6 +18,12 @@ operator's true prior values. ``rp_filter`` and the ``send_redirects`` /
 cannot be restored here at all — they are left as the daemon set them. This
 is acceptable because the safe defaults are exactly what a fresh boot would
 have, and the precise restore still happens whenever the clean teardown runs.
+
+The client's ``net.ipv4.conf.all.src_valid_mark`` is the exception: its
+prior value IS saved to disk (``SrcValidMarkEnabler.STATE_PATH``) and is
+restored exactly. Forcing a default of 0 would break other tools that need
+it on (wg-quick sets it to 1), and this runs on every stop, not only after
+a crash.
 """
 
 from __future__ import annotations
@@ -36,6 +42,7 @@ from dsm.net.resolv_conf import (
     parse_symlink_backup,
 )
 from dsm.net.transport._fwmark import SO_MARK_VALUE as FWMARK
+from dsm.net.tunnel import SrcValidMarkEnabler
 
 log = logging.getLogger(__name__)
 
@@ -93,7 +100,33 @@ def cleanup_host_state() -> None:
         ("net.ipv4.ip_forward", "0"),
     ):
         _best_effort(["sysctl", "-w", f"{key}={value}"])
+    _restore_src_valid_mark()
     log.info("dsm host-state cleanup complete")
+
+
+def _restore_src_valid_mark() -> None:
+    """Put back the src_valid_mark value a crashed client saved, if any.
+
+    No state file means dsm did not change it (or the clean exit already
+    restored it), so the operator's value is left alone.
+    """
+    path = SrcValidMarkEnabler.STATE_PATH
+    try:
+        saved = path.read_text(encoding="ascii").strip()
+    except FileNotFoundError:
+        return
+    except (OSError, UnicodeDecodeError) as e:
+        log.warning("could not read %s: %s", path, e)
+        return
+    # The value goes into a sysctl command line: accept only 0 or 1.
+    if saved in ("0", "1"):
+        _best_effort(["sysctl", "-w", f"{SrcValidMarkEnabler.KEY}={saved}"])
+    else:
+        log.warning("ignoring bad value in %s", path)
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as e:
+        log.warning("could not remove %s: %s", path, e)
 
 
 def _restore_resolv_conf() -> None:

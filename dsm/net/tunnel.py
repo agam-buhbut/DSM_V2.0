@@ -20,8 +20,9 @@ from pathlib import Path
 # validate keys loaded from the persisted IPv6 state file before they are
 # interpolated into a sysctl path on restore. See dsm.core._validators
 # for the strict TUN-naming counterpart used by config / forwarding.
-from dsm.core import netaudit
+from dsm.core import netaudit, sysctl
 from dsm.core._validators import LINUX_IFACE_NAME_RE as _IFACE_NAME_RE
+from dsm.core.sysctl import SysctlOverride
 from dsm.net._addresses import TUN_PREFIX_LEN
 
 # VPN fwmark to prevent routing loops. Single source of truth lives in the
@@ -59,6 +60,72 @@ def _run_commands(cmds: list[list[str]], *, strict: bool = True) -> None:
                     e.stderr.decode(errors="replace"),
                 )
                 raise RuntimeError(f"TUN configure failed: {' '.join(cmd)}")
+
+
+class SrcValidMarkEnabler:
+    """Turn on ``net.ipv4.conf.all.src_valid_mark`` while the client is up.
+
+    The client's ``not fwmark`` ip rule sends every unmarked packet to table
+    100 (the TUN). With strict reverse-path filtering (``rp_filter=1``) the
+    kernel checks each incoming packet by looking up the route back to its
+    sender. The server's replies arrive on the physical link unmarked, so
+    that lookup lands in table 100 and the kernel drops them. The kill
+    switch's ``mark_restore`` chain puts DSM's mark back on those replies;
+    this sysctl makes the reverse-path check use it. Same as wg-quick.
+
+    The prior value is written to :attr:`STATE_PATH` before the change, so
+    ``dsm cleanup`` (``dsm.net.cleanup``) can put it back after a crash.
+    """
+
+    KEY = "net.ipv4.conf.all.src_valid_mark"
+    STATE_PATH = Path("/run/dsm/src_valid_mark.orig")
+
+    def __init__(self) -> None:
+        self._sysctl = SysctlOverride()
+        # True only once THIS run wrote STATE_PATH. A file left by an earlier
+        # crashed run is not ours to drop: it holds the operator's value,
+        # which ``dsm cleanup`` still has to put back.
+        self._state_saved = False
+
+    def apply(self) -> None:
+        try:
+            current = sysctl.sysctl_path(self.KEY).read_text().strip()
+        except OSError as e:
+            log.warning("could not read %s: %s", self.KEY, e)
+            return
+        if current == "1":
+            return
+        # Save first: a crash right after the write must still be undoable.
+        self._save_state(current)
+        if self._sysctl.set(self.KEY, "1") is None:
+            self._drop_state()
+
+    def remove(self) -> None:
+        self._sysctl.restore_all()
+        self._drop_state()
+
+    def _save_state(self, value: str) -> None:
+        from dsm.core.atomic_io import atomic_write
+
+        try:
+            parent = self.STATE_PATH.parent
+            parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            os.chmod(parent, 0o700)
+            atomic_write(self.STATE_PATH, f"{value}\n".encode(), mode=0o600)
+            self._state_saved = True
+        except OSError as e:
+            # Best-effort: the clean exit still restores from memory; only
+            # the crash path loses the exact prior value.
+            log.warning("could not save %s state: %s", self.KEY, e)
+
+    def _drop_state(self) -> None:
+        if not self._state_saved:
+            return
+        try:
+            self.STATE_PATH.unlink(missing_ok=True)
+            self._state_saved = False
+        except OSError as e:
+            log.warning("could not remove %s: %s", self.STATE_PATH, e)
 
 
 class TunDevice:
