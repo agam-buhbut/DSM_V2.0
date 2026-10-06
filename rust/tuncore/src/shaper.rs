@@ -1699,4 +1699,95 @@ mod tests {
             }
         }
     }
+
+    // ---- Reproduction of the 2026-10-07 live test. Keep it as a regression
+    // ---- test once the step-up rule is fixed, or drop it with the fix.
+
+    /// REPRODUCTION (live test 2026-10-07): a download from a sender that
+    /// adapts to the rate it gets, as TCP does, fills nearly every slot of
+    /// tier 2 for 30 s, yet the rate never steps up.
+    ///
+    /// The step-up rule only looks at how long the oldest queued packet has
+    /// waited (0.25-0.5 s at the 0.5 s budget). An adaptive sender never lets
+    /// the queue get that long: it only puts more packets in flight when
+    /// earlier ones have been delivered. Here it keeps twice the delivered
+    /// rate times the round trip in flight (the in-flight cap BBR uses), so
+    /// about one round trip of packets waits in the queue: 0.1 s, well under
+    /// the step-up point. On the wire this matches the capture: ~99% of the
+    /// tier 2 slots carried real data for 37 s and the rate stayed at tier 2.
+    ///
+    /// Fails today (the rate stays at tier 2). It passes once a full tier
+    /// counts as demand.
+    #[test]
+    fn repro_an_adaptive_download_that_fills_a_tier_steps_up() {
+        // Round trip outside the shaper queue (s): link, far end and the
+        // other side's slot wait. The in-tunnel round trip in the live test
+        // was about 0.03-0.05 s under load.
+        const RTT: f64 = 0.1;
+        let end = T0 + 30.0;
+        for seed in 0..20 {
+            let mut s = shaper(with(|c| c.tiers_pps = vec![10.0, 50.0, 200.0, 400.0]), seed);
+            // The live server was already at tier 2 when the download began.
+            s.change_tier(2, T0);
+            // Arrival time of each queued packet.
+            let mut queue: VecDeque<f64> = VecDeque::new();
+            // When each sent packet's acknowledgement reaches the sender.
+            let mut acks: VecDeque<f64> = VecDeque::new();
+            // Acknowledgements received in the last second.
+            let mut delivered: VecDeque<f64> = VecDeque::new();
+            let mut in_flight = 0_usize;
+            let mut real_sent = 0_u32;
+            let (mut slots, mut real) = (0_u32, 0_u32);
+            let mut longest_wait = 0.0_f64;
+            let mut now = T0;
+            let mut wake = T0;
+            while now <= end {
+                while acks.front().is_some_and(|&t| t <= now) {
+                    acks.pop_front();
+                    in_flight -= 1;
+                    delivered.push_back(now);
+                }
+                while delivered.front().is_some_and(|&t| now - t > 1.0) {
+                    delivered.pop_front();
+                }
+                // The sender queues new packets as soon as its window allows
+                // (starting from 10 packets). Queuing never wakes the shaper,
+                // as in the scheduler: it is polled only at its next wake.
+                let window = (2.0 * count(delivered.len()) * RTT).ceil().max(10.0);
+                while count(in_flight) < window {
+                    queue.push_back(now);
+                    in_flight += 1;
+                }
+                if now >= wake {
+                    let oldest_wait = queue.front().map_or(0.0, |&t| now - t);
+                    longest_wait = longest_wait.max(oldest_wait);
+                    let poll = s.poll(now, queue.len(), oldest_wait, real_sent);
+                    real_sent = 0;
+                    slots += poll.slots_due;
+                    for _ in 0..poll.slots_due {
+                        if queue.pop_front().is_some() {
+                            real_sent += 1;
+                            real += 1;
+                            s.real_size_class(1320);
+                            acks.push_back(now + RTT);
+                        } else {
+                            s.chaff_size_class();
+                        }
+                    }
+                    assert!(poll.next_wake >= now, "next_wake must not go back in time");
+                    wake = poll.next_wake;
+                }
+                now = acks.front().map_or(wake, |&t| t.min(wake));
+            }
+            assert_eq!(
+                s.tier,
+                3,
+                "seed {seed}: real packets took {:.1}% of the slots for 30 s and the \
+                 oldest one waited at most {longest_wait:.3} s (step-up point 0.25-0.5 s), \
+                 but the rate ended at tier {} instead of the top",
+                100.0 * f64::from(real) / f64::from(slots),
+                s.tier
+            );
+        }
+    }
 }
