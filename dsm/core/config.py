@@ -251,6 +251,14 @@ def _validate_types(c: Config) -> None:
             value, (int, float)
         ) or isinstance(value, bool):
             raise ValueError(f"{name} must be a number, got {type(value).__name__}")
+    # A string or list here would reach _validate_dns and crash on .get().
+    if not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
+        c.dns_provider_pins, dict
+    ):
+        raise ValueError(
+            f"dns_provider_pins must be a table (a [dns_provider_pins] "
+            f"section), got {type(c.dns_provider_pins).__name__}"
+        )
 
 
 def _validate_mode(c: Config) -> None:

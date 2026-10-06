@@ -78,6 +78,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   DSM runs and gets a new tag after a restart.
 
 ### Fixed
+- `dns_provider_pins` written as a plain value (a string or list) instead
+  of a `[dns_provider_pins]` section is now a clear config error naming the
+  key, not a crash at server start.
 - A client whose set `listen_port` is already in use now exits with one
   clear error line instead of a Python traceback.
 - UDP sessions no longer end within ~50 ms of the handshake: a send before
