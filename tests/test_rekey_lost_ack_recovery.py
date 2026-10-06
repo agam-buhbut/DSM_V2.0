@@ -92,7 +92,8 @@ async def test_lost_ack_recovers_with_resent_init() -> None:
     _t, new_epoch, payload = await initiate_rekey(
         init.keys, init.fsm, shaper, _unused_send, None, paced_send=init.paced_send
     )
-    assert new_epoch == old_epoch + 1 and payload is not None
+    assert new_epoch is not None and payload is not None
+    assert new_epoch == old_epoch + 1
     (wire,) = await init.flush()
     inner, _prev = resp.receive(wire)
     last_time, ack_epoch, ack_payload = await handle_rekey_init(

@@ -78,13 +78,15 @@ class UDPTransport:
         sock.setblocking(False)
         try:
             sock.bind((local_addr, local_port))
-        except OSError:
+            transport, _ = await loop.create_datagram_endpoint(
+                lambda: protocol,
+                sock=sock,
+            )
+        except BaseException:
+            # Close on any failure, cancellation included, so the socket
+            # does not leak; the error still goes up.
             sock.close()
             raise
-        transport, _ = await loop.create_datagram_endpoint(
-            lambda: protocol,
-            sock=sock,
-        )
         sock = transport.get_extra_info("socket")
         apply_so_mark(sock)
         if pmtu_discover and sock is not None:
@@ -170,13 +172,14 @@ class UDPTransport:
         new_sock.setblocking(False)
         try:
             new_sock.bind((local_addr, 0))  # 0 = kernel picks
-        except OSError:
+            new_transport, _ = await loop.create_datagram_endpoint(
+                lambda: new_protocol,
+                sock=new_sock,
+            )
+        except BaseException:
+            # Same as bind(): never leak the socket.
             new_sock.close()
             raise
-        new_transport, _ = await loop.create_datagram_endpoint(
-            lambda: new_protocol,
-            sock=new_sock,
-        )
         new_sock = new_transport.get_extra_info("socket")
         apply_so_mark(new_sock)
         if self._pmtu_enabled and new_sock is not None:
