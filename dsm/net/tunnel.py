@@ -97,7 +97,7 @@ class SrcValidMarkEnabler:
         self._prior: str | None = None
 
     def apply(self) -> None:
-        if self.STATE_PATH.exists():
+        if self._state_exists():
             log.warning(
                 "%s was left by an earlier run that did not exit cleanly; "
                 "keeping it. Run `dsm cleanup` after this run to put back "
@@ -113,7 +113,7 @@ class SrcValidMarkEnabler:
         if current == "1":
             return
         # Save first: a crash right after the write must still be undoable.
-        if not self.STATE_PATH.exists():
+        if not self._state_exists():
             self._save_state(current)
         if self._sysctl.set(self.KEY, "1") is None:
             self._drop_state()
@@ -140,6 +140,15 @@ class SrcValidMarkEnabler:
             return
         self._prior = None
         self._drop_state()
+
+    def _state_exists(self) -> bool:
+        # /run/dsm is root-only; without root (or on any other error) treat
+        # the file as absent, the same as when it cannot be saved.
+        try:
+            return self.STATE_PATH.exists()
+        except OSError as e:
+            log.warning("could not check %s: %s", self.STATE_PATH, e)
+            return False
 
     def _save_state(self, value: str) -> None:
         from dsm.core.atomic_io import atomic_write

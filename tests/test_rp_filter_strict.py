@@ -19,6 +19,7 @@ tests/test_sysctl.py) and the state-file path.
 from __future__ import annotations
 
 import asyncio
+import os
 import subprocess
 from contextlib import ExitStack
 from pathlib import Path
@@ -573,3 +574,20 @@ async def test_client_sets_src_valid_mark_around_the_policy_route() -> None:
     assert events.index("svm.apply") < events.index("tun.configure")
     # ... and back to the old value only after that rule is gone (tun.close).
     assert events.index("svm.remove") > events.index("tun.close")
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can read any directory")
+def test_unreadable_state_dir_does_not_crash_start(fake_proc: Any) -> None:
+    # /run/dsm is root-only; a check there without root raised before.
+    from dsm.net.tunnel import SrcValidMarkEnabler
+
+    fake_path, state = fake_proc
+    _seed(fake_path, "1")
+    state.parent.mkdir(parents=True)
+    state.parent.chmod(0)
+    try:
+        svm = SrcValidMarkEnabler()
+        svm.apply()
+        svm.remove()
+    finally:
+        state.parent.chmod(0o700)
