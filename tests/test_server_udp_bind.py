@@ -100,10 +100,22 @@ class _UdpBindCase(unittest.IsolatedAsyncioTestCase):
 
 class TestBindFailureAtStartup(_UdpBindCase):
     async def test_port_in_use_exits_with_one_error_line(self) -> None:
-        # A plain socket, without SO_REUSEADDR: the server sets that option,
-        # but Linux lets two UDP sockets share a port only if both set it.
+        # A plain socket on a free port; the server must not share it.
         taken = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.addCleanup(taken.close)
+        taken.bind(("0.0.0.0", 0))
+        port = taken.getsockname()[1]
+
+        rc = await self._run(port)
+
+        self._assert_one_line_exit(rc, port, os.strerror(errno.EADDRINUSE))
+
+    async def test_port_held_by_a_sharing_socket_still_fails(self) -> None:
+        # A holder that allows sharing (like an older dsm did) must still
+        # make this server fail, not quietly split the port's packets.
+        taken = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.addCleanup(taken.close)
+        taken.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         taken.bind(("0.0.0.0", 0))
         port = taken.getsockname()[1]
 

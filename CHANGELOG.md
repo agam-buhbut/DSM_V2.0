@@ -19,6 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The timing and size decisions now run in the Rust core (`tuncore`), and
   the size list lives there too. So `dsm.core.protocol`, and every module
   that uses it, no longer loads without the built extension.
+- A second DSM on a UDP port that is already in use now fails at start with
+  a clear error. Before, both could share the port and each got only some
+  of the packets, so sessions broke with no error.
 - A queued packet now takes the next free place, with no random extra wait.
 - The send loop no longer wakes up early when a packet is queued, so send
   times do not drift toward your real traffic.
