@@ -78,6 +78,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   DSM runs and gets a new tag after a restart.
 
 ### Fixed
+- A client whose set `listen_port` is already in use now exits with one
+  clear error line instead of a Python traceback.
 - UDP sessions no longer end within ~50 ms of the handshake: a send before
   the server knows the client's address is dropped instead of shutting the
   session down.

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import logging
+import os
 import socket
 from contextlib import AsyncExitStack
 
@@ -221,10 +222,22 @@ async def run_client(
 
         if config.transport == "udp":
             transport = UDPTransport()
-            await transport.bind(
-                local_port=config.listen_port,
-                pmtu_discover=config.pmtu_discover,
-            )
+            try:
+                await transport.bind(
+                    local_port=config.listen_port,
+                    pmtu_discover=config.pmtu_discover,
+                )
+            except OSError as e:
+                # A fixed listen_port that is already taken: retrying cannot
+                # fix it, so log one line and exit like the server does. The
+                # stack unwinds the stores and the kill switch.
+                reason = os.strerror(e.errno) if e.errno else str(e)
+                log.error(
+                    "cannot listen on UDP port %d: %s; exiting",
+                    config.listen_port,
+                    reason,
+                )
+                return 1
         else:
             transport = TCPTransport()
             await transport.connect(server_ip, config.server_port)
