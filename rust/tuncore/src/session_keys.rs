@@ -35,7 +35,7 @@ const GRACE_PERIOD_SECS: u64 = 5;
 /// in dsm/rekey.py, 68 s today). A Python test checks this. After the
 /// limit the responder gives up waiting: it swaps to the new send key and
 /// drops the old recv key.
-pub const PEER_CONFIRM_LIMIT_SECS: u64 = 75;
+pub const PEER_CONFIRM_LIMIT_SECS: u64 = 110;
 
 /// Cap on operator-supplied rotation bases. The defaults are 5_000 packets
 /// and 600 s; the cap leaves several orders of magnitude of headroom while

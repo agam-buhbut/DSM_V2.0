@@ -678,7 +678,7 @@ async def _handle_rekey_init(ctx: DataPathContext, inner: InnerPacket) -> None:
         # INIT, through the shaper schedule so their wire timing matches
         # the steady stream. As control messages they go ahead of any
         # queued data and take the next free slot, far inside the
-        # initiator's first retry (1.5 s) and long before the 75 s limit
+        # initiator's first retry (1.5 s) and long before the 110 s limit
         # after which we stop waiting for the peer to confirm the new keys.
         paced_send=functools.partial(ctx.scheduler.enqueue, control=True),
     )

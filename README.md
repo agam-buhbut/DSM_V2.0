@@ -142,7 +142,7 @@ SESSION_CLOSE packet.
   still reads the old one) until the first packet under the new keys
   arrives, which shows the other side got the ACK. So a lost ACK is fixed
   by a resend instead of breaking the session. If no such packet comes
-  within 75 s, it switches to the new keys anyway.
+  within 110 s, it switches to the new keys anyway.
 - DSM does not resend lost data packets. It relies on the protocol inside
   the tunnel, or on TCP.
 

@@ -8,7 +8,7 @@ still read, the cached ACK goes back under the old send key, and both
 sides end up on the new keys.
 
 The Rust side holds the time-based part (old keys kept past the 5 s grace,
-75 s limit) in its own unit tests: Rust's clock cannot be moved from here.
+110 s limit) in its own unit tests: Rust's clock cannot be moved from here.
 """
 
 from __future__ import annotations
@@ -16,9 +16,11 @@ from __future__ import annotations
 import asyncio
 
 import tuncore
+from dsm.core.config import MAX_SHAPER_LATENCY_BUDGET_MS
 from dsm.core.fsm import SessionFSM, State
 from dsm.core.protocol import InnerPacket, PacketType
 from dsm.rekey import (
+    MAX_REKEY_RETRIES,
     MIN_REKEY_INTERVAL,
     REKEY_RETRY_BUDGET,
     handle_rekey_ack,
@@ -155,7 +157,13 @@ async def test_lost_ack_recovers_with_resent_init() -> None:
 def test_responder_waits_longer_than_the_retry_plan() -> None:
     # Rust and Python constants live in two languages; keep them in step.
     assert REKEY_RETRY_BUDGET > MIN_REKEY_INTERVAL
-    assert tuncore.REKEY_PEER_CONFIRM_LIMIT_SECS > REKEY_RETRY_BUDGET
+    # Each resend also waits for a send slot. At the slowest allowed setting a
+    # first-tier gap is under half the largest latency budget (config.py's
+    # first-tier rule), so the last resend reaches the responder by about
+    # REKEY_RETRY_BUDGET + (MAX_REKEY_RETRIES + 1) * 2.5 s.
+    longest_slot_wait = 0.5 * MAX_SHAPER_LATENCY_BUDGET_MS / 1000.0
+    worst_last_resend = REKEY_RETRY_BUDGET + (MAX_REKEY_RETRIES + 1) * longest_slot_wait
+    assert tuncore.REKEY_PEER_CONFIRM_LIMIT_SECS > worst_last_resend + 10
 
 
 if __name__ == "__main__":

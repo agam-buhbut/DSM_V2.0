@@ -38,7 +38,7 @@ MIN_REKEY_INTERVAL = 60  # seconds — minimum time between rekey operations
 # and is silently rate-limiting our INIT (because its 60s window hasn't
 # elapsed) still gets a later retry it can accept.
 # 1.5 + 2.5 + 8 x 8 = 68s. The responder keeps its old keys for
-# PEER_CONFIRM_LIMIT_SECS (session_keys.rs, 75s) so it can still answer
+# PEER_CONFIRM_LIMIT_SECS (session_keys.rs, 110 s) so it can still answer
 # the last retry; a test checks that limit stays above this budget.
 REKEY_ACK_TIMEOUT = 8.0
 REKEY_EARLY_RETRY_DELAYS = (1.5, 2.5)
