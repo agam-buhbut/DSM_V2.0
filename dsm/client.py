@@ -29,7 +29,7 @@ from dsm.net.nftables import (
     PreHandshakeKillSwitch,
     TcpTimestampsDisabler,
 )
-from dsm.net.resolv_conf import ResolvConfManager
+from dsm.net.resolv_conf import ResolvConfError, ResolvConfManager
 from dsm.net.transport.tcp import TCPTransport
 from dsm.net.transport.udp import UDPTransport
 from dsm.net.tunnel import SrcValidMarkEnabler, TunDevice
@@ -354,7 +354,7 @@ async def run_client(
                 except Exception:  # noqa: BLE001
                     log.warning("nft.remove during failed apply also failed")
                 raise
-        except Exception:
+        except Exception as e:
             # tun.configure or nft.apply (or resolv.apply if it re-raised
             # above) failed. Undo tun.close manually since we never
             # registered the cleanup.
@@ -363,6 +363,11 @@ async def run_client(
             # cleanup path: any failure here must not mask the original
             except Exception:  # noqa: BLE001
                 log.warning("tun.close during failed apply also failed")
+            if isinstance(e, ResolvConfError):
+                # A host problem (e.g. a read-only resolv.conf), not a bug:
+                # one line, no traceback. The stack unwinds the rest.
+                log.error("%s; exiting", e)
+                return 1
             raise
 
         # All three host-mutating resources are up. Register cleanups in

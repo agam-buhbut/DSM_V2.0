@@ -13,6 +13,7 @@ resolver and nftables keeps silently dropping it.
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
 from pathlib import Path
@@ -37,6 +38,42 @@ DSM_MARKER = b"# Managed by dsm"
 # NetworkManager hosts) — this sentinel line recording the link target so a
 # crash-restart or teardown can RECREATE the symlink instead of losing it.
 _SYMLINK_SENTINEL = b"# dsm-resolv-symlink -> "
+
+
+class ResolvConfError(Exception):
+    """resolv.conf could not be written. ``str()`` is one line for the log."""
+
+    def __init__(self, path: Path, reason: str) -> None:
+        super().__init__(f"cannot write {path}: {reason}")
+
+
+def write_in_place(path: Path, data: bytes, *, mode: int = 0o644) -> None:
+    """Overwrite ``path`` through the existing file (truncate, write, fsync).
+
+    For when ``path`` is a mount point (a bind-mounted resolv.conf in a
+    container or ``ip netns exec``): rename(2) onto it fails with EBUSY, so
+    the atomic swap cannot be used. Readers may briefly see a short file.
+    Never creates the file and never follows a symlink.
+    """
+    fd = os.open(path, os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        if os.fstat(fd).st_mode & 0o7777 != mode:
+            os.fchmod(fd, mode)
+        # Truncate only once open and chmod worked, so the usual failures
+        # (read-only mount, no permission) leave the file as it was.
+        os.ftruncate(fd, 0)
+        view = memoryview(data)
+        written = 0
+        while written < len(view):
+            written += os.write(fd, view[written:])
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def is_mount_point_error(e: OSError) -> bool:
+    """True if a rename onto the target failed because it is a mount point."""
+    return e.errno == errno.EBUSY
 
 
 def parse_symlink_backup(data: bytes) -> str | None:
@@ -76,6 +113,18 @@ class ResolvConfManager:
         self._original_contents: bytes | None = None
         self._original_symlink_target: str | None = None
         self._applied = False
+
+    @staticmethod
+    def _write(data: bytes) -> None:
+        """Swap RESOLV_CONF atomically, or in place if it is a mount point."""
+        try:
+            atomic_write(RESOLV_CONF, data, mode=0o644, mkdir=False)
+            return
+        except OSError as e:
+            if not is_mount_point_error(e):
+                raise
+        log.info("%s is a mount point; writing it in place", RESOLV_CONF)
+        write_in_place(RESOLV_CONF, data, mode=0o644)
 
     @staticmethod
     def _load_backup() -> bytes | None:
@@ -192,7 +241,12 @@ class ResolvConfManager:
         contents, then ``os.rename`` replaces the destination atomically.
         rename(2) overwrites both regular files AND symlinks in a single
         syscall, so there is no window where /etc/resolv.conf is absent
-        between capturing the original and the new file appearing.
+        between capturing the original and the new file appearing. If the
+        file is a mount point (rename fails with EBUSY) it is written in
+        place instead.
+
+        Raises:
+            ResolvConfError: the file could not be written either way.
 
         M-NET-1 WARNING: on systems running NetworkManager or systemd-
         resolved, our /etc/resolv.conf swap is fighting against another
@@ -219,7 +273,11 @@ class ResolvConfManager:
             f"nameserver {self._nameserver}\n"
             f"options edns0 trust-ad\n"
         ).encode()
-        atomic_write(RESOLV_CONF, payload, mode=0o644, mkdir=False)
+        try:
+            self._write(payload)
+        except OSError as e:
+            reason = e.strerror or str(e)
+            raise ResolvConfError(RESOLV_CONF, reason) from e
 
         self._applied = True
         log.info("resolv.conf -> nameserver %s", self._nameserver)
@@ -253,12 +311,7 @@ class ResolvConfManager:
                 atomic_symlink_restore(self._original_symlink_target)
                 restored = True
             elif self._original_contents is not None:
-                atomic_write(
-                    RESOLV_CONF,
-                    self._original_contents,
-                    mode=0o644,
-                    mkdir=False,
-                )
+                self._write(self._original_contents)
                 restored = True
             else:
                 # No original to restore — explicitly remove our file.

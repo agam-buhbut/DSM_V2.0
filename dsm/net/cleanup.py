@@ -40,7 +40,9 @@ from dsm.net.resolv_conf import (
     RESOLV_BACKUP,
     RESOLV_CONF,
     atomic_symlink_restore,
+    is_mount_point_error,
     parse_symlink_backup,
+    write_in_place,
 )
 from dsm.net.transport._fwmark import SO_MARK_VALUE as FWMARK
 from dsm.net.tunnel import SrcValidMarkEnabler
@@ -163,7 +165,12 @@ def _restore_resolv_conf() -> None:
                 # as file contents (B2).
                 atomic_symlink_restore(target)
             else:
-                atomic_write(RESOLV_CONF, data, mode=0o644, mkdir=False)
+                try:
+                    atomic_write(RESOLV_CONF, data, mode=0o644, mkdir=False)
+                except OSError as e:
+                    if not is_mount_point_error(e):
+                        raise
+                    write_in_place(RESOLV_CONF, data, mode=0o644)
             RESOLV_BACKUP.unlink(missing_ok=True)
             log.info("restored resolv.conf from backup")
         elif RESOLV_CONF.exists():

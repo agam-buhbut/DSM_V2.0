@@ -94,6 +94,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   key, not a crash at server start.
 - A client whose set `listen_port` is already in use now exits with one
   clear error line instead of a Python traceback.
+- The client no longer crashes when /etc/resolv.conf is a mount point (in
+  containers and `ip netns exec`): it writes the file in place, or exits
+  with one clear error line if it cannot write it at all.
 - UDP sessions no longer end within ~50 ms of the handshake: a send before
   the server knows the client's address is dropped instead of shutting the
   session down.
