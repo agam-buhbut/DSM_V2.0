@@ -1674,7 +1674,7 @@ mod tests {
                 "{name}: the wire went quiet"
             );
             match name {
-                "idle" => assert!(trace.tier_changes.is_empty()),
+                "idle" => assert_eq!(trace.tier_changes, [] as [(f64, usize); 0]),
                 "long download" => {
                     assert!(
                         trace.tier_changes.iter().any(|&(_, t)| t == 3),
