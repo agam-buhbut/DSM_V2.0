@@ -315,10 +315,10 @@ always long enough for at least 200 free places, so 3 to 5 seconds at tier
 1 and longer at idle). The second one is for downloads that slow down to
 the speed they get, as TCP does: their packets never wait long, so the
 first reason never comes. This climb goes one tier and runs exactly like a
-decoy that aims one tier up, so on its own, a watcher cannot tell such a
-step from a decoy's (but see the steps a few seconds apart under "What it
-does not hide"). If the tier above fills up too, it climbs again. Now and
-then a step jumps two tiers at once.
+decoy that aims one tier up, so a watcher cannot tell such a step from a
+decoy's. If the tier above fills up too, it climbs again, a few seconds
+later. Decoys pause between steps in the same way (below), so that pause
+does not give it away either. Now and then a step jumps two tiers at once.
 
 It comes down slowly. After every change it does not come down for about
 1 to 5 minutes (it can still go up). Then it steps down if, over the last
@@ -337,20 +337,23 @@ it stays one step up, and the next drop to idle waits again.
 climb the way a real page load does. Each one picks a tier to reach: the
 top tier between half and four fifths of the time (each session picks how
 often), otherwise a lower one. It climbs there one step at a time, through
-exactly the same steps as real use. Then it stays busy for a while and
-comes down slowly, just like real use. So a watcher cannot tell which
-short busy periods were real. A decoy's busy stretch lasts 1 to 6 minutes
-on average, so a much longer busy period is almost surely real. By default
-a decoy comes about every 2 hours on average (each session picks its own
-average, between 1 and 4 hours).
+exactly the same steps as real use. A third to two thirds of the time it
+pauses a few seconds between steps, as a download does while it fills each
+tier (each session picks how often, and roughly how long). Then it stays
+busy for a while and comes down slowly, just like real use. So a watcher
+cannot tell which short busy periods were real. A decoy's busy stretch
+lasts 1 to 6 minutes on average, so a much longer busy period is almost
+surely real. By default a decoy comes about every 2 hours on average (each
+session picks its own average, between 1 and 4 hours).
 
 **Secret numbers.** Every session secretly picks its own timing values:
 how fast each tier really is (within 20% of the set value), how uneven the
 gaps between packets are, how often it jumps two tiers, how long it waits
 before coming down, how it judges your use (when a tier counts as full, and
-when your use fits the tier below), how often decoys come and how often
-they go to the top. It picks new values every 10 to 40 minutes. So
-reading this code does not tell a watcher the numbers your session uses.
+when your use fits the tier below), how often decoys come, how often
+they go to the top and how they pause. It picks new values every 10 to 40
+minutes. So reading this code does not tell a watcher the numbers your
+session uses.
 
 **Sizes.** Real and fake packets are padded to sizes from the same fixed
 list (128 to 1400 bytes), using the same fixed mix in which smaller sizes
@@ -388,11 +391,11 @@ server:
 - that you use DSM at all;
 - roughly how much you send: a watcher sees which tier you are on, and a
   long download keeps the rate up for as long as it runs;
-- whether a climb was real when a full-tier step comes a few seconds after
-  another step up, for example when a download starts from idle or fills
-  one tier after another. A decoy's steps come half to one latency budget
-  apart (0.25 to 0.5 seconds by default) and never pause like that, so such
-  a climb is almost surely real;
+- over many climbs, which ones were real. One climb does not give itself
+  away by a pause between steps, because decoys pause the same way. But
+  their pauses only roughly match how fast real senders speed up, so a
+  watcher who sees many climbs from you might still tell them apart by
+  statistics;
 - the packet counter at the start of every packet. It is not encrypted, and
   it links your traffic across port changes. (A fix is planned.)
 - anything from someone who watches both your link and your server's own

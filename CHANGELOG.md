@@ -92,9 +92,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tier 1), the rate climbs one tier, the same way a decoy aimed one tier
   up climbs. The rate also steps down when your use would fit the lower
   tier with room to spare, so steady use that fits a lower tier does not
-  stay at the top. Known limit: a full-tier step comes a few seconds after
-  the step before it, which a decoy never does, so a watcher can tell such
-  a climb is real.
+  stay at the top. A full-tier step comes a few seconds after the step
+  before it, so decoys now pause between steps the same way, now and then:
+  one climb no longer gives itself away by such a pause. Known limit: the
+  decoys' pauses only roughly match real ramp-up times, so many climbs
+  from one user might still be told apart by statistics.
 - On a host with strict reverse-path filtering, the client no longer cuts
   itself off from its own local network: ARP requests from the router (or a
   DSM server on the same network) were dropped, so incoming traffic stopped

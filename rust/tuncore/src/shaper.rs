@@ -7,7 +7,8 @@
 //! packets have filled nearly all of the tier for a few seconds. It steps
 //! down slowly (holds of about 1-5 minutes, a usage check, an optional
 //! linger before idle). Decoys are fake backlogs: they climb to a target
-//! tier through the exact same step-up path, then hold a fake busy stretch.
+//! tier through the exact same step-up path, pausing between steps now and
+//! then as a real climb does, then hold a fake busy stretch.
 //! A full tier starts the same climb as a decoy aimed one tier up, so the
 //! two look alike. Each session draws its own secret timing values and
 //! draws them again now and then.
@@ -89,6 +90,12 @@ const FILL_MIN_SLOTS: f64 = 200.0;
 /// it fits there with room to spare. Below `FILL_LIMIT.0`, so a steady
 /// stream that stepped down does not fill the lower tier and climb back.
 const FIT_LIMIT: (f64, f64) = (0.5, 0.7);
+/// Decoy pause: the chance that a decoy climb that has not reached its
+/// target yet pauses after a step...
+const DECOY_PAUSE_P: (f64, f64) = (0.3, 0.7);
+/// ...for the new tier's `fill_window()` plus an exponential wait with this
+/// mean (s), which stands in for a sender's ramp-up (see `step_up`).
+const DECOY_PAUSE_MEAN_S: (f64, f64) = (0.5, 2.0);
 
 // Config rules (the same limits dsm/core/config.py enforces).
 const TIER_COUNT: (usize, usize) = (2, 8);
@@ -211,6 +218,8 @@ struct Secrets {
     fill_limit: f64,
     fill_window_s: f64,
     fit_limit: f64,
+    decoy_pause_p: f64,
+    decoy_pause_mean_s: f64,
 }
 
 impl Secrets {
@@ -229,6 +238,8 @@ impl Secrets {
             fill_limit: uniform(rng, FILL_LIMIT),
             fill_window_s: uniform(rng, FILL_WINDOW_S),
             fit_limit: uniform(rng, FIT_LIMIT),
+            decoy_pause_p: uniform(rng, DECOY_PAUSE_P),
+            decoy_pause_mean_s: uniform(rng, DECOY_PAUSE_MEAN_S),
         }
     }
 }
@@ -298,8 +309,9 @@ pub struct Shaper<R> {
     linger_until: Option<f64>,
     step_up_after: f64,
     last_step_up: f64,
-    /// Tier a climb is heading for, and when its fake backlog began. A climb
-    /// is a decoy's or a full tier's; both run the same way.
+    /// Tier a climb is heading for, and when its fake backlog began (after a
+    /// decoy pause: when it begins again, which may be ahead). A climb is a
+    /// decoy's or a full tier's; both run the same way.
     decoy_target: Option<usize>,
     decoy_since: f64,
     /// Whether the climb is a decoy's: only a decoy's ends in a busy stretch.
@@ -521,6 +533,15 @@ impl<R: RngCore + CryptoRng> Shaper<R> {
 
     /// Up one tier, or two with the secret overshoot chance, capped at the
     /// top. Real backlogs, full tiers and decoys all come through here.
+    ///
+    /// A decoy climb that has not reached its target may then pause. A real
+    /// full-tier step can only come a whole `fill_window()` of the new tier
+    /// after the step before it, plus the sender's ramp-up, so a decoy that
+    /// never paused would let one such gap mark a climb as real. With the
+    /// secret chance, the decoy's fake backlog restarts that window plus an
+    /// exponential wait from now; `step_up_at` adds the step-up point, so
+    /// its next step has the same shape. A real backlog still steps from its
+    /// own start, so a paused decoy never delays it.
     fn step_up(&mut self, now: f64) {
         let top = self.top();
         if self.tier >= top {
@@ -541,13 +562,21 @@ impl<R: RngCore + CryptoRng> Shaper<R> {
         if candidate < self.next_departure {
             self.next_departure = candidate.max(now);
         }
+        let mid_decoy = self.climb_is_decoy && self.decoy_target.is_some_and(|t| self.tier < t);
+        if mid_decoy && self.rng.gen::<f64>() < self.secrets.decoy_pause_p {
+            // Read after the tier change: the new tier's window, as the
+            // full-tier check restarts there too.
+            let ramp = exponential(&mut self.rng, self.secrets.decoy_pause_mean_s);
+            self.decoy_since = now + self.fill_window() + ramp;
+        }
     }
 
     /// A decoy: a fake backlog that climbs like a real page load. It picks a
     /// target tier (the top with the secret chance, otherwise a random tier
     /// from 1 to the one below the top) and climbs there one step-up point at
-    /// a time through the normal step-up path. One climb at a time, and no
-    /// decoy starts at the top tier.
+    /// a time through the normal step-up path, now and then pausing between
+    /// steps (see `step_up`). One climb at a time, and no decoy starts at the
+    /// top tier.
     fn start_decoy(&mut self, now: f64) {
         let top = self.top();
         if self.tier < top && self.decoy_target.is_none() {
@@ -1463,6 +1492,7 @@ mod tests {
             let mut s = shaper(with(|c| c.decoy_interval_s = 300.0), seed);
             // Aim every decoy at the top tier.
             s.secrets.decoy_top_p = 1.0;
+            s.secrets.decoy_pause_p = 0.0;
             s.next_repick = f64::INFINITY;
             let due = T0 + 10.0;
             s.next_decoy = Some(due);
@@ -2120,20 +2150,26 @@ mod tests {
     }
 
     #[test]
-    fn full_tier_and_fit_secrets_stay_in_range_and_differ_per_session() {
-        let mut draws: [Vec<u64>; 3] = Default::default();
+    fn full_tier_fit_and_pause_secrets_stay_in_range_and_differ_per_session() {
+        let mut draws: [Vec<u64>; 5] = Default::default();
         for seed in 0..200 {
             let s = shaper(cfg(), seed);
             let k = &s.secrets;
             assert!((0.85..=0.95).contains(&k.fill_limit));
             assert!((1.0..=3.0).contains(&k.fill_window_s));
             assert!((0.5..=0.7).contains(&k.fit_limit));
+            assert!((0.3..=0.7).contains(&k.decoy_pause_p));
+            assert!((0.5..=2.0).contains(&k.decoy_pause_mean_s));
             // What fits the lower tier can never fill it.
             assert!(k.fit_limit < k.fill_limit);
-            for (all, value) in draws
-                .iter_mut()
-                .zip([k.fill_limit, k.fill_window_s, k.fit_limit])
-            {
+            let values = [
+                k.fill_limit,
+                k.fill_window_s,
+                k.fit_limit,
+                k.decoy_pause_p,
+                k.decoy_pause_mean_s,
+            ];
+            for (all, value) in draws.iter_mut().zip(values) {
                 all.push(value.to_bits());
             }
         }
@@ -2243,6 +2279,107 @@ mod tests {
                 assert_eq!(busy.times(), quiet.times(), "seed {seed}");
             }
         }
+    }
+
+    /// Poll `s` with no real traffic from `T0` until it reaches the top tier.
+    /// At each step: when, the new tier's `fill_window()` and the next
+    /// step-up point.
+    fn climb_to_top(s: &mut Shaper<StdRng>) -> Vec<(f64, f64, f64)> {
+        let mut steps = Vec::new();
+        let mut now = T0;
+        while s.tier < s.top() {
+            assert!(now < T0 + 600.0, "the climb never reached the top");
+            let tier = s.tier;
+            let poll = s.poll(now, 0, 0.0, 0);
+            if s.tier != tier {
+                steps.push((now, s.fill_window(), s.step_up_after));
+            }
+            now = poll.next_wake;
+        }
+        steps
+    }
+
+    /// A decoy climbing through the middle tiers pauses like a real
+    /// full-tier climb. A real full-tier step comes at least a whole
+    /// `fill_window()` of the new tier, plus the sender's ramp-up, plus one
+    /// step-up point after the step before it. With the pause chance at 1,
+    /// every decoy step that does not reach the target is followed by that
+    /// same gap (with an exponential ramp-up, or exactly when its mean is 0).
+    /// With the chance at 0, steps stay one step-up point apart, at most the
+    /// budget. A real backlog during a pause still steps one step-up point
+    /// after it starts: the paused decoy does not hold it back.
+    #[test]
+    fn a_decoy_climb_pauses_between_steps_like_a_full_tier_climb() {
+        let budget = cfg().latency_budget_s;
+        // Each ramp-up, in units of the session's secret mean.
+        let mut ramps = Vec::new();
+        let start = |seed: u64, pause: f64| {
+            let mut s = shaper(with(|c| c.decoy_interval_s = 300.0), seed);
+            // Aim at the top one tier at a time: two steps that do not reach
+            // the target. A re-pick would redraw the values set here.
+            s.secrets.decoy_top_p = 1.0;
+            s.secrets.overshoot_p = 0.0;
+            s.secrets.decoy_pause_p = pause;
+            s.next_repick = f64::INFINITY;
+            s.next_decoy = Some(T0 + 10.0);
+            s
+        };
+        for seed in 0..30 {
+            for (pauses, ramp) in [(true, Some(0.0)), (true, None), (false, None)] {
+                let mut s = start(seed, if pauses { 1.0 } else { 0.0 });
+                if let Some(mean) = ramp {
+                    s.secrets.decoy_pause_mean_s = mean;
+                }
+                let mean = s.secrets.decoy_pause_mean_s;
+                let steps = climb_to_top(&mut s);
+                assert_eq!(steps.len(), 3, "seed {seed}: one tier at a time");
+                for pair in steps.windows(2) {
+                    let ((at, window, point), (next, _, _)) = (pair[0], pair[1]);
+                    let gap = next - at;
+                    let floor = if pauses { window + point } else { point };
+                    assert!(
+                        gap >= floor - 1e-9,
+                        "seed {seed}: steps {gap} s apart, under {floor} s"
+                    );
+                    if ramp.is_some() || !pauses {
+                        assert!(
+                            (gap - floor).abs() < 1e-9,
+                            "seed {seed}: steps {gap} s apart, not {floor} s"
+                        );
+                    } else {
+                        ramps.push((gap - floor) / mean);
+                    }
+                    if !pauses {
+                        assert!(gap <= budget + 1e-9, "seed {seed}: no pause, yet {gap} s");
+                    }
+                }
+            }
+            // A real burst 0.1 s after the first step, while the decoy pauses.
+            let mut s = start(seed, 1.0);
+            let mut now = T0;
+            while s.tier == 0 {
+                now = s.poll(now, 0, 0.0, 0).next_wake;
+            }
+            let burst_at = s.last_step_up + 0.1;
+            let point = s.step_up_after;
+            let paused_step = s.decoy_since + point;
+            let trace = simulate(&mut s, now, &[burst_at; 100], burst_at + 1.0);
+            let (first, _) = trace.tier_changes[0];
+            assert!(
+                (first - (burst_at + point)).abs() < 1e-9,
+                "seed {seed}: the burst stepped {} s after it began, not {point} s",
+                first - burst_at
+            );
+            assert!(first < paused_step, "seed {seed}: the decoy was not paused");
+        }
+        // Exponential with the secret mean: over 60 pauses the average is
+        // 1 in units of that mean, give or take about 0.13.
+        let average = ramps.iter().sum::<f64>() / count(ramps.len());
+        assert_eq!(ramps.len(), 60);
+        assert!(
+            (0.6..=1.4).contains(&average),
+            "ramp-up {average} x the mean"
+        );
     }
 
     /// A secret re-pick starts the full-tier check over. Here the tier is
