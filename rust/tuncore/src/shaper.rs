@@ -2,13 +2,15 @@
 //!
 //! Packets leave at a steady rate that only changes in a few fixed steps
 //! ("tiers"). Real packets take free slots; the caller fills the rest with
-//! chaff. Apart from decoys, the rate steps up only when real packets have
-//! waited past a random point inside the latency budget, and steps down
-//! slowly (holds of about 1-5 minutes, a usage check, an optional linger
-//! before idle). Decoys are fake backlogs: they climb to a target tier
-//! through the exact same step-up path, then hold a fake busy stretch. Each
-//! session draws its own secret timing values and draws them again now and
-//! then.
+//! chaff. Apart from decoys, the rate steps up when real packets have
+//! waited past a random point inside the latency budget, or when real
+//! packets have filled nearly all of the tier for a few seconds. It steps
+//! down slowly (holds of about 1-5 minutes, a usage check, an optional
+//! linger before idle). Decoys are fake backlogs: they climb to a target
+//! tier through the exact same step-up path, then hold a fake busy stretch.
+//! A full tier starts the same climb as a decoy aimed one tier up, so the
+//! two look alike. Each session draws its own secret timing values and
+//! draws them again now and then.
 //!
 //! Plain Rust with no Python types; the PyO3 wrapper lives in `lib.rs`.
 //! Secret values have no getters and never appear in `Debug` output.
@@ -46,6 +48,9 @@ const REPICK_S: (f64, f64) = (600.0, 2400.0);
 const STEP_UP_FRACTION: (f64, f64) = (0.5, 1.0);
 /// Real-sent counts closer together than this (s) share one log entry.
 const USAGE_BUCKET_S: f64 = 0.1;
+/// The same for the full-tier check, which needs a finer clock: at most
+/// 1% of its shortest window.
+const FILL_BUCKET_S: f64 = 0.01;
 /// Slack for the step-up comparison. A real backlog's start is recomputed
 /// as `now - oldest_wait` at every poll, so float rounding can put the
 /// step-up time a hair after the wake meant for it; without slack that
@@ -64,6 +69,14 @@ const USAGE_LIMIT: (f64, f64) = (0.35, 0.65);
 /// log2 of the decoy-mean factor: x0.5 to x2.0, centred on x1.0.
 const DECOY_MEAN_LOG2: (f64, f64) = (-1.0, 1.0);
 const BUSY_MEAN_S: (f64, f64) = (60.0, 360.0);
+/// Full tier: the share of the tier's slots real packets must take...
+const FILL_LIMIT: (f64, f64) = (0.85, 0.95);
+/// ...over this many seconds, all at the current tier.
+const FILL_WINDOW_S: (f64, f64) = (1.0, 3.0);
+/// Step down also when real use is at most this share of the lower tier:
+/// it fits there with room to spare. Below `FILL_LIMIT.0`, so a steady
+/// stream that stepped down does not fill the lower tier and climb back.
+const FIT_LIMIT: (f64, f64) = (0.5, 0.7);
 
 // Config rules (the same limits dsm/core/config.py enforces).
 const TIER_COUNT: (usize, usize) = (2, 8);
@@ -183,6 +196,9 @@ struct Secrets {
     usage_limit: f64,
     decoy_mean_s: f64,
     busy_mean_s: f64,
+    fill_limit: f64,
+    fill_window_s: f64,
+    fit_limit: f64,
 }
 
 impl Secrets {
@@ -198,6 +214,9 @@ impl Secrets {
             usage_limit: uniform(rng, USAGE_LIMIT),
             decoy_mean_s: decoy_interval_s * uniform(rng, DECOY_MEAN_LOG2).exp2(),
             busy_mean_s: uniform(rng, BUSY_MEAN_S),
+            fill_limit: uniform(rng, FILL_LIMIT),
+            fill_window_s: uniform(rng, FILL_WINDOW_S),
+            fit_limit: uniform(rng, FIT_LIMIT),
         }
     }
 }
@@ -209,6 +228,21 @@ fn uniform<R: Rng + ?Sized>(rng: &mut R, (lo, hi): (f64, f64)) -> f64 {
 /// Exponential wait with the given mean: `-mean * ln(u)` with `u` in (0, 1].
 fn exponential<R: Rng + ?Sized>(rng: &mut R, mean: f64) -> f64 {
     -mean * (1.0 - rng.gen::<f64>()).ln()
+}
+
+/// Add `n` real packets sent at `now` to a (time, count) log: counts less
+/// than `bucket` seconds apart share an entry, and entries more than `keep`
+/// seconds old are dropped.
+fn add_to_log(log: &mut VecDeque<(f64, u32)>, now: f64, n: u32, bucket: f64, keep: f64) {
+    if n > 0 {
+        match log.back_mut() {
+            Some((t, count)) if now - *t < bucket => *count = count.saturating_add(n),
+            _ => log.push_back((now, n)),
+        }
+    }
+    while log.front().is_some_and(|(t, _)| now - *t > keep) {
+        log.pop_front();
+    }
 }
 
 fn class_weight(class: u16) -> f64 {
@@ -252,14 +286,21 @@ pub struct Shaper<R> {
     linger_until: Option<f64>,
     step_up_after: f64,
     last_step_up: f64,
-    /// Tier a climbing decoy is heading for, and when its fake backlog began.
+    /// Tier a climb is heading for, and when its fake backlog began. A climb
+    /// is a decoy's or a full tier's; both run the same way.
     decoy_target: Option<usize>,
     decoy_since: f64,
+    /// Whether the climb is a decoy's: only a decoy's ends in a busy stretch.
+    climb_is_decoy: bool,
     busy_until: f64,
     next_decoy: Option<f64>,
     next_repick: f64,
     /// (time, real packets sent) for the step-down usage check.
     real_log: VecDeque<(f64, u32)>,
+    /// When the current tier began, and (time, real packets sent) since
+    /// then, for the full-tier check.
+    tier_since: f64,
+    fill_log: VecDeque<(f64, u32)>,
     active: Vec<u16>,
     cumulative: Vec<f64>,
 }
@@ -302,10 +343,13 @@ impl<R: RngCore + CryptoRng> Shaper<R> {
             last_step_up: f64::NEG_INFINITY,
             decoy_target: None,
             decoy_since: now,
+            climb_is_decoy: false,
             busy_until: f64::NEG_INFINITY,
             next_decoy: None,
             next_repick: now,
             real_log: VecDeque::new(),
+            tier_since: now,
+            fill_log: VecDeque::new(),
             active: Vec::new(),
             cumulative: Vec::new(),
         };
@@ -351,13 +395,16 @@ impl<R: RngCore + CryptoRng> Shaper<R> {
         if self.next_decoy.is_some_and(|t| now >= t) {
             self.start_decoy(now);
         }
+        if self.tier_is_full(now) {
+            self.start_climb(now, self.tier + 1, false);
+        }
         if self
             .step_up_at(now, queue_len, oldest_wait)
             .is_some_and(|at| now + STEP_UP_SLACK_S >= at)
         {
             self.step_up(now);
         }
-        self.end_decoy_climb(now);
+        self.end_climb(now);
         self.maybe_step_down(now);
         let slots_due = self.take_due_slots(now);
         Poll {
@@ -452,13 +499,18 @@ impl<R: RngCore + CryptoRng> Shaper<R> {
 
     /// Every tier change starts a hold of random length.
     fn change_tier(&mut self, tier: usize, now: f64) {
+        if tier != self.tier {
+            // The full-tier check measures one tier at a time.
+            self.tier_since = now;
+            self.fill_log.clear();
+        }
         self.tier = tier;
         let hold = (self.secrets.hold_min_s, self.secrets.hold_max_s);
         self.hold_until = now + uniform(&mut self.rng, hold);
     }
 
     /// Up one tier, or two with the secret overshoot chance, capped at the
-    /// top. Real backlogs and decoys both come through here.
+    /// top. Real backlogs, full tiers and decoys all come through here.
     fn step_up(&mut self, now: f64) {
         let top = self.top();
         if self.tier >= top {
@@ -484,8 +536,8 @@ impl<R: RngCore + CryptoRng> Shaper<R> {
     /// A decoy: a fake backlog that climbs like a real page load. It picks a
     /// target tier (the top with the secret chance, otherwise a random tier
     /// from 1 to the one below the top) and climbs there one step-up point at
-    /// a time through the normal step-up path. One decoy at a time, and none
-    /// starts at the top tier.
+    /// a time through the normal step-up path. One climb at a time, and no
+    /// decoy starts at the top tier.
     fn start_decoy(&mut self, now: f64) {
         let top = self.top();
         if self.tier < top && self.decoy_target.is_none() {
@@ -494,27 +546,61 @@ impl<R: RngCore + CryptoRng> Shaper<R> {
             } else {
                 self.rng.gen_range(1..top)
             };
-            self.decoy_target = Some(target);
-            self.decoy_since = now;
+            self.start_climb(now, target, true);
         }
         self.next_decoy = self.draw_next_decoy(now);
     }
 
-    /// Once a climbing decoy has reached its target, its fake busy stretch
-    /// starts; after that, the normal step-down and linger take over.
-    fn end_decoy_climb(&mut self, now: f64) {
+    /// A fake backlog that begins now and climbs to `target`, one step-up
+    /// point at a time. Decoys and full tiers both start their climbs here,
+    /// so a full tier climbs exactly like a decoy aimed one tier up.
+    fn start_climb(&mut self, now: f64, target: usize, decoy: bool) {
+        self.decoy_target = Some(target);
+        self.decoy_since = now;
+        self.climb_is_decoy = decoy;
+    }
+
+    /// A full tier: over the last `fill_window_s` seconds, all of them at
+    /// this tier, real packets took at least `fill_limit` of the slots the
+    /// tier offers. Measured against the tier's rate, not against the slots
+    /// handed out: their count jitters with the gap spread, which would let
+    /// steady traffic well below the limit look full now and then. Only
+    /// real packets count, so decoys and chaff never fill a tier. Draws
+    /// nothing, so traffic that does not fill the tier leaves the timing
+    /// exactly as it was.
+    fn tier_is_full(&self, now: f64) -> bool {
+        let window = self.secrets.fill_window_s;
+        if self.tier >= self.top() || self.decoy_target.is_some() || now - self.tier_since < window
+        {
+            return false;
+        }
+        let sent = self
+            .fill_log
+            .iter()
+            .filter(|(t, _)| now - *t <= window)
+            .fold(0_u32, |acc, (_, n)| acc.saturating_add(*n));
+        f64::from(sent) >= self.secrets.fill_limit * window * self.rate_of(self.tier)
+    }
+
+    /// Once a climb has reached its target it ends. A decoy's fake busy
+    /// stretch starts then; a full tier needs none, since its real traffic
+    /// keeps the usage up. After that, the normal step-down and linger take
+    /// over.
+    fn end_climb(&mut self, now: f64) {
         if self.decoy_target.is_some_and(|target| self.tier >= target) {
             self.decoy_target = None;
-            let busy = exponential(&mut self.rng, self.secrets.busy_mean_s);
-            self.busy_until = self.busy_until.max(now + busy);
+            if self.climb_is_decoy {
+                let busy = exponential(&mut self.rng, self.secrets.busy_mean_s);
+                self.busy_until = self.busy_until.max(now + busy);
+            }
         }
     }
 
-    /// At a hold end: step down if recent real use is low, else hold again.
-    /// A step from tier 1 to idle lingers at tier 1 first. The linger end
-    /// runs the same usage check: while the link is still in use, or a decoy
-    /// is climbing or busy, it holds at tier 1 again, and the next return to
-    /// idle lingers again.
+    /// At a hold end: step down if recent real use is low or fits the lower
+    /// tier with room to spare, else hold again. A step from tier 1 to idle
+    /// lingers at tier 1 first. The linger end runs the same usage check:
+    /// while the link is still in use, or a decoy is climbing or busy, it
+    /// holds at tier 1 again, and the next return to idle lingers again.
     fn maybe_step_down(&mut self, now: f64) {
         if let Some(end) = self.linger_until {
             if now >= end {
@@ -545,9 +631,11 @@ impl<R: RngCore + CryptoRng> Shaper<R> {
     }
 
     /// usage = real sent in the look-back window / (window x lower tier rate).
+    /// Low below `usage_limit`; at or below `fit_limit` the traffic fits
+    /// the lower tier with room to spare. Either one steps down.
     fn usage_is_low(&self, now: f64) -> bool {
         if self.decoy_target.is_some() || now < self.busy_until {
-            // A decoy climb or busy stretch: usage counts as high.
+            // A climb or a busy stretch: usage counts as high.
             return false;
         }
         let window = self.secrets.lookback_s;
@@ -556,25 +644,14 @@ impl<R: RngCore + CryptoRng> Shaper<R> {
             .iter()
             .filter(|(t, _)| now - *t <= window)
             .fold(0_u32, |acc, (_, n)| acc.saturating_add(*n));
-        f64::from(sent) < self.secrets.usage_limit * window * self.rate_of(self.tier - 1)
+        let sent = f64::from(sent);
+        let lower = window * self.rate_of(self.tier - 1);
+        sent < self.secrets.usage_limit * lower || sent <= self.secrets.fit_limit * lower
     }
 
     fn record_real_sent(&mut self, now: f64, n: u32) {
-        if n > 0 {
-            match self.real_log.back_mut() {
-                Some((t, count)) if now - *t < USAGE_BUCKET_S => {
-                    *count = count.saturating_add(n);
-                }
-                _ => self.real_log.push_back((now, n)),
-            }
-        }
-        while self
-            .real_log
-            .front()
-            .is_some_and(|(t, _)| now - *t > LOOKBACK_S.1)
-        {
-            self.real_log.pop_front();
-        }
+        add_to_log(&mut self.real_log, now, n, USAGE_BUCKET_S, LOOKBACK_S.1);
+        add_to_log(&mut self.fill_log, now, n, FILL_BUCKET_S, FILL_WINDOW_S.1);
     }
 
     /// Draw all secret values again. A running hold, linger or busy stretch
@@ -756,6 +833,15 @@ mod tests {
             now = poll.next_wake;
         }
         trace
+    }
+
+    /// Real-packet arrivals spaced evenly at `rate` per second, from `T0`
+    /// until `end`.
+    fn steady(rate: f64, end: f64) -> Vec<f64> {
+        (0..u32::MAX)
+            .map(|i| T0 + f64::from(i) / rate)
+            .take_while(|&t| t < end)
+            .collect()
     }
 
     /// Every gap between two departures at the same tier, with the same
@@ -1700,26 +1786,21 @@ mod tests {
         }
     }
 
-    // ---- Reproduction of the 2026-10-07 live test. Keep it as a regression
-    // ---- test once the step-up rule is fixed, or drop it with the fix.
-
-    /// REPRODUCTION (live test 2026-10-07): a download from a sender that
-    /// adapts to the rate it gets, as TCP does, fills nearly every slot of
-    /// tier 2 for 30 s, yet the rate never steps up.
+    /// Live test 2026-10-07: a download from a sender that adapts to the
+    /// rate it gets, as TCP does, fills nearly every slot of tier 2, and the
+    /// rate must step up.
     ///
-    /// The step-up rule only looks at how long the oldest queued packet has
-    /// waited (0.25-0.5 s at the 0.5 s budget). An adaptive sender never lets
-    /// the queue get that long: it only puts more packets in flight when
-    /// earlier ones have been delivered. Here it keeps twice the delivered
-    /// rate times the round trip in flight (the in-flight cap BBR uses), so
-    /// about one round trip of packets waits in the queue: 0.1 s, well under
-    /// the step-up point. On the wire this matches the capture: ~99% of the
-    /// tier 2 slots carried real data for 37 s and the rate stayed at tier 2.
-    ///
-    /// Fails today (the rate stays at tier 2). It passes once a full tier
-    /// counts as demand.
+    /// The wait rule alone never fires here. It only looks at how long the
+    /// oldest queued packet has waited (0.25-0.5 s at the 0.5 s budget), and
+    /// an adaptive sender never lets the queue get that long: it only puts
+    /// more packets in flight when earlier ones have been delivered. Here it
+    /// keeps twice the delivered rate times the round trip in flight (the
+    /// in-flight cap BBR uses), so about one round trip of packets waits in
+    /// the queue: 0.1 s, well under the step-up point. On the wire this
+    /// matches the capture: ~99% of the tier 2 slots carried real data for
+    /// 37 s and the rate stayed at tier 2. The full-tier rule climbs.
     #[test]
-    fn repro_an_adaptive_download_that_fills_a_tier_steps_up() {
+    fn an_adaptive_download_that_fills_a_tier_steps_up() {
         // Round trip outside the shaper queue (s): link, far end and the
         // other side's slot wait. The in-tunnel round trip in the live test
         // was about 0.03-0.05 s under load.
@@ -1784,10 +1865,234 @@ mod tests {
                 3,
                 "seed {seed}: real packets took {:.1}% of the slots for 30 s and the \
                  oldest one waited at most {longest_wait:.3} s (step-up point 0.25-0.5 s), \
-                 but the rate ended at tier {} instead of the top",
+                 and the rate ended at tier {} instead of the top",
                 100.0 * f64::from(real) / f64::from(slots),
                 s.tier
             );
+        }
+    }
+
+    /// A tier that real packets keep full for the secret window climbs one
+    /// tier through the decoy climb: one step-up point after the trigger,
+    /// one tier or two (overshoot), then a hold. A decoy aimed at the same
+    /// tier from the same moment makes the very same step: same time, same
+    /// tier, same hold. Still full, it climbs again, but only after a whole
+    /// window at the new tier. The sender keeps one fresh packet queued, so
+    /// every slot carries real data but none waits long enough for the wait
+    /// rule.
+    #[test]
+    fn a_full_tier_climbs_like_a_decoy_aimed_one_tier_up() {
+        for seed in 0..30 {
+            let mut real = shaper(cfg(), seed);
+            let mut decoy = shaper(cfg(), seed);
+            for s in [&mut real, &mut decoy] {
+                // A re-pick would redraw the window mid-test.
+                s.next_repick = f64::INFINITY;
+                s.change_tier(1, T0);
+            }
+            let window = real.secrets.fill_window_s;
+            let point = real.step_up_after;
+            let (mut now, mut sent) = (T0, 0_u32);
+            let mut trigger = None;
+            let mut stepped = None;
+            while stepped.is_none() {
+                assert!(now < T0 + 10.0, "seed {seed}: the full tier never climbed");
+                let poll = real.poll(now, 1, 0.001, sent);
+                sent = poll.slots_due;
+                let quiet = decoy.poll(now, 0, 0.0, 0);
+                if trigger.is_none() && real.decoy_target.is_some() {
+                    assert_eq!(real.decoy_target, Some(2), "seed {seed}: one tier up");
+                    trigger = Some(now);
+                    // The decoy climb, from the same moment to the same tier.
+                    decoy.start_climb(now, 2, true);
+                }
+                if real.tier != 1 {
+                    stepped = Some(now);
+                }
+                now = poll.next_wake.min(quiet.next_wake);
+            }
+            let trigger = trigger.expect("a climb started");
+            let stepped = stepped.expect("a step");
+            assert!(
+                trigger >= T0 + window,
+                "seed {seed}: full before a whole window"
+            );
+            assert!(
+                (stepped - (trigger + point)).abs() < 1e-9,
+                "seed {seed}: stepped {} s after the trigger, not one point ({point} s)",
+                stepped - trigger
+            );
+            assert!(real.tier == 2 || real.tier == 3, "one tier, or two");
+            assert_eq!(
+                decoy.tier, real.tier,
+                "seed {seed}: the decoy stepped elsewhere"
+            );
+            assert_eq!(decoy.hold_until.to_bits(), real.hold_until.to_bits());
+            let hold = real.hold_until - stepped;
+            assert!((real.secrets.hold_min_s..=real.secrets.hold_max_s).contains(&hold));
+            // Both climbs are over; only the decoy fakes a busy stretch.
+            assert!(real.decoy_target.is_none() && decoy.decoy_target.is_none());
+            assert!(
+                real.busy_until < T0,
+                "seed {seed}: a busy stretch after a real climb"
+            );
+            assert!(decoy.busy_until > stepped);
+            if real.tier == 2 {
+                let mut again = None;
+                while real.tier == 2 {
+                    assert!(now < stepped + 10.0, "seed {seed}: no second climb");
+                    let poll = real.poll(now, 1, 0.001, sent);
+                    sent = poll.slots_due;
+                    if again.is_none() && real.decoy_target.is_some() {
+                        assert_eq!(real.decoy_target, Some(3));
+                        again = Some(now);
+                    }
+                    now = poll.next_wake;
+                }
+                let again = again.expect("a second climb");
+                assert!(
+                    again >= stepped + window,
+                    "seed {seed}: climbed again before a whole window at tier 2"
+                );
+                assert_eq!(real.tier, 3);
+            }
+        }
+    }
+
+    /// Steady real traffic that takes 60-70% of the tier's slots for ten
+    /// minutes never fills it: it never climbs, and every send time is the
+    /// same as with the full-tier rule switched off.
+    #[test]
+    fn traffic_below_the_full_limit_never_climbs_or_moves_send_times() {
+        let end = T0 + 600.0;
+        for (seed, tier, share) in [(61, 1, 0.6), (62, 1, 0.7), (63, 2, 0.6), (64, 2, 0.7)] {
+            let start = |off: bool| {
+                let mut s = shaper(cfg(), seed);
+                // A re-pick would redraw the switched-off limit.
+                s.next_repick = f64::INFINITY;
+                if off {
+                    s.secrets.fill_limit = f64::INFINITY;
+                }
+                s.change_tier(tier, T0);
+                s
+            };
+            let (mut on, mut off) = (start(false), start(true));
+            let rate = share * on.rate_of(tier);
+            let arrivals = steady(rate, end);
+            let with_rule = simulate(&mut on, T0, &arrivals, end);
+            let without = simulate(&mut off, T0, &arrivals, end);
+            assert!(
+                with_rule.tier_changes.is_empty(),
+                "seed {seed}: {share} of tier {tier} changed the tier"
+            );
+            assert_eq!(with_rule.times(), without.times());
+            let used = count(with_rule.real_count()) / count(with_rule.departures.len());
+            assert!((used - share).abs() < 0.02, "seed {seed}: used {used}");
+        }
+    }
+
+    /// Softening: at a hold end the rate also steps down when real use fits
+    /// the lower tier with room to spare, above the old usage limit. With the
+    /// live test's tiers, a steady stream at about a quarter to a third of
+    /// the top tier fits tier 2: it steps down at the first hold end and
+    /// stays there. At tier 2 it takes at most 70% of the slots, below any
+    /// full-tier limit, so it never climbs back. With only the old limit
+    /// (here at its lowest) it would have stayed at the top.
+    #[test]
+    fn a_stream_that_fits_the_lower_tier_steps_down_and_stays() {
+        let end = T0 + 1000.0;
+        for seed in 0..10 {
+            let start = |fit: bool| {
+                let mut s = shaper(with(|c| c.tiers_pps = vec![10.0, 50.0, 200.0, 400.0]), seed);
+                // A re-pick would redraw the limits set here.
+                s.next_repick = f64::INFINITY;
+                s.secrets.usage_limit = USAGE_LIMIT.0;
+                if !fit {
+                    s.secrets.fit_limit = 0.0;
+                }
+                s.change_tier(3, T0);
+                s
+            };
+            let (mut soft, mut old) = (start(true), start(false));
+            let hold_end = soft.hold_until;
+            let rate = 0.95 * soft.secrets.fit_limit * soft.rate_of(2);
+            let arrivals = steady(rate, end);
+            let softened = simulate(&mut soft, T0, &arrivals, end);
+            assert_eq!(softened.tier_changes.len(), 1, "seed {seed}: flapped");
+            let (at, tier) = softened.tier_changes[0];
+            assert_eq!(tier, 2, "seed {seed}");
+            assert!((at - hold_end).abs() < 1e-9, "seed {seed}: stepped at {at}");
+            assert!(
+                softened.waits.iter().all(|&w| w < 0.25),
+                "seed {seed}: tier 2 did not carry the stream"
+            );
+            let unsoftened = simulate(&mut old, T0, &arrivals, end);
+            assert!(unsoftened.tier_changes.is_empty(), "seed {seed}");
+        }
+    }
+
+    /// Decoys and chaff never fill a tier: only real packets count. Two
+    /// hours of decoys with no real traffic run exactly as with the
+    /// full-tier rule switched off: every poll gives the same answer.
+    #[test]
+    fn decoys_alone_never_fill_a_tier() {
+        let edit: Edit = |c| {
+            c.decoy_interval_s = 300.0;
+            c.linger_s = (300.0, 600.0);
+        };
+        let end = T0 + 2.0 * 3600.0;
+        for seed in 0..3 {
+            let start = |off: bool| {
+                let mut s = shaper(with(edit), seed);
+                // A re-pick would redraw the switched-off limit.
+                s.next_repick = f64::INFINITY;
+                if off {
+                    s.secrets.fill_limit = f64::INFINITY;
+                }
+                s
+            };
+            let (mut on, mut off) = (start(false), start(true));
+            let (mut now, mut tier, mut climbs) = (T0, 0, 0);
+            while now <= end {
+                let poll = on.poll(now, 0, 0.0, 0);
+                assert_eq!(
+                    poll,
+                    off.poll(now, 0, 0.0, 0),
+                    "seed {seed}: parted at {now}"
+                );
+                assert_eq!(on.tier, off.tier);
+                if on.tier > tier {
+                    climbs += 1;
+                }
+                tier = on.tier;
+                now = poll.next_wake;
+            }
+            assert!(climbs >= 4, "seed {seed}: decoys ran");
+        }
+    }
+
+    #[test]
+    fn full_tier_and_fit_secrets_stay_in_range_and_differ_per_session() {
+        let mut draws: [Vec<u64>; 3] = Default::default();
+        for seed in 0..200 {
+            let s = shaper(cfg(), seed);
+            let k = &s.secrets;
+            assert!((0.85..=0.95).contains(&k.fill_limit));
+            assert!((1.0..=3.0).contains(&k.fill_window_s));
+            assert!((0.5..=0.7).contains(&k.fit_limit));
+            // What fits the lower tier can never fill it.
+            assert!(k.fit_limit < k.fill_limit);
+            for (all, value) in draws
+                .iter_mut()
+                .zip([k.fill_limit, k.fill_window_s, k.fit_limit])
+            {
+                all.push(value.to_bits());
+            }
+        }
+        for mut all in draws {
+            all.sort_unstable();
+            all.dedup();
+            assert_eq!(all.len(), 200, "two sessions drew the same value");
         }
     }
 }

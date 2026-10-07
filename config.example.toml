@@ -148,12 +148,17 @@ padding_max = 1400
 # Packets leave at a steady rate that only changes in a few fixed steps
 # ("tiers"). Your real packets take free places in that flow; fake packets
 # (chaff) fill the rest. Apart from decoys (below), the rate goes up a step
-# only when real packets have waited too long, and comes down slowly: after
-# each change it does not come down for about 1 to 5 minutes (it can still go
-# up). Now and then a fake busy period (a "decoy") climbs and comes down the
-# same way, like a page load. Each session also picks its own secret timing
-# values and changes them every 10-40 minutes. All four keys are optional.
-# Both ends ship the same defaults; each end shapes only what it sends.
+# when real packets have waited too long, or when they have filled nearly
+# all of the tier for 1-3 seconds (a download that slows down to the speed
+# it gets, as TCP does, never waits long). That second climb runs exactly
+# like a decoy aimed one tier up. The rate comes down slowly: after each
+# change it does not come down for about 1 to 5 minutes (it can still go
+# up), and then only when your use would fit the lower tier with room to
+# spare. Now and then a fake busy period (a "decoy") climbs and comes down
+# the same way, like a page load. Each session also picks its own secret
+# timing values and changes them every 10-40 minutes. All four keys are
+# optional. Both ends ship the same defaults; each end shapes only what it
+# sends.
 #
 # What it costs, per direction (padding only, not your real traffic):
 #   * connected all day, no use, decoys on: about 3 GB a day
@@ -161,6 +166,9 @@ padding_max = 1400
 #   * each decoy: about 0.2 GB (climb, busy stretch, slow step-down, linger)
 #   * after using the top tier: the top for 1-5 minutes, then a few minutes
 #     per lower tier, then 5-30 minutes at tier 1 (about 0.15 GB)
+#   * a download or stream that fills a tier climbs a tier and pays that
+#     tier's padding while it runs: at the top up to about 1.8 GB an hour,
+#     less the places your own traffic takes
 #   * top speed (800 packets/s at the default top tier): about 7-10 Mbit/s
 #     at the default mtu = 1360 (less for a smaller mtu). Above 1360 each
 #     full-size packet is split in two, which halves it to about 3.6-5.4

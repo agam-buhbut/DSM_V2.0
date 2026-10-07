@@ -3,10 +3,10 @@
 The tier shaper core (``tuncore.Shaper``, rust/tuncore/src/shaper.rs) decides
 WHEN packets leave and HOW BIG they are. Packets leave at a steady rate that
 only changes in a few fixed steps ("tiers"); real packets take free slots and
-chaff fills the rest. Apart from decoys, the rate steps up only when real
-packets have waited too long, and it steps down slowly; decoys imitate real
-busy periods; every session picks its own secret timing values, which Python
-cannot read.
+chaff fills the rest. Apart from decoys, the rate steps up when real packets
+have waited too long or have filled nearly all of the tier for a few seconds,
+and it steps down slowly; decoys imitate real busy periods; every session
+picks its own secret timing values, which Python cannot read.
 
 This module only builds packet bytes. Real and chaff packets get their size
 from the same fixed, published size mix (``SIZE_CLASS_WEIGHTS``): a real

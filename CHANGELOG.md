@@ -83,6 +83,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   DSM runs and gets a new tag after a restart.
 
 ### Fixed
+- A download that slows down to the speed it gets (as TCP does) no longer
+  stays at a low tier for its whole length. Its packets never waited long
+  enough to step the rate up: in a live test a 50 MB download stayed at
+  about 1.8 Mbit/s. Now, when real packets fill nearly all of a tier for 1
+  to 3 seconds, the rate climbs one tier, the same way a decoy aimed one
+  tier up climbs. The rate also steps down when your use would fit the
+  lower tier with room to spare, so steady use that fits a lower tier does
+  not stay at the top.
 - On a host with strict reverse-path filtering, the client no longer cuts
   itself off from its own local network: ARP requests from the router (or a
   DSM server on the same network) were dropped, so incoming traffic stopped

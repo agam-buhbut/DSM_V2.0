@@ -307,16 +307,28 @@ that goes first, so a full queue of data never holds them up or drops them.
 Only the goodbye message at shutdown goes straight out.
 
 **Going up and coming down.** Apart from decoys (below), DSM moves up a
-tier only when your real packets have waited too long: by default, a
-random point between 0.25 and 0.5 seconds. Now and then it jumps two tiers
-at once. It comes down slowly. After every change it does not come down
-for about 1 to 5 minutes (it can still go up). Then it steps down only if,
-over the last 5 to 15 seconds, you used less than about half of what the
-lower tier can carry. So coming down from the top takes several minutes
-per tier. Before it drops back to idle, it stays one step up for a while
-longer: 5 to 30 minutes by default. When that time is up, it checks your
-use again. If you are still using the link, it stays one step up, and the
-next drop to idle waits again.
+tier for one of two reasons. The first: your real packets have waited too
+long, by default a random point between 0.25 and 0.5 seconds. The second:
+your real packets have filled nearly all of the tier for a few seconds
+(each session picks how full, 85 to 95%, and how long, 1 to 3 seconds).
+The second one is for downloads that slow down to the speed they get, as
+TCP does: their packets never wait long, so the first reason never comes,
+and before this change such a download could stay at a low tier for its
+whole length. This climb goes one tier and runs exactly like a decoy that
+aims one tier up, so a watcher cannot tell such a step from a decoy's. If
+the tier above fills up too, it climbs again. Now and then a step jumps two
+tiers at once.
+
+It comes down slowly. After every change it does not come down for about
+1 to 5 minutes (it can still go up). Then it steps down if, over the last
+5 to 15 seconds, your use would fit in the lower tier with room to spare:
+at most about half to 70% of what the lower tier can carry (each
+session picks its own limit). Use between that and a full tier keeps the
+tier where it is, so steady use does not bounce up and down. So coming down
+from the top takes several minutes per tier. Before it drops back to idle,
+it stays one step up for a while longer: 5 to 30 minutes by default. When
+that time is up, it checks your use again. If you are still using the link,
+it stays one step up, and the next drop to idle waits again.
 
 **Fake busy periods.** Now and then DSM pretends to be busy. These "decoys"
 climb the way a real page load does. Each one picks a tier to reach: the
@@ -332,8 +344,9 @@ average, between 1 and 4 hours).
 **Secret numbers.** Every session secretly picks its own timing values:
 how fast each tier really is (within 20% of the set value), how uneven the
 gaps between packets are, how often it jumps two tiers, how long it waits
-before coming down, how it judges your use, how often decoys come and how
-often they go to the top. It picks new values every 10 to 40 minutes. So
+before coming down, how it judges your use (when a tier counts as full, and
+when your use fits the tier below), how often decoys come and how often
+they go to the top. It picks new values every 10 to 40 minutes. So
 reading this code does not tell a watcher the numbers your session uses.
 
 **Sizes.** Real and fake packets are padded to sizes from the same fixed
@@ -354,6 +367,7 @@ traffic):
 | Connected all day, about 20 bursts of real use | about 6 GB a day |
 | Each decoy | about 0.2 GB (the climb, the busy stretch, the slow step-down and the wait before idle) |
 | After using the top tier | the top tier for 1 to 5 minutes, then a few minutes per lower tier, then 5 to 30 minutes at tier 1 (about 0.15 GB) |
+| A download or stream that fills a tier | it climbs a tier and pays that tier's padding while it runs: at the top tier up to about 1.8 GB an hour, less the places your own traffic takes |
 | Top speed | about 7 to 10 Mbit/s at the default `mtu = 1360` (less for a smaller `mtu`). One DSM packet carries at most 1360 bytes, so with a larger `mtu` each full-size packet is split in two, which halves it to about 3.6 to 5.4 Mbit/s |
 | When a burst starts | about 0.5 to 1.5 seconds of extra wait while the pace steps up |
 
@@ -371,6 +385,9 @@ server:
 - that you use DSM at all;
 - roughly how much you send: a watcher sees which tier you are on, and a
   long download keeps the rate up for as long as it runs;
+- whether a climb was real when your use fills one tier after another:
+  those steps come a few seconds apart, while a decoy's steps come less
+  than half a second apart;
 - the packet counter at the start of every packet. It is not encrypted, and
   it links your traffic across port changes. (A fix is planned.)
 - anything from someone who watches both your link and your server's own
