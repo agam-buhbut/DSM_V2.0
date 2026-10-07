@@ -309,22 +309,25 @@ Only the goodbye message at shutdown goes straight out.
 **Going up and coming down.** Apart from decoys (below), DSM moves up a
 tier for one of two reasons. The first: your real packets have waited too
 long, by default a random point between 0.25 and 0.5 seconds. The second:
-your real packets have filled nearly all of the tier for a few seconds
-(each session picks how full, 85 to 95%, and how long, 1 to 3 seconds).
-The second one is for downloads that slow down to the speed they get, as
-TCP does: their packets never wait long, so the first reason never comes,
-and before this change such a download could stay at a low tier for its
-whole length. This climb goes one tier and runs exactly like a decoy that
-aims one tier up, so a watcher cannot tell such a step from a decoy's. If
-the tier above fills up too, it climbs again. Now and then a step jumps two
-tiers at once.
+your real packets have filled nearly all of the tier for a few seconds.
+Each session picks how full (85 to 95%) and how long (1 to 3 seconds, but
+always long enough for at least 200 free places, so 3 to 5 seconds at tier
+1 and longer at idle). The second one is for downloads that slow down to
+the speed they get, as TCP does: their packets never wait long, so the
+first reason never comes. This climb goes one tier and runs exactly like a
+decoy that aims one tier up, so on its own, a watcher cannot tell such a
+step from a decoy's (but see the steps a few seconds apart under "What it
+does not hide"). If the tier above fills up too, it climbs again. Now and
+then a step jumps two tiers at once.
 
 It comes down slowly. After every change it does not come down for about
 1 to 5 minutes (it can still go up). Then it steps down if, over the last
 5 to 15 seconds, your use would fit in the lower tier with room to spare:
 at most about half to 70% of what the lower tier can carry (each
 session picks its own limit). Use between that and a full tier keeps the
-tier where it is, so steady use does not bounce up and down. So coming down
+tier where it is, so evenly spaced use does not bounce up and down. Use
+that comes in bursts can still climb on a long burst and come back down at
+the end of a hold, now and then. So coming down
 from the top takes several minutes per tier. Before it drops back to idle,
 it stays one step up for a while longer: 5 to 30 minutes by default. When
 that time is up, it checks your use again. If you are still using the link,
@@ -369,7 +372,7 @@ traffic):
 | After using the top tier | the top tier for 1 to 5 minutes, then a few minutes per lower tier, then 5 to 30 minutes at tier 1 (about 0.15 GB) |
 | A download or stream that fills a tier | it climbs a tier and pays that tier's padding while it runs: at the top tier up to about 1.8 GB an hour, less the places your own traffic takes |
 | Top speed | about 7 to 10 Mbit/s at the default `mtu = 1360` (less for a smaller `mtu`). One DSM packet carries at most 1360 bytes, so with a larger `mtu` each full-size packet is split in two, which halves it to about 3.6 to 5.4 Mbit/s |
-| When a burst starts | about 0.5 to 1.5 seconds of extra wait while the pace steps up |
+| When a burst starts | about 0.5 to 1.5 seconds of extra wait while the pace steps up. A download that paces itself to the speed it gets (TCP) needs about 2 to 5 seconds per tier instead |
 
 **What it hides** from someone watching the link between you and your
 server:
@@ -385,9 +388,11 @@ server:
 - that you use DSM at all;
 - roughly how much you send: a watcher sees which tier you are on, and a
   long download keeps the rate up for as long as it runs;
-- whether a climb was real when your use fills one tier after another:
-  those steps come a few seconds apart, while a decoy's steps come less
-  than half a second apart;
+- whether a climb was real when a full-tier step comes a few seconds after
+  another step up, for example when a download starts from idle or fills
+  one tier after another. A decoy's steps come half to one latency budget
+  apart (0.25 to 0.5 seconds by default) and never pause like that, so such
+  a climb is almost surely real;
 - the packet counter at the start of every packet. It is not encrypted, and
   it links your traffic across port changes. (A fix is planned.)
 - anything from someone who watches both your link and your server's own

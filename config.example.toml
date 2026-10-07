@@ -149,16 +149,16 @@ padding_max = 1400
 # ("tiers"). Your real packets take free places in that flow; fake packets
 # (chaff) fill the rest. Apart from decoys (below), the rate goes up a step
 # when real packets have waited too long, or when they have filled nearly
-# all of the tier for 1-3 seconds (a download that slows down to the speed
-# it gets, as TCP does, never waits long). That second climb runs exactly
-# like a decoy aimed one tier up. The rate comes down slowly: after each
-# change it does not come down for about 1 to 5 minutes (it can still go
-# up), and then only when your use would fit the lower tier with room to
-# spare. Now and then a fake busy period (a "decoy") climbs and comes down
-# the same way, like a page load. Each session also picks its own secret
-# timing values and changes them every 10-40 minutes. All four keys are
-# optional. Both ends ship the same defaults; each end shapes only what it
-# sends.
+# all of the tier for a few seconds (1-3 s, and at least 200 free places:
+# 3-5 s at tier 1). A download that slows down to the speed it gets, as TCP
+# does, never waits long. That second climb runs exactly like a decoy aimed
+# one tier up. The rate comes down slowly: after each change it does not
+# come down for about 1 to 5 minutes (it can still go up), and then only
+# when your use would fit the lower tier with room to spare. Now and then a
+# fake busy period (a "decoy") climbs and comes down the same way, like a
+# page load. Each session also picks its own secret timing values and
+# changes them every 10-40 minutes. All four keys are optional. Both ends
+# ship the same defaults; each end shapes only what it sends.
 #
 # What it costs, per direction (padding only, not your real traffic):
 #   * connected all day, no use, decoys on: about 3 GB a day
@@ -173,6 +173,7 @@ padding_max = 1400
 #     at the default mtu = 1360 (less for a smaller mtu). Above 1360 each
 #     full-size packet is split in two, which halves it to about 3.6-5.4
 #   * when a burst starts: about 0.5-1.5 s of extra wait while it steps up
+#     (a download that paces itself, as TCP does: about 2-5 s per tier)
 #
 # Rates in packets per second, lowest first: 2-8 entries, each 1-5000, each
 # higher than the one before. The first one is the idle rate. It must be

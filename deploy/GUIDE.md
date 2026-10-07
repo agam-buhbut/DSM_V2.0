@@ -1677,7 +1677,9 @@ or prctl(PR_SET_DUMPABLE) didn't stick. Usually one of:
   Lower `mtu` in both configs until the warning is gone, OR set
   `auto_mtu = true` + `pmtu_discover = true` on the client.
 - The tier shaper adds wait by design. When a burst starts, packets
-  wait about 0.5 to 1.5 seconds while the rate steps up, and with the
+  wait about 0.5 to 1.5 seconds while the rate steps up (a download that
+  paces itself to the speed it gets, as TCP does, needs about 2 to 5
+  seconds per tier), and with the
   defaults the top tier caps speed at about 7 to 10 Mbit/s (less for a
   smaller `mtu`). One DSM packet carries at most 1360 bytes, so with `mtu`
   above 1360 each full-size packet is split in two and the cap halves to

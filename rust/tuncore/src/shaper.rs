@@ -71,8 +71,20 @@ const DECOY_MEAN_LOG2: (f64, f64) = (-1.0, 1.0);
 const BUSY_MEAN_S: (f64, f64) = (60.0, 360.0);
 /// Full tier: the share of the tier's slots real packets must take...
 const FILL_LIMIT: (f64, f64) = (0.85, 0.95);
-/// ...over this many seconds, all at the current tier.
+/// ...over this many seconds, all at the current tier and secret values...
 const FILL_WINDOW_S: (f64, f64) = (1.0, 3.0);
+/// ...but never over fewer than this many of the tier's slots. Real traffic
+/// comes in bursts, and a short window lets a burst look like a full tier:
+/// with the 40-60 slots of one second at tier 1, random arrivals averaging
+/// 60% of the tier climbed in most sessions within minutes. Measured over
+/// 200 ten-minute sessions at tier 1: with a 150-slot floor that load still
+/// climbed in 4% of them, with 200 in none; at 65% it climbed in 8%, about
+/// as often as the wait rule climbs on that load. Tiers 2 and up have 160 or
+/// more slots in the shortest window, so they barely change; a full tier 1
+/// climbs after 3.3-5 s instead of 1-3 s. It also takes at least 170 real
+/// packets to climb from tier 0, so lone packets never climb, however slow
+/// the first tier is.
+const FILL_MIN_SLOTS: f64 = 200.0;
 /// Step down also when real use is at most this share of the lower tier:
 /// it fits there with room to spare. Below `FILL_LIMIT.0`, so a steady
 /// stream that stepped down does not fill the lower tier and climb back.
@@ -297,8 +309,8 @@ pub struct Shaper<R> {
     next_repick: f64,
     /// (time, real packets sent) for the step-down usage check.
     real_log: VecDeque<(f64, u32)>,
-    /// When the current tier began, and (time, real packets sent) since
-    /// then, for the full-tier check.
+    /// When the full-tier check started over (the last tier change or
+    /// secret re-pick), and (time, real packets sent) since then.
     tier_since: f64,
     fill_log: VecDeque<(f64, u32)>,
     active: Vec<u16>,
@@ -500,9 +512,7 @@ impl<R: RngCore + CryptoRng> Shaper<R> {
     /// Every tier change starts a hold of random length.
     fn change_tier(&mut self, tier: usize, now: f64) {
         if tier != self.tier {
-            // The full-tier check measures one tier at a time.
-            self.tier_since = now;
-            self.fill_log.clear();
+            self.restart_fill_check(now);
         }
         self.tier = tier;
         let hold = (self.secrets.hold_min_s, self.secrets.hold_max_s);
@@ -560,16 +570,34 @@ impl<R: RngCore + CryptoRng> Shaper<R> {
         self.climb_is_decoy = decoy;
     }
 
-    /// A full tier: over the last `fill_window_s` seconds, all of them at
-    /// this tier, real packets took at least `fill_limit` of the slots the
-    /// tier offers. Measured against the tier's rate, not against the slots
-    /// handed out: their count jitters with the gap spread, which would let
-    /// steady traffic well below the limit look full now and then. Only
-    /// real packets count, so decoys and chaff never fill a tier. Draws
-    /// nothing, so traffic that does not fill the tier leaves the timing
-    /// exactly as it was.
+    /// How long a tier must stay full before it climbs: the secret window,
+    /// stretched to at least `FILL_MIN_SLOTS` of the tier's slots. As the
+    /// check starts over at every tier change, this is also the shortest
+    /// time from a step to a full-tier climb from the new tier.
+    fn fill_window(&self) -> f64 {
+        self.secrets
+            .fill_window_s
+            .max(FILL_MIN_SLOTS / self.rate_of(self.tier))
+    }
+
+    /// Start the full-tier check over, so that one window never mixes two
+    /// tiers or two sets of secret values (a re-pick changes the rate, and
+    /// packets sent at the old rate would be measured against the new one).
+    fn restart_fill_check(&mut self, now: f64) {
+        self.tier_since = now;
+        self.fill_log.clear();
+    }
+
+    /// A full tier: over the last `fill_window()` seconds, all of them at
+    /// this tier and these secret values, real packets took at least
+    /// `fill_limit` of the slots the tier offers. Measured against the
+    /// tier's rate, not against the slots handed out: their count jitters
+    /// with the gap spread, which would let steady traffic well below the
+    /// limit look full now and then. Only real packets count, so decoys and
+    /// chaff never fill a tier. Draws nothing, so traffic that does not fill
+    /// the tier leaves the timing exactly as it was.
     fn tier_is_full(&self, now: f64) -> bool {
-        let window = self.secrets.fill_window_s;
+        let window = self.fill_window();
         if self.tier >= self.top() || self.decoy_target.is_some() || now - self.tier_since < window
         {
             return false;
@@ -651,16 +679,21 @@ impl<R: RngCore + CryptoRng> Shaper<R> {
 
     fn record_real_sent(&mut self, now: f64, n: u32) {
         add_to_log(&mut self.real_log, now, n, USAGE_BUCKET_S, LOOKBACK_S.1);
-        add_to_log(&mut self.fill_log, now, n, FILL_BUCKET_S, FILL_WINDOW_S.1);
+        // The window only changes at a tier change or re-pick, which clear
+        // this log, so keeping one window's worth loses nothing.
+        let keep = self.fill_window();
+        add_to_log(&mut self.fill_log, now, n, FILL_BUCKET_S, keep);
     }
 
     /// Draw all secret values again. A running hold, linger or busy stretch
     /// keeps its end time; the next decoy is re-timed with the new mean
     /// (exponential waits are memoryless, so this does not bias the rate).
+    /// The full-tier check starts over.
     fn repick(&mut self, now: f64) {
         self.secrets = Secrets::draw(&mut self.rng, self.cfg.decoy_interval_s);
         self.next_repick = now + uniform(&mut self.rng, REPICK_S);
         self.next_decoy = self.draw_next_decoy(now);
+        self.restart_fill_check(now);
     }
 
     fn take_due_slots(&mut self, now: f64) -> u32 {
@@ -842,6 +875,20 @@ mod tests {
             .map(|i| T0 + f64::from(i) / rate)
             .take_while(|&t| t < end)
             .collect()
+    }
+
+    /// Real-packet arrivals at random times (a Poisson stream, as bursty as
+    /// independent arrivals get), `rate` per second on average, from `T0`
+    /// until `end`. The same `seed` gives the same arrivals.
+    fn random_arrivals(rate: f64, end: f64, seed: u64) -> Vec<f64> {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut arrivals = Vec::new();
+        let mut t = T0 + exponential(&mut rng, 1.0 / rate);
+        while t < end {
+            arrivals.push(t);
+            t += exponential(&mut rng, 1.0 / rate);
+        }
+        arrivals
     }
 
     /// Every gap between two departures at the same tier, with the same
@@ -1890,7 +1937,7 @@ mod tests {
                 s.next_repick = f64::INFINITY;
                 s.change_tier(1, T0);
             }
-            let window = real.secrets.fill_window_s;
+            let window = real.fill_window();
             let point = real.step_up_after;
             let (mut now, mut sent) = (T0, 0_u32);
             let mut trigger = None;
@@ -1938,6 +1985,7 @@ mod tests {
             );
             assert!(decoy.busy_until > stepped);
             if real.tier == 2 {
+                let window = real.fill_window();
                 let mut again = None;
                 while real.tier == 2 {
                     assert!(now < stepped + 10.0, "seed {seed}: no second climb");
@@ -2093,6 +2141,140 @@ mod tests {
             all.sort_unstable();
             all.dedup();
             assert_eq!(all.len(), 200, "two sessions drew the same value");
+        }
+    }
+
+    /// Bursty real traffic: random arrivals averaging 60% of tier 1 or 2
+    /// for ten minutes. Bursts push single seconds well past the full limit,
+    /// but not a whole window of at least 200 slots, so the full-tier rule
+    /// never fires: every tier change and send time is the same as with the
+    /// rule switched off. (With one-second windows at tier 1 it fired in most
+    /// sessions.)
+    #[test]
+    fn random_traffic_below_the_full_limit_never_climbs_by_the_full_rule() {
+        let end = T0 + 600.0;
+        for tier in [1, 2] {
+            for seed in 0..10 {
+                let start = |off: bool| {
+                    let mut s = shaper(cfg(), seed);
+                    // A re-pick would redraw the switched-off limit.
+                    s.next_repick = f64::INFINITY;
+                    if off {
+                        s.secrets.fill_limit = f64::INFINITY;
+                    }
+                    s.change_tier(tier, T0);
+                    s
+                };
+                let (mut on, mut off) = (start(false), start(true));
+                let arrivals = random_arrivals(0.6 * on.rate_of(tier), end, 500 + seed);
+                let with_rule = simulate(&mut on, T0, &arrivals, end);
+                let without = simulate(&mut off, T0, &arrivals, end);
+                assert_eq!(
+                    with_rule.tier_changes, without.tier_changes,
+                    "seed {seed}: 60% of tier {tier} climbed by the full rule"
+                );
+                assert_eq!(with_rule.times(), without.times());
+            }
+        }
+    }
+
+    /// The softening with bursty traffic: a random stream that fits tier 2
+    /// with room to spare (live test tiers) steps down from the top at the
+    /// first hold end and stays at tier 2 for the rest of the run. The old
+    /// usage limit is switched off here, so only the fit limit can step it
+    /// down; with that off too, it stays at the top.
+    #[test]
+    fn a_random_stream_that_fits_the_lower_tier_steps_down_and_stays() {
+        let end = T0 + 1000.0;
+        for seed in 0..10 {
+            let start = |fit: bool| {
+                let mut s = shaper(with(|c| c.tiers_pps = vec![10.0, 50.0, 200.0, 400.0]), seed);
+                // A re-pick would redraw the limits set here.
+                s.next_repick = f64::INFINITY;
+                s.secrets.usage_limit = 0.0;
+                if !fit {
+                    s.secrets.fit_limit = 0.0;
+                }
+                s.change_tier(3, T0);
+                s
+            };
+            let (mut soft, mut stuck) = (start(true), start(false));
+            let hold_end = soft.hold_until;
+            let rate = 0.8 * soft.secrets.fit_limit * soft.rate_of(2);
+            let arrivals = random_arrivals(rate, end, 700 + seed);
+            let softened = simulate(&mut soft, T0, &arrivals, end);
+            assert_eq!(softened.tier_changes.len(), 1, "seed {seed}: flapped");
+            let (at, tier) = softened.tier_changes[0];
+            assert_eq!(tier, 2, "seed {seed}");
+            assert!((at - hold_end).abs() < 1e-9, "seed {seed}: stepped at {at}");
+            assert!(
+                softened.waits.iter().all(|&w| w < 0.25),
+                "seed {seed}: tier 2 did not carry the stream"
+            );
+            let unsoftened = simulate(&mut stuck, T0, &arrivals, end);
+            assert!(unsoftened.tier_changes.is_empty(), "seed {seed}");
+        }
+    }
+
+    /// The slowest idle tier the config allows (1 packet/s with a 5 s
+    /// budget): lone real packets never climb, whatever the session's
+    /// secrets (re-picks on), and leave every send time as it was. The
+    /// window floor asks for at least 170 real packets; the secret window
+    /// alone asked for as few as one.
+    #[test]
+    fn lone_packets_never_climb_on_the_slowest_idle_tier() {
+        let edit: Edit = |c| {
+            c.tiers_pps = vec![1.0, 5000.0];
+            c.latency_budget_s = 5.0;
+        };
+        let end = T0 + 3600.0;
+        // One packet every 5 s: each leaves (at most 2.125 s later) before
+        // the next arrives.
+        let lone: Vec<f64> = (0..720_u32).map(|i| T0 + 5.0 * f64::from(i)).collect();
+        for seed in 0..20 {
+            let quiet = simulate(&mut shaper(with(edit), seed), T0, &[], end);
+            for arrivals in [&lone[..1], &lone[..2], &lone[..]] {
+                let busy = simulate(&mut shaper(with(edit), seed), T0, arrivals, end);
+                assert!(
+                    busy.tier_changes.is_empty(),
+                    "seed {seed}: {} lone packets climbed",
+                    arrivals.len()
+                );
+                assert_eq!(busy.times(), quiet.times(), "seed {seed}");
+            }
+        }
+    }
+
+    /// A secret re-pick starts the full-tier check over. Here the tier is
+    /// full but its limit is out of reach until the re-pick, which also
+    /// slows the rate. Packets sent at the old, faster rate must not count
+    /// against the new one: the climb waits for a whole new window.
+    #[test]
+    fn a_secret_repick_starts_the_full_tier_check_over() {
+        for seed in 0..20 {
+            let mut s = shaper(cfg(), seed);
+            s.change_tier(2, T0);
+            s.secrets.tier_scale = TIER_SCALE.1;
+            s.secrets.fill_limit = 2.0;
+            let repick = T0 + 10.0;
+            s.next_repick = repick;
+            let (mut now, mut sent) = (T0, 0_u32);
+            let mut trigger = None;
+            while trigger.is_none() {
+                assert!(now < repick + 10.0, "seed {seed}: never climbed");
+                let poll = s.poll(now, 1, 0.001, sent);
+                sent = poll.slots_due;
+                if s.decoy_target.is_some() {
+                    trigger = Some(now);
+                }
+                now = poll.next_wake;
+            }
+            let trigger = trigger.expect("a climb started");
+            assert!(
+                trigger >= repick + s.fill_window(),
+                "seed {seed}: climbed {} s after the re-pick",
+                trigger - repick
+            );
         }
     }
 }
