@@ -377,6 +377,18 @@ traffic):
 | Top speed | about 7 to 10 Mbit/s at the default `mtu = 1360` (less for a smaller `mtu`). One DSM packet carries at most 1360 bytes, so with a larger `mtu` each full-size packet is split in two, which halves it to about 3.6 to 5.4 Mbit/s |
 | When a burst starts | about 0.5 to 1.5 seconds of extra wait while the pace steps up. A download that paces itself to the speed it gets (TCP) needs about 2 to 5 seconds per tier instead |
 
+**Slow links.** DSM does not yet adjust to the speed of your link. At the
+default top tier it sends up to about 11 Mbit/s in each direction. If the
+link is slower than that, DSM floods it: packets are lost, key changes can
+be lost too, and the tunnel can stall or drop. On such a link, lower the
+top tier in `shaper_tiers_pps`: about 50 packets/s for each Mbit/s of the
+link's slower direction. For example, a link with 4 Mbit/s upload gets
+`[10, 50, 150, 200]`. Keep the list rising and the first entry above 8.5.
+Each end shapes only what it sends, so the end that sends over the slow
+direction needs the change; setting it in both configs is simplest. A top
+tier that differs from the default makes your link look less like other
+DSM users' links.
+
 **What it hides** from someone watching the link between you and your
 server:
 

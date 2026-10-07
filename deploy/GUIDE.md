@@ -1692,6 +1692,17 @@ or prctl(PR_SET_DUMPABLE) didn't stick. Usually one of:
   the largest allowed size is sent at its exact size, which no fake packet
   ever has, and that size shows how big the packet really is.
 
+### Tunnel stalls or drops during big downloads (slow link)
+
+At the default top tier (800 packets/s) DSM sends up to about 11 Mbit/s in
+each direction, and it does not yet adjust to the link. On a slower link
+it floods the link: packets are lost, key changes can be lost too, and the
+tunnel stalls or drops, mostly during big downloads. Lower the top tier in
+`shaper_tiers_pps` to about 50 packets/s per Mbit/s of the link's slower
+direction, e.g. `[10, 50, 150, 200]` for 4 Mbit/s. Keep the list rising and
+the first entry above 8.5. The end that sends over the slow direction needs
+it; setting it in both configs is simplest. Restart the end you changed.
+
 ### Tunnel up but nothing comes back (hardened host)
 
 On hosts with strict reverse-path filtering (`rp_filter=1`, often set in
