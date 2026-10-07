@@ -83,6 +83,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   DSM runs and gets a new tag after a restart.
 
 ### Fixed
+- On a host with strict reverse-path filtering, the client no longer cuts
+  itself off from its own local network: ARP requests from the router (or a
+  DSM server on the same network) were dropped, so incoming traffic stopped
+  for tens of seconds whenever an ARP entry expired. Local-network routes now
+  stay out of the tunnel, as with WireGuard; the kill switch still blocks
+  that traffic.
 - The client now works on hosts with strict reverse-path filtering
   (`rp_filter=1`, common on hardened systems). Before, the handshake
   worked but no replies came back.

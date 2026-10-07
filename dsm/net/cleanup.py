@@ -45,7 +45,7 @@ from dsm.net.resolv_conf import (
     write_in_place,
 )
 from dsm.net.transport._fwmark import SO_MARK_VALUE as FWMARK
-from dsm.net.tunnel import SrcValidMarkEnabler
+from dsm.net.tunnel import LAN_RULE_ARGS, SrcValidMarkEnabler
 
 log = logging.getLogger(__name__)
 
@@ -94,6 +94,7 @@ def cleanup_host_state() -> None:
             "10",
         ]
     )
+    _best_effort(["ip", "rule", "del", *LAN_RULE_ARGS])
     _restore_resolv_conf()
     # Restore the global IPv6 + forwarding sysctls to safe defaults.
     # Coarse crash-path fallback only — see the module docstring GAP note.

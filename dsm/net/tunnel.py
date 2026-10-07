@@ -39,6 +39,10 @@ TUNSETIFF = 0x400454CA
 IFF_TUN = 0x0001
 IFF_NO_PI = 0x1000  # No packet info header
 
+# The client's "local network stays local" rule, checked before the
+# priority-10 not-fwmark rule. Shared with crash cleanup (dsm.net.cleanup).
+LAN_RULE_ARGS = ["table", "main", "suppress_prefixlength", "0", "priority", "9"]
+
 
 def _run_commands(cmds: list[list[str]], *, strict: bool = True) -> None:
     """Run a sequence of shell commands.
@@ -407,12 +411,22 @@ class TunDevice:
                 "priority",
                 "10",
             ]
-            subprocess.run(  # pylint: disable=subprocess-run-check
-                ["ip", "rule", "del", *rule_args],
-                capture_output=True,
-                timeout=5,
-            )  # ignore errors — rule may not exist yet
+            # Before it, look up the main table but ignore its default
+            # route, so only the default route goes to the tunnel (what
+            # wg-quick does). Without this, the reverse-path check on a host
+            # with strict rp_filter sends the source of every unmarked
+            # incoming packet to the tunnel, including ARP requests from the
+            # local network, so neighbours can no longer reach this host once
+            # their ARP entry expires. Local-network traffic now leaves via
+            # its own interface, where the kill switch still drops it.
+            for args in (rule_args, LAN_RULE_ARGS):
+                subprocess.run(  # pylint: disable=subprocess-run-check
+                    ["ip", "rule", "del", *args],
+                    capture_output=True,
+                    timeout=5,
+                )  # ignore errors — rule may not exist yet
             cmds.append(["ip", "rule", "add", *rule_args])
+            cmds.append(["ip", "rule", "add", *LAN_RULE_ARGS])
 
         _run_commands(cmds)
         self._configured = True
@@ -458,6 +472,7 @@ class TunDevice:
                 ["ip", "link", "set", self._name, "down"],
                 ["ip", "route", "del", "default", "dev", self._name, "table", "100"],
                 ["ip", "rule", "del", "not", "fwmark", str(FWMARK), "table", "100"],
+                ["ip", "rule", "del", *LAN_RULE_ARGS],
             ],
             strict=False,
         )
