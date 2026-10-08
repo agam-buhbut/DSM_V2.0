@@ -90,6 +90,10 @@ closed as known:
   at most an hour per step, fresh with each connection, logged (`auto cap:`
   lines), and `shaper_auto_cap = false` turns it off. A quick step down a
   few seconds after a climb also shows a watcher when your link fills up.
+  A small, steady trickle of junk (about 2 packets a second) at an end's
+  DSM port turns auto cap off for the packets sent to that end for as long
+  as it lasts; that only brings back the behaviour from before auto cap
+  (no cap), so it costs speed on slow links, not privacy.
 
 These are described in the project's threat-model documentation. If you believe
 a property is materially worse than documented — or that one of these can be

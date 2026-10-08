@@ -82,6 +82,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   used to be a plain SHA-256 prefix (`qname-sha256=`), which anyone with a
   list of popular sites could reverse. The same name keeps its tag while
   DSM runs and gets a new tag after a restart.
+- The client's new UDP socket after a key change no longer sets
+  `SO_REUSEADDR`. Before, another program on the same machine, even
+  without special rights, could bind the same port and get the server's
+  packets instead of DSM.
 
 ### Fixed
 - The client no longer loses the server's packets after each key change.
@@ -153,8 +157,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   how many packets arrived. An end that loses 5% or more of what it sends
   for two seconds in a row, at tier 2 or higher, lowers its top tier one
   step (never below tier 1) and tries the higher step again after 5
-  minutes, waiting longer (up to an hour) while the loss comes back. On by
-  default; `shaper_auto_cap = false` turns it off at either end. Mixed
+  minutes, waiting longer (up to an hour) while the loss comes back. The
+  gap between reports is random, 0.5 to 1.5 s (1 s on average), so there
+  is no fixed 1 s beat that a watcher could use to pick them out. Junk
+  that reaches an end (packets that fail to decrypt, are too short or are
+  replays, that overflow the receive queue, or that the client's source
+  filter drops) does not count as loss: packets missing in a stretch
+  between two reports in which junk came in are reported as arrived, so a
+  junk flood cannot force the cap down. On by default;
+  `shaper_auto_cap = false` turns it off at either end. Mixed
   versions keep working: an older end drops the new report quietly, and a
   newer end facing an older one never caps. A config that sets
   `shaper_auto_cap` does not load in an older DSM.
