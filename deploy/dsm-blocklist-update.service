@@ -1,9 +1,11 @@
 # Downloads the DNS block lists for the DSM server's DNS blocklist. Started
 # once a day by dsm-blocklist-update.timer (see deploy/GUIDE.md §7h).
 #
-# If your DSM config is not in /opt/mtun, change /opt/mtun in ExecStart and
-# ReadWritePaths below. ReadWritePaths needs /opt/mtun/dns to exist: the
-# first run by hand (or by install.sh) creates it.
+# If your DSM config is not in /opt/mtun, change /opt/mtun in ExecStart,
+# TemporaryFileSystem, BindPaths and ReadWritePaths below. /opt/mtun/dns must
+# exist before the first run (install.sh creates it; by hand:
+# sudo install -d -m 0700 /opt/mtun/dns): if it is missing, the run fails
+# with "Read-only file system".
 [Unit]
 Description=Download DSM DNS block lists
 Documentation=file:///opt/dsm-repo/deploy/GUIDE.md
@@ -15,9 +17,17 @@ Type=oneshot
 User=root
 ExecStart=/usr/local/sbin/dsm-blocklist-update /opt/mtun
 UMask=0077
+# Each list may take up to 300 s (curl --max-time), so this fits 12 lists that
+# each take that long. A run stopped here keeps every list it finished.
+TimeoutStartSec=1h
 # The script needs the network and the lists folder, nothing else.
 ProtectSystem=strict
+# Of /opt/mtun only the dns folder is seen, and it can be written. An empty,
+# read-only folder hides the rest (DSM's keys and config). /etc/dsm is hidden.
+TemporaryFileSystem=/opt/mtun:ro
+BindPaths=-/opt/mtun/dns
 ReadWritePaths=-/opt/mtun/dns
+InaccessiblePaths=-/etc/dsm
 ProtectHome=true
 PrivateTmp=true
 PrivateDevices=true
@@ -25,8 +35,15 @@ NoNewPrivileges=true
 CapabilityBoundingSet=
 ProtectKernelTunables=true
 ProtectKernelModules=true
+ProtectKernelLogs=true
 ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProcSubset=pid
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
 RestrictSUIDSGID=true
 LockPersonality=true
 MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service

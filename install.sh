@@ -19,6 +19,12 @@
 #     A release host can still withhold a NEWER release (a freeze/downgrade-by-
 #     omission attack), but cannot substitute a different validly-signed wheel
 #     for the version this script pins. Bump DSM_VERSION per release.
+#   * --systemd also installs a daily download of a DNS block list for the
+#     server (default: StevenBlack/hosts) and runs it once right away. That
+#     list is NOT minisign-verified: it comes over HTTPS from the list's own
+#     host, so you trust that host for it. dsm only reads it as names to
+#     block, never runs it: a bad list can make names fail to resolve
+#     (deploy/GUIDE.md §7h).
 #
 # Usage:  curl -fsSL <release>/install.sh | sudo sh
 #         curl -fsSL <release>/install.sh | sudo sh -s -- --eval
@@ -233,13 +239,17 @@ if [ "$EVAL" = 0 ]; then
       install -m 0644 "$DEPLOY_DIR/dsm-blocklist-update.service" \
         "$DEPLOY_DIR/dsm-blocklist-update.timer" /etc/systemd/system/ \
         || die "could not install the DNS block list timer"
+      # The unit can see and write only this folder, so it must exist.
+      install -d -m 0700 /opt/mtun/dns || die "could not create /opt/mtun/dns"
       systemctl daemon-reload || die "systemctl daemon-reload failed"
       systemctl enable --now dsm-blocklist-update.timer \
         || die "could not enable dsm-blocklist-update.timer"
       # Download the default list once now, so blocking works from dsm's
-      # first start. Not fatal: the timer tries again every day.
-      /usr/local/sbin/dsm-blocklist-update /opt/mtun \
-        || echo "install.sh: WARNING — could not download the DNS block lists now; the daily timer tries again (deploy/GUIDE.md §7h)." >&2
+      # first start. Through the unit, so this run has the same sandbox as
+      # the daily ones (it cannot read DSM's keys or root's ~/.curlrc). Not
+      # fatal: the timer tries again every day.
+      systemctl start dsm-blocklist-update.service \
+        || echo "install.sh: WARNING — could not download the DNS block lists now; the daily timer tries again (journalctl -u dsm-blocklist-update, deploy/GUIDE.md §7h)." >&2
       echo "Installed dsm.service. Start with: sudo systemctl enable --now dsm" >&2
     else
       echo "install.sh: WARNING — --systemd requested but deploy/dsm.service not found locally; skipping unit install." >&2

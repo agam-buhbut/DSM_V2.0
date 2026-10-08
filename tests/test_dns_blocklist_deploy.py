@@ -208,21 +208,37 @@ def test_the_timer_runs_the_script_daily_at_a_random_time() -> None:
         assert line in service
 
 
-def test_install_sh_sets_up_the_timer_and_fetches_once_without_failing() -> None:
+def test_the_unit_sees_only_the_dns_folder_of_the_config() -> None:
+    service = SERVICE.read_text().splitlines()
+    for line in (
+        "TemporaryFileSystem=/opt/mtun:ro",
+        "BindPaths=-/opt/mtun/dns",
+        "InaccessiblePaths=-/etc/dsm",
+        "ProtectHome=true",
+        "SystemCallFilter=@system-service",
+    ):
+        assert line in service
+    assert any(line.startswith("TimeoutStartSec=") for line in service)
+
+
+def test_install_sh_sets_up_the_timer_and_fetches_once_through_the_unit() -> None:
     text = INSTALL.read_text()
     unit = text.index('install -m 0644 "$UNIT_SRC" /etc/systemd/system/dsm.service')
     script = text.index(
         'install -m 0755 "$DEPLOY_DIR/dsm-blocklist-update.sh" '
         "/usr/local/sbin/dsm-blocklist-update"
     )
+    folder = text.index("install -d -m 0700 /opt/mtun/dns")
     enable = text.index("systemctl enable --now dsm-blocklist-update.timer")
     fetch = re.search(
-        r"\n\s*/usr/local/sbin/dsm-blocklist-update /opt/mtun \\\n"
+        r"\n\s*systemctl start dsm-blocklist-update\.service \\\n"
         r"\s*\|\| echo \"install\.sh: WARNING",
         text,
     )
     assert fetch is not None
-    assert unit < script < enable < fetch.start()
+    assert unit < script < folder < enable < fetch.start()
+    # The first download runs in the unit's sandbox, never as plain root.
+    assert "/usr/local/sbin/dsm-blocklist-update /opt/mtun" not in _code(INSTALL)
 
 
 _CAP_CURL = """#!/bin/sh
