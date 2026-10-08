@@ -94,6 +94,9 @@ class TestNoSecretGetters(unittest.TestCase):
                 "pad_packet",
                 "poll",
                 "set_size_class_ceiling",
+                "set_tier_cap",
+                "tier",
+                "watch_tier",
             },
         )
 

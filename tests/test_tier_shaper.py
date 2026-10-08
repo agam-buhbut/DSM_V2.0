@@ -121,6 +121,8 @@ def test_no_getters_and_nothing_in_repr() -> None:
         "poll",
         "real_size_class",
         "set_size_class_ceiling",
+        "set_tier_cap",
+        "tier",
     }
     text = repr(shaper).lower()
     for word in ("scale", "spread", "hold", "tier", "decoy", "secret"):
