@@ -231,3 +231,38 @@ def isolate_src_valid_mark(
         "STATE_PATH",
         root / "run" / "dsm" / "src_valid_mark.orig",
     )
+
+
+class _NoBlocklist:
+    """Stand-in for ``DnsBlocklist``: takes the dns dir, does nothing."""
+
+    def __init__(self, dns_dir: Path) -> None:
+        self.dns_dir = dns_dir
+
+    def start(self) -> None:
+        pass
+
+    async def stop(self) -> None:
+        pass
+
+    def is_blocked(self, qname: str) -> bool:
+        del qname
+        return False
+
+
+@pytest.fixture(autouse=True)
+def isolate_dns_blocklist(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep server tests off the real blocklist folder.
+
+    ``run_server`` builds a ``DnsBlocklist`` on ``<config_dir>/dns`` (by
+    default ``/opt/mtun/dns``) and starts its reload task. Swap in a no-op
+    stub for ``dsm.server.DnsBlocklist`` so a test that never mentions the
+    blocklist cannot read that folder or leave a background task running.
+    Tests that patch ``dsm.server.DnsBlocklist`` themselves (e.g.
+    test_dns_blocklist_server.py) still win, as their patch is applied
+    later; tests that import the real class from ``dsm.net.dns_blocklist``
+    are not affected.
+    """
+    from dsm import server
+
+    monkeypatch.setattr(server, "DnsBlocklist", _NoBlocklist)
