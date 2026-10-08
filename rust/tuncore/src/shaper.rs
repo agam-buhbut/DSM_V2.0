@@ -13,6 +13,10 @@
 //! two look alike. Each session draws its own secret timing values and
 //! draws them again now and then.
 //!
+//! A tier cap (`set_tier_cap`) can hold the rate below the top tier for a
+//! while: every climb stops at it, and a tier above it steps down at the
+//! next poll. Raising it moves nothing by itself.
+//!
 //! Plain Rust with no Python types; the PyO3 wrapper lives in `lib.rs`.
 //! Secret values have no getters and never appear in `Debug` output.
 
@@ -302,6 +306,9 @@ pub struct Shaper<R> {
     size_rng: StdRng,
     secrets: Secrets,
     tier: usize,
+    /// Highest tier the shaper may use: the last tier (no cap) until
+    /// `set_tier_cap` lowers it. Not a secret: the rate shows it.
+    cap: usize,
     last_now: f64,
     last_departure: f64,
     next_departure: f64,
@@ -352,12 +359,15 @@ impl<R: RngCore + CryptoRng> Shaper<R> {
         rng.fill_bytes(&mut seed);
         let secrets = Secrets::draw(&mut rng, cfg.decoy_interval_s);
         let padding_max = cfg.padding_max;
+        // `validate` made sure there are at least two tiers.
+        let last_tier = cfg.tiers_pps.len() - 1;
         let mut shaper = Self {
             cfg,
             rng,
             size_rng: StdRng::from_seed(seed),
             secrets,
             tier: 0,
+            cap: last_tier,
             last_now: now,
             last_departure: now,
             next_departure: now,
@@ -416,6 +426,7 @@ impl<R: RngCore + CryptoRng> Shaper<R> {
             // Stalled: skip the missed slots and restart from now.
             self.next_departure = now;
         }
+        self.apply_cap(now);
         if self.next_decoy.is_some_and(|t| now >= t) {
             self.start_decoy(now);
         }
@@ -477,8 +488,26 @@ impl<R: RngCore + CryptoRng> Shaper<R> {
         &self.active
     }
 
+    /// Highest tier the shaper may use, from the next poll on. A value at
+    /// or above the top tier means no cap; 0 counts as 1 (the floor). The
+    /// next poll applies it: a tier above it steps down at once. Raising it
+    /// moves nothing by itself. Draws nothing.
+    pub fn set_tier_cap(&mut self, cap: usize) {
+        self.cap = cap.max(1);
+    }
+
+    /// The tier in use now (0 = idle). Not a secret: a watcher sees the
+    /// rate.
+    pub fn tier(&self) -> usize {
+        self.tier
+    }
+
+    /// The highest tier the shaper may use now: the last tier, or the cap
+    /// when that is lower. Every climb stops here (`step_up`, the decoy
+    /// target, the full-tier check, `next_wake`), so real climbs, full
+    /// tiers and decoys all obey the cap the same way.
     fn top(&self) -> usize {
-        self.cfg.tiers_pps.len() - 1
+        self.cap.min(self.cfg.tiers_pps.len() - 1)
     }
 
     fn rate_of(&self, tier: usize) -> f64 {
@@ -529,6 +558,21 @@ impl<R: RngCore + CryptoRng> Shaper<R> {
         self.tier = tier;
         let hold = (self.secrets.hold_min_s, self.secrets.hold_max_s);
         self.hold_until = now + uniform(&mut self.rng, hold);
+    }
+
+    /// Enforce the cap. A climb aimed above it is re-aimed at it, so it can
+    /// end (`end_climb`) instead of waiting for a tier it can never reach
+    /// while usage counts as high. A tier above it steps down to it at once,
+    /// not at a hold end: a hold can last minutes, and the link is flooding.
+    /// Draws nothing unless the cap forces a change.
+    fn apply_cap(&mut self, now: f64) {
+        let top = self.top();
+        if self.decoy_target.is_some_and(|target| target > top) {
+            self.decoy_target = Some(top);
+        }
+        if self.tier > top {
+            self.change_tier(top, now);
+        }
     }
 
     /// Up one tier, or two with the secret overshoot chance, capped at the
@@ -2412,6 +2456,643 @@ mod tests {
                 "seed {seed}: climbed {} s after the re-pick",
                 trigger - repick
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod cap_tests {
+    //! Tests for the tier cap: `set_tier_cap`, `tier` and the forced step-down
+    //! in `poll`. They have their own small helpers, copied rather than shared,
+    //! so the main `tests` module stays as it is.
+
+    use super::*;
+
+    const T0: f64 = 1000.0;
+
+    fn cfg() -> ShaperConfig {
+        ShaperConfig {
+            tiers_pps: vec![10.0, 50.0, 200.0, 800.0],
+            latency_budget_s: 0.5,
+            decoy_interval_s: 0.0,
+            linger_s: (0.0, 0.0),
+            padding_min: 128,
+            padding_max: 1400,
+        }
+    }
+
+    /// The test config with one change applied.
+    fn with(edit: fn(&mut ShaperConfig)) -> ShaperConfig {
+        let mut c = cfg();
+        edit(&mut c);
+        c
+    }
+
+    /// Decoys every 300 s on average (per session x0.5 to x2) and a linger.
+    fn busy_cfg() -> ShaperConfig {
+        with(|c| {
+            c.decoy_interval_s = 300.0;
+            c.linger_s = (300.0, 600.0);
+        })
+    }
+
+    fn shaper(cfg: ShaperConfig, seed: u64) -> Shaper<StdRng> {
+        Shaper::new(cfg, StdRng::seed_from_u64(seed), T0).expect("test config is valid")
+    }
+
+    /// At time `.0` (at the first poll from then on, just before it), call
+    /// `set_tier_cap(.1)`.
+    type CapAt = (f64, usize);
+
+    #[derive(Debug, Default)]
+    struct Trace {
+        /// (time, tier) of every packet on the wire.
+        departures: Vec<(f64, usize)>,
+        /// (time, new tier) at every tier change.
+        tier_changes: Vec<(f64, usize)>,
+        /// Seconds each real packet waited from arrival to departure.
+        waits: Vec<f64>,
+        /// How many times the shaper was polled.
+        polls: usize,
+    }
+
+    impl Trace {
+        fn times(&self) -> Vec<f64> {
+            self.departures.iter().map(|d| d.0).collect()
+        }
+
+        fn highest_tier(&self) -> usize {
+            self.departures.iter().map(|d| d.1).max().unwrap_or(0)
+        }
+    }
+
+    /// Drive `s` the way the scheduler does: poll at each `next_wake`, send real
+    /// packets first and chaff for the rest, size every packet. `arrivals` are
+    /// real-packet arrival times, ascending; `caps` are applied in order. Stops
+    /// a tight polling loop with a panic instead of hanging.
+    fn simulate(
+        s: &mut Shaper<StdRng>,
+        start: f64,
+        arrivals: &[f64],
+        caps: &[CapAt],
+        end: f64,
+    ) -> Trace {
+        let mut trace = Trace::default();
+        let mut queue: VecDeque<f64> = VecDeque::new();
+        let (mut next_arrival, mut next_cap) = (0, 0);
+        let mut real_sent = 0_u32;
+        let mut tier = s.tier();
+        let mut same_time = 0_u32;
+        let mut now = start;
+        while now <= end {
+            while next_cap < caps.len() && caps[next_cap].0 <= now {
+                s.set_tier_cap(caps[next_cap].1);
+                next_cap += 1;
+            }
+            while next_arrival < arrivals.len() && arrivals[next_arrival] <= now {
+                queue.push_back(arrivals[next_arrival]);
+                next_arrival += 1;
+            }
+            let oldest_wait = queue.front().map_or(0.0, |&t| now - t);
+            let poll = s.poll(now, queue.len(), oldest_wait, real_sent);
+            trace.polls += 1;
+            real_sent = 0;
+            if s.tier() != tier {
+                tier = s.tier();
+                trace.tier_changes.push((now, tier));
+            }
+            for _ in 0..poll.slots_due {
+                if let Some(arrived) = queue.pop_front() {
+                    trace.waits.push(now - arrived);
+                    real_sent += 1;
+                    s.real_size_class(100);
+                } else {
+                    s.chaff_size_class();
+                }
+                trace.departures.push((now, s.tier()));
+            }
+            assert!(poll.next_wake >= now, "next_wake must not go back in time");
+            if poll.next_wake > now {
+                same_time = 0;
+            } else {
+                same_time += 1;
+                assert!(same_time < 1000, "polled in a tight loop at {now}");
+            }
+            now = poll.next_wake;
+        }
+        trace
+    }
+
+    /// Real-packet arrivals spaced evenly at `rate` per second, from `from`
+    /// until `end`.
+    fn steady(rate: f64, from: f64, end: f64) -> Vec<f64> {
+        (0..u32::MAX)
+            .map(|i| from + f64::from(i) / rate)
+            .take_while(|&t| t < end)
+            .collect()
+    }
+
+    /// Every gap between two departures in `trace` lies in the band of a tier
+    /// with this `rate` and gap `spread`.
+    fn assert_gaps_follow(trace: &Trace, rate: f64, spread: f64) {
+        let times = trace.times();
+        assert!(times.len() > 10, "too few departures to check");
+        let (lo, hi) = ((1.0 - spread) / rate, (1.0 + spread) / rate);
+        for pair in times.windows(2) {
+            let gap = pair[1] - pair[0];
+            assert!(
+                gap >= lo - 1e-9 && gap <= hi + 1e-9,
+                "gap {gap} outside [{lo}, {hi}]"
+            );
+        }
+    }
+
+    /// Spec test 1: a cap at or above the top changes nothing. Same seed, a
+    /// mixed trace (bursts, a long download, decoys, linger and re-picks on),
+    /// once without caps and once with caps at and above the top set at
+    /// several points, one of them mid-download at the top tier.
+    #[test]
+    fn a_cap_at_or_above_the_top_changes_nothing() {
+        let end = T0 + 3600.0;
+        let mut arrivals: Vec<f64> = (0..20_u32)
+            .flat_map(|b| {
+                (0..50_u32).map(move |i| T0 + 30.0 + f64::from(b) * 60.0 + f64::from(i) * 0.002)
+            })
+            .collect();
+        arrivals.extend(steady(600.0, T0 + 1300.0, T0 + 1400.0));
+        let caps: [CapAt; 4] = [
+            (T0, 3),
+            (T0 + 500.0, usize::MAX),
+            (T0 + 1350.0, 3),
+            (T0 + 2000.0, 7),
+        ];
+        for seed in 0..5 {
+            let plain = simulate(&mut shaper(busy_cfg(), seed), T0, &arrivals, &[], end);
+            let capped = simulate(&mut shaper(busy_cfg(), seed), T0, &arrivals, &caps, end);
+            assert_eq!(
+                plain.highest_tier(),
+                3,
+                "seed {seed}: never reached the top"
+            );
+            assert_eq!(capped.tier_changes, plain.tier_changes, "seed {seed}");
+            assert_eq!(capped.times(), plain.times(), "seed {seed}");
+        }
+    }
+
+    /// Spec test 2, the key property under a cap: traffic that fits does not
+    /// move departures. Cap 2 of 4 from the start; same seed with and without
+    /// fitting traffic; decoys, linger and re-picks on.
+    #[test]
+    fn fitting_traffic_does_not_move_departures_under_a_cap() {
+        let end = T0 + 2.0 * 3600.0;
+        // One packet every 2 s: each leaves at the next slot (gaps are at most
+        // 0.2125 s at tier 0), before the earliest step-up point (0.25 s).
+        let arrivals: Vec<f64> = (0..3500_u32)
+            .map(|i| T0 + 0.5 + f64::from(i) * 2.0)
+            .collect();
+        let caps: [CapAt; 1] = [(T0, 2)];
+        for seed in [11, 12, 13] {
+            let quiet = simulate(&mut shaper(busy_cfg(), seed), T0, &[], &caps, end);
+            let busy = simulate(&mut shaper(busy_cfg(), seed), T0, &arrivals, &caps, end);
+            assert!(quiet.tier_changes.len() >= 4, "seed {seed}: decoys ran");
+            assert!(quiet.highest_tier() <= 2, "seed {seed}: above the cap");
+            assert_eq!(
+                busy.waits.len(),
+                arrivals.len(),
+                "seed {seed}: not all carried"
+            );
+            assert_eq!(busy.tier_changes, quiet.tier_changes, "seed {seed}");
+            assert_eq!(busy.times(), quiet.times(), "seed {seed}");
+        }
+    }
+
+    /// Spec test 3: a cap below the tier steps down at the next poll, with a
+    /// new hold; later gaps follow the capped tier, and nothing steps down
+    /// before that hold ends.
+    #[test]
+    fn a_cap_below_the_tier_steps_down_at_the_next_poll() {
+        for seed in 0..20 {
+            let mut s = shaper(cfg(), seed);
+            // A re-pick would change the rate mid-test.
+            s.next_repick = f64::INFINITY;
+            simulate(&mut s, T0, &[T0 + 1.0; 2000], &[], T0 + 4.0);
+            assert_eq!(
+                s.tier(),
+                3,
+                "seed {seed}: the backlog never reached the top"
+            );
+            let now = s.last_now + 0.001;
+            s.set_tier_cap(2);
+            assert_eq!(
+                s.tier(),
+                3,
+                "seed {seed}: set_tier_cap alone moved the tier"
+            );
+            s.poll(now, 0, 0.0, 0);
+            assert_eq!(s.tier(), 2, "seed {seed}: no step-down at the next poll");
+            let hold_end = s.hold_until;
+            let hold = hold_end - now;
+            assert!(
+                (s.secrets.hold_min_s..=s.secrets.hold_max_s).contains(&hold),
+                "seed {seed}: no new hold"
+            );
+            let after = simulate(&mut s, now, &[], &[], hold_end - 0.01);
+            assert!(
+                after.tier_changes.is_empty(),
+                "seed {seed}: stepped during the hold"
+            );
+            assert_gaps_follow(&after, 200.0 * s.secrets.tier_scale, s.secrets.gap_spread);
+        }
+    }
+
+    /// Spec test 4: nothing climbs above the cap. An hour with bursts, a
+    /// five-minute download far above every tier, and frequent decoys; the
+    /// poll count stays bounded (and `simulate` stops a tight loop).
+    #[test]
+    fn nothing_climbs_above_the_cap() {
+        let end = T0 + 3600.0;
+        let mut arrivals: Vec<f64> = (0..30_u32)
+            .flat_map(|b| {
+                (0..400_u32).map(move |i| T0 + 10.0 + f64::from(b) * 120.0 + f64::from(i) * 0.0001)
+            })
+            .collect();
+        arrivals.extend(steady(600.0, T0 + 1805.0, T0 + 2105.0));
+        arrivals.sort_by(f64::total_cmp);
+        for (seed, cap) in [(1_u64, 1_usize), (2, 2), (3, 2), (4, 1)] {
+            let trace = simulate(
+                &mut shaper(busy_cfg(), seed),
+                T0,
+                &arrivals,
+                &[(T0, cap)],
+                end,
+            );
+            assert!(
+                trace.highest_tier() <= cap,
+                "seed {seed}: a packet left above cap {cap}"
+            );
+            assert!(
+                trace.tier_changes.iter().all(|&(_, t)| t <= cap),
+                "seed {seed}: climbed above cap {cap}"
+            );
+            assert!(
+                trace.tier_changes.iter().any(|&(_, t)| t == cap),
+                "seed {seed}: never reached cap {cap}"
+            );
+            assert!(
+                trace.polls <= trace.departures.len() + 20_000,
+                "seed {seed}: {} polls for {} departures",
+                trace.polls,
+                trace.departures.len()
+            );
+        }
+    }
+
+    /// Spec test 5: the floor is tier 1. `set_tier_cap(0)` acts as cap 1; a
+    /// backlog still reaches tier 1 and never 2; linger still works.
+    #[test]
+    fn the_floor_is_tier_one() {
+        for seed in 0..10 {
+            let mut s = shaper(with(|c| c.linger_s = (300.0, 600.0)), seed);
+            s.next_repick = f64::INFINITY;
+            s.set_tier_cap(0);
+            assert_eq!(s.cap, 1, "seed {seed}: 0 did not count as 1");
+            let trace = simulate(&mut s, T0, &[T0 + 1.0; 500], &[], T0 + 30.0);
+            assert_eq!(
+                trace.tier_changes.first().map(|c| c.1),
+                Some(1),
+                "seed {seed}"
+            );
+            assert_eq!(trace.highest_tier(), 1, "seed {seed}: above the floor");
+            // At the hold end, with the backlog long gone, tier 1 lingers.
+            s.poll(s.hold_until + 0.001, 0, 0.0, 0);
+            assert_eq!(s.tier(), 1, "seed {seed}");
+            assert!(s.linger_until.is_some(), "seed {seed}: no linger");
+        }
+    }
+
+    /// Spec test 6: a decoy aimed above the cap is re-aimed at the cap and
+    /// ends there with a busy stretch. It does not stick: once the busy
+    /// stretch is over, a hold end steps it down.
+    #[test]
+    fn a_decoy_aimed_above_the_cap_is_re_aimed_and_does_not_stick() {
+        for seed in 0..20 {
+            let mut s = shaper(with(|c| c.decoy_interval_s = 300.0), seed);
+            s.secrets.decoy_top_p = 1.0;
+            s.secrets.decoy_pause_p = 0.0;
+            s.next_repick = f64::INFINITY;
+            let due = T0 + 10.0;
+            s.next_decoy = Some(due);
+            s.poll(due, 0, 0.0, 0);
+            assert_eq!(s.decoy_target, Some(3), "seed {seed}");
+            s.next_decoy = None;
+            s.set_tier_cap(2);
+            let trace = simulate(&mut s, due, &[], &[], due + 5.0);
+            assert!(
+                trace.highest_tier() <= 2,
+                "seed {seed}: climbed above the cap"
+            );
+            assert!(
+                s.decoy_target.is_none(),
+                "seed {seed}: the climb never ended"
+            );
+            assert_eq!(s.tier(), 2, "seed {seed}: did not end at the cap");
+            let busy_end = s.busy_until;
+            assert!(busy_end > due, "seed {seed}: no busy stretch");
+            let mut now = due + 5.0;
+            for _ in 0..1000 {
+                if s.tier() < 2 {
+                    break;
+                }
+                now = s.hold_until + 0.001;
+                s.poll(now, 0, 0.0, 0);
+            }
+            assert_eq!(s.tier(), 1, "seed {seed}: stuck at the cap");
+            assert!(
+                now > busy_end,
+                "seed {seed}: stepped down during the busy stretch"
+            );
+        }
+    }
+
+    /// Spec test 7: a paused decoy aimed above the cap is re-aimed the same
+    /// way, then resumes and ends at the cap.
+    #[test]
+    fn a_paused_decoy_is_re_aimed_the_same_way() {
+        for seed in 0..20 {
+            let mut s = shaper(with(|c| c.decoy_interval_s = 300.0), seed);
+            s.secrets.decoy_top_p = 1.0;
+            s.secrets.overshoot_p = 0.0;
+            s.secrets.decoy_pause_p = 1.0;
+            s.next_repick = f64::INFINITY;
+            s.next_decoy = Some(T0 + 10.0);
+            let mut now = T0;
+            while s.tier() == 0 {
+                assert!(now < T0 + 20.0, "seed {seed}: the decoy never stepped");
+                now = s.poll(now, 0, 0.0, 0).next_wake;
+            }
+            s.next_decoy = None;
+            assert_eq!(s.decoy_target, Some(3), "seed {seed}");
+            assert!(s.decoy_since > s.last_step_up, "seed {seed}: not paused");
+            s.set_tier_cap(2);
+            let trace = simulate(&mut s, now, &[], &[], now + 60.0);
+            assert!(
+                trace.highest_tier() <= 2,
+                "seed {seed}: climbed above the cap"
+            );
+            assert!(
+                s.decoy_target.is_none(),
+                "seed {seed}: the climb never ended"
+            );
+            assert_eq!(s.tier(), 2, "seed {seed}");
+            assert!(s.busy_until > now, "seed {seed}: no busy stretch");
+        }
+    }
+
+    /// Spec test 8: a full-tier climb aimed above the cap ends at once, with no
+    /// busy stretch (it is not a decoy).
+    #[test]
+    fn a_full_tier_climb_aimed_above_the_cap_ends_at_once() {
+        for seed in 0..20 {
+            let mut s = shaper(cfg(), seed);
+            s.next_repick = f64::INFINITY;
+            // Real packets take every slot: far above this limit.
+            s.secrets.fill_limit = 0.5;
+            s.change_tier(2, T0);
+            let (mut now, mut sent) = (T0, 0_u32);
+            while s.decoy_target.is_none() {
+                assert!(now < T0 + 20.0, "seed {seed}: the tier never filled");
+                let poll = s.poll(now, 1, 0.001, sent);
+                sent = poll.slots_due;
+                now = poll.next_wake;
+            }
+            assert_eq!(s.decoy_target, Some(3), "seed {seed}");
+            assert_eq!(s.tier(), 2, "seed {seed}: stepped before the cap");
+            s.set_tier_cap(2);
+            let poll = s.poll(now, 1, 0.001, sent);
+            assert!(
+                s.decoy_target.is_none(),
+                "seed {seed}: the climb did not end"
+            );
+            assert_eq!(s.tier(), 2, "seed {seed}");
+            assert!(
+                s.busy_until < T0,
+                "seed {seed}: a busy stretch after a full-tier climb"
+            );
+            assert!(
+                poll.next_wake > now,
+                "seed {seed}: tight loop at the capped top"
+            );
+        }
+    }
+
+    /// Spec test 9: under a cap, decoys aim at most at the cap, including cap 1
+    /// (the `top == 1` path: no empty `gen_range`).
+    #[test]
+    fn decoys_under_a_cap_aim_at_most_at_the_cap() {
+        for cap in [1, 2] {
+            let mut s = shaper(with(|c| c.decoy_interval_s = 300.0), 31);
+            s.next_repick = f64::INFINITY;
+            s.set_tier_cap(cap);
+            let (mut t, mut at_cap) = (T0, 0);
+            for _ in 0..2000 {
+                t += 10.0;
+                s.change_tier(0, t);
+                s.next_decoy = Some(t);
+                s.poll(t, 0, 0.0, 0);
+                let target = s.decoy_target.expect("a decoy started");
+                assert!((1..=cap).contains(&target), "cap {cap}: aimed at {target}");
+                if target == cap {
+                    at_cap += 1;
+                }
+                s.decoy_target = None;
+            }
+            assert!(at_cap > 0, "cap {cap}: never aimed at the cap");
+        }
+    }
+
+    /// Spec test 10: raising the cap moves nothing. Decoys off; no traffic, and
+    /// separately fitting traffic; from idle and from the capped tier. A run
+    /// that raises the cap and one that never does are identical to the end.
+    #[test]
+    fn raising_the_cap_moves_nothing() {
+        let end = T0 + 1800.0;
+        let fitting: Vec<f64> = (0..1700_u32)
+            .map(|i| T0 + 0.5 + f64::from(i) * 1.05)
+            .collect();
+        let none: &[f64] = &[];
+        for seed in 0..5 {
+            for arrivals in [none, &fitting[..]] {
+                for start_tier in [0, 2] {
+                    let run = |raise: Option<usize>| {
+                        let mut s = shaper(cfg(), seed);
+                        s.change_tier(start_tier, T0);
+                        let mut caps = vec![(T0, 2)];
+                        if let Some(cap) = raise {
+                            caps.push((T0 + 600.0, cap));
+                        }
+                        simulate(&mut s, T0, arrivals, &caps, end)
+                    };
+                    let kept = run(None);
+                    for raised in [3, usize::MAX] {
+                        let got = run(Some(raised));
+                        assert_eq!(got.tier_changes, kept.tier_changes, "seed {seed}");
+                        assert_eq!(got.times(), kept.times(), "seed {seed}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Spec test 11: after a lift, a backlog that waited at the cap climbs at
+    /// the next poll through the normal step-up: one tier, or two with
+    /// overshoot, never above the new cap.
+    #[test]
+    fn after_a_lift_a_waiting_backlog_steps_up_by_the_normal_rules() {
+        for seed in 0..10 {
+            for (overshoot, new_cap, want) in [(0.0, 2, 2), (1.0, 2, 2), (0.0, 3, 2), (1.0, 3, 3)] {
+                let mut s = shaper(cfg(), seed);
+                s.next_repick = f64::INFINITY;
+                s.secrets.overshoot_p = overshoot;
+                s.set_tier_cap(1);
+                simulate(&mut s, T0, &vec![T0 + 1.0; 5000], &[], T0 + 5.0);
+                assert_eq!(s.tier(), 1, "seed {seed}: left the cap");
+                let now = s.last_now + 0.001;
+                s.set_tier_cap(new_cap);
+                assert_eq!(s.tier(), 1, "seed {seed}: the lift alone moved the tier");
+                s.poll(now, 4000, now - (T0 + 1.0), 0);
+                assert_eq!(
+                    s.tier(),
+                    want,
+                    "seed {seed}: overshoot {overshoot}, cap {new_cap}"
+                );
+            }
+        }
+    }
+
+    /// Spec 8.7: after a lift, a tier that real traffic kept full at the cap
+    /// starts its full-tier climb at the next poll and steps one step-up point
+    /// later, never above the new cap.
+    #[test]
+    fn after_a_lift_a_full_tier_starts_its_climb_at_the_next_poll() {
+        for seed in 0..20 {
+            let mut s = shaper(cfg(), seed);
+            s.next_repick = f64::INFINITY;
+            s.secrets.fill_limit = 0.5;
+            s.set_tier_cap(2);
+            s.change_tier(2, T0);
+            let (mut now, mut sent) = (T0, 0_u32);
+            while now < T0 + 10.0 {
+                let poll = s.poll(now, 1, 0.001, sent);
+                sent = poll.slots_due;
+                now = poll.next_wake;
+            }
+            assert!(
+                s.decoy_target.is_none(),
+                "seed {seed}: a climb at the capped top"
+            );
+            s.set_tier_cap(3);
+            let lifted = now;
+            let poll = s.poll(lifted, 1, 0.001, sent);
+            assert_eq!(
+                s.decoy_target,
+                Some(3),
+                "seed {seed}: no climb at the next poll"
+            );
+            let point = s.step_up_after;
+            sent = poll.slots_due;
+            now = poll.next_wake;
+            let mut stepped = None;
+            while stepped.is_none() {
+                assert!(now < lifted + 1.0, "seed {seed}: the climb never stepped");
+                let at = now;
+                let poll = s.poll(at, 1, 0.001, sent);
+                sent = poll.slots_due;
+                if s.tier() != 2 {
+                    stepped = Some(at);
+                }
+                now = poll.next_wake;
+            }
+            let stepped = stepped.expect("a step");
+            assert!(
+                (stepped - (lifted + point)).abs() < 1e-9,
+                "seed {seed}: stepped {} s after the lift, not {point} s",
+                stepped - lifted
+            );
+            assert_eq!(s.tier(), 3, "seed {seed}");
+        }
+    }
+
+    /// Spec test 12: a secret re-pick keeps the cap, and its own draws are the
+    /// same as without a cap.
+    #[test]
+    fn a_secret_repick_keeps_the_cap() {
+        for seed in 0..10 {
+            let mut plain = shaper(cfg(), seed);
+            let mut capped = shaper(cfg(), seed);
+            capped.set_tier_cap(2);
+            let repick = plain.next_repick;
+            plain.poll(repick, 0, 0.0, 0);
+            capped.poll(repick, 0, 0.0, 0);
+            assert_eq!(
+                capped.secrets.tier_scale.to_bits(),
+                plain.secrets.tier_scale.to_bits(),
+                "seed {seed}"
+            );
+            assert_eq!(
+                capped.secrets.hold_max_s.to_bits(),
+                plain.secrets.hold_max_s.to_bits(),
+                "seed {seed}"
+            );
+            assert_eq!(
+                capped.next_repick.to_bits(),
+                plain.next_repick.to_bits(),
+                "seed {seed}"
+            );
+            assert_eq!(capped.cap, 2, "seed {seed}: the re-pick changed the cap");
+            let trace = simulate(
+                &mut capped,
+                repick,
+                &vec![repick + 1.0; 3000],
+                &[],
+                repick + 10.0,
+            );
+            assert_eq!(
+                trace.highest_tier(),
+                2,
+                "seed {seed}: the backlog left the cap"
+            );
+        }
+    }
+
+    /// Spec test 13: `tier()` reports the tier in use; `Debug` shows no cap.
+    #[test]
+    fn tier_reports_the_tier_in_use_and_debug_shows_no_cap() {
+        let mut s = shaper(cfg(), 1);
+        assert_eq!(s.tier(), 0);
+        s.change_tier(2, T0);
+        assert_eq!(s.tier(), 2);
+        s.set_tier_cap(1);
+        s.poll(T0 + 0.001, 0, 0.0, 0);
+        assert_eq!(s.tier(), 1);
+        assert_eq!(format!("{s:?}"), "Shaper { .. }");
+    }
+
+    /// Review focus 3: a cap that comes while a big backlog waits above it
+    /// steps down and stays at the cap, and the backlog sets no wake there.
+    #[test]
+    fn a_forced_step_down_with_a_waiting_backlog_stays_at_the_cap() {
+        for seed in 0..20 {
+            let mut s = shaper(cfg(), seed);
+            s.next_repick = f64::INFINITY;
+            s.change_tier(3, T0);
+            s.set_tier_cap(2);
+            let mut now = T0 + 0.01;
+            for _ in 0..2000 {
+                let poll = s.poll(now, 500, now - T0, 0);
+                assert_eq!(s.tier(), 2, "seed {seed}: left the cap at {now}");
+                assert!(poll.next_wake > now, "seed {seed}: tight loop at {now}");
+                now = poll.next_wake;
+            }
         }
     }
 }
