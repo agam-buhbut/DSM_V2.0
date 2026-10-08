@@ -1,0 +1,32 @@
+# Downloads the DNS block lists for the DSM server's DNS blocklist. Started
+# once a day by dsm-blocklist-update.timer (see deploy/GUIDE.md §7h).
+#
+# If your DSM config is not in /opt/mtun, change /opt/mtun in ExecStart and
+# ReadWritePaths below. ReadWritePaths needs /opt/mtun/dns to exist: the
+# first run by hand (or by install.sh) creates it.
+[Unit]
+Description=Download DSM DNS block lists
+Documentation=file:///opt/dsm-repo/deploy/GUIDE.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/local/sbin/dsm-blocklist-update /opt/mtun
+UMask=0077
+# The script needs the network and the lists folder, nothing else.
+ProtectSystem=strict
+ReadWritePaths=-/opt/mtun/dns
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+NoNewPrivileges=true
+CapabilityBoundingSet=
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true

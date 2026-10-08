@@ -225,7 +225,21 @@ if [ "$EVAL" = 0 ]; then
     if [ -n "$UNIT_SRC" ]; then
       install -m 0644 "$UNIT_SRC" /etc/systemd/system/dsm.service \
         || die "could not install dsm.service"
+      # DNS blocklist: the download script, its unit and its daily timer sit
+      # next to dsm.service (deploy/GUIDE.md §7h).
+      DEPLOY_DIR="$(dirname "$UNIT_SRC")"
+      install -m 0755 "$DEPLOY_DIR/dsm-blocklist-update.sh" /usr/local/sbin/dsm-blocklist-update \
+        || die "could not install dsm-blocklist-update"
+      install -m 0644 "$DEPLOY_DIR/dsm-blocklist-update.service" \
+        "$DEPLOY_DIR/dsm-blocklist-update.timer" /etc/systemd/system/ \
+        || die "could not install the DNS block list timer"
       systemctl daemon-reload || die "systemctl daemon-reload failed"
+      systemctl enable --now dsm-blocklist-update.timer \
+        || die "could not enable dsm-blocklist-update.timer"
+      # Download the default list once now, so blocking works from dsm's
+      # first start. Not fatal: the timer tries again every day.
+      /usr/local/sbin/dsm-blocklist-update /opt/mtun \
+        || echo "install.sh: WARNING — could not download the DNS block lists now; the daily timer tries again (deploy/GUIDE.md §7h)." >&2
       echo "Installed dsm.service. Start with: sudo systemctl enable --now dsm" >&2
     else
       echo "install.sh: WARNING — --systemd requested but deploy/dsm.service not found locally; skipping unit install." >&2

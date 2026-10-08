@@ -1,0 +1,12 @@
+# Runs dsm-blocklist-update.service once a day, at a random time within an
+# hour of midnight, so list hosts do not see every DSM server at once.
+[Unit]
+Description=Daily download of DSM DNS block lists
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
