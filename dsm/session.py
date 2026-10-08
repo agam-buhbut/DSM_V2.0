@@ -482,6 +482,12 @@ def _decrypt_with_fallback(
     return result
 
 
+def _note_junk(link_stats: LinkStats | None) -> None:
+    """Count a packet that was not the peer's (slow-link auto cap)."""
+    if link_stats is not None:
+        link_stats.note_junk()
+
+
 def decrypt_packet(
     data: bytes,
     session_keys: tuncore.SessionKeyManager,
@@ -496,7 +502,8 @@ def decrypt_packet(
 
     ``link_stats`` (slow-link auto cap) counts every packet that passed AEAD
     with a new seq, before the inner packet is parsed: a genuine packet that
-    is dropped later still crossed the link.
+    is dropped later still crossed the link. A packet dropped before that
+    (too short, a replay, AEAD failed) counts as junk.
 
     There are TWO replay windows — this
     Python-side ``replay`` ARG (checked here BEFORE AEAD work) and the
@@ -512,11 +519,13 @@ def decrypt_packet(
     """
     if len(data) < OUTER_HEADER_SIZE:
         log.debug("packet too short, dropping")
+        _note_junk(link_stats)
         return None
 
     seq = SEQ_STRUCT.unpack_from(data)[0]
     if not replay.check(seq):
         log.debug("replay detected, dropping seq=%d", seq)
+        _note_junk(link_stats)
         return None
 
     # nonce sits between the 8-byte seq and the ciphertext.
@@ -526,6 +535,7 @@ def decrypt_packet(
 
     result = _decrypt_with_fallback(session_keys, nonce_bytes, ciphertext, aad, seq)
     if result is None:
+        _note_junk(link_stats)
         return None
     plaintext, decrypted_prev_epoch = result
 
@@ -895,12 +905,12 @@ async def liveness_loop(ctx: DataPathContext) -> None:
 def _link_report_step(ctx: DataPathContext, stats: LinkStats, reported: int) -> int:
     """One wake of ``link_report_loop``: if packets came in since the last
     report handed over, hand the scheduler a new one with the current
-    totals; then run the auto cap's lift timer. Returns the ``received``
-    total of the last report handed over."""
+    totals (``LinkStats.report_totals``: loss while junk came in is
+    forgiven); then run the auto cap's lift timer. Returns the ``received``
+    count of the last report handed over."""
     if stats.received > reported:
-        payload = LinkReport(
-            highest_seq=stats.highest_seq, received=stats.received
-        ).serialize()
+        high, received = stats.report_totals()
+        payload = LinkReport(highest_seq=high, received=received).serialize()
         padded, target_size = _build_control_packet(
             ctx, PacketType.LINK_REPORT, payload
         )
@@ -964,7 +974,7 @@ def make_auto_cap(
         last_seq=lambda: seq.value,
     )
     shaper.watch_tier(autocap.note_tier)
-    return LinkStats(), autocap
+    return LinkStats(queue_drops=transport.recv_drops), autocap
 
 
 async def _tcp_recv_raced(
@@ -1066,6 +1076,7 @@ async def run_data_loops(
                                 "packet from unexpected source %s, dropping",
                                 recv_addr,
                             )
+                            _note_junk(ctx.link_stats)
                             continue
                     else:
                         assert shutdown_wait is not None

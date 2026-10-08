@@ -59,6 +59,10 @@ class UDPTransport:
         self._deferred_closes: list[
             tuple[asyncio.TimerHandle, asyncio.DatagramTransport]
         ] = []
+        # Packets dropped because the receive queue was full, over all
+        # sockets this transport had. A junk flood shows here; the
+        # slow-link auto cap reads it (dsm/traffic/autocap.py LinkStats).
+        self._recv_drops = 0
 
     async def bind(
         self,
@@ -74,7 +78,7 @@ class UDPTransport:
         ``get_path_mtu()``). Only effective on Linux.
         """
         loop = asyncio.get_running_loop()
-        protocol = _UDPProtocol(self._recv_queue)
+        protocol = _UDPProtocol(self._recv_queue, on_drop=self._note_recv_drop)
         # No SO_REUSEADDR or SO_REUSEPORT: on Linux either one lets a second
         # instance bind the same UDP port, and the kernel then hands each
         # packet to only one of them, so sessions break with no error. UDP
@@ -171,7 +175,7 @@ class UDPTransport:
         old_addr = old_sock.getsockname() if old_sock else ("0.0.0.0", 0)
         local_addr = old_addr[0]
 
-        new_protocol = _UDPProtocol(self._recv_queue)
+        new_protocol = _UDPProtocol(self._recv_queue, on_drop=self._note_recv_drop)
         # No SO_REUSEADDR, as in bind(): it would let a local user bind the
         # same port and take the server's packets. Port 0 never needs it.
         new_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -224,6 +228,14 @@ class UDPTransport:
         log.info("UDP rebound to fresh ephemeral port %d", new_port)
         return new_port
 
+    def recv_drops(self) -> int:
+        """How many incoming packets were dropped so far because the receive
+        queue was full."""
+        return self._recv_drops
+
+    def _note_recv_drop(self) -> None:
+        self._recv_drops += 1
+
     async def recv(self, timeout: float | None = None) -> tuple[bytes, tuple[str, int]]:
         if timeout is not None:
             return await asyncio.wait_for(self._recv_queue.get(), timeout)
@@ -257,8 +269,10 @@ class _UDPProtocol(asyncio.DatagramProtocol):
         queue: asyncio.Queue[tuple[bytes, tuple[str, int]]],
         *,
         clock: Callable[[], float] = time.monotonic,
+        on_drop: Callable[[], None] | None = None,
     ) -> None:
         self._queue = queue
+        self._on_drop = on_drop
         # Both can repeat once per packet (when the peer is unreachable, every
         # send comes back as an error): log the first, then at most one line
         # per 10 s with a count.
@@ -269,6 +283,8 @@ class _UDPProtocol(asyncio.DatagramProtocol):
         try:
             self._queue.put_nowait((data, addr))
         except asyncio.QueueFull:
+            if self._on_drop is not None:
+                self._on_drop()
             # No sender address: it would only add a peer's IP to the log.
             self._drop_log.log("recv queue full, dropping incoming packet")
 

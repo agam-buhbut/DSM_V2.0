@@ -5,7 +5,9 @@ count lost packets exactly (gaps in the seq), and the sender holds the knob:
 
 * Receiver side: ``LinkStats`` holds two totals for the session, the highest
   authenticated seq and how many authenticated packets arrived. About once a
-  second the session sends them to the peer in a LINK_REPORT.
+  second the session sends them to the peer in a LINK_REPORT. Packets
+  missing while junk reached this end (a flood fills the receive queue, so
+  genuine packets are dropped before AEAD) are reported as arrived.
 * Sender side: ``AutoCap`` compares two reports, so it knows how many packets
   it sent in that stretch (every packet takes the next seq) and how many
   arrived, and its tier log tells which tier they left at. Two bad stretches
@@ -24,7 +26,7 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from fractions import Fraction
 from typing import TYPE_CHECKING, Protocol
 
@@ -68,17 +70,57 @@ _LOSS = Fraction(LOSS_THRESHOLD).limit_denominator(1000)
 _IGNORED_REPORT = "auto cap: ignored a short or nonsensical link report"
 
 
+def _no_queue_drops() -> int:
+    return 0
+
+
 @dataclass(slots=True)
 class LinkStats:
-    """Receiver totals for one session: genuine packets from the peer."""
+    """Receiver totals for one session: genuine packets from the peer.
+
+    ``junk`` counts packets that reached this end but were not the peer's
+    (failed AEAD, too short, a replay, or from the wrong address), and
+    ``queue_drops`` reads how many packets the full receive queue dropped.
+    """
 
     received: int = 0
     highest_seq: int = 0
+    junk: int = 0
+    queue_drops: Callable[[], int] = field(
+        default=_no_queue_drops, repr=False, compare=False
+    )
+    # Missing packets reported as arrived, and (highest_seq, received, junk
+    # plus queue drops) when the last report was built.
+    forgiven: int = field(default=0, init=False)
+    _last: tuple[int, int, int] = field(default=(0, 0, 0), init=False, repr=False)
 
     def note(self, seq: int) -> None:
         """Count one packet that passed AEAD with a seq not seen before."""
         self.received += 1
         self.highest_seq = max(self.highest_seq, seq)
+
+    def note_junk(self) -> None:
+        """Count one packet that was not the peer's."""
+        self.junk += 1
+
+    def report_totals(self) -> tuple[int, int]:
+        """``(highest_seq, received)`` for the report about to go out.
+
+        Junk sent at this end fills its receive queue, so genuine packets
+        are dropped before AEAD and would read as lost on the link. So when
+        junk reached this end since the last report (``junk`` or the queue
+        drops moved), the packets missing in that time are forgiven: counted
+        as arrived. Loss further up the path still counts. The totals stay
+        cumulative, so a lost report changes nothing, and ``received`` never
+        exceeds ``highest_seq`` (a forgiven packet can still arrive late).
+        """
+        junk = self.junk + self.queue_drops()
+        high, received, last_junk = self._last
+        if junk != last_junk:
+            missing = (self.highest_seq - high) - (self.received - received)
+            self.forgiven += max(0, missing)
+        self._last = (self.highest_seq, self.received, junk)
+        return self.highest_seq, min(self.received + self.forgiven, self.highest_seq)
 
 
 class TierCapTarget(Protocol):

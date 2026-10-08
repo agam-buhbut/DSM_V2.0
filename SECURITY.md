@@ -82,12 +82,14 @@ closed as known:
   can line up your real busy periods; and in TCP mode the TCP connection
   itself stays visible. Perfect hiding from someone who can watch the whole
   internet is not promised.
-- **Slow-link auto cap.** Someone on the path who drops a few percent of
-  your packets for a few seconds can lower your top tier for minutes. It
-  only costs speed: never below tier 1, at most an hour per step, fresh
-  with each connection, logged (`auto cap:` lines), and
-  `shaper_auto_cap = false` turns it off. A quick step down a few seconds
-  after a climb also shows a watcher when your link fills up.
+- **Slow-link auto cap.** Anyone who can congest the path for a few
+  seconds, so that 5% or more of your packets are lost, can lower your top
+  tier for minutes. They need no place on the path: flooding a link on the
+  way, for example your access link, is enough. Junk sent to the DSM host
+  itself no longer counts as loss. It only costs speed: never below tier 1,
+  at most an hour per step, fresh with each connection, logged (`auto cap:`
+  lines), and `shaper_auto_cap = false` turns it off. A quick step down a
+  few seconds after a climb also shows a watcher when your link fills up.
 
 These are described in the project's threat-model documentation. If you believe
 a property is materially worse than documented — or that one of these can be
