@@ -13,6 +13,11 @@ their own small queue, which is always sent first and which the data
 queue's drop-oldest never touches. They still take normal slots, so the wire
 looks the same. Within each queue, packets leave in the order they were
 queued.
+
+A LINK_REPORT (slow-link auto cap) has a one-packet slot of its own
+(``set_report``): a newer report replaces a waiting one. It is not real
+traffic, so the shaper never sees it: it takes a slot that would carry
+chaff, or a slot ahead of data once it has waited REPORT_OVERDUE_S.
 """
 
 from __future__ import annotations
@@ -47,6 +52,11 @@ MAX_QUEUE_SIZE = 512
 # queue. Only a few are ever queued at once; if more pile up, the oldest
 # control packet is dropped, as in the data queue.
 MAX_CONTROL_QUEUE_SIZE = 32
+
+# A link report (set_report) normally takes a slot that would carry chaff.
+# Once it has waited this long it goes ahead of data, so a tier that real
+# traffic keeps full can never starve it.
+REPORT_OVERDUE_S = 1.0
 
 
 @dataclass(order=True)
@@ -98,6 +108,8 @@ class SendScheduler:
         self._queue: list[_ScheduledPacket] = []
         # Control messages: always sent before the data queue.
         self._control: list[_ScheduledPacket] = []
+        # The waiting link report, if any (one slot; see set_report).
+        self._report: _ScheduledPacket | None = None
         self._order = itertools.count()
         self._max_queue_size = MAX_QUEUE_SIZE
         self._running = False
@@ -111,6 +123,20 @@ class SendScheduler:
         self._drop_log = RepeatLog(log, logging.WARNING, clock=clock)
         self._control_drop_log = RepeatLog(log, logging.WARNING, clock=clock)
         self._failure_logs: dict[tuple[str, type[BaseException]], RepeatLog] = {}
+
+    def set_report(self, data: bytes, target_size: int) -> None:
+        """Hold a LINK_REPORT for a free slot (one slot only).
+
+        A newer report replaces a waiting one and keeps its waiting time: the
+        reports carry totals, so the newest says it all. It is not real
+        traffic: the shaper never sees it (not in queue_len, oldest_wait or
+        real_sent). It takes a slot that would carry chaff, or a slot ahead
+        of data once it has waited REPORT_OVERDUE_S, goes out through
+        ``send_fn``, and is sent even while the chaff gate is closed.
+        """
+        report = self._report
+        queued_at = report.queued_at if report is not None else self._clock()
+        self._report = _ScheduledPacket(queued_at, next(self._order), data, target_size)
 
     def enqueue(
         self,
@@ -208,13 +234,22 @@ class SendScheduler:
         send = pkt.send_via if pkt.send_via is not None else self._send_fn
         await self._keep_alive(send(pkt.data, pkt.target_size), "send")
 
+    async def _send_report(self) -> None:
+        """Send the waiting link report with the scheduler's own send_fn."""
+        report, self._report = self._report, None
+        if report is not None:
+            await self._keep_alive(
+                self._send_fn(report.data, report.target_size), "send"
+            )
+
     async def _tick(self, now: float) -> None:
         """Fill exactly the slots that are due.
 
-        Queued control messages go first, then queued data, each oldest
-        first; chaff fills the remaining slots. The count comes from the
-        shaper, never from the queues, so the wire rate follows the tier,
-        not the real traffic.
+        Queued control messages go first, then an overdue link report, then
+        queued data (each queue oldest first), then a waiting link report;
+        chaff fills the remaining slots. The count comes from the shaper,
+        never from the queues, so the wire rate follows the tier, not the
+        real traffic.
         """
         heads = [q[0].queued_at for q in (self._control, self._queue) if q]
         oldest_wait = max(0.0, now - min(heads)) if heads else 0.0
@@ -224,9 +259,16 @@ class SendScheduler:
         self._real_sent = 0
         chaff_allowed = self._should_chaff_fn is None or self._should_chaff_fn()
         for _ in range(slots):
-            queue = self._control or self._queue
-            if queue:
-                await self._send_one(heapq.heappop(queue))
+            if self._control:
+                await self._send_one(heapq.heappop(self._control))
+                self._real_sent += 1
+            elif self._report is not None and (
+                not self._queue or now - self._report.queued_at >= REPORT_OVERDUE_S
+            ):
+                # Not real traffic: never counted in real_sent.
+                await self._send_report()
+            elif self._queue:
+                await self._send_one(heapq.heappop(self._queue))
                 self._real_sent += 1
             elif self._chaff_fn is not None and chaff_allowed:
                 # Chaff fills the slot. Sent DIRECTLY (not via enqueue) so it
