@@ -474,16 +474,23 @@ class DnsBlocklist:
             )
 
     def start(self) -> None:
-        """Start ``run`` as a task on the running loop."""
+        """Start ``run`` as a task on the running loop; does nothing if it runs."""
+        if self._task is not None and not self._task.done():
+            return
         self._task = asyncio.create_task(self.run())
 
     async def stop(self) -> None:
         """Cancel the task and wait for it to end."""
-        if self._task is None:
+        # Cleared first, so a second stop() during the wait does nothing.
+        task, self._task = self._task, None
+        if task is None:
             return
-        self._task.cancel()
+        task.cancel()
         try:
-            await self._task
+            await task
         except asyncio.CancelledError:
-            pass
-        self._task = None
+            # The task ending is expected. A cancel aimed at our caller is not
+            # ours to swallow.
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                raise

@@ -27,6 +27,7 @@ from dsm.crypto.cert_allowlist import CNAllowlist, CNAllowlistError
 from dsm.crypto.keystore import KeyStore
 from dsm.net._addresses import SERVER_TUN_IP
 from dsm.net.dns import DNSResolver
+from dsm.net.dns_blocklist import DnsBlocklist
 from dsm.net.dns_proxy import DNSProxyPortInUseError, LocalDNSProxy
 from dsm.net.forwarding import IPForwardingManager, MasqueradeManager
 from dsm.net.handshake_acceptor import (
@@ -291,6 +292,7 @@ async def _run_one_session(
     client_pub: bytes,
     transport: UDPTransport | TCPTransport,
     process_shutdown: asyncio.Event,
+    blocklist: DnsBlocklist | None = None,
 ) -> None:
     """Stand up per-session host state, run the data loops, then unwind.
 
@@ -306,6 +308,9 @@ async def _run_one_session(
     task propagates ``process_shutdown`` into it so a signal arriving during
     a live session also stops the loops. The bridge is cancelled when the
     session ends.
+
+    ``blocklist`` is the daemon's one DNS blocklist (None when
+    ``dns_blocklist`` is off); this session's DNS proxy answers from it.
     """
     import tuncore
 
@@ -365,6 +370,7 @@ async def _run_one_session(
             bind_ip=SERVER_TUN_IP,
             bind_port=53,
             debug_dns=config.debug_dns,
+            blocklist=blocklist,
         )
         await dns_proxy.start()
         session_stack.callback(dns_proxy.stop)  # sync
@@ -626,6 +632,15 @@ async def run_server(
         tcp_ts.apply()
         stack.callback(tcp_ts.remove)
 
+        # DNS blocklist: one per daemon run, shared by every session. It loads
+        # in a worker thread and checks the list files every 5 minutes, so no
+        # session waits for it.
+        blocklist: DnsBlocklist | None = None
+        if config.dns_blocklist:
+            blocklist = DnsBlocklist(config.config_dir / "dns")
+            blocklist.start()
+            stack.push_async_callback(blocklist.stop)
+
         # The handshake rejects attestation timestamps more than ~5 minutes
         # off, so an unsynchronized clock fails with a confusing peer error.
         _clock_warn = check_clock_sync()
@@ -758,6 +773,7 @@ async def run_server(
                     client_pub,
                     transport_obj,
                     process_shutdown,
+                    blocklist,
                 )
             except DNSProxyPortInUseError as e:
                 # A host resolver holds :53. Retrying cannot fix that and would
