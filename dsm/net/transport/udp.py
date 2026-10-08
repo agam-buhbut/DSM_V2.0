@@ -147,12 +147,11 @@ class UDPTransport:
     async def rebind_to_fresh_port(self) -> int:
         """Rebind to a fresh ephemeral source port.
 
-        Closes the current socket and binds a new one with kernel-picked
-        ephemeral port + the same options (SO_MARK, PMTUD). The
-        ``_recv_queue`` is preserved across the swap, so the recv loop continues —
-        packets that arrive on the OLD socket
-        between the close and the next sock arrival are dropped (a
-        protocol-level ACK or retransmit deals with any loss).
+        Binds a new socket on a kernel-picked ephemeral port with the same
+        options (SO_MARK, PMTUD) and sends from it from now on. The old
+        socket stays open for OLD_PORT_GRACE_S, so packets the server still
+        sends to the old port arrive; both sockets feed the same
+        ``_recv_queue``, so the recv loop continues.
 
         Returns the new bound port. Caller (e.g., rekey completion
         hook) typically discards the return value but it is useful for
@@ -173,8 +172,9 @@ class UDPTransport:
         local_addr = old_addr[0]
 
         new_protocol = _UDPProtocol(self._recv_queue)
+        # No SO_REUSEADDR, as in bind(): it would let a local user bind the
+        # same port and take the server's packets. Port 0 never needs it.
         new_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        new_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         new_sock.setblocking(False)
         try:
             new_sock.bind((local_addr, 0))  # 0 = kernel picks
