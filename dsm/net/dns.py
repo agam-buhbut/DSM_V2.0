@@ -1,6 +1,6 @@
 """Server-side DNS resolution via DoH and DoT.
 
-Resolution order: offline hosts -> primary (DoH) -> secondary (DoT) -> tertiary.
+Resolution order: cache -> primary (DoH) -> secondary (DoT) -> tertiary.
 No DNS traffic ever leaves the client machine directly.
 """
 
@@ -8,14 +8,12 @@ from __future__ import annotations
 
 import asyncio
 import hmac
-import ipaddress
 import logging
 import secrets
 import struct
 import time
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
-from pathlib import Path
 from typing import cast
 from urllib.parse import urlparse
 
@@ -109,6 +107,9 @@ class DNSResolver:
         hosts_file: str = "/opt/mtun/hosts.txt",
         debug_dns: bool = False,
     ) -> None:
+        # Ignored: DSM no longer reads a hosts file. Kept so callers that
+        # still pass it keep working.
+        del hosts_file
         if not providers:
             raise ValueError("DNSResolver requires at least one provider")
         # debug_dns mirrors the LocalDNSProxy flag — when False (the
@@ -126,71 +127,7 @@ class DNSResolver:
                 )
             self._pins[provider] = [bytes.fromhex(h) for h in hex_pins]
         self._providers = list(providers)
-        self._hosts_file = Path(hosts_file)
         self._cache: dict[str, _CacheEntry] = {}
-        self._static_hosts: dict[str, str] = {}
-        self._load_hosts_file()
-
-    # Cap the hosts file read so a 100 MiB symlink-to-some-other-file cannot
-    # blow process memory at startup. 1 MiB fits ~30k entries which is well
-    # beyond any realistic static-hosts use case.
-    _HOSTS_FILE_MAX_BYTES = 1 << 20
-
-    def _load_hosts_file(self) -> None:
-        """Load static host mappings from hosts file.
-
-        Refuses to follow symlinks so an attacker who plants a symlink at
-        the hosts-file path cannot redirect reads to (e.g.) /etc/shadow or
-        another sensitive file. Caps the read size to bound memory cost on
-        startup. Parse errors are logged without echoing the offending line
-        — the file might point to attacker content and we don't want
-        unparseable bytes from it landing in the operator's journald.
-        """
-        if not self._hosts_file.exists():
-            return
-        if self._hosts_file.is_symlink():
-            log.warning(
-                "hosts file %s is a symlink; refusing to follow",
-                self._hosts_file,
-            )
-            return
-        try:
-            raw = self._hosts_file.read_bytes()
-        except OSError as e:
-            log.warning("failed to read hosts file %s: %s", self._hosts_file, e)
-            return
-        if len(raw) > self._HOSTS_FILE_MAX_BYTES:
-            log.warning(
-                "hosts file %s exceeds %d bytes; refusing to load",
-                self._hosts_file,
-                self._HOSTS_FILE_MAX_BYTES,
-            )
-            return
-        try:
-            text = raw.decode("utf-8")
-        except UnicodeDecodeError:
-            log.warning(
-                "hosts file %s is not valid UTF-8; refusing to load",
-                self._hosts_file,
-            )
-            return
-        for lineno, line in enumerate(text.splitlines(), start=1):
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            parts = line.split()
-            if len(parts) >= 2:
-                ip, hostname = parts[0], parts[1]
-                try:
-                    ipaddress.ip_address(ip)
-                except ValueError:
-                    log.warning(
-                        "hosts file %s line %d: invalid IP, skipping",
-                        self._hosts_file,
-                        lineno,
-                    )
-                    continue
-                self._static_hosts[hostname.lower()] = ip
 
     async def resolve(self, hostname: str) -> list[str]:
         """Resolve hostname to A-record IP addresses.
@@ -206,22 +143,13 @@ class DNSResolver:
     async def resolve_detailed(self, hostname: str) -> DnsResult:
         """Resolve ``hostname``, distinguishing authoritative-empty from failure.
 
-        Checks: static hosts -> cache -> DoH -> DoT -> custom. On an
+        Checks: cache -> DoH -> DoT -> custom. On an
         authoritative answer (addresses, NXDOMAIN, or NODATA) provider
         fan-out STOPS and the result is returned/negative-cached. Only a
         transport-level failure across every provider yields a
         non-authoritative empty result (rcode -1).
         """
         hostname = hostname.lower().rstrip(".")
-
-        static = self._static_hosts.get(hostname)
-        if static:
-            return DnsResult(
-                addresses=[static],
-                ttl=MAX_TTL,
-                rcode=int(dns.rcode.NOERROR),
-                authoritative=True,
-            )
 
         # Positive and negative entries; an empty address list is a
         # cached authoritative-empty answer per RFC 2308.
