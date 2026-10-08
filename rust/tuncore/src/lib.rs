@@ -713,9 +713,10 @@ fn complete_bootstrap(
 }
 
 /// Python-visible tier shaper (see `shaper.rs`), one per session and
-/// direction. Only the scheduling and sizing calls cross the FFI: there are
-/// no getters for the session's secret timing values, and the default
-/// `repr` shows none of them.
+/// direction. Only the scheduling and sizing calls cross the FFI, plus the
+/// tier cap and the tier in use, which are not secrets (the rate shows
+/// both): there are no getters for the session's secret timing values, and
+/// the default `repr` shows none of them.
 #[pyclass(name = "Shaper")]
 struct PyShaper {
     inner: shaper::Shaper<OsRng>,
@@ -768,6 +769,18 @@ impl PyShaper {
 
     fn active_classes(&self) -> Vec<u16> {
         self.inner.active_classes().to_vec()
+    }
+
+    /// Highest tier the shaper may use, from the next poll on; see
+    /// `shaper::Shaper::set_tier_cap`. A negative number raises
+    /// `OverflowError` (PyO3's usize conversion).
+    fn set_tier_cap(&mut self, cap: usize) {
+        self.inner.set_tier_cap(cap);
+    }
+
+    /// The tier in use now (0 = idle).
+    fn tier(&self) -> usize {
+        self.inner.tier()
     }
 }
 

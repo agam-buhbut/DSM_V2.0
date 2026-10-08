@@ -194,8 +194,11 @@ class Shaper:
 
     Decides when packets leave and how big they are. Each session draws its
     own secret timing values from the OS RNG; nothing exposes them (no
-    getters, nothing in ``repr``). Config errors raise ``ValueError``. An
-    integer outside the range a call takes raises ``OverflowError``.
+    getters, nothing in ``repr``). A tier cap (``set_tier_cap``) holds the
+    rate below the top tier: every climb stops at it, and a higher tier steps
+    down at the next poll. ``tier()`` reads the tier in use, which is not a
+    secret. Config errors raise ``ValueError``. An integer outside the range
+    a call takes raises ``OverflowError``.
     """
 
     def __init__(
@@ -226,6 +229,13 @@ class Shaper:
         ...
 
     def active_classes(self) -> list[int]: ...
+    def set_tier_cap(self, cap: int) -> None:
+        """Highest tier to use from the next poll on (0 counts as 1)."""
+        ...
+
+    def tier(self) -> int:
+        """The tier in use now (0 = idle)."""
+        ...
 
 def harden_process() -> None: ...
 def complete_bootstrap(

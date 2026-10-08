@@ -12,6 +12,10 @@ This module only builds packet bytes. Real and chaff packets get their size
 from the same fixed, published size mix (``SIZE_CLASS_WEIGHTS``): a real
 packet's class is bumped up to fit its payload, a chaff packet's class gets a
 one-class nudge up or down. No size state carries over between packets.
+
+A tier cap (``set_tier_cap``) can hold the rate below the top tier for a
+while; the slow-link auto cap (dsm/traffic/autocap.py) sets it, and
+``watch_tier`` tells it when the tier changes.
 """
 
 from __future__ import annotations
@@ -51,6 +55,11 @@ _CHAFF_SIZE_PERTURB_DOWN_P: float = tuncore.CHAFF_PERTURB_DOWN_P
 # set_size_class_ceiling crosses the FFI as a u16.
 _MAX_U16 = 0xFFFF
 
+# set_tier_cap crosses the FFI as a usize. Any value at or above the top tier
+# means no cap, so clamping to this range changes nothing and keeps PyO3's
+# OverflowError out.
+_MAX_TIER_CAP = 0xFFFF
+
 
 def _min_outer(payload_len: int) -> int:
     """Smallest outer packet that carries ``payload_len`` payload bytes."""
@@ -82,6 +91,9 @@ class TrafficShaper:
             padding_max,
             clock(),
         )
+        # Tier listener (watch_tier) and the tier it saw last.
+        self._tier_listener: Callable[[int], None] | None = None
+        self._watched_tier = 0
 
     @classmethod
     def from_config(
@@ -104,6 +116,31 @@ class TrafficShaper:
         """Size classes in use now (public information, not a secret)."""
         return tuple(self._core.active_classes())
 
+    @property
+    def tier(self) -> int:
+        """The tier in use now (0 = idle). Not a secret: a watcher sees the
+        rate."""
+        return self._core.tier()
+
+    def set_tier_cap(self, cap: int) -> None:
+        """Highest tier the shaper may use, from the next poll on.
+
+        At or above the top tier means no cap; below 1 counts as 1 (the
+        floor). A tier above the cap steps down at the next poll; raising
+        the cap moves nothing by itself. Never raises.
+        """
+        self._core.set_tier_cap(min(max(cap, 0), _MAX_TIER_CAP))
+
+    def watch_tier(self, listener: Callable[[int], None]) -> None:
+        """After each poll that changed the tier, call ``listener(new_tier)``.
+
+        One extra FFI call per poll while a listener is set. The listener runs
+        inside the send loop, after the core's poll has returned: it must not
+        raise and must not call back into the shaper.
+        """
+        self._tier_listener = listener
+        self._watched_tier = self._core.tier()
+
     def poll(
         self, now: float, queue_len: int, oldest_wait: float, real_sent: int
     ) -> tuple[int, float]:
@@ -111,9 +148,17 @@ class TrafficShaper:
 
         ``queue_len``: real packets waiting. ``oldest_wait``: seconds the
         oldest sendable one has waited (0 if none). ``real_sent``: real
-        packets sent since the previous poll.
+        packets sent since the previous poll. A tier listener set with
+        ``watch_tier`` is called after the poll when the tier changed.
         """
-        return self._core.poll(now, queue_len, oldest_wait, real_sent)
+        result = self._core.poll(now, queue_len, oldest_wait, real_sent)
+        listener = self._tier_listener
+        if listener is not None:
+            tier = self._core.tier()
+            if tier != self._watched_tier:
+                self._watched_tier = tier
+                listener(tier)
+        return result
 
     def set_size_class_ceiling(self, max_outer: int) -> None:
         """Cap padded sizes at ``max_outer`` bytes (path MTU minus IP + UDP).
