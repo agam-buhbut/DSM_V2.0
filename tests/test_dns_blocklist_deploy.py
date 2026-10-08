@@ -221,9 +221,18 @@ def test_the_unit_sees_only_the_dns_folder_of_the_config() -> None:
     assert any(line.startswith("TimeoutStartSec=") for line in service)
 
 
+_CHECK = re.compile(
+    r"for f in (?P<names>[^;\n]*); do\n"
+    r"\s*\[ -f \"\$DEPLOY_DIR/\$f\" \] \|\| BLOCKLIST=0\n"
+    r"\s*done\n"
+)
+
+
 def test_install_sh_sets_up_the_timer_and_fetches_once_through_the_unit() -> None:
     text = INSTALL.read_text()
     unit = text.index('install -m 0644 "$UNIT_SRC" /etc/systemd/system/dsm.service')
+    check = _CHECK.search(text)
+    assert check is not None
     script = text.index(
         'install -m 0755 "$DEPLOY_DIR/dsm-blocklist-update.sh" '
         "/usr/local/sbin/dsm-blocklist-update"
@@ -236,9 +245,30 @@ def test_install_sh_sets_up_the_timer_and_fetches_once_through_the_unit() -> Non
         text,
     )
     assert fetch is not None
-    assert unit < script < folder < enable < fetch.start()
+    assert unit < check.start() < script < folder < enable < fetch.start()
     # The first download runs in the unit's sandbox, never as plain root.
     assert "/usr/local/sbin/dsm-blocklist-update /opt/mtun" not in _code(INSTALL)
+
+
+def test_install_sh_skips_the_blocklist_when_deploy_lacks_its_files() -> None:
+    # An older /opt/dsm/deploy has dsm.service but not these files: install.sh
+    # must warn and still reach daemon-reload, not stop half way.
+    text = INSTALL.read_text()
+    check = _CHECK.search(text)
+    assert check is not None
+    assert check.group("names").split() == [
+        "dsm-blocklist-update.sh",
+        "dsm-blocklist-update.service",
+        "dsm-blocklist-update.timer",
+    ]
+    skip = text.index("skipping the daily list download")
+    reload = text.index("systemctl daemon-reload || die")
+    assert check.start() < skip < reload
+    guards = [m.start() for m in re.finditer(r'if \[ "\$BLOCKLIST" = 1 \]', text)]
+    assert len(guards) == 2
+    script = text.index('install -m 0755 "$DEPLOY_DIR/dsm-blocklist-update.sh"')
+    enable = text.index("systemctl enable --now dsm-blocklist-update.timer")
+    assert guards[0] < script < skip < reload < guards[1] < enable
 
 
 _CAP_CURL = """#!/bin/sh

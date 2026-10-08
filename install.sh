@@ -232,24 +232,35 @@ if [ "$EVAL" = 0 ]; then
       install -m 0644 "$UNIT_SRC" /etc/systemd/system/dsm.service \
         || die "could not install dsm.service"
       # DNS blocklist: the download script, its unit and its daily timer sit
-      # next to dsm.service (deploy/GUIDE.md §7h).
+      # next to dsm.service (deploy/GUIDE.md §7h). An older copy of deploy/
+      # may not have them; then dsm runs without the daily list download.
       DEPLOY_DIR="$(dirname "$UNIT_SRC")"
-      install -m 0755 "$DEPLOY_DIR/dsm-blocklist-update.sh" /usr/local/sbin/dsm-blocklist-update \
-        || die "could not install dsm-blocklist-update"
-      install -m 0644 "$DEPLOY_DIR/dsm-blocklist-update.service" \
-        "$DEPLOY_DIR/dsm-blocklist-update.timer" /etc/systemd/system/ \
-        || die "could not install the DNS block list timer"
-      # The unit can see and write only this folder, so it must exist.
-      install -d -m 0700 /opt/mtun/dns || die "could not create /opt/mtun/dns"
+      BLOCKLIST=1
+      for f in dsm-blocklist-update.sh dsm-blocklist-update.service dsm-blocklist-update.timer; do
+        [ -f "$DEPLOY_DIR/$f" ] || BLOCKLIST=0
+      done
+      if [ "$BLOCKLIST" = 1 ]; then
+        install -m 0755 "$DEPLOY_DIR/dsm-blocklist-update.sh" /usr/local/sbin/dsm-blocklist-update \
+          || die "could not install dsm-blocklist-update"
+        install -m 0644 "$DEPLOY_DIR/dsm-blocklist-update.service" \
+          "$DEPLOY_DIR/dsm-blocklist-update.timer" /etc/systemd/system/ \
+          || die "could not install the DNS block list timer"
+        # The unit can see and write only this folder, so it must exist.
+        install -d -m 0700 /opt/mtun/dns || die "could not create /opt/mtun/dns"
+      else
+        echo "install.sh: WARNING — the DNS block list files are not in $DEPLOY_DIR; skipping the daily list download (deploy/GUIDE.md §7h)." >&2
+      fi
       systemctl daemon-reload || die "systemctl daemon-reload failed"
-      systemctl enable --now dsm-blocklist-update.timer \
-        || die "could not enable dsm-blocklist-update.timer"
-      # Download the default list once now, so blocking works from dsm's
-      # first start. Through the unit, so this run has the same sandbox as
-      # the daily ones (it cannot read DSM's keys or root's ~/.curlrc). Not
-      # fatal: the timer tries again every day.
-      systemctl start dsm-blocklist-update.service \
-        || echo "install.sh: WARNING — could not download the DNS block lists now; the daily timer tries again (journalctl -u dsm-blocklist-update, deploy/GUIDE.md §7h)." >&2
+      if [ "$BLOCKLIST" = 1 ]; then
+        systemctl enable --now dsm-blocklist-update.timer \
+          || die "could not enable dsm-blocklist-update.timer"
+        # Download the default list once now, so blocking works from dsm's
+        # first start. Through the unit, so this run has the same sandbox as
+        # the daily ones (it cannot read DSM's keys or root's ~/.curlrc). Not
+        # fatal: the timer tries again every day.
+        systemctl start dsm-blocklist-update.service \
+          || echo "install.sh: WARNING — could not download the DNS block lists now; the daily timer tries again (journalctl -u dsm-blocklist-update, deploy/GUIDE.md §7h)." >&2
+      fi
       echo "Installed dsm.service. Start with: sudo systemctl enable --now dsm" >&2
     else
       echo "install.sh: WARNING — --systemd requested but deploy/dsm.service not found locally; skipping unit install." >&2
