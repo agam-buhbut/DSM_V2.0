@@ -280,6 +280,58 @@ def test_thirty_clean_intervals_at_the_opened_tier_reset_the_wait(
     assert _messages(caplog, logging.INFO)[-1].endswith("next try in 10 min")
 
 
+def _lift_to_the_top(link: _Link) -> None:
+    """Cap at 2, then 1; two lifts open tier 3 again (no cap), and the next
+    loss doubles the wait unless 30 clean intervals at tier 3 reset it."""
+    link.interval(800)
+    link.flood(3)
+    capped_at = link.flood(2)
+    link.wait_until(capped_at + 300.0)
+    link.wait_until(capped_at + 600.0)
+    assert link.shaper.caps == [2, 1, 2, 3]
+
+
+def test_clean_intervals_below_the_opened_tier_do_not_reset_the_wait(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    link = _Link()
+    _lift_to_the_top(link)
+    link.set_tier(2)
+    for _ in range(30):
+        link.interval(200)  # clean, but below the opened tier 3
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger=_LOGGER):
+        link.flood(3)
+    assert _messages(caplog, logging.INFO)[-1].endswith("next try in 10 min")
+
+
+def test_a_bad_interval_below_the_opened_tier_keeps_the_clean_run(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    link = _Link()
+    _lift_to_the_top(link)
+    link.set_tier(3)
+    for _ in range(15):
+        link.interval(800)
+    link.set_tier(2)
+    link.interval(200, 20)  # bad, but below the opened tier 3
+    link.set_tier(3)
+    for _ in range(15):
+        link.interval(800)  # 30 clean at tier 3: the wait is back at 300
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger=_LOGGER):
+        link.flood(3)
+    assert _messages(caplog, logging.INFO)[-1].endswith("next try in 5 min")
+
+
+def test_loss_at_tier_zero_is_not_judged() -> None:
+    link = _Link(start_tier=0)
+    link.interval(800)
+    for _ in range(10):
+        link.interval(800, 400)
+    assert link.shaper.caps == []
+
+
 def test_reports_that_make_no_sense_are_ignored_and_keep_the_run(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
