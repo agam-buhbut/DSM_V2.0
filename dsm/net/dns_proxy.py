@@ -43,7 +43,8 @@ DEFAULT_CACHED_TTL = 60
 # device how long to remember "no such name" (RFC 2308). dsm.invalid can never
 # be a real zone.
 _BLOCKED_SOA = f"dsm.invalid. hostmaster.dsm.invalid. 1 3600 600 86400 {NEGATIVE_TTL_S}"
-# Longest valid DNS name as text. The blocklist has no length cap of its own.
+# The blocklist has no length cap of its own. A legal name is at most 253
+# characters as text, unless it holds escaped bytes (\001 is 4 characters).
 _MAX_QNAME_LEN = 253
 
 
@@ -254,8 +255,9 @@ class LocalDNSProxy:
         # for every query type (AAAA, HTTPS, ...), not an empty answer.
         if self._blocklist is not None:
             if len(qname) > _MAX_QNAME_LEN:
-                # Not a valid name; treated like a malformed query.
-                log.debug("dropping DNS query with an over-long name from %s", addr)
+                # Over 253 characters as text only happens with escaped bytes;
+                # drop it like a malformed query.
+                log.debug("dropping DNS query with an over-long name")
                 return None
             if self._blocklist.is_blocked(qname):
                 send(_make_blocked(query), addr)

@@ -173,7 +173,7 @@ async def test_a_blocked_answer_logs_nothing_about_the_name(
 
 
 async def test_a_name_over_253_bytes_is_dropped_before_the_blocklist_sees_it(
-    tmp_path: Path,
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     resolver = _RecordingResolver()
     blocklist = await _blocklist(tmp_path, block=b"0.0.0.0 ads.example.com\n")
@@ -182,6 +182,9 @@ async def test_a_name_over_253_bytes_is_dropped_before_the_blocklist_sees_it(
     # characters "\001", so the name's text is far over 253.
     labels = [b"\x01" * 63] * 3 + [b"\x01" * 60, b""]
     query = dns.message.make_query(dns.name.Name(labels), "A")
+    caplog.set_level(logging.DEBUG)
     assert await _send(proxy, query) == []
     assert blocklist.asked == []
     assert resolver.asked == []
+    assert "over-long name" in caplog.text
+    assert _CLIENT[0] not in caplog.text
