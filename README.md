@@ -394,7 +394,7 @@ either end can turn it off for both directions of its connections.
 
 You can still set the top tier by hand. Do that in TCP mode, when the other
 end runs an older version, with auto cap turned off, or on a link slower
-than tier 1 (about 0.5 Mbit/s): lower the top tier in `shaper_tiers_pps` to
+than tier 1 (about 0.7 Mbit/s): lower the top tier in `shaper_tiers_pps` to
 about 50 packets/s for each Mbit/s of the link's slower direction. For
 example, a link with 4 Mbit/s upload gets `[10, 50, 150, 200]`. Keep the
 list rising and the first entry above 8.5. Each end shapes only what it

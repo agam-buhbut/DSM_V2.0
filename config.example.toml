@@ -184,7 +184,7 @@ padding_max = 1400
 # (shaper_auto_cap, below) handles that on its own. Lower the top tier by
 # hand, to about 50 per Mbit/s of the link's slower direction (e.g.
 # [10, 50, 150, 200] for 4 Mbit/s), only in TCP mode, against an older DSM,
-# with auto cap off, or on a link slower than tier 1 (about 0.5 Mbit/s).
+# with auto cap off, or on a link slower than tier 1 (about 0.7 Mbit/s).
 # shaper_tiers_pps = [10, 50, 200, 800]
 #
 # How long a real packet may wait before the rate steps up, in milliseconds

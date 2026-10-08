@@ -1707,7 +1707,7 @@ hour) while the loss keeps coming back.
 
 Set the tiers by hand only when auto cap cannot help: in TCP mode, when the
 other end runs an older DSM, when `shaper_auto_cap = false`, or when the
-link is slower than tier 1 (about 0.5 Mbit/s). Then lower the top tier in
+link is slower than tier 1 (about 0.7 Mbit/s). Then lower the top tier in
 `shaper_tiers_pps` to about 50 packets/s per Mbit/s of the link's slower
 direction, e.g. `[10, 50, 150, 200]` for 4 Mbit/s. Keep the list rising and
 the first entry above 8.5. The end that sends over the slow direction needs
