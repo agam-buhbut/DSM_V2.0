@@ -13,14 +13,18 @@ paths only, never names or hashes.
 
 from __future__ import annotations
 
+import asyncio
 import errno
 import hashlib
 import ipaddress
 import logging
 import os
 import re
+import secrets
 import stat
 from array import array
+from bisect import bisect_left
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple
@@ -344,3 +348,142 @@ def list_signature(dns_dir: Path) -> Signature:
             )
         )
     return tuple(out)
+
+
+def _contains(table: array[int], value: int) -> bool:
+    i = bisect_left(table, value)
+    return i < len(table) and table[i] == value
+
+
+def _name_and_parents(name: bytes) -> list[bytes]:
+    """``a.b.com`` gives ``a.b.com`` and ``b.com``: list names have 2+ labels."""
+    out: list[bytes] = []
+    while b"." in name:
+        out.append(name)
+        name = name.partition(b".")[2]
+    return out
+
+
+class DnsBlocklist:
+    """The lists in use, the change check, and the blocked-query count.
+
+    Only ``list_signature`` and ``load_lists`` run in a worker thread; new
+    lists are swapped in on the event loop thread, so no state is shared
+    between threads.
+    """
+
+    def __init__(self, dns_dir: Path) -> None:
+        self._dns_dir = dns_dir
+        # New on every run and never logged or saved: without it a stored
+        # hash cannot be checked against a guessed name.
+        self._key = secrets.token_bytes(16)
+        self._lists = _no_lists()
+        self._signature: Signature | None = None
+        self._blocked = 0
+        self._task: asyncio.Task[None] | None = None
+
+    def is_blocked(self, qname: str) -> bool:
+        """True if ``qname`` (any case, trailing dot or not) gets NXDOMAIN.
+
+        The canary always does. Otherwise a name is blocked when it or a
+        parent is on a block list and neither it nor a parent is allowed.
+        """
+        name = qname.lower().rstrip(".")
+        # First, so neither allow.txt nor an `@@||name^` line can turn it off.
+        if name == CANARY or name.endswith(_CANARY_SUFFIX):
+            self._blocked += 1
+            return True
+        lists = self._lists
+        if not lists.block:
+            return False
+        hashes = [
+            name_hash(n, self._key)
+            for n in _name_and_parents(name.encode("ascii", "replace"))
+        ]
+        if any(_contains(lists.allow, h) for h in hashes):
+            return False
+        if any(_contains(lists.block, h) for h in hashes):
+            self._blocked += 1
+            return True
+        return False
+
+    async def refresh(self) -> None:
+        """Load the lists again if the files changed since the last try.
+
+        A refused load keeps the lists in use and warns once; it is not
+        tried again until the files change.
+        """
+        signature = await asyncio.to_thread(list_signature, self._dns_dir)
+        if signature == self._signature:
+            return
+        self._signature = signature
+        try:
+            lists = await asyncio.to_thread(load_lists, self._dns_dir, self._key)
+        except (BlocklistError, OSError) as e:
+            # A BlocklistError says which file and how to fix it. For a disk
+            # error (EIO and the like) log only the reason: str(e) adds a path.
+            reason = str(e) if isinstance(e, BlocklistError) else e.strerror
+            log.warning(
+                "DNS blocklist not loaded: %s. The lists already in use stay.", reason
+            )
+            return
+        self._lists = lists
+        log.info(
+            "DNS blocklist loaded: %s names to block, %s allowed (files read: %d, "
+            "lines skipped: %s)",
+            f"{len(lists.block):,}",
+            f"{len(lists.allow):,}",
+            lists.files,
+            f"{lists.skipped:,}",
+        )
+        if not lists.block:
+            log.warning(
+                "DNS blocklist is on but has no names to block; put lists in %s "
+                "(deploy/GUIDE.md §7h)",
+                self._dns_dir / BLOCK_DIR,
+            )
+
+    def log_blocked_count(self) -> None:
+        """Log how many queries were blocked since the last call, if any."""
+        if self._blocked:
+            log.info(
+                "DNS blocklist: queries blocked in the last hour: %s",
+                f"{self._blocked:,}",
+            )
+            self._blocked = 0
+
+    async def run(
+        self, *, sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
+    ) -> None:
+        """Load now, then check for changes every 5 minutes; count hourly."""
+        checks = 0
+        try:
+            while True:
+                await self.refresh()
+                await sleep(CHECK_INTERVAL_S)
+                checks += 1
+                if checks % REPORT_EVERY_CHECKS == 0:
+                    self.log_blocked_count()
+        # refresh() handles refused lists; this is for a bug. Report it once
+        # and end, keeping the lists in use. Cancellation is not an Exception.
+        except Exception as e:  # noqa: BLE001
+            log.error(
+                "DNS blocklist: list checks stopped (%s); the lists in use stay "
+                "until dsm restarts",
+                type(e).__name__,
+            )
+
+    def start(self) -> None:
+        """Start ``run`` as a task on the running loop."""
+        self._task = asyncio.create_task(self.run())
+
+    async def stop(self) -> None:
+        """Cancel the task and wait for it to end."""
+        if self._task is None:
+            return
+        self._task.cancel()
+        try:
+            await self._task
+        except asyncio.CancelledError:
+            pass
+        self._task = None
