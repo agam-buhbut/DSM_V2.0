@@ -387,8 +387,9 @@ step at once and logs a line like
 `auto cap: lost 12% at tier 3 (800/s); top tier now 2 (200/s), next try in 5 min`.
 After 5 minutes it allows the higher step again. If the loss comes back, it
 waits twice as long the next time, up to an hour. It never goes below tier
-1, and every new connection starts with no limit. If even tier 1 keeps
-losing packets, it logs a warning at most every 10 minutes:
+1, and every new connection starts with no limit. If packets are still
+lost after auto cap has already dropped to tier 1, it logs a warning at
+most every 10 minutes:
 `auto cap: link too slow even for tier 1 (about 12% lost); lower shaper_tiers_pps by hand`.
 It needs this version at
 the other end too (an older end sends no reports, so nothing changes), and

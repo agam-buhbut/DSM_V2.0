@@ -12,7 +12,8 @@ count lost packets exactly (gaps in the seq), and the sender holds the knob:
   in a row at a tier k of 2 or more cap the shaper at k - 1; after a wait the
   cap is lifted one tier. The loss check (tier log, intervals) is kept apart
   from the reaction (cap and lift), so a later rule can replace the reaction
-  alone.
+  alone. Once the cap is at tier 1, the floor, loss that lasts there logs a
+  warning instead (nothing is left to cap).
 
 Nothing here logs seq numbers or report totals. Every method runs on the
 session's asyncio thread and never awaits.
@@ -106,7 +107,9 @@ class AutoCap:
         """
         Args:
             shaper: gets ``set_tier_cap`` calls, nothing else.
-            tiers_pps: the configured tier rates, for log lines only.
+            tiers_pps: the configured tier rates. Their count sets the top
+                tier, which is the no-cap value and where lifts stop; the
+                rates show in log lines.
             start_tier: the shaper's tier now.
             last_seq: our last used seq (``SequenceCounter.value``).
             clock: monotonic clock for the lift timer.
@@ -248,9 +251,15 @@ class AutoCap:
         Not judged, and the run of bad intervals starts over: a mixed or
         unknown tier, fewer than MIN_INTERVAL_PACKETS sent, a tier above the
         cap (sent before the last cap, so stale), or the floor and below
-        (nothing to cap there).
+        (nothing to cap there). An interval at the floor goes to the floor
+        warning instead (``_note_floor``), but only while the cap is there.
         """
-        if tier == MIN_CAP_TIER:
+        # Pool tier-1 loss only once the cap is at the floor: auto cap
+        # stepped down there because a higher tier lost packets, or the tier
+        # list tops out at tier 1 (the cap starts at the top). Loss at tier 1
+        # without that, for example in linger on a fast but lossy Wi-Fi, does
+        # not show that the link is too slow.
+        if tier == MIN_CAP_TIER and self._cap == MIN_CAP_TIER:
             self._note_floor(sent, lost)
         else:
             self._floor_sent = self._floor_lost = self._floor_bad_run = 0
@@ -277,7 +286,8 @@ class AutoCap:
             self._cap_at(tier, loss_pct)
 
     def _note_floor(self, sent: int, lost: int) -> None:
-        """Loss at tier 1, the floor: nothing to cap, so warn when it lasts.
+        """Loss at tier 1 with the cap there: nothing left to cap, so warn
+        when it lasts.
 
         One-second intervals at tier 1 hold fewer than MIN_INTERVAL_PACKETS
         packets at the default tiers (40-60 a second), so consecutive ones

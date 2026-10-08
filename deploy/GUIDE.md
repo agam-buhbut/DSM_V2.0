@@ -1704,8 +1704,9 @@ line like this means it worked:
 `auto cap: lost 12% at tier 3 (800/s); top tier now 2 (200/s), next try in 5 min`.
 It tries the higher tier again after 5 minutes, and waits longer (up to an
 hour) while the loss keeps coming back. A line
-`auto cap: link too slow even for tier 1` means the link cannot carry even
-the lowest busy tier: set the tiers by hand as below.
+`auto cap: link too slow even for tier 1` comes only after auto cap has
+already dropped to tier 1, and means the link cannot carry even tier 1:
+set the tiers by hand as below.
 
 Set the tiers by hand only when auto cap cannot help: in TCP mode, when the
 other end runs an older DSM, when `shaper_auto_cap = false`, or when the

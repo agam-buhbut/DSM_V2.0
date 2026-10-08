@@ -158,8 +158,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   versions keep working: an older end drops the new report quietly, and a
   newer end facing an older one never caps. A config that sets
   `shaper_auto_cap` does not load in an older DSM.
-- A warning, at most every 10 minutes, when the link loses packets even at
-  tier 1, where auto cap cannot go lower.
+- A warning, at most every 10 minutes, when the link still loses packets
+  after auto cap has already dropped to tier 1, where it cannot go lower.
 - `server_ip` may be a DNS hostname (e.g. DDNS for a home server); the
   client resolves it once, before the kill switch goes up. The deploy guide
   has a new section on running over the internet.
