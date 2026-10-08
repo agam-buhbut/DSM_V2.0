@@ -7,13 +7,17 @@ import ipaddress
 import logging
 import os
 import socket
+import time
+from collections.abc import Callable, Coroutine
 from contextlib import AsyncExitStack
+from typing import Any, TypeVar
 
 from cryptography.x509.oid import ExtendedKeyUsageOID
 
 from dsm.core import netaudit
 from dsm.core.config import Config
 from dsm.core.fsm import SessionFSM, State
+from dsm.core.log import RepeatLog
 from dsm.core.preflight import check_clock_sync
 from dsm.core.protocol import ReassemblyBuffer
 from dsm.crypto.attest_store import AttestStore
@@ -47,6 +51,32 @@ from dsm.traffic.scheduler import SendScheduler
 from dsm.traffic.shaper import TrafficShaper, make_chaff_packet
 
 log = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
+
+# Waits between tries while there is no tunnel: 1 s, doubling up to 30 s,
+# with no limit on tries. The pre-handshake kill switch stays up meanwhile.
+RETRY_FIRST_S = 1.0
+RETRY_MAX_S = 30.0
+# After this many failed tries in a row, a client that looked up the
+# server's name at start says the address may have changed.
+HOSTNAME_HINT_AFTER = 5
+# The outage notice comes once per outage, and at most once in this many
+# seconds, so a server that takes the session and drops it at once cannot
+# flood the log.
+OUTAGE_NOTICE_EVERY_S = 60.0
+
+_OUTAGE_NOTICE = (
+    "no tunnel: all traffic is blocked until DSM connects again; it keeps "
+    "trying. To get internet back without the VPN, stop DSM: Ctrl-C, or "
+    "`sudo systemctl stop dsm-client`. If DSM is not running, run "
+    "`sudo dsm cleanup`."
+)
+_HOSTNAME_HINT = (
+    "server IP may have changed since DSM looked up its name at start; DSM "
+    "does not look it up again while the tunnel is down. If this goes on, "
+    "stop and start DSM."
+)
 
 
 async def _resolve_server_endpoint(server_ip: str, server_port: int) -> str:
@@ -95,6 +125,107 @@ def _emit_handshake_failure(err: Exception) -> None:
         outcome="failed",
         error=type(err).__name__,
     )
+
+
+class _Reconnect:
+    """The waits between tries, and the log lines about an outage.
+
+    An outage starts when a try gets no session or a session ends, and ends
+    when a session is up again.
+    """
+
+    def __init__(
+        self,
+        *,
+        looked_up_name: bool,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._looked_up_name = looked_up_name
+        self._notice = RepeatLog(
+            log, logging.WARNING, interval_s=OUTAGE_NOTICE_EVERY_S, clock=clock
+        )
+        self._waits = 0
+        self._failures = 0
+        self._noticed = False
+        self._hinted = False
+
+    def connected(self) -> None:
+        """A session is up: the outage is over."""
+        self._waits = 0
+        self._failures = 0
+        self._noticed = False
+        self._hinted = False
+
+    def failed(self) -> None:
+        """A try got no session."""
+        self._failures += 1
+        if (
+            self._looked_up_name
+            and not self._hinted
+            and self._failures >= HOSTNAME_HINT_AFTER
+        ):
+            log.warning(_HOSTNAME_HINT)
+            self._hinted = True
+
+    def next_wait(self) -> float:
+        """The wait before the next try. Logs the outage notice once."""
+        if not self._noticed:
+            self._notice.log(_OUTAGE_NOTICE)
+            self._noticed = True
+        delay = min(RETRY_FIRST_S * 2.0 ** min(self._waits, 5), RETRY_MAX_S)
+        self._waits += 1
+        return delay
+
+
+async def _wait_or_stop(shutdown: asyncio.Event, delay: float) -> bool:
+    """Wait ``delay`` seconds before the next try.
+
+    Returns True as soon as the user stops DSM, False when the wait is over.
+    """
+    try:
+        await asyncio.wait_for(shutdown.wait(), timeout=delay)
+    except TimeoutError:
+        return False
+    return True
+
+
+async def _unless_stopped(
+    shutdown: asyncio.Event, work: Coroutine[Any, Any, _T]
+) -> _T | None:
+    """Run ``work``, but cancel it as soon as ``shutdown`` is set.
+
+    Returns what ``work`` returns, or None when the stop came first; errors
+    from ``work`` go up. A connect or a handshake can take tens of seconds,
+    and a stop must not wait for them: under systemd a slow stop ends in
+    SIGKILL, which leaves the kill switch up.
+    """
+    task = asyncio.ensure_future(work)
+    stop = asyncio.ensure_future(shutdown.wait())
+    both: set[asyncio.Future[Any]] = {task, stop}
+    try:
+        await asyncio.wait(both, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        task.cancel()
+        stop.cancel()
+        await asyncio.gather(task, stop, return_exceptions=True)
+    if task.cancelled():
+        return None
+    return task.result()
+
+
+async def _set_when(src: asyncio.Event, dst: asyncio.Event) -> None:
+    """Set ``dst`` once ``src`` is set."""
+    await src.wait()
+    dst.set()
+
+
+async def _cancel_and_wait(task: asyncio.Task[None]) -> None:
+    """Cancel ``task`` and wait for it, so no task is left pending."""
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
 
 
 async def run_client(
