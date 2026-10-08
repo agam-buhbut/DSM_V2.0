@@ -28,6 +28,8 @@ Companion files in this directory:
   structure (same P-256 SPKI algorithm, same critical noiseStaticBinding
   extension) whether the key is soft or TPM-resident.
 - `deploy/dsm.service` — systemd unit shipped with the repo.
+- `deploy/dsm-blocklist-update.sh`, `.service`, `.timer` — the daily DNS
+  block list download for the server (§7h).
 
 Protocol, crypto, anonymity properties, threat model, and the full config
 reference are in the top-level `README.md`.
@@ -917,6 +919,7 @@ Expected server log lines:
 ```
 ... CN allowlist loaded (1 entries)
 ... server listening on UDP port 51820
+... DNS blocklist loaded: 72,525 names to block, 0 allowed (files read: 1, lines skipped: 13)
 ... handshake complete (server) — client_cn=dsm-XXXXXXXX-client
 ... client connected (noise_static=<first 16 hex>)
 ```
@@ -1095,6 +1098,106 @@ blob only loads on the TPM that made it, so a cleared or swapped TPM
 makes the existing attest key unrecoverable even if attest.key is
 intact. Re-enroll per §3 (new attest key in the new TPM → new CSR →
 new signed cert) and revoke the old cert per §7e.
+
+### 7h. DNS blocklist (server)
+
+The server answers "no such name" (NXDOMAIN) for every name on your block
+lists and every name under a listed name, for every kind of query. Devices
+remember that answer for 5 minutes. It is on by default
+(`dns_blocklist = true`).
+
+The files, all owned by root, mode 0600 (folders 0700), no links:
+
+```
+/opt/mtun/dns/sources.txt      # list URLs, one per line (you edit this)
+/opt/mtun/dns/block/*.txt      # the block lists; fetched-*.txt come from sources.txt
+/opt/mtun/dns/allow.txt        # names that are never blocked (you edit this)
+```
+
+Only `block/` files that end in `.txt` and do not start with a dot are read.
+A list can hold hosts lines (`0.0.0.0 ads.example.com`), one name per line,
+or `||ads.example.com^` lines. `@@||name^` lines count as allowed names.
+Lines that start with `#` or `!` are comments. Rules to know:
+
+- A hosts line blocks its names whatever address is in front of them. DSM
+  never answers with that address. So an old hosts file of fixed answers,
+  copied into `block/`, blocks its names; it does not redirect them. DSM no
+  longer reads such a file by itself.
+- A list can block a shared suffix such as `co.uk`, and with it every name
+  under it. Only bare one-word names such as `localhost` are refused. Read a
+  list before you add it.
+- Other AdGuard rules (wildcards, `$` options, regular expressions) and
+  lines longer than 4096 bytes are skipped, and counted in the log line
+  below.
+- Limits: 64 MiB per file and 2,000,000 names in all (counted before
+  duplicates are dropped).
+- `allow.txt` takes the same line forms; every name in it is allowed.
+- One refused file stops the whole new load, not only that file (see §11).
+
+An allowed name also covers the names under it, and it wins over the block
+lists. One name is the exception: `use-application-dns.net` always gets "no
+such name", even if it is on `allow.txt` or on an `@@||name^` line.
+
+DSM never downloads anything. `dsm-blocklist-update` downloads every URL in
+`sources.txt` into `block/` once a day (a systemd timer, at a random time in
+the hour after midnight). Only `https://` URLs are used. A list over
+64 MiB is refused while it is written. When a download fails, the copy from
+before stays. When `sources.txt` is missing, the script writes one with the
+default list: StevenBlack's unified ads and malware hosts list, about 72,000
+names (`https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts`).
+That list merges others that keep their own licences, some only for
+non-commercial use. DSM only ships its address; to use another list, replace
+that line in `sources.txt` (see "Everyday tasks"). `install.sh --systemd`
+sets all this up and downloads once; if that first download fails, it only
+warns, and the timer tries again the next day. From a source checkout, set it
+up by hand:
+
+```sh
+$ sudo install -m 0755 deploy/dsm-blocklist-update.sh /usr/local/sbin/dsm-blocklist-update
+$ sudo install -m 0644 deploy/dsm-blocklist-update.service deploy/dsm-blocklist-update.timer /etc/systemd/system/
+$ sudo systemctl daemon-reload
+$ sudo systemctl enable --now dsm-blocklist-update.timer
+$ sudo dsm-blocklist-update                 # first download, now
+```
+
+If your config is not in /opt/mtun, give the folder to the script
+(`sudo dsm-blocklist-update /path/to/config`) and change /opt/mtun in the
+`.service` file.
+
+dsm looks at the folder every 5 minutes and loads the lists again, in the
+background, when a file changed. You never need to restart dsm. Log lines
+(the first comes when a load ends, so it can show a moment after start; both
+need `log_level = "info"`, the default):
+
+```
+... DNS blocklist loaded: 72,525 names to block, 0 allowed (files read: 1, lines skipped: 13)
+... DNS blocklist: queries blocked in the last hour: 1,234
+```
+
+The second line comes once an hour, only if something was blocked. Logs show
+counts, and file paths in a warning. They never show the names.
+
+Everyday tasks:
+
+- Add a list: add its `https://` URL to `sources.txt`, then
+  `sudo systemctl start dsm-blocklist-update`.
+- Stop using the default list: put a `#` in front of its line. The next
+  download run deletes the file it made from that line. Do not delete
+  `sources.txt`: a missing one is written again with the default.
+- Use a list file of your own: `sudo install -m 0600 my-list.txt
+  /opt/mtun/dns/block/`. The download job only touches `fetched-*.txt`.
+- Never block a name: add it to `allow.txt`. Create the file first if it is
+  missing (`sudo install -m 0600 /dev/null /opt/mtun/dns/allow.txt`), then
+  `echo good.example.com | sudo tee -a /opt/mtun/dns/allow.txt`.
+- Turn the blocklist off: `dns_blocklist = false` in config.toml, above the
+  `[dns_provider_pins]` table, then restart dsm. This also turns off the
+  `use-application-dns.net` answer below.
+
+Limit: an app that uses its own encrypted DNS (DNS over HTTPS or over TLS)
+through the tunnel skips the blocklist. DSM answers "no such name" for
+`use-application-dns.net`, which tells Firefox not to switch to its own
+encrypted DNS, but a Firefox set to always use it, and other apps, still
+skip the list. Pi-hole has the same limit.
 
 ## 8. Single-Host Loopback Smoke Test
 
@@ -1848,6 +1951,48 @@ $ sudo ss -ulnp | grep ':53 '
 - Server's local firewall blocks the DNS-proxy bind. Allow UDP 53 on
   10.8.0.1 (the TUN address).
 
+### Server log: "DNS blocklist not loaded: ... The lists already in use stay."
+
+The message names the file and says why. Fix it as it says: `chmod 600`
+for a file, `chmod 700` for a folder, owner root
+(`sudo chown root:root <file>`), a real file in place of a link, or fewer or
+smaller lists (64 MiB per file, 2,000,000 names in all). One bad file stops
+the whole new load, so lists you added or changed since the last good load
+wait until it is fixed. dsm loads the lists within 5 minutes after the file
+changes; nothing else to do. Until then it keeps the lists it had (none if
+this happened at start, so only `use-application-dns.net` is blocked). It
+warns once per change, not every 5 minutes.
+
+### Server log: "DNS blocklist is on but has no names to block"
+
+There is no list in `/opt/mtun/dns/block/` yet, or the lists hold no usable
+lines. Usually the download did not run or failed:
+
+```sh
+$ sudo systemctl status dsm-blocklist-update.timer
+$ sudo journalctl -u dsm-blocklist-update.service -n 20
+$ sudo dsm-blocklist-update        # run it now
+```
+
+`could not download <url>` means that host was down or refused; an older
+copy, if any, stays. If the unit fails at once with "Read-only file system",
+`/opt/mtun/dns` does not exist yet: run `sudo dsm-blocklist-update` once by
+hand, which creates it. If you do not want a blocklist, set
+`dns_blocklist = false` (§7h).
+
+### A site or app breaks: is the blocklist stopping it?
+
+On the client:
+
+```sh
+$ dig +noall +comments +authority <name>
+```
+
+`status: NXDOMAIN` with `dsm.invalid.` in the authority section means the
+DSM blocklist answered. Add the name to `/opt/mtun/dns/allow.txt` on the
+server (§7h). dsm picks it up within 5 minutes; the device may remember the
+old answer for 5 more minutes.
+
 ### Host IPv6 stuck off after a crashed client
 
 /run/dsm/ipv6_state.json persists across crashes; the next clean
@@ -1904,9 +2049,13 @@ $ sudo /usr/bin/python3 -m pip install --break-system-packages \
 
 ```sh
 $ sudo systemctl disable --now dsm
+$ sudo systemctl disable --now dsm-blocklist-update.timer
 $ sudo rm -rf /opt/mtun /etc/dsm /run/dsm
 $ sudo /usr/bin/python3 -m pip uninstall --break-system-packages dsm   # if pip-installed
 $ sudo rm /etc/systemd/system/dsm.service
+$ sudo rm /etc/systemd/system/dsm-blocklist-update.service \
+      /etc/systemd/system/dsm-blocklist-update.timer \
+      /usr/local/sbin/dsm-blocklist-update
 $ sudo systemctl daemon-reload
 ```
 
@@ -1938,6 +2087,11 @@ $ for iface in $(ls /sys/class/net); do
 /opt/mtun/allowed_cns.txt             # server only: one CN per line (0o600)
 /etc/dsm/passphrase                   # non-interactive passphrase source (0o600)
 /run/dsm/ipv6_state.json              # per-iface IPv6 state snapshot
+/opt/mtun/dns/sources.txt             # server: DNS block list URLs (0o600)
+/opt/mtun/dns/block/*.txt             # server: DNS block lists (0o600)
+/opt/mtun/dns/allow.txt               # server: names never blocked (0o600)
+/usr/local/sbin/dsm-blocklist-update  # server: block list download script
+/etc/systemd/system/dsm-blocklist-update.{service,timer}  # daily download
 /etc/systemd/system/dsm.service       # (optional) systemd unit
 ```
 

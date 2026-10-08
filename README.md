@@ -25,7 +25,8 @@ means your offline CA signs the device's certificate request.
 ```sh
 # 1. Install (downloads + minisign-verifies the wheel, apt-installs the TPM
 #    runtime libs, creates /opt/dsm/venv, symlinks `dsm`). Add `--systemd`
-#    to also install the dsm.service unit.
+#    to also install the dsm.service unit and the daily DNS block list
+#    download, and to fetch the default block list once.
 curl -fsSL https://github.com/agam-buhbut/DSM_V2.0/releases/download/v0.1.0/install.sh | sudo sh -s -- --systemd
 
 # 2. Provision config + CA-pin + enroll (orchestrates config + TPM preflight +
@@ -472,9 +473,59 @@ defaults, and each end shapes only what it sends.
 - VPN sockets are marked with SO_MARK=0x1, so the ip rule skips the TUN
   routing table for them. This avoids routing loops.
 - Name lookups run on the server. A DNS proxy listens on UDP port 53 on the
-  server's TUN address. It resolves each query asynchronously (DoH, DoT, a
-  static hosts file, caching) and sends the answer back to the client inside
-  the tunnel.
+  server's TUN address. It checks each name against the DNS blocklist
+  (below), resolves the rest asynchronously (DoH or DoT, with a cache) and
+  sends the answer back to the client inside the tunnel.
+
+### DNS Blocklist
+
+The server blocks ads, trackers and malware by name, for every device on the
+tunnel. It is on by default (`dns_blocklist`).
+
+- A name on a block list gets "no such name" (NXDOMAIN) for every query
+  type (A, AAAA, HTTPS, ...). The answer tells the device to remember it for
+  5 minutes, so it does not ask again every second.
+- A list entry blocks the name and every name under it: `ads.example.com`
+  also blocks `x.ads.example.com`. A list can also block a shared suffix such
+  as `co.uk`, and with it every site under that suffix; only bare one-word
+  names such as `localhost` are refused. Read a list before you add it.
+- Names on the allowlist are never blocked, and an allowed name also covers
+  the names under it. The allowlist wins over the block lists, with one
+  exception.
+- The exception: `use-application-dns.net` always gets "no such name", even
+  if you put it on the allowlist. That tells Firefox not to switch to its own
+  encrypted DNS, which would skip the blocklist.
+- The lists live in one folder, `/opt/mtun/dns/` (`dns/` next to
+  config.toml): every `block/*.txt` is a block list and `allow.txt` is the
+  allowlist. They follow the same rules as DSM's other files: owned by root,
+  mode 0600 (folders 0700), no links. A list can hold hosts lines
+  (`0.0.0.0 ads.example.com`), one name per line, or `||ads.example.com^`
+  lines; `@@||name^` lines go on the allowlist. A hosts line blocks its names
+  whatever address it has in front; DSM never answers with that address.
+  Other AdGuard rules (wildcards, `$` options, regular expressions) and
+  lines longer than 4096 bytes are skipped and counted.
+- DSM never downloads anything. A small script and a daily systemd timer
+  (`deploy/dsm-blocklist-update.*`) download the URLs in
+  `/opt/mtun/dns/sources.txt` into `block/`. `install.sh --systemd` sets
+  them up and downloads once, so blocking works from the first start. The
+  default list is StevenBlack's unified ads and malware hosts list. It merges
+  lists that keep their own licences (some only for non-commercial use), and
+  DSM ships only its address. To use another list, replace the URL in
+  `sources.txt`.
+- DSM checks the folder every 5 minutes and loads the lists again in the
+  background when a file changes; no restart is needed. If any one file
+  breaks a rule or a limit (64 MiB per file, 2,000,000 names in all), DSM
+  skips the whole new load, logs one warning and keeps the lists it already
+  has.
+- Memory: each name is kept as an 8-byte keyed hash, about 8 MB per million
+  names.
+- Logs show counts (names loaded, and once an hour how many queries were
+  blocked) and, in a warning, file paths. They never show names.
+
+What it does not do: an app that uses its own encrypted DNS (DNS over HTTPS
+or over TLS) through the tunnel skips the blocklist. Pi-hole has the same
+limit. See `SECURITY.md`. Setup and everyday tasks are in `deploy/GUIDE.md`
+§7h.
 
 ## Threat Model
 
@@ -653,6 +704,10 @@ The config file is TOML, at `/opt/mtun/config.toml`.
   logs show `qname-tag=` and 16 hex characters in place of each name: a
   keyed hash with a random key made at each start, so the same name keeps
   its tag while DSM runs and gets a new one after a restart.
+- dns_blocklist: server only. Answer "no such name" for the names on the
+  lists in `/opt/mtun/dns/` (default: true; see DNS Blocklist above). false
+  turns it off. Only true or false is accepted. An older DSM refuses a
+  config that sets this key.
 - debug_net: write structured JSON events to the `dsm.netaudit` logger
   (handshake start/end, nft apply/remove, TUN configure/deconfigure, rekey,
   liveness, shutdown, auto_mtu_change, auto_cap_change, crl_missing,
@@ -664,7 +719,9 @@ The config file is TOML, at `/opt/mtun/config.toml`.
 `deploy/GUIDE.md` walks an operator through setup, from prerequisites to
 checking that it works. It also covers routine tasks and debugging by
 symptom. The same directory holds `openssl-ca.cnf` (the OpenSSL config for
-the offline CA) and `dsm.service` (the systemd unit).
+the offline CA), `dsm.service` (the systemd unit), and
+`dsm-blocklist-update.sh` with its `.service` and `.timer` (the daily DNS
+block list download).
 
 ## Logging
 

@@ -108,9 +108,12 @@ expected_server_cn = "dsm-1234abcd-server"
 #
 # Server only: DNS blocklist, on by default. The server answers "no such
 # name" (NXDOMAIN) for every name on your block lists and every name under
-# one, for every query type. The lists live in <config dir>/dns/: each
-# block/*.txt is a block list, and allow.txt holds names that are never
-# blocked (it always wins). sources.txt holds the list URLs that the daily
+# a listed name, for every query type. The lists live in <config dir>/dns/:
+# each block/*.txt is a block list, and allow.txt holds names that are never
+# blocked. allow.txt wins over the block lists, and an allowed name covers
+# the names under it. The one exception is use-application-dns.net: it is
+# always blocked, even if allowed, because that tells Firefox not to switch
+# to its own encrypted DNS. sources.txt holds the list URLs that the daily
 # download job fetches; DSM itself never downloads (deploy/GUIDE.md §7h).
 # DSM looks for changed files every 5 minutes. Apps that use their own
 # encrypted DNS skip the blocklist. Only true or false is accepted. An older

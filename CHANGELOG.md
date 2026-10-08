@@ -60,6 +60,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   them stops at startup with a clear message.
 - The send loop's mode without the tier shaper, so the send loop cannot
   send unshaped traffic by mistake.
+- **Breaking:** DSM no longer reads `/opt/mtun/hosts.txt` (fixed
+  name-to-address answers on the server). It had no owner or mode check,
+  and an IPv6 line made the answer fail. To block names, use the DNS
+  blocklist (below).
 
 ### Security
 - A malformed or truncated TCP frame from an unauthenticated peer (oversized
@@ -153,6 +157,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with the usual one-line config error naming the key, not a traceback.
 
 ### Added
+- Server DNS blocklist, on by default (`dns_blocklist`). The server answers
+  "no such name" (NXDOMAIN, which devices remember for 5 minutes) for every
+  name on the lists in `/opt/mtun/dns/block/*.txt` and every name under
+  a listed name, for every query type. Names in `/opt/mtun/dns/allow.txt`, and
+  `@@||name^` lines, are never blocked. Lists may be hosts files (any
+  address in front of a name blocks it), one name per line, or `||name^`
+  lines. DSM checks the folder every 5 minutes. If any one file is refused,
+  it skips the whole new load, keeps the lists it has and logs one warning;
+  it logs only counts and file paths, never names. DSM never downloads:
+  `deploy/dsm-blocklist-update.sh` and a daily timer fetch the URLs in
+  `/opt/mtun/dns/sources.txt`, and `install.sh --systemd` installs them and
+  fetches the default list (StevenBlack/hosts) once. With the blocklist on,
+  `use-application-dns.net` always gets "no such name", even if it is on the
+  allowlist; that tells Firefox not to switch to its own encrypted DNS. A
+  config that sets `dns_blocklist` does not load in an older DSM.
 - Slow-link auto cap. Each end now tells the other, about once a second,
   how many packets arrived. An end that loses 5% or more of what it sends
   for two seconds in a row, at tier 2 or higher, lowers its top tier one

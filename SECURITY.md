@@ -94,6 +94,15 @@ closed as known:
   DSM port turns auto cap off for the packets sent to that end for as long
   as it lasts; that only brings back the behaviour from before auto cap
   (no cap), so it costs speed on slow links, not privacy.
+- **DNS blocklist bypass.** The server's DNS blocklist sees only the
+  queries sent to DSM's DNS proxy. An app that uses its own encrypted DNS
+  (DNS over HTTPS or over TLS) through the tunnel skips it. DSM answers "no
+  such name" for `use-application-dns.net`, which tells Firefox not to
+  switch to its own encrypted DNS, but a Firefox set to always use it, and
+  other apps, still skip the list. Pi-hole has the same limit. The
+  blocklist cuts ads and trackers; it is not a wall. A list can only make
+  names fail, never send them somewhere else, so a bad or hostile list can
+  break sites but cannot redirect you.
 
 These are described in the project's threat-model documentation. If you believe
 a property is materially worse than documented — or that one of these can be
