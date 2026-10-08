@@ -157,3 +157,25 @@ async def test_set_when_passes_a_stop_on_and_cancel_leaves_nothing_pending() -> 
     idle = asyncio.ensure_future(client_mod._set_when(asyncio.Event(), asyncio.Event()))
     await client_mod._cancel_and_wait(idle)
     assert idle.cancelled()
+
+
+async def test_a_cancel_of_the_caller_goes_through_cancel_and_wait() -> None:
+    stopping = asyncio.Event()
+
+    async def slow_to_stop() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            stopping.set()
+            await asyncio.Event().wait()  # takes long to wind down
+            raise
+
+    inner = asyncio.ensure_future(slow_to_stop())
+    caller = asyncio.ensure_future(client_mod._cancel_and_wait(inner))
+    await stopping.wait()  # inner got our cancel; the caller waits for it
+    caller.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+    assert caller.cancelled()
+    await asyncio.gather(inner, return_exceptions=True)
+    assert inner.done()

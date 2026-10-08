@@ -222,10 +222,10 @@ async def _set_when(src: asyncio.Event, dst: asyncio.Event) -> None:
 async def _cancel_and_wait(task: asyncio.Task[None]) -> None:
     """Cancel ``task`` and wait for it, so no task is left pending."""
     task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
+    # gather keeps our own cancel of ``task`` quiet, but a cancel of the
+    # caller while it waits here still goes through (a bare except would
+    # swallow both).
+    await asyncio.gather(task, return_exceptions=True)
 
 
 async def run_client(
