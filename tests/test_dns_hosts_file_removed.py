@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+from pathlib import Path
 
 import dsm.net.dns as dns_module
 from dsm.net.dns import DNSResolver, DnsResult
@@ -17,10 +18,17 @@ def test_the_resolver_has_no_hosts_file_reader() -> None:
     assert "read_bytes" not in source
 
 
-async def test_every_name_goes_to_the_providers() -> None:
+async def test_a_hosts_file_no_longer_changes_answers(tmp_path: Path) -> None:
+    hosts = tmp_path / "hosts.txt"
+    hosts.write_text("10.9.8.7 pinned.example\n", encoding="utf-8")
+
     class _Resolver(DNSResolver):
         def __init__(self) -> None:
-            super().__init__(providers=[_DOH], provider_pins={_DOH: ["a" * 64]})
+            super().__init__(
+                providers=[_DOH],
+                provider_pins={_DOH: ["a" * 64]},
+                hosts_file=str(hosts),
+            )
             self.asked: list[str] = []
 
         async def _resolve_doh(self, url: str, hostname: str) -> DnsResult:
@@ -30,6 +38,7 @@ async def test_every_name_goes_to_the_providers() -> None:
             )
 
     resolver = _Resolver()
-    result = await resolver.resolve_detailed("Localhost.Example.")
-    assert resolver.asked == ["localhost.example"]
+    result = await resolver.resolve_detailed("Pinned.Example.")
+    assert resolver.asked == ["pinned.example"]
     assert result.addresses == ["192.0.2.1"]
+    assert "10.9.8.7" not in result.addresses
