@@ -20,6 +20,12 @@ MAX_DATAGRAM = 1472
 # the user-packet boundary, so anonymity is unchanged (attacker cannot
 # distinguish a drop from loss on the link).
 RECV_QUEUE_SIZE = 256
+# How long the old socket stays open after a rebind. The server keeps sending
+# to the old port until the new one passes its address check (a
+# PATH_CHALLENGE / PATH_RESPONSE round trip, tried at most once a second), so
+# this covers a few lost tries on a slow link. Nothing is sent from the old
+# port, so keeping it open longer shows nothing on the wire.
+OLD_PORT_GRACE_S = 5.0
 
 # Linux IP_MTU_DISCOVER values (from <linux/in.h>). CPython's `socket` module
 # does not export these on any platform, so they are spelled out here.
@@ -197,14 +203,12 @@ class UDPTransport:
             self._transport = new_transport
         new_port = new_transport.get_extra_info("sockname")[1]
 
-        # Don't immediately close the old transport
-        # — server replies to the OLD src addr that are already in flight
-        # (sent before the server's `post_authenticate` saw the NEW addr)
-        # would otherwise be dropped at kernel ICMP-port-unreachable.
-        # Defer the close ~250ms so the old socket keeps accepting
-        # inbound until the server learns the new addr from our first
-        # post-rebind packet. Both old and new protocols feed the SAME
-        # `self._recv_queue`, so deferred-old packets still arrive.
+        # Don't immediately close the old transport: the server keeps
+        # sending to the OLD addr until the new one passes its address
+        # check, and those packets would otherwise be dropped at kernel
+        # ICMP-port-unreachable. Defer the close by OLD_PORT_GRACE_S. Both
+        # old and new protocols feed the SAME `self._recv_queue`, so
+        # deferred-old packets still arrive.
         # Track the handle + transport so shutdown can
         # cancel/close cleanly without leaving an orphan callback.
         # Register the deferred close WITHIN the
@@ -215,7 +219,7 @@ class UDPTransport:
                 old_transport.close()
                 log.info("UDP rebind raced with close(); old transport closed sync")
                 return new_port
-            handle = loop.call_later(0.25, old_transport.close)
+            handle = loop.call_later(OLD_PORT_GRACE_S, old_transport.close)
             self._deferred_closes.append((handle, old_transport))
         log.info("UDP rebound to fresh ephemeral port %d", new_port)
         return new_port

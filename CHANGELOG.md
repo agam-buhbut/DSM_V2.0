@@ -84,6 +84,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   DSM runs and gets a new tag after a restart.
 
 ### Fixed
+- The client no longer loses the server's packets after each key change.
+  It moves to a new port then, and the server keeps sending to the old one
+  until the new one passes its address check. The old port closed after
+  0.25 s, which was too short on slower links; it now stays open 5 s.
 - A download that slows down to the speed it gets (as TCP does) no longer
   stays at a low tier for its whole length. Its packets never waited long
   enough to step the rate up: in a live test a 50 MB download stayed at
