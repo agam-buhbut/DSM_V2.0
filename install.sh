@@ -245,8 +245,12 @@ if [ "$EVAL" = 0 ]; then
         install -m 0644 "$DEPLOY_DIR/dsm-blocklist-update.service" \
           "$DEPLOY_DIR/dsm-blocklist-update.timer" /etc/systemd/system/ \
           || die "could not install the DNS block list timer"
-        # The unit can see and write only this folder, so it must exist.
-        install -d -m 0700 /opt/mtun/dns || die "could not create /opt/mtun/dns"
+        # The unit can see and write only this folder, so it must exist. Not
+        # fatal: daemon-reload below must still run.
+        if ! (umask 077; install -d -m 0700 /opt/mtun/dns); then
+          echo "install.sh: WARNING — could not create /opt/mtun/dns; the daily list download stays off (deploy/GUIDE.md §7h)." >&2
+          BLOCKLIST=0
+        fi
       else
         echo "install.sh: WARNING — the DNS block list files are not in $DEPLOY_DIR; skipping the daily list download (deploy/GUIDE.md §7h)." >&2
       fi

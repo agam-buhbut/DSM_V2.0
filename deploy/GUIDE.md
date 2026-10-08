@@ -1157,12 +1157,13 @@ $ sudo install -m 0755 deploy/dsm-blocklist-update.sh /usr/local/sbin/dsm-blockl
 $ sudo install -m 0644 deploy/dsm-blocklist-update.service deploy/dsm-blocklist-update.timer /etc/systemd/system/
 $ sudo systemctl daemon-reload
 $ sudo systemctl enable --now dsm-blocklist-update.timer
-$ sudo dsm-blocklist-update                 # first download, now
+$ sudo install -d -m 0700 /opt/mtun/dns     # the unit needs this folder
+$ sudo systemctl start dsm-blocklist-update # first download, now
 ```
 
-If your config is not in /opt/mtun, give the folder to the script
-(`sudo dsm-blocklist-update /path/to/config`) and change /opt/mtun in the
-`.service` file.
+The download runs inside the unit's sandbox, never as plain root. If your
+config is not in /opt/mtun, change /opt/mtun in the `.service` file (the
+comment at its top lists the lines) and in the `install -d` command.
 
 dsm looks at the folder every 5 minutes and loads the lists again, in the
 background, when a file changed. You never need to restart dsm. Log lines
@@ -1974,14 +1975,14 @@ lines. Usually the download did not run or failed:
 ```sh
 $ sudo systemctl status dsm-blocklist-update.timer
 $ sudo journalctl -u dsm-blocklist-update.service -n 20
-$ sudo dsm-blocklist-update        # run it now
+$ sudo systemctl start dsm-blocklist-update        # run it now
 ```
 
 `could not download <url>` means that host was down or refused; an older
 copy, if any, stays. If the unit fails at once with "Read-only file system",
-`/opt/mtun/dns` does not exist yet: run `sudo dsm-blocklist-update` once by
-hand, which creates it. If you do not want a blocklist, set
-`dns_blocklist = false` (§7h).
+`/opt/mtun/dns` does not exist yet: make it with
+`sudo install -d -m 0700 /opt/mtun/dns`, then start the unit again. If you do
+not want a blocklist, set `dns_blocklist = false` (§7h).
 
 ### A site or app breaks: is the blocklist stopping it?
 

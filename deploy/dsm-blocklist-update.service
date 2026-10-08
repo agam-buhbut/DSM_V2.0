@@ -28,6 +28,10 @@ TemporaryFileSystem=/opt/mtun:ro
 BindPaths=-/opt/mtun/dns
 ReadWritePaths=-/opt/mtun/dns
 InaccessiblePaths=-/etc/dsm
+# dsm.service uses LoadCredential=passphrase, and systemd keeps a copy of it
+# under /run/credentials/dsm.service/ that root can read on systemd 255 and
+# older. Hide that folder from this unit.
+InaccessiblePaths=-/run/credentials
 ProtectHome=true
 PrivateTmp=true
 PrivateDevices=true
@@ -40,6 +44,8 @@ ProtectControlGroups=true
 ProtectClock=true
 ProtectHostname=true
 ProcSubset=pid
+# Hide other users' processes in /proc (root's own stay visible).
+ProtectProc=invisible
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 RestrictNamespaces=true
 RestrictSUIDSGID=true
