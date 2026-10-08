@@ -1562,7 +1562,7 @@ reproducing a bug. Switch back to "info" for steady state.
 JSON event per state transition on the `dsm.netaudit` logger
 (handshake_start, handshake_end, nft_apply/_remove, tun_configure/
 _deconfigure, rekey_epoch, liveness_fire, shutdown_signal,
-auto_mtu_change, crl_missing/stale). Capture with:
+auto_mtu_change, auto_cap_change, crl_missing/stale). Capture with:
 
 ```sh
 $ sudo journalctl -u dsm -o cat | grep dsm.netaudit > /tmp/audit.jsonl
