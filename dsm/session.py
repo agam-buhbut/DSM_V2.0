@@ -49,6 +49,7 @@ from dsm.rekey import (
     rekey_retry_delay,
     resend_rekey_init,
 )
+from dsm.traffic.autocap import LinkStats
 from dsm.traffic.scheduler import SendScheduler
 from dsm.traffic.shaper import TrafficShaper
 
@@ -482,11 +483,17 @@ def decrypt_packet(
     data: bytes,
     session_keys: tuncore.SessionKeyManager,
     replay: tuncore.ReplayWindow,
+    *,
+    link_stats: LinkStats | None = None,
 ) -> tuple[InnerPacket, bool] | None:
     """Parse, replay-check, decrypt, and validate an incoming packet.
 
     Returns (inner_packet, decrypted_prev_epoch) or None if the packet
     should be dropped (too short, replay, auth failure, malformed, epoch mismatch).
+
+    ``link_stats`` (slow-link auto cap) counts every packet that passed AEAD
+    with a new seq, before the inner packet is parsed: a genuine packet that
+    is dropped later still crossed the link.
 
     There are TWO replay windows — this
     Python-side ``replay`` ARG (checked here BEFORE AEAD work) and the
@@ -520,6 +527,8 @@ def decrypt_packet(
     plaintext, decrypted_prev_epoch = result
 
     replay.update(seq)
+    if link_stats is not None:
+        link_stats.note(seq)
 
     try:
         inner = InnerPacket.deserialize(plaintext)
@@ -540,11 +549,15 @@ def decrypt_packet(
     # make_send_fn at send time, or arrive during a rekey grace window, so
     # exempt them from the outer epoch-nibble check. They self-authenticate
     # via AEAD plus the 16-byte token echo; the nibble adds nothing.
+    # LINK_REPORT is exempt too: a report built just before a key change could
+    # otherwise be dropped here. AEAD proves it genuine, and its totals mean
+    # the same under any epoch.
     if inner.ptype not in (
         PacketType.CHAFF,
         PacketType.REKEY_ACK,
         PacketType.PATH_CHALLENGE,
         PacketType.PATH_RESPONSE,
+        PacketType.LINK_REPORT,
     ):
         if decrypted_prev_epoch:
             expected_eid = (session_keys.epoch - 1) & 0x0F

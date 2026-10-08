@@ -8,6 +8,18 @@ Inner plaintext (after AEAD decryption):
     [Type: 1 byte][Epoch|Flags: 1 byte][Inner Length: 2 bytes][Payload][Inner Padding]
 
 AAD = sequence number (8 bytes).  Nonce is bound as the GCM IV.
+
+Inner types: every version drops an inner packet whose type it does not
+know, quietly (one DEBUG line, no error count, no teardown). Newer versions
+rely on this rule to add a type without a version bump, so changes to
+``InnerPacket.deserialize`` must keep it.
+
+LINK_REPORT (0x0A) payload, for the sender's slow-link auto cap:
+    [highest_seq: 8 bytes][received: 8 bytes]
+Unsigned 64-bit big-endian totals since the session started: the highest
+authenticated seq received, and how many authenticated packets arrived.
+Readers take the first 16 bytes and ignore the rest, so later versions can
+append fields; a shorter payload is dropped.
 """
 
 from __future__ import annotations
@@ -57,12 +69,43 @@ class PacketType(IntEnum):
     # Both authenticated (inside AEAD); each carries a 16-byte token.
     PATH_CHALLENGE = 0x08
     PATH_RESPONSE = 0x09
+    # Receiver loss report for the sender's slow-link auto cap
+    # (dsm/traffic/autocap.py); layout in the module docstring. 0x01 stays
+    # unused: it was the old HANDSHAKE type, and reusing it could confuse a
+    # very old build.
+    LINK_REPORT = 0x0A
 
 
 # Return-routability token: 128 bits of CSPRNG entropy is unguessable by an
 # on-path attacker who must echo it back from a spoofed (and unreachable to
 # them) source address. The token rides inside the AEAD envelope.
 PATH_TOKEN_SIZE = 16
+
+# LINK_REPORT payload: highest_seq, received (see the module docstring).
+LINK_REPORT_STRUCT = struct.Struct("!QQ")
+
+
+@dataclass(slots=True, frozen=True)
+class LinkReport:
+    """What the receiver has seen so far in this session."""
+
+    highest_seq: int
+    received: int
+
+    def serialize(self) -> bytes:
+        return LINK_REPORT_STRUCT.pack(self.highest_seq, self.received)
+
+    @classmethod
+    def deserialize(cls, payload: bytes) -> LinkReport:
+        """Read the first 16 bytes of ``payload``; later bytes are ignored.
+
+        Raises:
+            ValueError: ``payload`` is shorter than 16 bytes.
+        """
+        if len(payload) < LINK_REPORT_STRUCT.size:
+            raise ValueError(f"link report too short: {len(payload)} bytes")
+        highest_seq, received = LINK_REPORT_STRUCT.unpack_from(payload)
+        return cls(highest_seq=highest_seq, received=received)
 
 
 @dataclass(slots=True)
