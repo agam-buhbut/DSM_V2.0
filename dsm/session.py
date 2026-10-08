@@ -29,6 +29,7 @@ from dsm.core.protocol import (
     SIZE_CLASSES,
     Fragment,
     InnerPacket,
+    LinkReport,
     OuterPacket,
     PacketType,
     ReassemblyBuffer,
@@ -49,7 +50,7 @@ from dsm.rekey import (
     rekey_retry_delay,
     resend_rekey_init,
 )
-from dsm.traffic.autocap import LinkStats
+from dsm.traffic.autocap import REPORT_INTERVAL_S, AutoCap, LinkStats
 from dsm.traffic.scheduler import SendScheduler
 from dsm.traffic.shaper import TrafficShaper
 
@@ -646,6 +647,11 @@ class DataPathContext:
     # pre-fix behavior (silent drop) when either is None.
     local_static_pub: bytes | None = None
     remote_static_pub: bytes | None = None
+    # Slow-link auto cap (dsm/traffic/autocap.py): receiver counts and the
+    # sender's cap rules. None when auto cap is off or in TCP mode; older
+    # test fixtures leave them unset and get the feature off.
+    link_stats: LinkStats | None = None
+    autocap: AutoCap | None = None
 
 
 async def _handle_data(ctx: DataPathContext, inner: InnerPacket) -> None:
@@ -803,6 +809,21 @@ async def send_session_close(ctx: DataPathContext) -> None:
         log.debug("SESSION_CLOSE send failed (continuing shutdown): %s", e)
 
 
+async def _handle_link_report(ctx: DataPathContext, inner: InnerPacket) -> None:
+    """Sender side of the auto cap: pass the peer's LINK_REPORT on. Ignored
+    when auto cap is off at this end (owner decision: off at either end means
+    off for both directions)."""
+    autocap = ctx.autocap
+    if autocap is None:
+        return
+    try:
+        report = LinkReport.deserialize(inner.payload)
+    except ValueError:
+        autocap.note_short_report()
+        return
+    autocap.on_report(report)
+
+
 _DISPATCH: dict[
     PacketType, Callable[[DataPathContext, InnerPacket], Awaitable[None]]
 ] = {
@@ -813,6 +834,8 @@ _DISPATCH: dict[
     PacketType.SESSION_CLOSE: _handle_session_close,
     # Client answers a server's PATH_CHALLENGE with a PATH_RESPONSE.
     PacketType.PATH_CHALLENGE: _handle_path_challenge,
+    # The peer's loss report for this end's slow-link auto cap.
+    PacketType.LINK_REPORT: _handle_link_report,
     # PATH_RESPONSE: the server validates+commits in post_authenticate (it has
     # recv_addr there); reaching dispatch it is a no-op (client never gets one).
 }
@@ -867,6 +890,69 @@ async def liveness_loop(ctx: DataPathContext) -> None:
             ctx.liveness.last_real_send_time = now
 
 
+def _link_report_step(ctx: DataPathContext, stats: LinkStats, reported: int) -> int:
+    """One wake of ``link_report_loop``: if packets came in since the last
+    report handed over, hand the scheduler a new one with the current
+    totals; then run the auto cap's lift timer. Returns the ``received``
+    total of the last report handed over."""
+    if stats.received > reported:
+        payload = LinkReport(
+            highest_seq=stats.highest_seq, received=stats.received
+        ).serialize()
+        padded, target_size = _build_control_packet(
+            ctx, PacketType.LINK_REPORT, payload
+        )
+        ctx.scheduler.set_report(padded, target_size)
+        reported = stats.received
+    if ctx.autocap is not None:
+        ctx.autocap.tick()
+    return reported
+
+
+async def link_report_loop(ctx: DataPathContext) -> None:
+    """Every REPORT_INTERVAL_S: send a LINK_REPORT when packets came in, and
+    run the auto cap's lift timer. No packets, no report: a dead link is the
+    liveness check's job. Returns at once when auto cap is off
+    (``ctx.link_stats`` is None)."""
+    stats = ctx.link_stats
+    if stats is None:
+        return
+    reported = 0
+    while not ctx.shutdown.is_set():
+        try:
+            await asyncio.wait_for(ctx.shutdown.wait(), timeout=REPORT_INTERVAL_S)
+            return
+        except TimeoutError:
+            pass
+        reported = _link_report_step(ctx, stats, reported)
+
+
+def make_auto_cap(
+    config: Config,
+    transport: UDPTransport | TCPTransport,
+    shaper: TrafficShaper,
+    seq: SequenceCounter,
+) -> tuple[LinkStats | None, AutoCap | None]:
+    """Build the slow-link auto cap for one session, or ``(None, None)``.
+
+    Off when ``shaper_auto_cap`` is false, and in TCP mode (TCP resends lost
+    data, so no loss ever shows). Off means this end sends no reports and
+    ignores the peer's. Client and server both call it after building the
+    shaper and before ``scheduler.start()``, so the tier listener sees every
+    tier change.
+    """
+    if not config.shaper_auto_cap or not isinstance(transport, UDPTransport):
+        return None, None
+    autocap = AutoCap(
+        shaper,
+        tiers_pps=config.shaper_tiers_pps,
+        start_tier=shaper.tier,
+        last_seq=lambda: seq.value,
+    )
+    shaper.watch_tier(autocap.note_tier)
+    return LinkStats(), autocap
+
+
 async def _tcp_recv_raced(
     transport: TCPTransport, shutdown_wait: asyncio.Task[bool]
 ) -> bytes | None:
@@ -912,7 +998,7 @@ async def run_data_loops(
     ) = None,
     shutdown_log: str = "shutting down",
 ) -> None:
-    """Drive the steady-state recv/tun_send/liveness loops to completion.
+    """Drive the steady-state recv/tun_send/liveness/link-report loops to completion.
 
     On exit — clean shutdown OR ``CancelledError`` from the surrounding
     AsyncExitStack — emits SESSION_CLOSE (best-effort) and transitions
@@ -981,7 +1067,9 @@ async def run_data_loops(
                     ctx.shutdown.set()
                     return
 
-                result = decrypt_packet(data, session_keys, replay)
+                result = decrypt_packet(
+                    data, session_keys, replay, link_stats=ctx.link_stats
+                )
                 if result is None:
                     continue
 
@@ -1050,6 +1138,7 @@ async def run_data_loops(
             _supervised(recv_loop(), "recv"),
             _supervised(tun_send_loop(ctx), "tun_send"),
             _supervised(liveness_loop(ctx), "liveness"),
+            _supervised(link_report_loop(ctx), "link_report"),
             _supervised(_tcp_idle_tick_loop(), "tcp_tick"),
             *(_supervised(c, f"extra[{i}]") for i, c in enumerate(extra_loops)),
         )

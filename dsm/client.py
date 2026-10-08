@@ -39,6 +39,7 @@ from dsm.session import (
     RekeyState,
     SequenceCounter,
     auto_mtu_loop,
+    make_auto_cap,
     make_send_fn,
     setup_signal_handlers,
 )
@@ -429,6 +430,11 @@ async def run_client(
         # handshake, the first poll would find every slot of the setup time
         # due and send them all back to back.
         shaper = TrafficShaper.from_config(config)
+        # Slow-link auto cap: count what arrives, report it to the server, and
+        # cap our own top tier on sustained loss. Wired before the scheduler
+        # starts so the tier listener sees every tier change; the server does
+        # the same. (None, None) in TCP mode or when turned off.
+        link_stats, autocap = make_auto_cap(config, transport, shaper, seq)
 
         # Shaper-driven: the tier shaper decides when packets leave (real
         # first, chaff in the other slots), so the wire rate follows the tier,
@@ -459,6 +465,8 @@ async def run_client(
             # Static pubs for mutual-init tie-break.
             local_static_pub=bytes(keystore.identity.public_key),
             remote_static_pub=server_static_pub,
+            link_stats=link_stats,
+            autocap=autocap,
         )
 
         # The AsyncExitStack stays in this module; ``run_data_loops``

@@ -43,6 +43,7 @@ from dsm.session import (
     RekeyState,
     SequenceCounter,
     make_addr_send_fn,
+    make_auto_cap,
     make_send_fn,
     setup_signal_handlers,
 )
@@ -426,6 +427,11 @@ async def _run_one_session(
         def _chaff_allowed() -> bool:
             return client_addr[0] is not None
 
+        # Slow-link auto cap, wired exactly as the client does: before the
+        # scheduler starts, so the tier listener sees every tier change.
+        # (None, None) in TCP mode or when turned off.
+        link_stats, autocap = make_auto_cap(config, transport, shaper, seq)
+
         # Scheduler+shaper params must mirror the client's — divergence here
         # reintroduces a direction-correlation fingerprint. See
         # tests/test_symmetric_shaping.py for the regression lock.
@@ -452,6 +458,8 @@ async def _run_one_session(
             # Static pubs for mutual-init tie-break.
             local_static_pub=bytes(keystore.identity.public_key),
             remote_static_pub=client_pub_bytes,
+            link_stats=link_stats,
+            autocap=autocap,
         )
 
         # Return-routability state for egress roaming. The first authenticated
