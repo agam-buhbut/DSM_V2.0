@@ -55,6 +55,9 @@ MAX_LIFT_WAIT_S = 3600.0
 CLEAN_INTERVALS_TO_RESET = 30
 # Most tier log entries kept, for a peer that never reports.
 TIER_LOG_MAX = 64
+# Loss that lasts at tier 1 (nothing left to cap) logs a warning at most
+# this often (s).
+FLOOR_WARN_INTERVAL_S = 600.0
 
 # LOSS_THRESHOLD as an exact ratio, so the check is an integer one
 # (lost * 20 >= sent at 5%) and exactly 5% is bad for any packet count.
@@ -127,6 +130,12 @@ class AutoCap:
         self._opened_tier: int | None = None
         self._clean_run = 0
         self._ignored = RepeatLog(log, logging.DEBUG, clock=clock)
+        # Tier-1 warning: pooled tier-1 intervals, bad pools in a row, and
+        # when the last warning went out.
+        self._floor_sent = 0
+        self._floor_lost = 0
+        self._floor_bad_run = 0
+        self._floor_warned_at: float | None = None
 
     def note_tier(self, tier: int) -> None:
         """Shaper listener: the last poll changed the tier to ``tier``.
@@ -241,6 +250,10 @@ class AutoCap:
         cap (sent before the last cap, so stale), or the floor and below
         (nothing to cap there).
         """
+        if tier == MIN_CAP_TIER:
+            self._note_floor(sent, lost)
+        else:
+            self._floor_sent = self._floor_lost = self._floor_bad_run = 0
         if (
             tier is None
             or sent < MIN_INTERVAL_PACKETS
@@ -262,6 +275,36 @@ class AutoCap:
         if self._bad_run >= BAD_INTERVALS_TO_CAP:
             self._bad_run = 0
             self._cap_at(tier, loss_pct)
+
+    def _note_floor(self, sent: int, lost: int) -> None:
+        """Loss at tier 1, the floor: nothing to cap, so warn when it lasts.
+
+        One-second intervals at tier 1 hold fewer than MIN_INTERVAL_PACKETS
+        packets at the default tiers (40-60 a second), so consecutive ones
+        are pooled until they reach it. BAD_INTERVALS_TO_CAP bad pools in a
+        row warn, at most every FLOOR_WARN_INTERVAL_S.
+        """
+        self._floor_sent += sent
+        self._floor_lost += lost
+        if self._floor_sent < MIN_INTERVAL_PACKETS:
+            return
+        bad = self._floor_lost * _LOSS.denominator >= self._floor_sent * _LOSS.numerator
+        loss_pct = self._floor_lost * 100 // self._floor_sent
+        self._floor_sent = self._floor_lost = 0
+        self._floor_bad_run = self._floor_bad_run + 1 if bad else 0
+        if self._floor_bad_run < BAD_INTERVALS_TO_CAP:
+            return
+        self._floor_bad_run = 0
+        now = self._clock()
+        warned_at = self._floor_warned_at
+        if warned_at is not None and now - warned_at < FLOOR_WARN_INTERVAL_S:
+            return
+        self._floor_warned_at = now
+        log.warning(
+            "auto cap: link too slow even for tier 1 (about %d%% lost); "
+            "lower shaper_tiers_pps by hand",
+            loss_pct,
+        )
 
     def _note_clean(self, tier: int) -> None:
         """A clean interval. CLEAN_INTERVALS_TO_RESET in a row at or above
