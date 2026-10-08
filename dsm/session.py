@@ -16,7 +16,7 @@ import os
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from dsm.core import netaudit
 from dsm.core.config import MIN_TUN_MTU, Config
@@ -1132,6 +1132,14 @@ async def run_data_loops(
                 exc_info=True,
             )
             ctx.shutdown.set()
+
+    # The scheduler's send loop runs in its own task, outside the gather
+    # below: if it dies from an error (it logs it), end the session the same
+    # way. Test stand-ins for the scheduler have no send loop to watch (the
+    # cast lets the type checker accept the check).
+    scheduler = cast(object, ctx.scheduler)
+    if isinstance(scheduler, SendScheduler):
+        scheduler.on_failure(ctx.shutdown.set)
 
     try:
         await asyncio.gather(

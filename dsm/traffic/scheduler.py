@@ -123,6 +123,21 @@ class SendScheduler:
         self._drop_log = RepeatLog(log, logging.WARNING, clock=clock)
         self._control_drop_log = RepeatLog(log, logging.WARNING, clock=clock)
         self._failure_logs: dict[tuple[str, type[BaseException]], RepeatLog] = {}
+        # Send loop death (see on_failure): set once, never cleared.
+        self._failed = False
+        self._on_failure: Callable[[], None] | None = None
+
+    def on_failure(self, callback: Callable[[], None]) -> None:
+        """Call ``callback`` if the send loop dies from an error, or at once
+        if it already has.
+
+        The loop runs in its own task, so nothing else would notice: no
+        packet, real or chaff, would leave again. The session passes its
+        shutdown event's ``set`` here. A stop by ``stop()`` is not a failure.
+        """
+        self._on_failure = callback
+        if self._failed:
+            callback()
 
     def set_report(self, data: bytes, target_size: int) -> None:
         """Hold a LINK_REPORT for a free slot (one slot only).
@@ -187,9 +202,19 @@ class SendScheduler:
     async def _run(self) -> None:
         # Sleep until the shaper's next wake; nothing shortens that sleep, so
         # queuing a packet cannot pull a send time toward its arrival.
-        while self._running:
-            await self._tick(self._clock())
-            await asyncio.sleep(max(0.0, self._next_wake - self._clock()))
+        try:
+            while self._running:
+                await self._tick(self._clock())
+                await asyncio.sleep(max(0.0, self._next_wake - self._clock()))
+        # Sends are already kept alive (_keep_alive); this catches the rest,
+        # e.g. a shaper tier listener that raised out of poll. The loop cannot
+        # go on, so it reports once and ends normally: stop() then has nothing
+        # to raise at teardown. stop()'s cancel is not an Exception.
+        except Exception:
+            log.error("scheduler send loop failed — ending the session", exc_info=True)
+            self._failed = True
+            if self._on_failure is not None:
+                self._on_failure()
 
     async def _keep_alive(self, coro: Awaitable[_T], what: str) -> _T | None:
         """Await ``coro``, absorbing failures so the detached loop stays alive.

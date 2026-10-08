@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 from collections.abc import Callable
 from typing import Any
 
@@ -17,7 +18,7 @@ import pytest
 
 from dsm import client, server, session
 from dsm.core.config import Config
-from dsm.core.fsm import SessionFSM
+from dsm.core.fsm import SessionFSM, State
 from dsm.core.protocol import InnerPacket, LinkReport, PacketType
 from dsm.net.transport.tcp import TCPTransport
 from dsm.net.transport.udp import UDPTransport
@@ -30,8 +31,11 @@ from dsm.session import (
     dispatch_inner,
     link_report_loop,
     make_auto_cap,
+    run_data_loops,
 )
 from dsm.traffic.autocap import AutoCap, LinkStats
+from dsm.traffic.scheduler import SendScheduler
+from dsm.traffic.shaper import TrafficShaper
 
 
 class _Keys:
@@ -237,3 +241,90 @@ def test_the_data_loops_count_packets_and_run_the_report_loop() -> None:
     src = inspect.getsource(session.run_data_loops)
     assert "link_stats=ctx.link_stats" in src
     assert "link_report_loop(ctx)" in src
+
+
+class _TierCore:
+    """Stands in for tuncore.Shaper: every poll climbs to tier 1 and gives
+    one slot, so the first poll calls the tier listener."""
+
+    def __init__(self) -> None:
+        self._tier = 0
+
+    def poll(
+        self, now: float, queue_len: int, oldest_wait: float, real_sent: int
+    ) -> tuple[int, float]:
+        self._tier = 1
+        return 1, now + 0.01
+
+    def tier(self) -> int:
+        return self._tier
+
+    def real_size_class(self, payload_len: int) -> int:
+        return 128
+
+
+class _IdleKeys:
+    epoch = 0
+
+    def needs_rotation(self) -> bool:
+        return False
+
+    def tick(self) -> None:
+        return None
+
+
+class _Never:
+    """A TUN and a (non-UDP) transport that never deliver anything."""
+
+    async def read(self) -> bytes:
+        await asyncio.Event().wait()
+        return b""
+
+    async def recv(self) -> bytes:
+        await asyncio.Event().wait()
+        return b""
+
+
+def _broken_listener(tier: int) -> None:
+    raise RuntimeError("tier listener bug")
+
+
+async def test_a_send_loop_crash_ends_the_session_with_one_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The guard: the scheduler's send loop runs in its own task, so when a
+    tier listener raises out of the shaper's poll, the session must still
+    end (shutdown set, normal teardown) with one ERROR line and no hang."""
+    caplog.set_level(logging.ERROR)
+    # The real TrafficShaper.poll and watch_tier around a stand-in core.
+    shaper = TrafficShaper.__new__(TrafficShaper)
+    shaper._core = _TierCore()  # type: ignore[assignment]
+    shaper.watch_tier(_broken_listener)
+    scheduler = SendScheduler(_no_send, shaper=shaper)
+    fsm = SessionFSM()
+    for state in (State.CONNECTING, State.HANDSHAKING, State.ESTABLISHED):
+        fsm.transition(state)
+    ctx = DataPathContext(
+        tun=_Never(),  # type: ignore[arg-type]
+        session_keys=_IdleKeys(),  # type: ignore[arg-type]
+        fsm=fsm,
+        shaper=shaper,
+        send_fn=_no_send,
+        scheduler=scheduler,
+        rekey=RekeyState(),
+        liveness=LivenessState(),
+        shutdown=asyncio.Event(),
+    )
+    await scheduler.start()
+    try:
+        await asyncio.wait_for(
+            run_data_loops(ctx, _Never(), ctx.session_keys, None, fsm),  # type: ignore[arg-type]
+            timeout=5.0,
+        )
+    finally:
+        await scheduler.stop()  # a handled crash must not raise again here
+    assert ctx.shutdown.is_set()
+    assert fsm.state == State.IDLE, "the session did not go through teardown"
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert len(errors) == 1, [r.getMessage() for r in errors]
+    assert errors[0].exc_info is not None, "no traceback"
