@@ -531,17 +531,22 @@ async def test_client_sets_src_valid_mark_around_the_policy_route() -> None:
         async def stop(self) -> None:
             pass
 
+    stops: list[asyncio.Event] = []
+
     async def _data_loops(
         *_a: object, extra_loops: tuple[Any, ...] = (), **_k: object
     ) -> None:
         for loop in extra_loops:
             loop.close()  # never started here
+        # The user stops DSM here; a session that ends without a stop makes
+        # the client reconnect.
+        stops[0].set()
 
     patches = [
         patch("tuncore.harden_process"),
         patch("dsm.core.hardening.set_process_nondumpable"),
         patch("dsm.crypto.attest_gate.enforce_attest_backend_policy"),
-        patch("dsm.client.setup_signal_handlers"),
+        patch("dsm.client.setup_signal_handlers", stops.append),
         patch("dsm.client.load_cert_materials", return_value=_Materials()),
         patch("dsm.client.verify_cert_matches_identity"),
         patch("dsm.crypto._stores.load_daemon_stores", return_value=True),

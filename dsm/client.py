@@ -4,20 +4,26 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import json
 import logging
 import os
 import socket
 import time
 from collections.abc import Callable, Coroutine
 from contextlib import AsyncExitStack
-from typing import Any, TypeVar
+from enum import Enum, auto
+from pathlib import Path
+from types import TracebackType
+from typing import Any, TypeVar, cast
 
 from cryptography.x509.oid import ExtendedKeyUsageOID
 
 from dsm.core import netaudit
+from dsm.core.atomic_io import atomic_write
 from dsm.core.config import Config
 from dsm.core.fsm import SessionFSM, State
 from dsm.core.log import RepeatLog
+from dsm.core.path_security import check_user_file_permissions
 from dsm.core.preflight import check_clock_sync
 from dsm.core.protocol import ReassemblyBuffer
 from dsm.crypto.attest_store import AttestStore
@@ -77,6 +83,27 @@ _HOSTNAME_HINT = (
     "does not look it up again while the tunnel is down. If this goes on, "
     "stop and start DSM."
 )
+_KEPT_AFTER_ERROR = (
+    "DSM stopped on an error and left the kill switch up, so all traffic "
+    "stays blocked. Start DSM again, or run `sudo dsm cleanup` to get "
+    "internet back without the VPN."
+)
+
+# The address a server name had at the last run whose handshake worked. A
+# start whose lookup fails (a kill switch left up blocks it) uses it instead
+# of exiting. In /run, so a reboot clears it; `dsm cleanup` leaves it alone.
+_SERVER_ENDPOINT_FILE = Path("/run/dsm/server-endpoint.json")
+_USING_SAVED_ADDRESS = (
+    "could not look up the server name; using the last address it had"
+)
+
+
+class _End(Enum):
+    """How one try ended."""
+
+    SETUP_ERROR = auto()  # a host problem at the first try: exit 1
+    FAILED = auto()  # no session: connect or handshake failed, or a stop
+    ENDED = auto()  # a session was up and has ended
 
 
 async def _resolve_server_endpoint(server_ip: str, server_port: int) -> str:
@@ -108,6 +135,54 @@ async def _resolve_server_endpoint(server_ip: str, server_port: int) -> str:
         raise OSError(f"could not resolve server hostname {server_ip!r}")
     # An AF_INET sockaddr is (host, port); the host is already a str.
     return str(infos[0][4][0])
+
+
+def _save_server_endpoint(name: str, ip: str) -> None:
+    """Keep ``ip`` as the last address found for the server name ``name``.
+
+    Written like the other /run/dsm state files (folder 0700, file 0600,
+    temp file then rename). A failure logs one WARNING; DSM goes on.
+    """
+    try:
+        folder = _SERVER_ENDPOINT_FILE.parent
+        folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(folder, 0o700)
+        atomic_write(
+            _SERVER_ENDPOINT_FILE,
+            json.dumps({"name": name, "ip": ip}).encode(),
+            mode=0o600,
+        )
+    except OSError as e:
+        log.warning("could not save %s: %s", _SERVER_ENDPOINT_FILE, e)
+
+
+def _saved_server_ip(name: str) -> str | None:
+    """The address saved for the server name ``name``, or None.
+
+    A file that is missing, a symlink, not owned by the user DSM runs as
+    (root), open to group or world, not JSON, for another name, or without
+    an IPv4 address counts as no file.
+    """
+    try:
+        check_user_file_permissions(_SERVER_ENDPOINT_FILE)
+        fd = os.open(_SERVER_ENDPOINT_FILE, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        with os.fdopen(fd, "rb") as f:
+            saved: object = json.loads(f.read())
+    except (OSError, ValueError):
+        # Missing, a symlink, foreign, open to others, unreadable or not
+        # JSON: no address we can trust. The caller logs the lookup error.
+        return None
+    if not isinstance(saved, dict):
+        return None
+    entry = cast(dict[str, object], saved)
+    ip = entry.get("ip")
+    if entry.get("name") != name or not isinstance(ip, str):
+        return None
+    try:
+        ipaddress.IPv4Address(ip)
+    except ipaddress.AddressValueError:
+        return None
+    return ip
 
 
 def _emit_handshake_failure(err: Exception) -> None:
@@ -233,26 +308,35 @@ async def run_client(
     passphrase_fd: int | None = None,
     passphrase_env_file: str | None = None,
 ) -> int:
-    """Run DSM in client mode using transactional resource management.
+    """Run DSM in client mode until the user stops it.
 
-    Every resource that mutates host state (TUN, nftables, resolv.conf, etc.)
-    is registered with an ``AsyncExitStack`` the moment it succeeds so that
-    any failure downstream unwinds them in reverse order — never leaving
-    the host in a half-configured state.
+    The kill switch stays up from before the passphrase read until the user
+    stops DSM (a signal: Ctrl-C, ``systemctl stop``). Each session swaps the
+    pre-handshake kill switch for the full one and, when it ends, swaps it
+    back, each time in one nft commit. A session that ends any other way
+    (dead peer, SESSION_CLOSE, a TCP reset, a rekey that gives up) and a
+    connect or handshake that fails keep the block: the client tries again
+    with backoff, with the address it found at start. A server name is
+    looked up once, at start; its address is saved once a handshake with it
+    works, and a later start whose lookup fails uses the address saved for
+    the same name.
+
+    Every host change of a session is registered on that session's
+    ``AsyncExitStack`` the moment it succeeds, so any failure unwinds them in
+    reverse order and never leaves the host half configured.
 
     Returns:
-        0 on a clean shutdown (signal / SESSION_CLOSE / dead-peer), 1 on any
-        startup or handshake error path. ``main()`` ``sys.exit``s this so a
-        failed connection is a nonzero exit (so ``Restart=on-failure`` fires
-        and the kill switch is not left masking a silent outage).
+        0 when the user stops DSM, 1 on a setup error a retry cannot fix
+        (keys, cert, or a UDP port in use or a read-only resolv.conf at the
+        first try). Both take the kill switch down. An unexpected error goes
+        up with the kill switch still up (fail closed); the next start
+        replaces it.
     """
     import tuncore
     from dsm.core.hardening import harden_and_gate
 
     if not harden_and_gate(config):
         return 1
-
-    fsm = SessionFSM()
 
     # Cert auth materials must load BEFORE we touch any host state, so a
     # missing cert file aborts cleanly with no rules / no TUN created.
@@ -263,40 +347,63 @@ async def run_client(
         return 1
 
     async with AsyncExitStack() as stack:
-        # Create the shutdown event and install signal
-        # handlers BEFORE the pre-handshake kill switch. A SIGTERM during
-        # connect/handshake must trigger the AsyncExitStack unwind (removing
-        # the kill switch) rather than killing the process with the kill
-        # switch still applied and the host offline.
+        # Create the shutdown event and install signal handlers BEFORE the
+        # pre-handshake kill switch, so a SIGTERM during startup unwinds the
+        # stack instead of killing the process with the kill switch up. Only
+        # the signal handlers set `shutdown`: it means the user stopped DSM,
+        # the one case that takes the kill switch down.
         shutdown = asyncio.Event()
         setup_signal_handlers(shutdown)
 
         # The kill-switch rules need a literal address, so a hostname is
         # resolved and pinned here, before the kill switch goes up. This one
-        # cleartext lookup is accepted; see config._validate_server_ip.
+        # cleartext lookup is accepted; see config._validate_server_ip. The
+        # name is not looked up again in this run, not even while the client
+        # reconnects: no lookup goes out through the kill switch.
+        # save_address: the address came from a working lookup of a name; it
+        # is saved once a handshake with it works (F3).
+        save_address = False
         try:
             server_ip = await _resolve_server_endpoint(
                 config.server_ip, config.server_port
             )
         except OSError as e:
-            log.error(
-                "could not resolve server endpoint %r: %s — refusing to "
-                "start (fail-closed)",
-                config.server_ip,
-                e,
-            )
-            return 1
-        if server_ip != config.server_ip:
-            log.info("resolved server hostname %s -> %s", config.server_ip, server_ip)
+            saved_ip = _saved_server_ip(config.server_ip)
+            if saved_ip is None:
+                log.error(
+                    "could not resolve server endpoint %r: %s — refusing to "
+                    "start (fail-closed)",
+                    config.server_ip,
+                    e,
+                )
+                log.error(
+                    "if an earlier DSM run left its kill switch up, it blocks "
+                    "this lookup: run `sudo dsm cleanup`, then start DSM "
+                    "again, or set server_ip to the server's IP address"
+                )
+                return 1
+            # A kill switch left up (by a crash, or kept for a restart)
+            # blocks the lookup: use the address saved for this name after
+            # an earlier good handshake. The log line names no address.
+            log.warning(_USING_SAVED_ADDRESS)
+            server_ip = saved_ip
+        else:
+            if server_ip != config.server_ip:
+                log.info(
+                    "resolved server hostname %s -> %s", config.server_ip, server_ip
+                )
+                # A working lookup always wins. Its address replaces the
+                # saved one only once a handshake with it works.
+                save_address = True
 
         # Pre-handshake kill switch: applied BEFORE the (possibly interactive)
         # passphrase read + key unlock below, so the host is fail-closed for
-        # the ENTIRE startup window — not just from socket bind onward. A slow
-        # passphrase prompt or key load must never leave user traffic
-        # unprotected. Allows only loopback, DHCP renewal, and the configured
-        # server endpoint; upgraded atomically to the full kill switch (which
-        # also covers the TUN interface and DNS leaks) by NFTablesManager
-        # .apply() below, once the TUN is up.
+        # the ENTIRE startup window. Allows only loopback, DHCP renewal and
+        # the configured server endpoint. It replaces, in the same nft
+        # commit, any client kill-switch table a crashed run left, so a
+        # restart has no gap. Each session upgrades it to the full kill
+        # switch (which also covers the TUN and DNS leaks) and swaps it back
+        # when the session ends.
         pre_killswitch = PreHandshakeKillSwitch(server_ip, config.server_port)
         try:
             pre_killswitch.apply()
@@ -310,7 +417,22 @@ async def run_client(
                 e,
             )
             return 1
-        stack.callback(pre_killswitch.remove)
+
+        def _release_kill_switch(
+            exc_type: type[BaseException] | None,
+            _exc: BaseException | None,
+            _tb: TracebackType | None,
+        ) -> bool:
+            # Only a stop the user asked for, or a setup error a retry cannot
+            # fix, gets here without an error: take the kill switch down. An
+            # error leaves it up (fail closed); the next start replaces it.
+            if exc_type is None:
+                pre_killswitch.remove()
+            else:
+                log.error(_KEPT_AFTER_ERROR)
+            return False
+
+        stack.push(_release_kill_switch)
 
         # Read the passphrase once and unlock both stores, now BEHIND the kill
         # switch. Identity (X25519 Noise static) and attest key (ECDSA P-256)
@@ -330,8 +452,8 @@ async def run_client(
             return 1
 
         # Register the unloads now that the stores are loaded. They unwind
-        # before the kill switch is removed (the nft teardown does not need
-        # the keys); the identity stays resident for the whole session.
+        # before the kill switch is removed; the identity stays resident for
+        # the whole run, across reconnects.
         stack.callback(keystore.unload)
         stack.callback(attest_store.unload)
 
@@ -352,34 +474,7 @@ async def run_client(
         if _clock_warn:
             log.warning(_clock_warn)
 
-        if config.transport == "udp":
-            transport = UDPTransport()
-            try:
-                await transport.bind(
-                    local_port=config.listen_port,
-                    pmtu_discover=config.pmtu_discover,
-                )
-            except OSError as e:
-                # A fixed listen_port that is already taken: retrying cannot
-                # fix it, so log one line and exit like the server does. The
-                # stack unwinds the stores and the kill switch.
-                reason = os.strerror(e.errno) if e.errno else str(e)
-                log.error(
-                    "cannot listen on UDP port %d: %s; exiting",
-                    config.listen_port,
-                    reason,
-                )
-                return 1
-        else:
-            transport = TCPTransport()
-            await transport.connect(server_ip, config.server_port)
-        stack.push_async_callback(transport.aclose)
-
-        server_addr = (server_ip, config.server_port)
-
-        fsm.transition(State.CONNECTING)
-        fsm.transition(State.HANDSHAKING)
-
+        # Imported here, not at the top, so tests can replace them.
         from dsm.crypto.handshake import (
             CertAuthError,
             CertRevokedError,
@@ -387,232 +482,352 @@ async def run_client(
             HandshakeError,
             client_handshake,
         )
+        from dsm.session import run_data_loops
 
         assert (
             config.expected_server_cn is not None
         ), "client mode requires expected_server_cn (validated in Config)"
+        expected_server_cn: str = config.expected_server_cn
+        server_addr = (server_ip, config.server_port)
+        reconnect = _Reconnect(looked_up_name=server_ip != config.server_ip)
 
-        try:
-            session_keys, _handshake_hash, server_static_pub = await client_handshake(
-                transport,
-                keystore.identity,
-                server_addr,
-                attest_key=attest_store.attest_key,
-                cert_der=materials.cert_der,
-                ca_root=materials.ca_root,
-                expected_server_cn=config.expected_server_cn,
-                crl=materials.crl,
-                required_server_eku=ExtendedKeyUsageOID.SERVER_AUTH,
-                rotation_packets=config.rotation_packets,
-                rotation_seconds=config.rotation_seconds,
-            )
-        except (
-            CNMismatchError,
-            CertRevokedError,
-            CertAuthError,
-            HandshakeError,
-        ) as e:
-            # Most-specific first: CNMismatchError and CertRevokedError are
-            # subclasses of CertAuthError, which is a subclass of HandshakeError.
-            if isinstance(e, CNMismatchError):
-                prefix = "server CN check failed"
-            elif isinstance(e, CertRevokedError):
-                prefix = "server cert revoked"
-            elif isinstance(e, CertAuthError):
-                prefix = "server cert auth failed"
-            else:
-                prefix = "handshake failed"
-            log.error("%s: %s", prefix, e)
-            _emit_handshake_failure(e)
-            fsm.transition(State.TEARDOWN)
-            return 1  # AsyncExitStack unwinds transport + keystore
+        async def _connect_and_run(first_try: bool) -> _End:
+            """One try: connect, handshake, and run a session until it ends.
 
-        fsm.transition(State.ESTABLISHED)
+            At the first try, a UDP port in use or a read-only resolv.conf is
+            a setup error: DSM exits and removes the kill switch, as the user
+            is there and nothing was protected yet. On later tries every
+            failure keeps the block, so nothing on the host or the network
+            can turn the kill switch off.
+            """
+            nonlocal save_address
+            fsm = SessionFSM()
+            async with AsyncExitStack() as attempt:
+                transport: UDPTransport | TCPTransport
+                if config.transport == "udp":
+                    transport = UDPTransport()
+                    try:
+                        await transport.bind(
+                            local_port=config.listen_port,
+                            pmtu_discover=config.pmtu_discover,
+                        )
+                    except OSError as e:
+                        reason = os.strerror(e.errno) if e.errno else str(e)
+                        if first_try:
+                            # A fixed listen_port that is already taken:
+                            # one line and exit, like the server.
+                            log.error(
+                                "cannot listen on UDP port %d: %s; exiting",
+                                config.listen_port,
+                                reason,
+                            )
+                            return _End.SETUP_ERROR
+                        log.error(
+                            "cannot listen on UDP port %d: %s; trying again",
+                            config.listen_port,
+                            reason,
+                        )
+                        return _End.FAILED
+                    attempt.push_async_callback(transport.aclose)
+                else:
+                    transport = TCPTransport()
+                    attempt.push_async_callback(transport.aclose)
+                    try:
+                        await _unless_stopped(
+                            shutdown,
+                            transport.connect(server_ip, config.server_port),
+                        )
+                    except OSError as e:
+                        # Not str(e): asyncio's connect error holds the address.
+                        reason = os.strerror(e.errno) if e.errno else type(e).__name__
+                        log.error("cannot connect to the server: %s", reason)
+                        return _End.FAILED
+                    if shutdown.is_set():
+                        return _End.FAILED
 
-        # Host-mutating resources.
-        #
-        # Apply order is fixed by dependency:
-        #   tcp_ts → src_valid_mark → tun → nft → resolv
-        # (nft references tun's name; resolv goes last so the kill switch
-        # is already up when the new resolver becomes visible.)
-        #
-        # Unwind order is anonymity-critical: the kill switch (nft) MUST
-        # stay applied while the TUN is being torn down. Tun teardown
-        # briefly removes the routing rule that forces traffic through
-        # the tunnel; during that window unmarked traffic can fall to
-        # the main routing table and hit the WAN interface. If the kill
-        # switch is gone by then, that traffic leaks. If it is still up,
-        # nftables drops it.
-        #
-        # Desired unwind: resolv → tun → nft → src_valid_mark → tcp_ts
-        # Reverse of that (= AsyncExitStack registration order):
-        #         tcp_ts, src_valid_mark, nft, tun, resolv
-        # which is NOT the apply order. We use an explicit try/except
-        # block to keep partial-failure safety: if any apply between tun
-        # and resolv fails, we manually unwind what was already applied
-        # before re-raising.
+                fsm.transition(State.CONNECTING)
+                fsm.transition(State.HANDSHAKING)
 
-        tcp_ts = TcpTimestampsDisabler()
-        tcp_ts.apply()
-        stack.callback(tcp_ts.remove)
-
-        # Lets strict rp_filter hosts accept the server's replies once the
-        # not-fwmark ip rule is in (see SrcValidMarkEnabler). On before
-        # tun.configure adds that rule; registered here so it is restored
-        # only after tun.close has removed the rule again.
-        src_valid_mark = SrcValidMarkEnabler()
-        src_valid_mark.apply()
-        stack.callback(src_valid_mark.remove)
-
-        # TUN must be opened/configured before nftables (kill-switch rules
-        # reference TUN by name). Apply tun + nft + resolv in that order
-        # but DEFER the cleanup-callback registration so we control the
-        # unwind sequence.
-        tun = TunDevice(config.tun_name)
-        tun.open()
-        try:
-            tun.configure(mtu=config.mtu)
-            nft = NFTablesManager(server_ip, config.server_port, config.tun_name)
-            nft.apply()
-            try:
-                resolv = ResolvConfManager(nameserver=SERVER_TUN_IP)
-                resolv.apply()
-            except Exception:
-                # resolv failed after nft was applied. Undo nft, then
-                # let the outer except undo tun.
                 try:
-                    nft.remove()
-                # cleanup path: any failure here must not mask the original
-                except Exception:  # noqa: BLE001
-                    log.warning("nft.remove during failed apply also failed")
-                raise
-        except Exception as e:
-            # tun.configure or nft.apply (or resolv.apply if it re-raised
-            # above) failed. Undo tun.close manually since we never
-            # registered the cleanup.
-            try:
-                tun.close()
-            # cleanup path: any failure here must not mask the original
-            except Exception:  # noqa: BLE001
-                log.warning("tun.close during failed apply also failed")
-            if isinstance(e, ResolvConfError):
-                # A host problem (e.g. a read-only resolv.conf), not a bug:
-                # one line, no traceback. The stack unwinds the rest.
-                log.error("%s; exiting", e)
-                return 1
-            raise
-
-        # All three host-mutating resources are up. Register cleanups in
-        # REVERSE of desired unwind order. AsyncExitStack pops LIFO, so:
-        #   register nft.remove  → unwinds 3rd (LAST: kill switch down)
-        #   register tun.close   → unwinds 2nd (kill switch still up)
-        #   register resolv.remove → unwinds 1st (DNS reverted while kill switch up)
-        stack.callback(nft.remove)
-        stack.callback(tun.close)
-        stack.callback(resolv.remove)
-
-        log.info("tunnel established")
-
-        # After the handshake has exchanged several full-size datagrams,
-        # the kernel may have learned the path MTU via ICMP. Log it once
-        # so the operator can tell whether the configured tun MTU is a
-        # good fit. When `auto_mtu` is on, the adapter loop below will
-        # also act on this information; we still log the warning when
-        # `auto_mtu` is off so a misconfigured static MTU is visible at
-        # startup.
-        if isinstance(transport, UDPTransport):
-            path_mtu = transport.get_path_mtu()
-            if path_mtu is not None:
-                # See dsm.session.WIRE_OVERHEAD for the breakdown.
-                from dsm.session import WIRE_OVERHEAD
-
-                usable = path_mtu - WIRE_OVERHEAD
-                log.info("kernel path MTU = %d (usable inner %d)", path_mtu, usable)
-                if usable < config.mtu and not config.auto_mtu:
-                    log.warning(
-                        "configured tun mtu=%d exceeds usable inner %d "
-                        "(path MTU %d); enable `auto_mtu` or lower `mtu` "
-                        "in config to avoid fragmentation",
-                        config.mtu,
-                        usable,
-                        path_mtu,
+                    handshake = await _unless_stopped(
+                        shutdown,
+                        client_handshake(
+                            transport,
+                            keystore.identity,
+                            server_addr,
+                            attest_key=attest_store.attest_key,
+                            cert_der=materials.cert_der,
+                            ca_root=materials.ca_root,
+                            expected_server_cn=expected_server_cn,
+                            crl=materials.crl,
+                            required_server_eku=ExtendedKeyUsageOID.SERVER_AUTH,
+                            rotation_packets=config.rotation_packets,
+                            rotation_seconds=config.rotation_seconds,
+                        ),
                     )
+                except (
+                    CNMismatchError,
+                    CertRevokedError,
+                    CertAuthError,
+                    HandshakeError,
+                ) as e:
+                    # Most-specific first: CNMismatchError and
+                    # CertRevokedError are subclasses of CertAuthError, which
+                    # is a subclass of HandshakeError. All of them come from
+                    # the network (someone on the path can send a bad or
+                    # revoked cert), so they keep the block and DSM retries.
+                    if isinstance(e, CNMismatchError):
+                        prefix = "server CN check failed"
+                    elif isinstance(e, CertRevokedError):
+                        prefix = "server cert revoked"
+                    elif isinstance(e, CertAuthError):
+                        prefix = "server cert auth failed"
+                    else:
+                        prefix = "handshake failed"
+                    log.error("%s: %s", prefix, e)
+                    _emit_handshake_failure(e)
+                    fsm.transition(State.TEARDOWN)
+                    return _End.FAILED
+                except OSError as e:
+                    reason = os.strerror(e.errno) if e.errno else type(e).__name__
+                    log.error("handshake failed: %s", reason)
+                    _emit_handshake_failure(e)
+                    fsm.transition(State.TEARDOWN)
+                    return _End.FAILED
+                if handshake is None:
+                    return _End.FAILED  # the user stopped DSM first
+                session_keys, _handshake_hash, server_static_pub = handshake
 
-        seq = SequenceCounter()
-        replay = tuncore.ReplayWindow()
-        rekey = RekeyState()
-        liveness = LivenessState()
-        reassembly = ReassemblyBuffer()
+                fsm.transition(State.ESTABLISHED)
 
-        # shutdown + signal handlers were installed at the top of the stack
-        # before the pre-handshake kill switch. Reuse that
-        # same event here so make_send_fn / DataPathContext observe signals.
-        send_packet = make_send_fn(
-            session_keys,
-            transport,
-            lambda: server_addr,
-            seq,
-            liveness=liveness,
-            shutdown=shutdown,
-        )
+                if save_address:
+                    # The run's first good handshake proves the looked-up
+                    # address: keep it for a start whose lookup fails (F3).
+                    # A run with no good handshake leaves the old file alone.
+                    _save_server_endpoint(config.server_ip, server_ip)
+                    save_address = False
 
-        # Build the shaper here, right before the send loop starts, as the
-        # server does. Its slots start when it is built: built before the
-        # handshake, the first poll would find every slot of the setup time
-        # due and send them all back to back.
-        shaper = TrafficShaper.from_config(config)
-        # Slow-link auto cap: count what arrives, report it to the server, and
-        # cap our own top tier on sustained loss. Wired before the scheduler
-        # starts so the tier listener sees every tier change; the server does
-        # the same. (None, None) in TCP mode or when turned off.
-        link_stats, autocap = make_auto_cap(config, transport, shaper, seq)
+                # Host-mutating resources.
+                #
+                # Apply order is fixed by dependency:
+                #   tcp_ts → src_valid_mark → tun → nft → resolv
+                # (nft references tun's name; resolv goes last so the kill
+                # switch is already up when the new resolver becomes visible.)
+                #
+                # Unwind order is anonymity-critical: the full kill switch
+                # MUST stay applied while the TUN is being torn down. Tun
+                # teardown briefly removes the routing rule that forces
+                # traffic through the tunnel; during that window unmarked
+                # traffic can fall to the main routing table and hit the WAN
+                # interface. The kill switch is never removed here: the
+                # session ends by swapping it back to the pre-handshake table
+                # in one nft commit, after the TUN is closed.
+                #
+                # Desired unwind: resolv → tun → swap back → src_valid_mark
+                #                 → tcp_ts
+                # Reverse of that (= AsyncExitStack registration order):
+                #         tcp_ts, src_valid_mark, swap back, tun, resolv
+                # which is NOT the apply order. An explicit try/except keeps
+                # partial-failure safety: if any apply between tun and resolv
+                # fails, we undo by hand what was already applied.
 
-        # Shaper-driven: the tier shaper decides when packets leave (real
-        # first, chaff in the other slots), so the wire rate follows the tier,
-        # not the real traffic. No should_chaff_fn: the client always knows
-        # its destination, so chaff may fill every free slot.
-        scheduler = SendScheduler(
-            send_fn=send_packet,
-            chaff_fn=lambda: make_chaff_packet(shaper, session_keys.epoch & 0x0F),
-            shaper=shaper,
-        )
-        await scheduler.start()
-        stack.push_async_callback(scheduler.stop)
+                tcp_ts = TcpTimestampsDisabler()
+                tcp_ts.apply()
+                attempt.callback(tcp_ts.remove)
 
-        ctx = DataPathContext(
-            tun=tun,
-            session_keys=session_keys,
-            fsm=fsm,
-            shaper=shaper,
-            send_fn=send_packet,
-            scheduler=scheduler,
-            rekey=rekey,
-            liveness=liveness,
-            shutdown=shutdown,
-            reassembly=reassembly,
-            # Pass the UDPTransport so post-rekey hook can
-            # rebind to a fresh ephemeral src port; None on TCP.
-            udp_transport=transport if isinstance(transport, UDPTransport) else None,
-            # Static pubs for mutual-init tie-break.
-            local_static_pub=bytes(keystore.identity.public_key),
-            remote_static_pub=server_static_pub,
-            link_stats=link_stats,
-            autocap=autocap,
-        )
+                # Lets strict rp_filter hosts accept the server's replies once
+                # the not-fwmark ip rule is in (see SrcValidMarkEnabler). On
+                # before tun.configure adds that rule; registered here so it
+                # is restored only after tun.close has removed the rule again.
+                src_valid_mark = SrcValidMarkEnabler()
+                src_valid_mark.apply()
+                attempt.callback(src_valid_mark.remove)
 
-        # The AsyncExitStack stays in this module; ``run_data_loops``
-        # only owns the loops + the SESSION_CLOSE / FSM teardown.
-        from dsm.session import run_data_loops
+                tun = TunDevice(config.tun_name)
+                tun.open()
+                try:
+                    tun.configure(mtu=config.mtu)
+                    nft = NFTablesManager(
+                        server_ip, config.server_port, config.tun_name
+                    )
+                    nft.apply()
+                    try:
+                        resolv = ResolvConfManager(nameserver=SERVER_TUN_IP)
+                        resolv.apply()
+                    except ResolvConfError:
+                        if not first_try:
+                            # Keep the block: back to the pre-handshake table
+                            # in one commit. If that fails, its error goes up
+                            # and DSM stops with the full kill switch up.
+                            pre_killswitch.apply()
+                            raise
+                        # First try: DSM exits and removes every table.
+                        try:
+                            nft.remove()
+                        # cleanup path: any failure here must not mask the original
+                        except Exception:  # noqa: BLE001
+                            log.warning("nft.remove during failed apply also failed")
+                        raise
+                except Exception as e:
+                    # tun.configure, nft.apply or resolv.apply failed. Close
+                    # the TUN by hand: its cleanup is not registered yet. Any
+                    # error but ResolvConfError goes up with the kill switch
+                    # still up.
+                    try:
+                        tun.close()
+                    # cleanup path: any failure here must not mask the original
+                    except Exception:  # noqa: BLE001
+                        log.warning("tun.close during failed apply also failed")
+                    if isinstance(e, ResolvConfError):
+                        # A host problem, not a bug: one line, no traceback.
+                        if first_try:
+                            log.error("%s; exiting", e)
+                            return _End.SETUP_ERROR
+                        log.error("%s; trying again", e)
+                        return _End.FAILED
+                    raise
 
-        await run_data_loops(
-            ctx,
-            transport,
-            session_keys,
-            replay,
-            fsm,
-            extra_loops=(auto_mtu_loop(ctx, transport, config),),
-            udp_addr_filter=lambda addr: addr == server_addr,
-            shutdown_log="shutting down",
-        )
+                # All three are up. Register in REVERSE of the desired unwind
+                # (AsyncExitStack pops LIFO): resolv.remove first, then
+                # tun.close under the full kill switch, then the swap back to
+                # the pre-handshake table.
+                attempt.callback(pre_killswitch.apply)
+                attempt.callback(tun.close)
+                attempt.callback(resolv.remove)
+
+                log.info("tunnel established")
+                reconnect.connected()
+
+                # After the handshake has exchanged several full-size
+                # datagrams, the kernel may have learned the path MTU via
+                # ICMP. Log it once so the operator can tell whether the
+                # configured tun MTU is a good fit. When `auto_mtu` is on, the
+                # adapter loop below also acts on it; the warning still shows
+                # when `auto_mtu` is off so a misconfigured static MTU is
+                # visible at startup.
+                if isinstance(transport, UDPTransport):
+                    path_mtu = transport.get_path_mtu()
+                    if path_mtu is not None:
+                        # See dsm.session.WIRE_OVERHEAD for the breakdown.
+                        from dsm.session import WIRE_OVERHEAD
+
+                        usable = path_mtu - WIRE_OVERHEAD
+                        log.info(
+                            "kernel path MTU = %d (usable inner %d)",
+                            path_mtu,
+                            usable,
+                        )
+                        if usable < config.mtu and not config.auto_mtu:
+                            log.warning(
+                                "configured tun mtu=%d exceeds usable inner %d "
+                                "(path MTU %d); enable `auto_mtu` or lower "
+                                "`mtu` in config to avoid fragmentation",
+                                config.mtu,
+                                usable,
+                                path_mtu,
+                            )
+
+                seq = SequenceCounter()
+                replay = tuncore.ReplayWindow()
+                rekey = RekeyState()
+                liveness = LivenessState()
+                reassembly = ReassemblyBuffer()
+
+                # The session's own end event. A stop also ends it (the task
+                # below copies `shutdown` into it); a session that ends any
+                # other way leaves `shutdown` unset, so the loop reconnects.
+                session_end = asyncio.Event()
+                attempt.push_async_callback(
+                    _cancel_and_wait,
+                    asyncio.ensure_future(_set_when(shutdown, session_end)),
+                )
+
+                send_packet = make_send_fn(
+                    session_keys,
+                    transport,
+                    lambda: server_addr,
+                    seq,
+                    liveness=liveness,
+                    shutdown=session_end,
+                )
+
+                # Build the shaper here, right before the send loop starts, as
+                # the server does. Its slots start when it is built: built
+                # before the handshake, the first poll would find every slot
+                # of the setup time due and send them all back to back.
+                shaper = TrafficShaper.from_config(config)
+                # Slow-link auto cap: count what arrives, report it to the
+                # server, and cap our own top tier on sustained loss. Wired
+                # before the scheduler starts so the tier listener sees every
+                # tier change; the server does the same. (None, None) in TCP
+                # mode or when turned off.
+                link_stats, autocap = make_auto_cap(config, transport, shaper, seq)
+
+                # Shaper-driven: the tier shaper decides when packets leave
+                # (real first, chaff in the other slots), so the wire rate
+                # follows the tier, not the real traffic. No should_chaff_fn:
+                # the client always knows its destination, so chaff may fill
+                # every free slot.
+                scheduler = SendScheduler(
+                    send_fn=send_packet,
+                    chaff_fn=lambda: make_chaff_packet(
+                        shaper, session_keys.epoch & 0x0F
+                    ),
+                    shaper=shaper,
+                )
+                await scheduler.start()
+                attempt.push_async_callback(scheduler.stop)
+
+                ctx = DataPathContext(
+                    tun=tun,
+                    session_keys=session_keys,
+                    fsm=fsm,
+                    shaper=shaper,
+                    send_fn=send_packet,
+                    scheduler=scheduler,
+                    rekey=rekey,
+                    liveness=liveness,
+                    shutdown=session_end,
+                    reassembly=reassembly,
+                    # Pass the UDPTransport so post-rekey hook can rebind to a
+                    # fresh ephemeral src port; None on TCP.
+                    udp_transport=(
+                        transport if isinstance(transport, UDPTransport) else None
+                    ),
+                    # Static pubs for mutual-init tie-break.
+                    local_static_pub=bytes(keystore.identity.public_key),
+                    remote_static_pub=server_static_pub,
+                    link_stats=link_stats,
+                    autocap=autocap,
+                )
+
+                # The AsyncExitStack stays in this module; ``run_data_loops``
+                # only owns the loops + the SESSION_CLOSE / FSM teardown.
+                await run_data_loops(
+                    ctx,
+                    transport,
+                    session_keys,
+                    replay,
+                    fsm,
+                    extra_loops=(auto_mtu_loop(ctx, transport, config),),
+                    udp_addr_filter=lambda addr: addr == server_addr,
+                    shutdown_log="shutting down",
+                )
+            return _End.ENDED
+
+        # Connect, run the session, and connect again when it ends, until the
+        # user stops DSM. Between tries only the pre-handshake table is up.
+        first = True
+        while not shutdown.is_set():
+            end = await _connect_and_run(first)
+            if end is _End.SETUP_ERROR:
+                return 1
+            if shutdown.is_set():
+                break
+            first = False
+            if end is _End.FAILED:
+                reconnect.failed()
+            if await _wait_or_stop(shutdown, reconnect.next_wait()):
+                break
 
     return 0

@@ -112,6 +112,7 @@ async def test_the_first_poll_after_a_slow_setup_sends_at_most_one_slot() -> Non
     fake_clock = _FakeClock()
     first_poll: list[int] = []
     polled = asyncio.Event()
+    stops: list[asyncio.Event] = []
 
     class _ClockedShaper(TrafficShaper):
         @classmethod
@@ -145,12 +146,15 @@ async def test_the_first_poll_after_a_slow_setup_sends_at_most_one_slot() -> Non
         for loop in extra_loops:
             loop.close()  # never started here
         await asyncio.wait_for(polled.wait(), timeout=5)
+        # The user stops DSM here; a session that ends without a stop makes
+        # the client reconnect.
+        stops[0].set()
 
     patches = [
         patch("tuncore.harden_process"),
         patch("dsm.core.hardening.set_process_nondumpable"),
         patch("dsm.crypto.attest_gate.enforce_attest_backend_policy"),
-        patch("dsm.client.setup_signal_handlers"),
+        patch("dsm.client.setup_signal_handlers", stops.append),
         patch("dsm.client.load_cert_materials", return_value=_Materials()),
         patch("dsm.client.verify_cert_matches_identity"),
         patch("dsm.crypto._stores.load_daemon_stores", return_value=True),

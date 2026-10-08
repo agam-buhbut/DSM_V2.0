@@ -23,6 +23,7 @@ filesystem mutation.
 
 from __future__ import annotations
 
+import asyncio
 import io
 import unittest
 from contextlib import redirect_stderr
@@ -207,7 +208,20 @@ class ClientSigtermDuringHandshakeUnwinds(unittest.IsolatedAsyncioTestCase):
             ca_root = object()
             crl = None
 
+        from dsm import session as session_mod
+
+        stops: list[asyncio.Event] = []
+
+        def _real_signal_handlers(shutdown: asyncio.Event) -> None:
+            # The real install, plus a handle on the event it sets.
+            stops.append(shutdown)
+            session_mod.setup_signal_handlers(shutdown)
+
         async def _failing_handshake(*_a: object, **_k: object) -> None:
+            # SIGTERM arrives during the handshake: the handler sets the
+            # shutdown event, then the handshake fails. A failed handshake
+            # alone keeps the kill switch up and tries again.
+            stops[0].set()
             raise HandshakeError("connect interrupted")
 
         class _FakeTransport:
@@ -241,9 +255,10 @@ class ClientSigtermDuringHandshakeUnwinds(unittest.IsolatedAsyncioTestCase):
             # Real setup_signal_handlers runs against this test's isolated
             # event loop (torn down per test), exercising the actual early
             # install rather than a mock.
+            patch("dsm.client.setup_signal_handlers", _real_signal_handlers),
             patch("dsm.crypto.handshake.client_handshake", _failing_handshake),
         ):
-            rc = await run_client_local(cfg)
+            rc = await asyncio.wait_for(run_client_local(cfg), timeout=10)
 
         self.assertTrue(applied["value"], "pre-handshake kill switch was applied")
         self.assertTrue(
@@ -251,7 +266,7 @@ class ClientSigtermDuringHandshakeUnwinds(unittest.IsolatedAsyncioTestCase):
             "AsyncExitStack must remove the pre-handshake kill switch on "
             "teardown (no leaked rules after an interrupted handshake)",
         )
-        self.assertEqual(rc, 1)
+        self.assertEqual(rc, 0)
 
 
 async def run_client_local(cfg: Config) -> int:

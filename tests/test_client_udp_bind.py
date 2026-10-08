@@ -145,20 +145,28 @@ class TestBindFailureAtStartup(_UdpBindCase):
 class TestBindSuccess(_UdpBindCase):
     async def test_a_bound_port_goes_on_to_the_handshake(self) -> None:
         bind = AsyncMock(return_value=51821)
-        # Stop right after the bind: a failed handshake is a normal exit 1.
+        # Stop right after the bind: a failed handshake keeps the kill switch
+        # up and waits to try again; the user stops DSM during that wait.
+        removed_during_wait: list[bool] = []
+
+        async def stop_during_wait(_shutdown: object, _delay: float) -> bool:
+            removed_during_wait.append(self.kill_switch.remove.called)
+            return True
 
         self.handshake.side_effect = HandshakeError("stop here")
         with (
             patch.object(client_mod.UDPTransport, "bind", bind),
             patch("dsm.client._emit_handshake_failure"),
+            patch("dsm.client._wait_or_stop", stop_during_wait),
         ):
             rc = await self._run(51821)
 
-        self.assertEqual(rc, 1)
+        self.assertEqual(rc, 0)
         bind.assert_awaited_once_with(local_port=51821, pmtu_discover=False)
         self.handshake.assert_awaited_once()
         messages = [r.getMessage() for r in self.errors.records]
         self.assertEqual(messages, ["handshake failed: stop here"])
+        self.assertEqual(removed_during_wait, [False])
         self.kill_switch.remove.assert_called_once_with()
 
 
