@@ -3,8 +3,8 @@ and the ``TrafficShaper`` wrapper: the clamp and the tier listener.
 
 The core draws its secret values from the OS RNG, so these tests drive it
 with an injected clock and check only what holds for every draw. The exact,
-seeded behavior is pinned by the Rust tests in
-rust/tuncore/src/shaper/cap_tests.rs.
+seeded behavior is pinned by the Rust tests in the inline ``mod cap_tests``
+at the end of rust/tuncore/src/shaper.rs.
 """
 
 from __future__ import annotations
