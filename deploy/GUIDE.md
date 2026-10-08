@@ -1186,9 +1186,12 @@ Everyday tasks:
   `sources.txt`: a missing one is written again with the default.
 - Use a list file of your own: `sudo install -m 0600 my-list.txt
   /opt/mtun/dns/block/`. The download job only touches `fetched-*.txt`.
-- Never block a name: add it to `allow.txt`. Create the file first if it is
-  missing (`sudo install -m 0600 /dev/null /opt/mtun/dns/allow.txt`), then
-  `echo good.example.com | sudo tee -a /opt/mtun/dns/allow.txt`.
+- Never block a name: add it to `allow.txt` with
+  `sudo sh -c 'umask 077; echo good.example.com >> /opt/mtun/dns/allow.txt'`.
+  This adds the line at the end, and makes the file (mode 0600) if it is
+  missing. If you allow a name under a blocked one (`x.ads.example.com` under
+  `ads.example.com`), a device that got "no such name" for the blocked one
+  may treat the allowed name as missing too, for up to 5 minutes (RFC 8020).
 - Turn the blocklist off: `dns_blocklist = false` in config.toml, above the
   `[dns_provider_pins]` table, then restart dsm. This also turns off the
   `use-application-dns.net` answer below.
