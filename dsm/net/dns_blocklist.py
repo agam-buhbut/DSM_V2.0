@@ -243,7 +243,8 @@ class _Reader:
         # Such a line is skipped whole: a cut piece must never be parsed, since
         # its tail could look like a name the list never held.
         in_long_line = False
-        with os.fdopen(fd, "rb") as f:
+        # Fewer, larger reads let the event loop run during a load.
+        with os.fdopen(fd, "rb", buffering=1 << 20) as f:
             while line := f.readline(_MAX_LINE_BYTES):
                 cut = len(line) == _MAX_LINE_BYTES and not line.endswith(b"\n")
                 if total == 0:

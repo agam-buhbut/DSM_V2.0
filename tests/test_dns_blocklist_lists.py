@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -308,6 +309,27 @@ def test_the_bytes_of_a_long_line_count_toward_the_size_limit(
     dns_dir = _dns_dir(tmp_path, block={"a.txt": b"0.0.0.0 ads.example.com\n"})
     with pytest.raises(BlocklistError, match="bigger than 5,000 bytes"):
         load_lists(dns_dir, KEY)
+
+
+def test_lists_are_read_in_big_pieces(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Small reads (8 KiB, the default) kept the event loop from running for a
+    # whole load, since the load runs in a worker thread.
+    real_fdopen = os.fdopen
+    sizes: list[int] = []
+
+    def spy(fd: int, mode: str = "r", buffering: int = -1, **kwargs: Any) -> Any:
+        sizes.append(buffering)
+        return real_fdopen(fd, mode, buffering, **kwargs)
+
+    monkeypatch.setattr(bl_mod.os, "fdopen", spy)
+    dns_dir = _dns_dir(
+        tmp_path, block={"a.txt": b"ads.example.com\n"}, allow=b"good.example.com\n"
+    )
+    assert load_lists(dns_dir, KEY).files == 2
+    assert len(sizes) == 2
+    assert all(size >= 1 << 20 for size in sizes)
 
 
 def test_the_signature_changes_when_the_lists_change(tmp_path: Path) -> None:
