@@ -111,9 +111,16 @@ class PreHandshakeKillSwitch:
     Upgraded to the full :class:`NFTablesManager` ruleset (which also
     handles the TUN interface, DNS leak prevention, etc.) atomically by
     `NFTablesManager.apply()` once the TUN device is up.
+
+    ``apply()`` also replaces every client kill-switch table in the same
+    commit: at start that removes one a crashed run left, and when a session
+    ends it swaps the full kill switch back to this table, so the host is
+    never without one.
     """
 
     TABLE_NAME = "dsm_killswitch_pre"
+    # The client's kill-switch tables: this one and NFTablesManager's two.
+    CLIENT_TABLES = (TABLE_NAME, "dsm_killswitch", "dsm_dns_leak")
 
     def __init__(self, server_ip: str, server_port: int) -> None:
         ipaddress.ip_address(server_ip)  # raises on bad input
@@ -125,7 +132,7 @@ class PreHandshakeKillSwitch:
 
     def apply(self) -> None:
         apply_ruleset(
-            self._render(),
+            self._ruleset(),
             log_label="pre-handshake kill switch",
         )
         self._applied = True
@@ -148,6 +155,16 @@ class PreHandshakeKillSwitch:
             tables=[self.TABLE_NAME],
             phase="pre_handshake",
         )
+
+    def _ruleset(self) -> str:
+        # "add" then "delete" removes a table whether or not it exists, in the
+        # same transaction as the new one (nft 1.0.6 on Debian 12 has no
+        # "destroy").
+        replace = "".join(
+            f"add table inet {name}\ndelete table inet {name}\n"
+            for name in self.CLIENT_TABLES
+        )
+        return replace + self._render()
 
     def _render(self) -> str:
         ip_proto = _ip_proto(self._server_ip)
