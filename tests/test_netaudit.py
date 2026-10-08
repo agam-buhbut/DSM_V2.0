@@ -181,6 +181,7 @@ class TestSchemaLock(unittest.TestCase):
         # soft-attest backend is refused (action=refused_start) or acknowledged
         # (action=warned).
         "soft_attest_acknowledged",
+        "auto_cap_change",
     }
 
     def test_call_sites_in_repo(self) -> None:
