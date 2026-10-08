@@ -8,6 +8,9 @@ egresses on a clear-text link.
 Fail-closed: if the upstream resolver returns no answers, we reply with
 SERVFAIL rather than silently dropping (so the client gets a fast failure
 instead of a timeout).
+
+Names on the server's DNS blocklist (dsm.net.dns_blocklist) get NXDOMAIN for
+every query type, answered here without asking upstream.
 """
 
 from __future__ import annotations
@@ -31,10 +34,17 @@ import dns.rrset
 import dsm.net.dns as _dns
 from dsm.net._addresses import TUN_PREFIX_LEN
 from dsm.net.dns import DNSResolver, DnsResult
+from dsm.net.dns_blocklist import NEGATIVE_TTL_S, DnsBlocklist
 
 log = logging.getLogger(__name__)
 
 DEFAULT_CACHED_TTL = 60
+# The SOA record on a blocked answer. Its TTL and its last field tell the
+# device how long to remember "no such name" (RFC 2308). dsm.invalid can never
+# be a real zone.
+_BLOCKED_SOA = f"dsm.invalid. hostmaster.dsm.invalid. 1 3600 600 86400 {NEGATIVE_TTL_S}"
+# Longest valid DNS name as text. The blocklist has no length cap of its own.
+_MAX_QNAME_LEN = 253
 
 
 class DNSProxyPortInUseError(OSError):
@@ -47,6 +57,9 @@ class LocalDNSProxy:
     ``debug_dns`` controls whether resolve-failure logs include the plaintext
     qname. Default is ``False`` so a local log reader learns only an opaque
     hash, not the user's browsing history.
+
+    ``blocklist``, when given (server with ``dns_blocklist = true``), answers
+    blocked names with NXDOMAIN before anything else.
     """
 
     # Bound task semaphore prevents unbounded growth on DoS.
@@ -74,11 +87,13 @@ class LocalDNSProxy:
         bind_ip: str,
         bind_port: int = 53,
         debug_dns: bool = False,
+        blocklist: DnsBlocklist | None = None,
     ) -> None:
         self._resolver = resolver
         self._bind_ip = bind_ip
         self._bind_port = bind_port
         self._debug_dns = debug_dns
+        self._blocklist = blocklist
         self._transport: asyncio.DatagramTransport | None = None
         self._tasks: set[asyncio.Task[None]] = set()
         self._sem = asyncio.Semaphore(self._MAX_CONCURRENT_QUERIES)
@@ -212,8 +227,9 @@ class LocalDNSProxy:
     ) -> tuple[dns.message.Message, str, int] | None:
         """Parse wire bytes; return (query, qname, qtype) or None if handled.
 
-        Returns ``None`` when the request was malformed (dropped), had no
-        question (FORMERR responded), or wasn't an A query (empty NOERROR
+        Returns ``None`` when the request was malformed or named something
+        over-long (dropped), had no question (FORMERR responded), asked for a
+        blocked name (NXDOMAIN responded), or wasn't an A query (empty NOERROR
         responded — answered here so the orchestrator can skip dedup/resolve).
         """
         try:
@@ -233,6 +249,17 @@ class LocalDNSProxy:
         q = query.question[0]
         qname = q.name.to_text(omit_final_dot=True).lower()
         qtype = q.rdtype
+
+        # Before the A-only shortcut below, so a blocked name gets NXDOMAIN
+        # for every query type (AAAA, HTTPS, ...), not an empty answer.
+        if self._blocklist is not None:
+            if len(qname) > _MAX_QNAME_LEN:
+                # Not a valid name; treated like a malformed query.
+                log.debug("dropping DNS query with an over-long name from %s", addr)
+                return None
+            if self._blocklist.is_blocked(qname):
+                send(_make_blocked(query), addr)
+                return None
 
         # Only A records are resolved via the upstream client today; other
         # types return an empty NOERROR so stubs fall through gracefully.
@@ -399,4 +426,21 @@ def _make_error(query: dns.message.Message, rcode: dns.rcode.Rcode) -> bytes:
     resp = dns.message.make_response(query)
     resp.set_rcode(rcode)
     resp.flags |= dns.flags.RA
+    return resp.to_wire()
+
+
+def _make_blocked(query: dns.message.Message) -> bytes:
+    """NXDOMAIN with an SOA, so the device remembers it for NEGATIVE_TTL_S."""
+    resp = dns.message.make_response(query)
+    resp.set_rcode(dns.rcode.NXDOMAIN)
+    resp.flags |= dns.flags.RA
+    resp.authority.append(
+        dns.rrset.from_text(
+            query.question[0].name,
+            NEGATIVE_TTL_S,
+            dns.rdataclass.IN,
+            dns.rdatatype.SOA,
+            _BLOCKED_SOA,
+        )
+    )
     return resp.to_wire()
