@@ -160,7 +160,6 @@ class NxdomainFanOutAndCache(unittest.IsolatedAsyncioTestCase):
                 "https://1.1.1.1/dns-query": ["a" * 64],
                 "https://9.9.9.9/dns-query": ["b" * 64],
             },
-            hosts_file="/nonexistent",
         )
 
     async def test_nxdomain_stops_fanout_and_relays_and_caches(self) -> None:
@@ -192,7 +191,6 @@ class TtlClamp(unittest.TestCase):
         return DNSResolver(
             providers=["https://1.1.1.1/dns-query"],
             provider_pins={"https://1.1.1.1/dns-query": ["a" * 64]},
-            hosts_file="/nonexistent",
         )
 
     def test_ttl_above_max_clamped_to_max(self) -> None:

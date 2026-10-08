@@ -104,12 +104,8 @@ class DNSResolver:
         self,
         providers: list[str],
         provider_pins: dict[str, list[str]],
-        hosts_file: str = "/opt/mtun/hosts.txt",
         debug_dns: bool = False,
     ) -> None:
-        # Ignored: DSM no longer reads a hosts file. Kept so callers that
-        # still pass it keep working.
-        del hosts_file
         if not providers:
             raise ValueError("DNSResolver requires at least one provider")
         # debug_dns mirrors the LocalDNSProxy flag — when False (the

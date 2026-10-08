@@ -19,16 +19,12 @@ def test_the_resolver_has_no_hosts_file_reader() -> None:
 
 
 async def test_a_hosts_file_no_longer_changes_answers(tmp_path: Path) -> None:
-    hosts = tmp_path / "hosts.txt"
-    hosts.write_text("10.9.8.7 pinned.example\n", encoding="utf-8")
+    # A resolver built the normal way has no way to be pointed at this file.
+    (tmp_path / "hosts.txt").write_text("10.9.8.7 pinned.example\n", encoding="utf-8")
 
     class _Resolver(DNSResolver):
         def __init__(self) -> None:
-            super().__init__(
-                providers=[_DOH],
-                provider_pins={_DOH: ["a" * 64]},
-                hosts_file=str(hosts),
-            )
+            super().__init__(providers=[_DOH], provider_pins={_DOH: ["a" * 64]})
             self.asked: list[str] = []
 
         async def _resolve_doh(self, url: str, hostname: str) -> DnsResult:
@@ -42,3 +38,7 @@ async def test_a_hosts_file_no_longer_changes_answers(tmp_path: Path) -> None:
     assert resolver.asked == ["pinned.example"]
     assert result.addresses == ["192.0.2.1"]
     assert "10.9.8.7" not in result.addresses
+
+
+def test_the_resolver_takes_no_hosts_file_argument() -> None:
+    assert "hosts_file" not in inspect.signature(DNSResolver.__init__).parameters

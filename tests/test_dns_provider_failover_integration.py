@@ -103,7 +103,6 @@ class _ScriptedResolver(DNSResolver):
         super().__init__(
             providers=providers,
             provider_pins={p: _PINS[p] for p in providers},
-            hosts_file="/nonexistent",
         )
         self._script = script
         self.attempts: list[str] = []
@@ -304,7 +303,6 @@ class WrongSchemeRaisesInsideProtocolResolver(unittest.IsolatedAsyncioTestCase):
         return DNSResolver(
             providers=[DOH_A],
             provider_pins={DOH_A: _PINS[DOH_A]},
-            hosts_file="/nonexistent",
         )
 
     async def test_resolve_doh_rejects_non_https_scheme(self) -> None:
