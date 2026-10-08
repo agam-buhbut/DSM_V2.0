@@ -235,8 +235,13 @@ class _Reader:
             return
         self._files += 1
         total = 0
+        # True while reading the rest of a line longer than _MAX_LINE_BYTES.
+        # Such a line is skipped whole: a cut piece must never be parsed, since
+        # its tail could look like a name the list never held.
+        in_long_line = False
         with os.fdopen(fd, "rb") as f:
             while line := f.readline(_MAX_LINE_BYTES):
+                cut = len(line) == _MAX_LINE_BYTES and not line.endswith(b"\n")
                 if total == 0:
                     line = line.removeprefix(_BOM)
                 total += len(line)
@@ -245,6 +250,11 @@ class _Reader:
                         f"{path} is bigger than {MAX_FILE_BYTES:,} bytes, the "
                         f"limit for one list"
                     )
+                if in_long_line or cut:
+                    if not in_long_line:
+                        self._skipped += 1
+                    in_long_line = cut
+                    continue
                 parsed = parse_line(line)
                 self._skipped += parsed.skipped
                 target = self._allow if allow_only or parsed.exception else self._block

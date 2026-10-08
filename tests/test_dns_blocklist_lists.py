@@ -254,6 +254,62 @@ def test_a_very_long_line_is_read_in_pieces(tmp_path: Path) -> None:
     assert lists.skipped >= 1
 
 
+def test_the_tail_of_a_long_comment_is_not_a_line(tmp_path: Path) -> None:
+    body = b"# " + b"x" * 4094 + b"evil.example.com\n0.0.0.0 ads.example.com\n"
+    lists = load_lists(_dns_dir(tmp_path, block={"a.txt": body}), KEY)
+    assert list(lists.block) == [_h(b"ads.example.com")]
+    assert lists.skipped == 1
+
+
+def test_a_hosts_line_cut_by_the_read_size_blocks_none_of_its_names(
+    tmp_path: Path,
+) -> None:
+    # The first 4096 bytes end in a whole, valid name that is really the start
+    # of "shop.example.com.au".
+    line = b"0.0.0.0" + b" " * 4073 + b"shop.example.com.au tail.example.org\n"
+    assert line[:4096].endswith(b" shop.example.com")
+    body = line + b"0.0.0.0 ads.example.com\n"
+    lists = load_lists(_dns_dir(tmp_path, block={"a.txt": body}), KEY)
+    assert list(lists.block) == [_h(b"ads.example.com")]
+    assert lists.skipped == 1
+
+
+def test_a_line_that_just_fits_the_read_size_is_still_read(tmp_path: Path) -> None:
+    line = b"0.0.0.0" + b" " * 4073 + b"ads.example.com\n"
+    assert len(line) == 4096
+    lists = load_lists(_dns_dir(tmp_path, block={"a.txt": line}), KEY)
+    assert list(lists.block) == [_h(b"ads.example.com")]
+    assert lists.skipped == 0
+
+
+def test_a_long_last_line_without_a_line_end_is_skipped(tmp_path: Path) -> None:
+    body = b"0.0.0.0 ads.example.com\n" + b"y" * 5000
+    lists = load_lists(_dns_dir(tmp_path, block={"a.txt": body}), KEY)
+    assert list(lists.block) == [_h(b"ads.example.com")]
+    assert lists.skipped == 1
+
+
+def test_the_bytes_of_a_long_line_count_toward_the_size_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The size check at open passes; the file then grows by one long line
+    # while it is read, as a download could. Only the running total sees it.
+    monkeypatch.setattr(bl_mod, "MAX_FILE_BYTES", 5000)
+    real_open = bl_mod._open_checked  # pylint: disable=protected-access
+
+    def grow_after_open(path: Path, dir_fd: int | None, *, folder: bool) -> int:
+        fd = real_open(path, dir_fd, folder=folder)
+        if not folder:
+            with path.open("ab") as f:
+                f.write(b"# " + b"x" * 6000 + b"\n")
+        return fd
+
+    monkeypatch.setattr(bl_mod, "_open_checked", grow_after_open)
+    dns_dir = _dns_dir(tmp_path, block={"a.txt": b"0.0.0.0 ads.example.com\n"})
+    with pytest.raises(BlocklistError, match="bigger than 5,000 bytes"):
+        load_lists(dns_dir, KEY)
+
+
 def test_the_signature_changes_when_the_lists_change(tmp_path: Path) -> None:
     dns_dir = _dns_dir(tmp_path, block={"a.txt": b"ads.example.com\n"})
     seen = [list_signature(dns_dir)]
