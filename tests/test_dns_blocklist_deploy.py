@@ -210,3 +210,65 @@ def test_install_sh_sets_up_the_timer_and_fetches_once_without_failing() -> None
     )
     assert fetch is not None
     assert unit < script < enable < fetch.start()
+
+
+_CAP_CURL = """#!/bin/sh
+# Writes FAKE_CURL_BYTES bytes, like a server that sends no length, then notes
+# how many bytes reached the disk.
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --output) out="$2"; shift ;;
+  esac
+  shift
+done
+head -c "$FAKE_CURL_BYTES" /dev/zero >"$out"
+status=$?
+wc -c <"$out" >"$FAKE_CURL_SIZE"
+exit "$status"
+"""
+
+
+def test_a_download_past_the_cap_is_stopped_while_it_is_written(
+    tmp_path: Path, config_dir: Path
+) -> None:
+    cap = 4096
+    script = tmp_path / "capped-update.sh"
+    text = SCRIPT.read_text()
+    assert "MAX_BYTES=67108864" in text
+    script.write_text(text.replace("MAX_BYTES=67108864", f"MAX_BYTES={cap}"))
+    fakebin = tmp_path / "capbin"
+    fakebin.mkdir()
+    (fakebin / "curl").write_text(_CAP_CURL)
+    (fakebin / "id").write_text("#!/bin/sh\necho 0\n")
+    for tool in fakebin.iterdir():
+        tool.chmod(0o755)
+    size_log = tmp_path / "size.log"
+
+    def _run(nbytes: int) -> subprocess.CompletedProcess[str]:
+        env = {
+            "PATH": f"{fakebin}:{os.environ['PATH']}",
+            "FAKE_CURL_BYTES": str(nbytes),
+            "FAKE_CURL_SIZE": str(size_log),
+        }
+        return subprocess.run(
+            ["sh", str(script), str(config_dir)],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+
+    assert _run(100).returncode == 0
+    block = config_dir / "dns" / "block"
+    kept = block / _fetched(DEFAULT_URL)
+    assert kept.stat().st_size == 100
+
+    result = _run(200_000)
+    assert result.returncode == 1
+    assert "could not download" in result.stderr
+    # The limit stopped the writer, so the disk never held the whole body
+    # (a size check only after the download would see all 200000 bytes).
+    assert 0 < int(size_log.read_text()) < 2 * cap + 512
+    assert sorted(p.name for p in block.iterdir()) == [kept.name]
+    assert kept.stat().st_size == 100

@@ -25,6 +25,12 @@ DEFAULT_SOURCE="https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts
 warn() { echo "dsm-blocklist-update: $*" >&2; }
 die() { warn "$*"; exit 1; }
 
+# curl before 8.4.0 ignores --max-filesize when the server sends no length.
+# So the system also stops any file this script or curl writes at the same
+# size (ulimit counts 512-byte blocks): curl is stopped, the download fails,
+# the temporary file goes and the list from before stays.
+ulimit -f $((MAX_BYTES / 512 + 1)) || die "cannot set the file size limit"
+
 [ "$(id -u)" = "0" ] || die "must run as root: the list files must belong to the uid dsm runs as"
 command -v curl >/dev/null 2>&1 || die "curl is not installed"
 
