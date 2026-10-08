@@ -164,6 +164,10 @@ class Config:
     shaper_linger_s: list[float] = field(
         default_factory=lambda: list(DEFAULT_SHAPER_LINGER_S)
     )
+    # Slow-link auto cap (dsm/traffic/autocap.py): lower the top tier one
+    # step on sustained loss and lift it again later. False also stops this
+    # end's loss reports, so it is off in both directions of the session.
+    shaper_auto_cap: bool = True
     rotation_packets: int = 5000
     rotation_seconds: int = 600
     debug_dns: bool = False
@@ -251,6 +255,12 @@ def _validate_types(c: Config) -> None:
             value, (int, float)
         ) or isinstance(value, bool):
             raise ValueError(f"{name} must be a number, got {type(value).__name__}")
+    # No other bool key is type-checked, but this one is an off switch: a TOML
+    # string "false" would otherwise count as on.
+    if not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
+        c.shaper_auto_cap, bool
+    ):
+        raise ValueError("shaper_auto_cap must be true or false")
     # A string or list here would reach _validate_dns and crash on .get().
     if not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
         c.dns_provider_pins, dict

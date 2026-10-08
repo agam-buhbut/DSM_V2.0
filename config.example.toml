@@ -197,6 +197,16 @@ padding_max = 1400
 # (seconds). This blurs when you stopped. [0, 0] turns it off; otherwise
 # 0 < first <= second <= 7200.
 # shaper_linger_s = [300, 1800]
+#
+# Slow-link auto cap. When 5% or more of the packets this end sends are lost
+# for two seconds in a row at tier 2 or higher, lower the top tier one step
+# at once; try the higher step again after 5 minutes, and wait twice as long
+# each time the loss comes back (up to an hour). Never below tier 1; every
+# connection starts with no limit. It needs a DSM with this feature at the
+# other end, and it does nothing in TCP mode. false turns it off at this end
+# and also stops this end's loss reports, so either end can turn it off for
+# both directions. An older DSM refuses a config that sets this key.
+# shaper_auto_cap = true
 
 # Key rotation
 rotation_packets = 5000                      # Rotate after N packets
