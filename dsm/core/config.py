@@ -171,6 +171,9 @@ class Config:
     rotation_packets: int = 5000
     rotation_seconds: int = 600
     debug_dns: bool = False
+    # Server only: answer "no such name" for the names on the lists in
+    # <config_dir>/dns/ (dsm/net/dns_blocklist.py). The client ignores it.
+    dns_blocklist: bool = True
     # Structured-JSON audit stream on the `dsm.netaudit` logger.
     # When True, dsm emits one JSON event per state transition
     # (handshake start/end, nft apply/remove, TUN configure/deconfigure,
@@ -255,12 +258,16 @@ def _validate_types(c: Config) -> None:
             value, (int, float)
         ) or isinstance(value, bool):
             raise ValueError(f"{name} must be a number, got {type(value).__name__}")
-    # No other bool key is type-checked, but this one is an off switch: a TOML
-    # string "false" would otherwise count as on.
+    # No other bool key is type-checked, but these two are off switches: a
+    # TOML string "false" would otherwise count as on.
     if not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
         c.shaper_auto_cap, bool
     ):
         raise ValueError("shaper_auto_cap must be true or false")
+    if not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
+        c.dns_blocklist, bool
+    ):
+        raise ValueError("dns_blocklist must be true or false")
     # A string or list here would reach _validate_dns and crash on .get().
     if not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
         c.dns_provider_pins, dict
