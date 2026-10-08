@@ -17,6 +17,8 @@ from dsm.net.dns_blocklist import NEGATIVE_TTL_S, DnsBlocklist
 from dsm.net.dns_proxy import LocalDNSProxy
 
 _CLIENT = ("10.8.0.2", 53000)
+_PROXY_LOGGER = "dsm.net.dns_proxy"
+_BLOCKLIST_LOGGER = "dsm.net.dns_blocklist"
 
 
 class _RecordingResolver:
@@ -166,7 +168,8 @@ async def test_a_blocked_answer_logs_nothing_about_the_name(
 ) -> None:
     blocklist = await _blocklist(tmp_path, block=b"0.0.0.0 secret-ads.example.com\n")
     proxy = LocalDNSProxy(_RecordingResolver(), bind_ip="10.8.0.1", blocklist=blocklist)  # type: ignore[arg-type]
-    caplog.set_level(logging.DEBUG)
+    caplog.set_level(logging.DEBUG, logger=_PROXY_LOGGER)
+    caplog.set_level(logging.DEBUG, logger=_BLOCKLIST_LOGGER)
     _query, reply = await _ask(proxy, "secret-ads.example.com")
     assert reply.rcode() == dns.rcode.NXDOMAIN
     assert "secret-ads" not in caplog.text
@@ -182,7 +185,7 @@ async def test_a_name_over_253_bytes_is_dropped_before_the_blocklist_sees_it(
     # characters "\001", so the name's text is far over 253.
     labels = [b"\x01" * 63] * 3 + [b"\x01" * 60, b""]
     query = dns.message.make_query(dns.name.Name(labels), "A")
-    caplog.set_level(logging.DEBUG)
+    caplog.set_level(logging.DEBUG, logger=_PROXY_LOGGER)
     assert await _send(proxy, query) == []
     assert blocklist.asked == []
     assert resolver.asked == []

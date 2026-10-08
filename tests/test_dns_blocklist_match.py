@@ -171,6 +171,9 @@ async def test_a_disk_error_while_loading_is_handled_like_a_refused_list(
 
     monkeypatch.setattr(bl_mod, "load_lists", flaky_load)
     caplog.set_level(logging.INFO, logger=_LOGGER)
+    # The first load above was logged too when "dsm" is at INFO; check only
+    # the two refreshes.
+    caplog.clear()
     _write(tmp_path / "dns" / "block" / "b.txt", b"0.0.0.0 new.example.com\n")
     await blocklist.refresh()
     await blocklist.refresh()
@@ -238,7 +241,7 @@ def test_the_hourly_line_counts_blocked_queries_and_starts_over(
 async def test_logs_never_show_names_or_hashes(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    caplog.set_level(logging.DEBUG)
+    caplog.set_level(logging.DEBUG, logger=_LOGGER)
     names = (b"secret-tracker.example.com", b"private-allowed.example.org")
     blocklist = await _loaded(
         tmp_path,
