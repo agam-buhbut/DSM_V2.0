@@ -124,6 +124,19 @@ def test_a_failed_download_keeps_the_old_copy_and_fails_the_run(
     assert (block / _fetched(DEFAULT_URL)).read_text() == "0.0.0.0 ads.example.com\n"
 
 
+def test_an_empty_download_keeps_the_old_copy_and_fails_the_run(
+    tmp_path: Path, config_dir: Path, run: Run
+) -> None:
+    assert run().returncode == 0
+    (tmp_path / "body.txt").write_text("")  # the server answers 200, no body
+    result = run()
+    assert result.returncode == 1
+    assert "could not download" in result.stderr
+    block = config_dir / "dns" / "block"
+    assert sorted(p.name for p in block.iterdir()) == [_fetched(DEFAULT_URL)]
+    assert (block / _fetched(DEFAULT_URL)).read_text() == "0.0.0.0 ads.example.com\n"
+
+
 def test_a_source_taken_out_takes_its_list_but_never_your_own_files(
     config_dir: Path, run: Run
 ) -> None:

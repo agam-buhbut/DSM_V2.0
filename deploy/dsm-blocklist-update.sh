@@ -71,10 +71,12 @@ while IFS= read -r line || [ -n "$line" ]; do
   keep="$keep$name "
   tmp=$(mktemp "$BLOCK_DIR/.fetch.XXXXXXXX") || die "cannot create a temporary file in $BLOCK_DIR"
   # --globoff: the URL is data; curl must not read [ ] { } in it as a pattern.
+  # An empty answer counts as a failed download: it must not replace a list.
   if curl --fail --silent --show-error --location --globoff \
       --proto '=https' --proto-redir '=https' --tlsv1.2 \
       --max-filesize "$MAX_BYTES" --max-time 300 \
       --output "$tmp" "$url" </dev/null \
+    && [ -s "$tmp" ] \
     && [ "$(wc -c <"$tmp")" -le "$MAX_BYTES" ]; then
     chmod 600 "$tmp"
     mv -f "$tmp" "$BLOCK_DIR/$name"
