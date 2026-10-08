@@ -180,9 +180,11 @@ padding_max = 1400
 # above 4.25 divided by the latency budget (below) in seconds: above 8.5 with
 # the default 500 ms. Otherwise DSM refuses the config at startup, because a
 # slower first tier would let light traffic change the send times.
-# On a link slower than about 11 Mbit/s, lower the top tier to about 50 per
-# Mbit/s of the link's slower direction, or DSM floods it and the tunnel can
-# stall (e.g. [10, 50, 150, 200] for 4 Mbit/s).
+# On a link slower than about 11 Mbit/s the top tier floods it. Auto cap
+# (shaper_auto_cap, below) handles that on its own. Lower the top tier by
+# hand, to about 50 per Mbit/s of the link's slower direction (e.g.
+# [10, 50, 150, 200] for 4 Mbit/s), only in TCP mode, against an older DSM,
+# with auto cap off, or on a link slower than tier 1 (about 0.5 Mbit/s).
 # shaper_tiers_pps = [10, 50, 200, 800]
 #
 # How long a real packet may wait before the rate steps up, in milliseconds

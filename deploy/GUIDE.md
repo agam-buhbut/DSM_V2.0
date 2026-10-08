@@ -1507,8 +1507,9 @@ the tunnel is up, even when you are not using it. Connected all day with
 decoys on, this extra traffic alone is about 3 GB a day in each direction.
 Real use adds more of it: about 6 GB a day with about 20 bursts of use, on
 top of your real traffic. The settings that control it are
-`shaper_tiers_pps`, `shaper_latency_budget_ms`, `shaper_decoy_interval_s`
-and `shaper_linger_s`; `config.example.toml` lists the costs.
+`shaper_tiers_pps`, `shaper_latency_budget_ms`, `shaper_decoy_interval_s`,
+`shaper_linger_s` and `shaper_auto_cap`; `config.example.toml` lists the
+costs.
 
 ### 10d. UDP-blocked networks (some cellular / captive Wi-Fi)
 
@@ -1695,9 +1696,18 @@ or prctl(PR_SET_DUMPABLE) didn't stick. Usually one of:
 ### Tunnel stalls or drops during big downloads (slow link)
 
 At the default top tier (800 packets/s) DSM sends up to about 11 Mbit/s in
-each direction, and it does not yet adjust to the link. On a slower link
-it floods the link: packets are lost, key changes can be lost too, and the
-tunnel stalls or drops, mostly during big downloads. Lower the top tier in
+each direction. On a slower link it floods the link: packets are lost, key
+changes can be lost too, and the tunnel stalls or drops, mostly during big
+downloads. DSM now lowers its own top tier when that happens. Look for
+`auto cap:` lines in the log (`journalctl -u dsm | grep 'auto cap'`). A
+line like this means it worked:
+`auto cap: lost 12% at tier 3 (800/s); top tier now 2 (200/s), next try in 5 min`.
+It tries the higher tier again after 5 minutes, and waits longer (up to an
+hour) while the loss keeps coming back.
+
+Set the tiers by hand only when auto cap cannot help: in TCP mode, when the
+other end runs an older DSM, when `shaper_auto_cap = false`, or when the
+link is slower than tier 1 (about 0.5 Mbit/s). Then lower the top tier in
 `shaper_tiers_pps` to about 50 packets/s per Mbit/s of the link's slower
 direction, e.g. `[10, 50, 150, 200]` for 4 Mbit/s. Keep the list rising and
 the first entry above 8.5. The end that sends over the slow direction needs

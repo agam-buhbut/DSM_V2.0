@@ -149,6 +149,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with the usual one-line config error naming the key, not a traceback.
 
 ### Added
+- Slow-link auto cap. Each end now tells the other, about once a second,
+  how many packets arrived. An end that loses 5% or more of what it sends
+  for two seconds in a row, at tier 2 or higher, lowers its top tier one
+  step (never below tier 1) and tries the higher step again after 5
+  minutes, waiting longer (up to an hour) while the loss comes back. On by
+  default; `shaper_auto_cap = false` turns it off at either end. Mixed
+  versions keep working: an older end drops the new report quietly, and a
+  newer end facing an older one never caps. A config that sets
+  `shaper_auto_cap` does not load in an older DSM.
 - `server_ip` may be a DNS hostname (e.g. DDNS for a home server); the
   client resolves it once, before the kill switch goes up. The deploy guide
   has a new section on running over the internet.

@@ -377,17 +377,30 @@ traffic):
 | Top speed | about 7 to 10 Mbit/s at the default `mtu = 1360` (less for a smaller `mtu`). One DSM packet carries at most 1360 bytes, so with a larger `mtu` each full-size packet is split in two, which halves it to about 3.6 to 5.4 Mbit/s |
 | When a burst starts | about 0.5 to 1.5 seconds of extra wait while the pace steps up. A download that paces itself to the speed it gets (TCP) needs about 2 to 5 seconds per tier instead |
 
-**Slow links.** DSM does not yet adjust to the speed of your link. At the
-default top tier it sends up to about 11 Mbit/s in each direction. If the
-link is slower than that, DSM floods it: packets are lost, key changes can
-be lost too, and the tunnel can stall or drop. On such a link, lower the
-top tier in `shaper_tiers_pps`: about 50 packets/s for each Mbit/s of the
-link's slower direction. For example, a link with 4 Mbit/s upload gets
-`[10, 50, 150, 200]`. Keep the list rising and the first entry above 8.5.
-Each end shapes only what it sends, so the end that sends over the slow
-direction needs the change; setting it in both configs is simplest. A top
-tier that differs from the default makes your link look less like other
-DSM users' links.
+**Slow links.** At the default top tier DSM sends up to about 11 Mbit/s in
+each direction. If the link is slower than that, DSM floods it: packets are
+lost, key changes can be lost too, and the tunnel can stall or drop. DSM
+now notices this on its own. About once a second each end tells the other
+how many packets arrived. When 5% or more of what one end sent was lost for
+two seconds in a row, at tier 2 or higher, that end lowers its top tier one
+step at once and logs a line like
+`auto cap: lost 12% at tier 3 (800/s); top tier now 2 (200/s), next try in 5 min`.
+After 5 minutes it allows the higher step again. If the loss comes back, it
+waits twice as long the next time, up to an hour. It never goes below tier
+1, and every new connection starts with no limit. It needs this version at
+the other end too (an older end sends no reports, so nothing changes), and
+it does nothing in TCP mode. To turn it off, set `shaper_auto_cap = false`;
+either end can turn it off for both directions of its connections.
+
+You can still set the top tier by hand. Do that in TCP mode, when the other
+end runs an older version, with auto cap turned off, or on a link slower
+than tier 1 (about 0.5 Mbit/s): lower the top tier in `shaper_tiers_pps` to
+about 50 packets/s for each Mbit/s of the link's slower direction. For
+example, a link with 4 Mbit/s upload gets `[10, 50, 150, 200]`. Keep the
+list rising and the first entry above 8.5. Each end shapes only what it
+sends, so the end that sends over the slow direction needs the change;
+setting it in both configs is simplest. A top tier that differs from the
+default makes your link look less like other DSM users' links.
 
 **What it hides** from someone watching the link between you and your
 server:
@@ -403,6 +416,8 @@ server:
 - that you use DSM at all;
 - roughly how much you send: a watcher sees which tier you are on, and a
   long download keeps the rate up for as long as it runs;
+- when your link fills up: with auto cap on, a step down a few seconds
+  after a climb shows that the link could not carry that tier;
 - over many climbs, which ones were real. One climb does not give itself
   away by a pause between steps, because decoys pause the same way. But
   their pauses only roughly match how fast real senders speed up, so a
@@ -623,6 +638,11 @@ The config file is TOML, at `/opt/mtun/config.toml`.
   four keys.
 - The removed `jitter_ms_min` and `jitter_ms_max` keys also stop startup,
   with a message that says to remove them.
+- shaper_auto_cap: lower the top tier one step on its own when packets get
+  lost on a slow link, and try the higher step again later (default: true;
+  see Slow links above). false turns it off at this end and also stops this
+  end's loss reports, so it is off in both directions. Only true or false
+  is accepted. An older DSM refuses a config that sets this key.
 - rotation_packets, rotation_seconds: when keys change, by packet count or
   by seconds (default: 5000/600)
 - debug_dns: log DNS queries in plain text (default: false). Otherwise the
@@ -631,9 +651,9 @@ The config file is TOML, at `/opt/mtun/config.toml`.
   its tag while DSM runs and gets a new one after a restart.
 - debug_net: write structured JSON events to the `dsm.netaudit` logger
   (handshake start/end, nft apply/remove, TUN configure/deconfigure, rekey,
-  liveness, shutdown, auto_mtu_change, crl_missing, crl_stale). Default:
-  false. It can also be turned on for a single run with the `--debug-net`
-  CLI flag.
+  liveness, shutdown, auto_mtu_change, auto_cap_change, crl_missing,
+  crl_stale). Default: false. It can also be turned on for a single run
+  with the `--debug-net` CLI flag.
 
 ## Operator Guide
 
