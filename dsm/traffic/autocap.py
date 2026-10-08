@@ -36,7 +36,8 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-# How often the session sends a report and runs the lift timer (s).
+# How often, on average, the session sends a report and runs the lift timer
+# (s). Each wait is drawn at random from half to one and a half times this.
 REPORT_INTERVAL_S = 1.0
 # An interval is bad when at least this share of what was sent was lost.
 LOSS_THRESHOLD = 0.05

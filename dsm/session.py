@@ -13,6 +13,8 @@ import functools
 import hmac
 import logging
 import os
+import random
+import secrets
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -909,18 +911,30 @@ def _link_report_step(ctx: DataPathContext, stats: LinkStats, reported: int) -> 
     return reported
 
 
+# The report loop's waits come from the OS RNG, so reports do not keep a
+# fixed 1 s rhythm that a watcher could pick them out by.
+_REPORT_RNG: random.Random = secrets.SystemRandom()
+
+
+def _report_wait(rng: random.Random | None = None) -> float:
+    """The wait before the next report step: uniform from 0.5 to 1.5 times
+    REPORT_INTERVAL_S, so REPORT_INTERVAL_S is the mean."""
+    source = _REPORT_RNG if rng is None else rng
+    return source.uniform(0.5 * REPORT_INTERVAL_S, 1.5 * REPORT_INTERVAL_S)
+
+
 async def link_report_loop(ctx: DataPathContext) -> None:
-    """Every REPORT_INTERVAL_S: send a LINK_REPORT when packets came in, and
-    run the auto cap's lift timer. No packets, no report: a dead link is the
-    liveness check's job. Returns at once when auto cap is off
-    (``ctx.link_stats`` is None)."""
+    """About every REPORT_INTERVAL_S (``_report_wait``): send a LINK_REPORT
+    when packets came in, and run the auto cap's lift timer. No packets, no
+    report: a dead link is the liveness check's job. Returns at once when
+    auto cap is off (``ctx.link_stats`` is None)."""
     stats = ctx.link_stats
     if stats is None:
         return
     reported = 0
     while not ctx.shutdown.is_set():
         try:
-            await asyncio.wait_for(ctx.shutdown.wait(), timeout=REPORT_INTERVAL_S)
+            await asyncio.wait_for(ctx.shutdown.wait(), timeout=_report_wait())
             return
         except TimeoutError:
             pass
