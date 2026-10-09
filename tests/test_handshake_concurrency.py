@@ -30,14 +30,17 @@ Cases:
 from __future__ import annotations
 
 import asyncio
+import itertools
 import unittest
 from unittest.mock import patch
 
+from dsm.crypto.handshake import HANDSHAKE_FRAME_SIZE
 from dsm.net import handshake_acceptor as hsa
 from dsm.net.handshake_acceptor import (
     _accept_until_winner,
     _PerPeerUDPView,
 )
+from dsm.net.handshake_gate import SourceLimiter
 from dsm.net.transport.udp import UDPTransport
 
 try:
@@ -169,7 +172,10 @@ def _make_fake_handshake(script: dict[tuple[str, int], str], *, observed: dict):
 
 
 def _seed_frame(addr: tuple[str, int], n: int = 0) -> tuple[bytes, tuple[str, int]]:
-    return (f"frame-{addr[0]}:{addr[1]}-{n}".encode(), addr)
+    # A new source's first datagram must be a full handshake frame to get a
+    # slot; the fake handshake never reads the bytes.
+    text = f"frame-{addr[0]}:{addr[1]}-{n}".encode()
+    return (text.ljust(HANDSHAKE_FRAME_SIZE, b"\x00"), addr)
 
 
 class HandshakeAcceptorConcurrency(unittest.IsolatedAsyncioTestCase):
@@ -621,12 +627,10 @@ class HandshakeAcceptorInboxLifecycle(unittest.IsolatedAsyncioTestCase):
         n_sources = 60
         max_inflight = 8
 
-        async def _no_sleep_backoff(_n: int, _ps: asyncio.Event) -> bool:
-            # Neutralise the timing defence for this property test so eviction
-            # is observed at speed (the backoff is exercised separately). It
-            # must NOT actually sleep, but yields so workers can run.
-            await asyncio.sleep(0)
-            return False
+        # Every clock reading is a minute later, so no rate bucket runs dry:
+        # this test is about eviction, not pacing (test_handshake_gate.py
+        # covers pacing).
+        minutes = itertools.count(0.0, 60.0)
 
         # Unique source addrs (the exact string is opaque to the acceptor —
         # only used as a dict key, modelling distinct spoofed sources).
@@ -654,7 +658,7 @@ class HandshakeAcceptorInboxLifecycle(unittest.IsolatedAsyncioTestCase):
                             stub,  # type: ignore[arg-type]
                             transport,
                             ps,
-                            backoff=_no_sleep_backoff,
+                            limiter=SourceLimiter(clock=lambda: next(minutes)),
                         ),
                         timeout=10.0,
                     )
@@ -758,71 +762,6 @@ class HandshakeAcceptorInboxLifecycle(unittest.IsolatedAsyncioTestCase):
             len(observed.get("started", set())),
             cap,
             "a new-source datagram past the inbox cap must be dropped (no worker)",
-        )
-
-    # ----- Finding #2: jittered backoff on the all-fail path --------------
-
-    async def test_all_fail_path_invokes_jittered_backoff(self) -> None:
-        """Under sustained all-fail load the acceptor must invoke the jittered
-        backoff (the serial path's anti-synchronization timing defence) rather
-        than tight-looping spawning doomed responders. Inject a fast backoff
-        stub and assert it is called once consecutive failures cross the
-        threshold, with the running failure count passed through."""
-        n_sources = 20
-        sources = [
-            (f"198.51.{i // 250}.{i % 250}", 42000 + i) for i in range(n_sources)
-        ]
-        script = {addr: "fail" for addr in sources}
-        observed = {"active": 0, "max_active": 0}
-        transport = _FakeRealTransport([])
-        ps = asyncio.Event()
-
-        backoff_calls: list[int] = []
-
-        async def _fast_backoff(consecutive_failures: int, _ps: asyncio.Event) -> bool:
-            backoff_calls.append(consecutive_failures)
-            await asyncio.sleep(0)  # yield, but do NOT actually sleep
-            return False  # never shutdown-during-backoff
-
-        with self._patch_handshake(script, observed):
-            config = _FakeConfig(4)
-            stub = _Stub()
-            task = asyncio.ensure_future(
-                _accept_until_winner(
-                    config,  # type: ignore[arg-type]
-                    stub,  # type: ignore[arg-type]
-                    stub,  # type: ignore[arg-type]
-                    stub,  # type: ignore[arg-type]
-                    stub,  # type: ignore[arg-type]
-                    transport,
-                    ps,
-                    backoff=_fast_backoff,
-                )
-            )
-            # Drip-feed a sustained all-fail stream: each source's worker fails
-            # and bumps the failure counter before the next source arrives, so
-            # by the time later sources spawn, consecutive_failures has crossed
-            # the threshold and the backoff must engage.
-            for addr in sources:
-                transport._recv_queue.put_nowait(_seed_frame(addr))
-                for _ in range(200):
-                    if transport._recv_queue.empty() and observed["active"] == 0:
-                        break
-                    await asyncio.sleep(0.001)
-                if backoff_calls:
-                    break
-            ps.set()
-            await asyncio.wait_for(task, timeout=5.0)
-
-        self.assertTrue(
-            backoff_calls,
-            "the jittered backoff was never invoked under sustained all-fail "
-            "load — UDP would tight-loop spawning doomed responders",
-        )
-        self.assertTrue(
-            all(c >= hsa._ALL_FAIL_BACKOFF_THRESHOLD for c in backoff_calls),
-            "backoff must only engage once consecutive failures cross the "
-            f"threshold ({hsa._ALL_FAIL_BACKOFF_THRESHOLD}); got {backoff_calls}",
         )
 
     async def test_default_backoff_used_when_none_injected(self) -> None:

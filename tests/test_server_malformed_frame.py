@@ -82,6 +82,7 @@ class TestRunServerLoopSurvivesFramingError(unittest.IsolatedAsyncioTestCase):
             cn_allowlist,
             transport_obj,
             ps,
+            limiter=None,
         ):
             nonlocal call_count
             call_count += 1
@@ -266,96 +267,6 @@ class TestTcpRecvRaisesFramingError(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(ValueError):
             await asyncio.wait_for(server.recv(), timeout=2.0)
-
-
-class TestAcceptOneSessionClosesTransportOnUnexpectedException(
-    unittest.IsolatedAsyncioTestCase
-):
-    """_accept_one_session MUST close the TCP listening transport on any
-    unexpected exception so file descriptors are not leaked under a sustained
-    oversized-frame attack.
-
-    Before the fix: an exception that is not in the
-    (CNNotAllowedError, CertRevokedError, CertAuthError, HandshakeError)
-    tuple (e.g. FramingError) escapes the except clause and propagates to
-    run_server's outer guard, which holds the *previous* transport reference —
-    not the new TCPTransport created inside _accept_one_session.  The newly
-    allocated transport is never closed until GC collects it.
-
-    After the fix: a bare ``except BaseException`` clause runs
-    ``await transport_obj.aclose()`` for TCP before re-raising, so the fd is
-    released on every attack-induced exception.
-    """
-
-    async def test_framing_error_triggers_transport_aclose(self) -> None:
-        """aclose() on the per-attempt TCP transport is called when an
-        unexpected exception (FramingError) propagates out of server_handshake
-        inside _accept_one_session."""
-        import dsm.server as _server_mod
-        from dsm.net.transport.tcp import FramingError
-
-        # Track aclose calls on the mock transport.
-        aclose_calls: list[str] = []
-
-        mock_transport = MagicMock()
-
-        async def _track_aclose() -> None:
-            aclose_calls.append("aclose")
-
-        mock_transport.aclose = _track_aclose
-
-        async def _fake_listen(**kwargs: object) -> int:  # type: ignore[misc]
-            return 0
-
-        mock_transport.listen = _fake_listen
-
-        # server_handshake raises FramingError — NOT in the expected-exception
-        # tuple, so it must fall through to the BaseException cleanup branch.
-        framing_calls = 0
-
-        async def _fake_handshake(*args: object, **kwargs: object) -> None:
-            nonlocal framing_calls
-            framing_calls += 1
-            raise FramingError("frame length 268435457 exceeds max 65536")
-
-        process_shutdown = asyncio.Event()  # NOT set — loop will enter once
-
-        mock_config = MagicMock()
-        mock_config.transport = "tcp"
-        mock_config.listen_port = 0
-
-        # Patch TCPTransport constructor in dsm.server to return our mock.
-        # Patch server_handshake at its definition module so the local import
-        # inside _accept_one_session picks up the stub.
-        import dsm.crypto.handshake as _hs_mod
-
-        patches = [
-            patch("dsm.server.TCPTransport", return_value=mock_transport),
-            patch.object(_hs_mod, "server_handshake", new=_fake_handshake),
-        ]
-        for p in patches:
-            p.start()
-        self.addCleanup(lambda: [p.stop() for p in patches])
-
-        with self.assertRaises(FramingError):
-            await _server_mod._accept_one_session(
-                mock_config,
-                MagicMock(),  # fsm
-                MagicMock(),  # keystore
-                MagicMock(),  # attest_store
-                MagicMock(),  # materials
-                MagicMock(),  # cn_allowlist
-                None,  # transport_obj starts as None (TCP path creates its own)
-                process_shutdown,
-            )
-
-        self.assertEqual(
-            aclose_calls,
-            ["aclose"],
-            "transport.aclose() must be called exactly once when FramingError "
-            "propagates out of server_handshake inside _accept_one_session",
-        )
-        self.assertEqual(framing_calls, 1, "server_handshake should be called once")
 
 
 if __name__ == "__main__":

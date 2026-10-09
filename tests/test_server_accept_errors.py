@@ -94,7 +94,7 @@ class TestListenFailureAtStartup(_AcceptLoopCase):
         port = taken.getsockname()[1]
 
         listen_calls = {"n": 0}
-        real_listen = server_mod.TCPTransport.listen
+        real_listen = server_mod.TCPListener.start
 
         async def _counting_listen(self: Any, *args: Any, **kwargs: Any) -> int:
             listen_calls["n"] += 1
@@ -103,7 +103,7 @@ class TestListenFailureAtStartup(_AcceptLoopCase):
         backoff_calls: list[int] = []
         self._start(
             [
-                patch.object(server_mod.TCPTransport, "listen", _counting_listen),
+                patch.object(server_mod.TCPListener, "start", _counting_listen),
                 patch(
                     "dsm.server._backoff_or_shutdown",
                     new=self._recording_backoff(backoff_calls),

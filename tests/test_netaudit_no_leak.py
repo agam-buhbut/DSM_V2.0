@@ -14,7 +14,7 @@ import unittest
 from dsm.client import _emit_handshake_failure as _emit_client_failure
 from dsm.core import netaudit
 from dsm.crypto.handshake import CNNotAllowedError
-from dsm.server import _emit_handshake_failure
+from dsm.net.handshake_acceptor import _emit_handshake_failure
 
 
 class _AuditCapture:
