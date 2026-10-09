@@ -134,6 +134,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A client whose third handshake message is slow no longer fails when the
   server sends its second message again: the client skips the copy and
   goes on waiting for the server's last handshake message.
+- The server now also ignores a repeated copy of the client's third
+  handshake message while it waits for the next frame. Before, a client
+  that resent it after a lost reply made the server fail the attempt.
 - The client no longer loses the server's packets after each key change.
   It moves to a new port then, and the server keeps sending to the old one
   until the new one passes its address check. The old port closed after

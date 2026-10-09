@@ -484,8 +484,16 @@ async def server_handshake(
 
     noise_transport = responder.into_transport()
 
-    # A copy of msg1 that was slow on the way can still land after msg3.
-    bootstrap_init_frame, bs_addr = await _recv_with_retry(transport, skip=_resent_msg1)
+    # A copy of msg1 that was slow on the way can still land after msg3. So
+    # can a copy of msg3: a client that hears no bootstrap reply resends msg3
+    # and then the bootstrap frame. Anyone on the path sees msg3's bytes, so
+    # a plain compare is fine.
+    def _resent_msg1_or_msg3(frame: bytes) -> bool:
+        return _resent_msg1(frame) or frame == msg3
+
+    bootstrap_init_frame, bs_addr = await _recv_with_retry(
+        transport, skip=_resent_msg1_or_msg3
+    )
     # Pin source: msg1 + msg3 are already source-pinned to ``addr``; the
     # bootstrap_init must come from the same peer. AEAD blocks content forge,
     # but a UDP-spoofed bootstrap frame would otherwise fail AEAD and abort
