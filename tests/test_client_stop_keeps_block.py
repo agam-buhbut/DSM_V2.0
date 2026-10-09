@@ -33,7 +33,7 @@ _DELETED = [
     "delete table inet dsm_dns_leak",
 ]
 _STOP_POST = (
-    "ExecStopPost=+/bin/sh -c '"
+    "ExecStopPost=/bin/sh -c '"
     'if [ "$$SERVICE_RESULT" = success ]; then '
     "queued=$$(systemctl list-jobs --no-legend --plain dsm-client.service "
     '2>/dev/null) || queued=""; '
@@ -142,21 +142,24 @@ def test_the_stop_step_line_checks_for_a_stop_job() -> None:
 
 
 def _stop_step(
-    tmp_path: Path, service_result: str, jobs: str, systemctl_rc: int
+    tmp_path: Path, service_result: str | None, jobs: str, systemctl_rc: int | None
 ) -> list[str]:
     """Run the unit's ExecStopPost script with fake systemctl and nft.
 
-    Returns the nft calls it made.
+    ``service_result`` None leaves SERVICE_RESULT unset; ``systemctl_rc`` None
+    leaves systemctl off PATH (the shell then fails with 127). Returns the nft
+    calls it made.
     """
-    head = "ExecStopPost=+/bin/sh -c '"
+    head = "ExecStopPost=/bin/sh -c '"
     line = _unit_line("ExecStopPost")
     assert line.startswith(head) and line.endswith("'")
     script = line[len(head) : -1].replace("$$", "$")  # what systemd hands sh
     fakes = tmp_path / "bin"
     fakes.mkdir()
-    (fakes / "systemctl").write_text(
-        '#!/bin/sh\nprintf "%s\\n" "$FAKE_JOBS"\nexit "$FAKE_SYSTEMCTL_RC"\n'
-    )
+    if systemctl_rc is not None:
+        (fakes / "systemctl").write_text(
+            '#!/bin/sh\nprintf "%s\\n" "$FAKE_JOBS"\nexit "$FAKE_SYSTEMCTL_RC"\n'
+        )
     (fakes / "nft").write_text('#!/bin/sh\necho "$*" >>"$FAKE_NFT_LOG"\n')
     for fake in fakes.iterdir():
         fake.chmod(0o755)
@@ -167,7 +170,7 @@ def _stop_step(
         # Only the fakes on PATH: the script must never reach the real nft.
         env={
             "PATH": str(fakes),
-            "SERVICE_RESULT": service_result,
+            **({} if service_result is None else {"SERVICE_RESULT": service_result}),
             "FAKE_JOBS": jobs,
             "FAKE_SYSTEMCTL_RC": str(systemctl_rc),
             "FAKE_NFT_LOG": str(nft_log),
@@ -197,13 +200,17 @@ def _stop_step(
         # A crash, a kill or a stop timeout: keep it (fail closed).
         ("exit-code", "42 dsm-client.service stop running", 0, []),
         ("signal", "42 dsm-client.service stop running", 0, []),
+        # The result is not set, or systemctl is not on PATH (rc 127): the
+        # check cannot say "stop", so keep it.
+        (None, "42 dsm-client.service stop running", 0, []),
+        ("success", "42 dsm-client.service stop running", None, []),
     ],
 )
 def test_the_stop_step_takes_the_block_down_only_for_a_stop_job(
     tmp_path: Path,
-    service_result: str,
+    service_result: str | None,
     jobs: str,
-    systemctl_rc: int,
+    systemctl_rc: int | None,
     deleted: list[str],
 ) -> None:
     assert _stop_step(tmp_path, service_result, jobs, systemctl_rc) == deleted

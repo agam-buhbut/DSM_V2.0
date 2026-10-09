@@ -55,11 +55,14 @@ TimeoutStopSec=30
 # again and the new start replaces the old tables in one nft commit, so the
 # host is never open. To get internet back without DSM, run
 # `sudo systemctl stop dsm-client`, or `sudo dsm cleanup` if the kill switch
-# is still up. "+" runs this line without the sandbox below, which could
-# block the systemctl call. Only the three client tables: `dsm cleanup`
-# would also force net.ipv4.ip_forward to 0, which breaks Docker and other
-# routing on a client. $$ passes a literal $ to the shell.
-ExecStopPost=+/bin/sh -c 'if [ "$$SERVICE_RESULT" = success ]; then queued=$$(systemctl list-jobs --no-legend --plain dsm-client.service 2>/dev/null) || queued=""; case "$$queued" in *" stop "*) for t in dsm_killswitch_pre dsm_killswitch dsm_dns_leak; do nft delete table inet "$$t" 2>/dev/null; done ;; esac; fi; exit 0'
+# is still up. Only the three client tables: `dsm cleanup` would also force
+# net.ipv4.ip_forward to 0, which breaks Docker and other routing on a
+# client. $$ passes a literal $ to the shell.
+# `2>/dev/null` on `nft delete` hides the error for a table that is already
+# gone. That is fine: after a swap back only the start-up table exists, so 2
+# of the 3 deletes fail by design. A real nft failure leaves the tables up,
+# which is the safe side.
+ExecStopPost=/bin/sh -c 'if [ "$$SERVICE_RESULT" = success ]; then queued=$$(systemctl list-jobs --no-legend --plain dsm-client.service 2>/dev/null) || queued=""; case "$$queued" in *" stop "*) for t in dsm_killswitch_pre dsm_killswitch dsm_dns_leak; do nft delete table inet "$$t" 2>/dev/null; done ;; esac; fi; exit 0'
 
 # DSM exits only when stopped (0), on a setup error at its first try (1;
 # it took the kill switch down itself) or on a crash (the kill switch stays
