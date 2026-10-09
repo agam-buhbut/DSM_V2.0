@@ -2053,12 +2053,26 @@ every handshake slot. The limits are the same for UDP and TCP:
 - "too many new handshakes overall": all addresses together may start 8 at
   once, then 4 a second.
 
-A real client starts about one handshake every 10-30 s, so it should never
-see these. A few lines while someone scans or floods the port are normal;
-the refused packets get no answer. Devices behind one home router share one
-address: if several of them connect to this server at the same moment, some
-may need their next retry. These lines never show the address, and each
-reason is logged at most once every 10 s, with a count.
+These are INFO lines. They show with `log_level = "info"` (the default),
+not with the `"warning"` that `config.example.toml` sets.
+
+A healthy client should not cause these lines, but a client with a config
+error may cause a few on its early retries. A few lines while someone scans
+or floods the port are normal. A refused UDP packet gets no answer; a
+refused TCP connection is closed at once. A UDP packet of the wrong size
+from a new address is dropped before these checks and logs nothing at INFO
+(DEBUG only). Devices behind one home router share one address: if several
+of them connect to this server at the same moment, some may need their next
+retry. These lines never show the address, and each reason is logged at
+most once every 10 s, with a count.
+
+If a client that works is refused for a long time with "already has 2
+running", someone may be targeting its address. Over UDP, a sender that
+fakes source addresses and knows the client's public IP can keep that
+address at 2 running with one full-size junk packet about every 6 s. The
+refusal ends at most 12 s after that stops. Four real addresses can also
+hold all 8 slots (UDP or TCP). Part 2 of the handshake hardening, with
+cookies that prove the address, closes the spoofed case.
 
 With `transport = "tcp"` the server keeps listening while handshakes run,
 so a silent connection no longer holds up other clients. It keeps at most 2

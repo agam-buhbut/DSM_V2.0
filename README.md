@@ -126,9 +126,9 @@ side under `asyncio.gather`: `recv_loop`, `tun_send_loop` and
 ### Connection
 
 Each server instance serves one client. The server opens a single socket.
-Over TCP it accepts one connection. Over UDP it locks onto the first peer
-address that passes authentication. A session ends cleanly with a
-SESSION_CLOSE packet.
+Over TCP it checks several connections at once and keeps one session. Over
+UDP it locks onto the first peer address that passes authentication. A
+session ends cleanly with a SESSION_CLOSE packet.
 
 ### Reliability
 
