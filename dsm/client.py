@@ -81,12 +81,19 @@ _OUTAGE_NOTICE = (
 _HOSTNAME_HINT = (
     "server IP may have changed since DSM looked up its name at start; DSM "
     "does not look it up again while the tunnel is down. If this goes on, "
-    "stop and start DSM."
+    "stop and start DSM: a restart keeps the kill switch up, so the name "
+    "cannot be looked up and the old address is used again."
 )
 _KEPT_AFTER_ERROR = (
     "DSM stopped on an error and left the kill switch up, so all traffic "
     "stays blocked. Start DSM again, or run `sudo dsm cleanup` to get "
     "internet back without the VPN."
+)
+_KEPT_ON_STOP = (
+    "stopped; the start-up kill switch stays up (--stop-keeps-block). "
+    "dsm-client.service takes it down only for `systemctl stop` and keeps "
+    "it otherwise. If it is still up when you want internet back, run "
+    "`sudo dsm cleanup`."
 )
 
 # The address a server name had at the last run whose handshake worked. A
@@ -307,6 +314,8 @@ async def run_client(
     config: Config,
     passphrase_fd: int | None = None,
     passphrase_env_file: str | None = None,
+    *,
+    stop_keeps_block: bool = False,
 ) -> int:
     """Run DSM in client mode until the user stops it.
 
@@ -325,12 +334,18 @@ async def run_client(
     ``AsyncExitStack`` the moment it succeeds, so any failure unwinds them in
     reverse order and never leaves the host half configured.
 
+    With ``stop_keeps_block`` (``--stop-keeps-block``, which
+    dsm-client.service passes) a stop leaves the pre-handshake kill switch
+    up: the unit's ExecStopPost takes it down only for ``systemctl stop``
+    and keeps it otherwise (a restart, a signal sent straight to DSM); the
+    next start replaces it.
+
     Returns:
         0 when the user stops DSM, 1 on a setup error a retry cannot fix
         (keys, cert, or a UDP port in use or a read-only resolv.conf at the
-        first try). Both take the kill switch down. An unexpected error goes
-        up with the kill switch still up (fail closed); the next start
-        replaces it.
+        first try). Both take the kill switch down, except a stop with
+        ``stop_keeps_block``. An unexpected error goes up with the kill
+        switch still up (fail closed); the next start replaces it.
     """
     import tuncore
     from dsm.core.hardening import harden_and_gate
@@ -426,10 +441,15 @@ async def run_client(
             # Only a stop the user asked for, or a setup error a retry cannot
             # fix, gets here without an error: take the kill switch down. An
             # error leaves it up (fail closed); the next start replaces it.
-            if exc_type is None:
-                pre_killswitch.remove()
-            else:
+            # With --stop-keeps-block a stop leaves it up too, and the unit's
+            # ExecStopPost decides: down only for `systemctl stop`. A setup
+            # error that meets a stop also keeps it: the safe side.
+            if exc_type is not None:
                 log.error(_KEPT_AFTER_ERROR)
+            elif stop_keeps_block and shutdown.is_set():
+                log.info(_KEPT_ON_STOP)
+            else:
+                pre_killswitch.remove()
             return False
 
         stack.push(_release_kill_switch)

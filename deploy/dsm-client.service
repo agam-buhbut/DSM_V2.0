@@ -30,23 +30,36 @@ SupplementaryGroups=tss
 # The passphrase as a systemd credential, from /etc/dsm/passphrase (0600).
 LoadCredential=passphrase:/etc/dsm/passphrase
 
-ExecStart=/opt/dsm/venv/bin/dsm --mode client \
+# --stop-keeps-block: on SIGTERM (or Ctrl-C) DSM swaps back to the start-up
+# kill switch, exits 0 and leaves that table up. ExecStopPost below decides
+# whether it comes down.
+ExecStart=/opt/dsm/venv/bin/dsm --mode client --stop-keeps-block \
           --passphrase-env-file=${CREDENTIALS_DIRECTORY}/passphrase
 
-# `systemctl stop` sends SIGTERM: DSM ends the session, takes the kill
-# switch down and exits 0. When the tunnel drops, DSM does not exit: it
-# keeps the kill switch up and reconnects by itself.
+# `systemctl stop` and `systemctl restart` send SIGTERM: DSM ends the
+# session and exits 0 with the start-up kill switch still up. When the
+# tunnel drops, DSM does not exit: it keeps the kill switch up and
+# reconnects by itself.
 KillSignal=SIGTERM
 TimeoutStopSec=30
 
-# Take the kill switch down only after a stop you asked for: such a stop
-# ends DSM with exit 0, so $SERVICE_RESULT is "success". After a crash, a
-# kill or a stop timeout it is something else, and the kill switch stays up
-# (fail closed) until DSM starts again or you run `sudo dsm cleanup`.
-# Only the three client tables: `dsm cleanup` would also force
-# net.ipv4.ip_forward to 0, which breaks Docker and other routing on a
-# client. $$ passes a literal $ to the shell.
-ExecStopPost=/bin/sh -c 'if [ "$$SERVICE_RESULT" = success ]; then for t in dsm_killswitch_pre dsm_killswitch dsm_dns_leak; do nft delete table inet "$$t" 2>/dev/null; done; fi; exit 0'
+# Take the kill switch down only for a stop you asked for with
+# `systemctl stop` (or another stop job: `disable --now`, shutdown). Two
+# checks: DSM ended cleanly ($SERVICE_RESULT is "success"), and systemd
+# holds a "stop" job for this unit (`systemctl list-jobs --no-legend
+# --plain dsm-client.service` prints "<id> dsm-client.service stop
+# running"). Every other case keeps the kill switch up (fail closed): a
+# `systemctl restart` (its job is "restart"), a signal sent straight to DSM
+# (`kill`, `systemctl kill`), a crash, a stop timeout, or a systemctl that
+# fails. After a restart, a signal or a crash, Restart=always starts DSM
+# again and the new start replaces the old tables in one nft commit, so the
+# host is never open. To get internet back without DSM, run
+# `sudo systemctl stop dsm-client`, or `sudo dsm cleanup` if the kill switch
+# is still up. "+" runs this line without the sandbox below, which could
+# block the systemctl call. Only the three client tables: `dsm cleanup`
+# would also force net.ipv4.ip_forward to 0, which breaks Docker and other
+# routing on a client. $$ passes a literal $ to the shell.
+ExecStopPost=+/bin/sh -c 'if [ "$$SERVICE_RESULT" = success ]; then queued=$$(systemctl list-jobs --no-legend --plain dsm-client.service 2>/dev/null) || queued=""; case "$$queued" in *" stop "*) for t in dsm_killswitch_pre dsm_killswitch dsm_dns_leak; do nft delete table inet "$$t" 2>/dev/null; done ;; esac; fi; exit 0'
 
 # DSM exits only when stopped (0), on a setup error at its first try (1;
 # it took the kill switch down itself) or on a crash (the kill switch stays

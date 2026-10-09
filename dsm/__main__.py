@@ -85,6 +85,13 @@ def main() -> None:
         "(handshake/nft/tun/rekey/liveness/shutdown). Overrides "
         "config.debug_net. See deploy/GUIDE.md §9 for capture flow.",
     )
+    parser.add_argument(
+        "--stop-keeps-block",
+        action="store_true",
+        help="Client only: on Ctrl-C or SIGTERM, leave the start-up kill "
+        "switch up. For dsm-client.service, whose stop step takes it down "
+        "only for `systemctl stop` and keeps it for a restart.",
+    )
     _add_passphrase_args(parser)
 
     subparsers = parser.add_subparsers(dest="command", help="Subcommand (optional)")
@@ -195,6 +202,7 @@ def main() -> None:
                     config,
                     passphrase_fd=getattr(args, "passphrase_fd", None),
                     passphrase_env_file=getattr(args, "passphrase_env_file", None),
+                    stop_keeps_block=args.stop_keeps_block,
                 )
             )
         )
