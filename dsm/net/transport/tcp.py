@@ -9,6 +9,7 @@ import asyncio
 import logging
 import struct
 
+from dsm.core.log import RepeatLog
 from dsm.net.transport._fwmark import apply_so_mark
 
 log = logging.getLogger(__name__)
@@ -35,6 +36,16 @@ class TCPTransport:
         self._writer: asyncio.StreamWriter | None = None
         self._server: asyncio.Server | None = None
         self._closed = False
+
+    @classmethod
+    def from_streams(
+        cls, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> TCPTransport:
+        """Wrap one accepted connection. Marking its socket is the caller's job."""
+        transport = cls()
+        transport._reader = reader
+        transport._writer = writer
+        return transport
 
     async def connect(self, host: str, port: int, timeout: float = 10.0) -> None:
         """Connect to a remote TCP endpoint.
@@ -181,3 +192,69 @@ class TCPTransport:
                 writer.transport.abort()
         if self._server:
             self._server.close()
+
+
+class TCPListener:
+    """One listening socket that queues each accepted connection.
+
+    Each connection becomes its own :class:`TCPTransport`, marked with
+    SO_MARK as ``TCPTransport.listen`` does, and is put on ``connections``
+    with its peer address for the caller to admit or close. The socket stays
+    open until :meth:`close`, which also closes every connection still
+    queued and any that arrives after it.
+    """
+
+    def __init__(self) -> None:
+        self.connections: asyncio.Queue[tuple[TCPTransport, tuple[str, int]]] = (
+            asyncio.Queue()
+        )
+        self._server: asyncio.Server | None = None
+        self._closed = False
+        self._mark_errors = RepeatLog(log, logging.ERROR)
+
+    async def start(self, host: str = "0.0.0.0", port: int = 0) -> int:
+        """Open the listening socket and return the bound port.
+
+        Raises:
+            OSError: the socket could not be opened (for example, the port
+                is in use).
+        """
+        self._server = await asyncio.start_server(self._on_connect, host, port)
+        bound: int = self._server.sockets[0].getsockname()[1]
+        log.debug("TCP listening on %s:%d", host, bound)
+        return bound
+
+    def _on_connect(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        # A plain callback, not a coroutine: admitting the connection is the
+        # caller's job, so asyncio makes no task for it here.
+        peer = writer.get_extra_info("peername")
+        if self._closed or not peer:
+            # Arrived after close(), or the peer is already gone.
+            writer.close()
+            return
+        try:
+            apply_so_mark(writer.get_extra_info("socket"))
+        except OSError:
+            # Unmarked, the session's packets could loop into the tunnel.
+            self._mark_errors.log(
+                "cannot mark an accepted TCP connection (SO_MARK); closed it",
+                exc_info=True,
+            )
+            writer.close()
+            return
+        self.connections.put_nowait(
+            (TCPTransport.from_streams(reader, writer), (str(peer[0]), int(peer[1])))
+        )
+
+    def close(self) -> None:
+        """Stop listening and close every connection still queued."""
+        self._closed = True
+        if self._server is not None:
+            # No wait_closed(): from Python 3.12 it also waits for every
+            # accepted connection, the winning session's included.
+            self._server.close()
+        while not self.connections.empty():
+            conn, _ = self.connections.get_nowait()
+            conn.close()
