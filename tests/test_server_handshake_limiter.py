@@ -1,5 +1,5 @@
 """run_server keeps one SourceLimiter for the whole run and hands it to every
-accept; the TCP accept opens one listener per accept cycle and closes it."""
+accept; the TCP accept uses the run's one listener and leaves it open."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ import dsm.server as server_mod
 from dsm.core.config import Config
 from dsm.core.fsm import SessionFSM, State
 from dsm.net.handshake_gate import SourceLimiter
+from dsm.net.session_slot import SessionSlot
 from dsm.server import _drive_fsm_to_idle, run_server
 from tests.test_server_dns_fatal import _base_patches, _server_config
 
@@ -66,6 +67,9 @@ async def test_every_tcp_accept_gets_the_same_limiter() -> None:
 
     with (
         _base_patches(_no_udp_accept, captured),
+        # run_server now opens its one TCP listener at start, on the config
+        # port; a stand-in keeps the test off real ports.
+        patch("dsm.server.TCPListener", _FakeListener),
         patch("dsm.server._accept_one_session", new=_accept),
         patch("dsm.server._run_one_session", new=_session),
     ):
@@ -97,18 +101,21 @@ class _FakeListener:
         self.closed = True
 
 
-async def _accept_one(
-    acceptor: Any, previous: Any = None
-) -> tuple[tuple[Any, Any, Any], SessionFSM, SourceLimiter, asyncio.Event]:
+async def _accept_one(acceptor: Any, previous: Any = None) -> tuple[
+    tuple[Any, Any, Any],
+    SessionFSM,
+    SourceLimiter,
+    asyncio.Event,
+    _FakeListener,
+    SessionSlot,
+]:
     fsm = SessionFSM()
     fsm.transition(State.CONNECTING)
     limiter = SourceLimiter()
+    slot = SessionSlot()
+    listener = _FakeListener()
     shutdown = asyncio.Event()
-    _FakeListener.made = []
-    with (
-        patch("dsm.server.TCPListener", _FakeListener),
-        patch("dsm.server._accept_until_winner_tcp", new=acceptor),
-    ):
+    with patch("dsm.server._accept_until_winner_tcp", new=acceptor):
         result = await server_mod._accept_one_session(
             _tcp_config(),
             fsm,
@@ -119,8 +126,10 @@ async def _accept_one(
             previous,
             shutdown,
             limiter,
+            listener,
+            slot,
         )
-    return result, fsm, limiter, shutdown
+    return result, fsm, limiter, shutdown, listener, slot
 
 
 async def test_tcp_accept_hands_queue_and_limiter_to_the_acceptor() -> None:
@@ -131,38 +140,38 @@ async def test_tcp_accept_hands_queue_and_limiter_to_the_acceptor() -> None:
 
     async def _acceptor(*args: Any) -> tuple[Any, Any, Any]:
         got["args"] = args
-        got["open_during"] = not _FakeListener.made[0].closed
         return "keys", b"\x01" * 32, winner_conn
 
-    (keys, pub, transport), fsm, limiter, shutdown = await _accept_one(
+    (keys, pub, transport), fsm, limiter, shutdown, listener, slot = await _accept_one(
         _acceptor, previous
     )
-    listener = _FakeListener.made[0]
     previous.aclose.assert_awaited_once_with()
-    assert listener.ports == [51820]
     assert got["args"][5] is listener.connections
     assert got["args"][6] is shutdown
     assert got["args"][7] is limiter
-    assert got["open_during"] is True
-    assert listener.closed
+    assert got["args"][8] is slot
+    assert listener.ports == []  # run_server opened it once, at start
+    assert not listener.closed  # it stays open while the session runs
     assert (keys, pub, transport) == ("keys", b"\x01" * 32, winner_conn)
     assert fsm.state is State.HANDSHAKING
 
 
-async def test_tcp_accept_on_shutdown_closes_the_listener_and_idles_the_fsm() -> None:
+async def test_tcp_accept_on_shutdown_leaves_the_listener_open_and_idles_the_fsm() -> (
+    None
+):
     async def _acceptor(*_args: Any) -> tuple[None, None, None]:
         return None, None, None
 
-    result, fsm, _limiter, _shutdown = await _accept_one(_acceptor)
+    result, fsm, _limiter, _shutdown, listener, _slot = await _accept_one(_acceptor)
     assert result == (None, None, None)
-    assert _FakeListener.made[0].closed
+    assert not listener.closed  # the run's stack closes it at exit
     assert fsm.state is State.IDLE
 
 
-async def test_tcp_accept_closes_the_listener_when_the_acceptor_fails() -> None:
+async def test_tcp_accept_leaves_the_listener_open_when_the_acceptor_fails() -> None:
     async def _acceptor(*_args: Any) -> Any:
         raise RuntimeError("acceptor bug")
 
     with pytest.raises(RuntimeError, match="acceptor bug"):
         await _accept_one(_acceptor)
-    assert _FakeListener.made[0].closed
+    assert not _FakeListener.made[-1].closed

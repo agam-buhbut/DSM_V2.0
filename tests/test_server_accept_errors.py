@@ -1,11 +1,12 @@
 """How run_server's accept loop handles errors.
 
-* A TCP listener that cannot be opened before any client has been served
-  (e.g. the port is taken) is fatal: one ERROR line and exit code 1, so
-  systemd restarts the daemon after its delay instead of it spinning.
-* Any other accept error, and a listener error after a client has been
-  served, waits for ``_backoff_or_shutdown`` before the next attempt. The
-  failure count starts over after each served client.
+* In TCP mode the listener is opened once, at start, and stays open for the
+  whole run. If it cannot be opened (e.g. the port is taken) that is fatal:
+  one ERROR line and exit code 1, so systemd restarts the daemon after its
+  delay instead of it spinning.
+* Any accept error waits for ``_backoff_or_shutdown`` before the next
+  attempt, on the same listener. The failure count starts over after each
+  served client.
 
 Host-level side effects (hardening, keys, nftables, signals) are patched out;
 the first test opens a real loopback listener to occupy the port.
@@ -34,6 +35,7 @@ def _tcp_config(port: int) -> MagicMock:
     config.allowed_cns_file = "/fake/cns"
     config.key_file = "/fake/key"
     config.attest_key_file = "/fake/attest"
+    config.max_inflight_handshakes = 8
     return config
 
 
@@ -157,7 +159,7 @@ class TestAcceptErrorsBackOff(_AcceptLoopCase):
         self.assertEqual(accept_calls["n"], 3)
         self.assertEqual(backoff_calls, [1, 2])
 
-    async def test_listen_error_after_a_served_client_backs_off(self) -> None:
+    async def test_accept_error_after_a_served_client_backs_off(self) -> None:
         accept_calls = {"n": 0}
 
         async def _accept(*args: Any) -> tuple[Any, Any, Any]:

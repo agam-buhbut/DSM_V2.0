@@ -83,6 +83,8 @@ class TestRunServerLoopSurvivesFramingError(unittest.IsolatedAsyncioTestCase):
             transport_obj,
             ps,
             limiter=None,
+            listener=None,
+            slot=None,
         ):
             nonlocal call_count
             call_count += 1
