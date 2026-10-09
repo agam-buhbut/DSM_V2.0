@@ -1282,7 +1282,9 @@ leaves it up; run `sudo dsm cleanup`.
   that do not match, a UDP `listen_port` in use, a read-only
   `/etc/resolv.conf`): DSM removes the kill switch and exits 1, as before:
   you are there, and nothing was protected yet. The same errors on a
-  later reconnect keep the block, and DSM tries again.
+  later reconnect keep the block, and DSM tries again. Under
+  `dsm-client.service` a UDP port in use keeps the block and retries too: a
+  program may take the port while DSM restarts.
 - **Server cert or CN errors** (`server CN check failed`, `server cert
   auth failed`, `server cert revoked`) keep the block too: someone on the
   network can send them. If your config is wrong, stop DSM, fix it, start

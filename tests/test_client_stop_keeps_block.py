@@ -11,10 +11,8 @@ fake ``systemctl`` and ``nft`` programs in ``tmp_path``, never the real ones.
 
 from __future__ import annotations
 
-import errno
 import functools
 import logging
-import os
 import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -24,6 +22,7 @@ import pytest
 import dsm.__main__ as entry
 import dsm.client as client_mod
 from dsm.crypto.handshake import HandshakeError
+from dsm.net.resolv_conf import ResolvConfError
 from tests.test_client_fail_closed import _config, _Run, _tables_after
 from tests.test_client_unit import CLIENT_UNIT, _code
 
@@ -95,10 +94,16 @@ async def test_a_stop_without_the_flag_takes_the_kill_switch_down() -> None:
 
 
 async def test_a_setup_error_with_the_flag_still_takes_it_down() -> None:
-    # The flag is about stops only: a UDP port in use at the first try is
-    # still a setup error that removes the kill switch and exits 1.
+    # The flag is about stops only: a read-only resolv.conf at the first try
+    # is still a setup error that removes the kill switch and exits 1. (A
+    # UDP port in use is not one under the flag: see
+    # tests/test_client_port_taken_under_unit.py.)
     run = _Run()
-    run.bind_errors = [OSError(errno.EADDRINUSE, os.strerror(errno.EADDRINUSE))]
+    run.raise_on = {
+        "resolv": {
+            "apply": ResolvConfError(Path("/etc/resolv.conf"), "Read-only file system")
+        }
+    }
 
     rc = await _run_with_flag(run)
 

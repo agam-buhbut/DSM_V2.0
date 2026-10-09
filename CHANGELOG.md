@@ -79,7 +79,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (after a crash or a signal sent straight to it) leaves it up: run
   `sudo dsm cleanup`. A crash leaves it up, and the next start replaces it
   in one step. Setup errors at the first start (passphrase, keys, cert, a
-  UDP port in use, a read-only resolv.conf) still remove it and exit 1.
+  UDP port in use, a read-only resolv.conf) still remove it and exit 1;
+  under `dsm-client.service` a UDP port in use keeps it and retries.
   Server cert and CN errors in the handshake now keep the block and retry,
   because someone on the network can send them. Once a handshake with it
   works, the address found for a server name is saved in

@@ -343,7 +343,8 @@ async def run_client(
     Returns:
         0 when the user stops DSM, 1 on a setup error a retry cannot fix
         (keys, cert, or a UDP port in use or a read-only resolv.conf at the
-        first try). Both take the kill switch down, except a stop with
+        first try; with ``stop_keeps_block`` a port in use is retried
+        instead). Both take the kill switch down, except a stop with
         ``stop_keeps_block``. An unexpected error goes up with the kill
         switch still up (fail closed); the next start replaces it.
     """
@@ -516,9 +517,12 @@ async def run_client(
 
             At the first try, a UDP port in use or a read-only resolv.conf is
             a setup error: DSM exits and removes the kill switch, as the user
-            is there and nothing was protected yet. On later tries every
-            failure keeps the block, so nothing on the host or the network
-            can turn the kill switch off.
+            is there and nothing was protected yet. With ``stop_keeps_block``
+            (the systemd unit) a port in use is not one: every restart is a
+            first try there and nobody may be at the host, so it keeps the
+            block and tries again. On later tries every failure keeps the
+            block, so nothing on the host or the network can turn the kill
+            switch off.
             """
             nonlocal save_address
             fsm = SessionFSM()
@@ -533,9 +537,11 @@ async def run_client(
                         )
                     except OSError as e:
                         reason = os.strerror(e.errno) if e.errno else str(e)
-                        if first_try:
+                        if first_try and not stop_keeps_block:
                             # A fixed listen_port that is already taken:
-                            # one line and exit, like the server.
+                            # one line and exit, like the server. Under the
+                            # unit it is retried instead: a local program
+                            # may have taken the port during a restart.
                             log.error(
                                 "cannot listen on UDP port %d: %s; exiting",
                                 config.listen_port,
