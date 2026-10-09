@@ -6,13 +6,19 @@ well-formed msg1 followed by silence parked the responder across its retries
 nftables rate-limiting bounds the packet rate but cannot tell a slow genuine
 handshake from a slow bogus one.
 
-Here a bounded pool of workers validates handshakes concurrently. Only one
-session is ever admitted (one TUN, one forwarding/MASQUERADE setup, one DNS
-proxy, one socket): the first worker to authenticate wins and the others are
-cancelled. While a session is live the acceptor is not running. For UDP, new
-handshake traffic then queues on the kernel socket; for TCP, the listener is
-closed before the session starts, so new connections are refused until the
-next accept opens a fresh listener.
+Here a bounded pool of workers validates handshakes concurrently. The server
+serves one session at a time (one TUN, one forwarding/MASQUERADE setup, one
+DNS proxy, one socket), and the acceptor runs in two places:
+
+* Between sessions (the idle accept): the first worker to authenticate wins
+  and the others are cancelled.
+* While a session runs (:class:`SessionWatch`, step R): over UDP the live
+  session still reads every datagram first and hands over each one it
+  cannot open; over TCP the run's one listener stays open and the watch
+  reads its queue. A client that passes the full handshake and the run's
+  :class:`~dsm.net.session_slot.SessionSlot` (the live session's CN, so the
+  same client coming back) ends the session and becomes the next one.
+  Another client is refused before the last handshake frame.
 
 * :func:`_demux_loop` is the only caller of the real ``transport.recv()``. It
   routes each datagram to a bounded per-source inbox. A new source must open
@@ -21,28 +27,40 @@ next accept opens a fresh listener.
   :class:`_PerPeerUDPView`, which gives ``server_handshake`` the transport
   surface it expects with the source address pinned. The demux awaits
   nothing but the socket, so no source can pause routing for the others.
+  In a session it reads the live session's leftovers through an
+  :class:`_IntakeView` instead.
 * Workers run under a semaphore of ``config.max_inflight_handshakes``, each
-  with a hard per-attempt deadline.
-* :func:`_accept_until_winner_tcp` does the same for TCP. The caller's
+  with a hard per-attempt deadline. With the run's slot, a client that
+  passed every check also needs the slot's yes before the last frame.
+* :func:`_accept_until_winner_tcp` does the same for TCP. The run's
   :class:`~dsm.net.transport.tcp.TCPListener` queues each accepted
   connection, and :func:`_tcp_admit_loop` gives it a slot and a worker under
   the same pool, limits and deadline, or closes it at once.
 
-Handoff: once a winner is chosen the demux stops reading the real socket, so
-the client's first post-handshake datagrams stay queued for the data path.
-Any the demux had already routed into the winner's inbox are re-injected
-ahead of the real queue. The handoff is loss-free up to the smaller of the
-winner's inbox (``_WINNER_INBOX_FRAMES``) and the real recv queue
-(``RECV_QUEUE_SIZE`` in ``udp.py``), both 256 frames — the same backpressure
-the live data path already applies.
+Handoff: once a winner is chosen the demux stops reading, so the client's
+first post-handshake datagrams stay queued for the data path. Any the demux
+had already routed into the winner's inbox (and, in a session, any the live
+session handed over since) are re-injected ahead of the real queue once
+nothing else reads the socket. The handoff is loss-free up to the smaller of
+the winner's inbox (``_WINNER_INBOX_FRAMES``) and the real recv queue
+(``RECV_QUEUE_SIZE`` in ``udp.py``), both 256 frames, and in a session the
+intake (``_INTAKE_FRAMES``, 64) — the same backpressure the live data path
+already applies.
 """
+
+# The idle accept and the in-session accept (step R) share the demux, the
+# workers and the TCP machinery, so this module is over pylint's 1000-line
+# ceiling by design.
+# pylint: disable=too-many-lines
 
 from __future__ import annotations
 
 import asyncio
 import logging
 import os
-from typing import TYPE_CHECKING
+from collections.abc import Callable, Coroutine
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
 from dsm.core.log import RepeatLog
 from dsm.crypto.handshake import HANDSHAKE_FRAME_SIZE
@@ -57,6 +75,7 @@ if TYPE_CHECKING:
     from dsm.crypto.auth_loader import CertAuthMaterials
     from dsm.crypto.cert_allowlist import CNAllowlist
     from dsm.crypto.keystore import KeyStore
+    from dsm.net.session_slot import SessionSlot
 
 log = logging.getLogger(__name__)
 
@@ -107,6 +126,11 @@ _MAX_INBOXES = 4096
 
 # Shutdown/winner check cadence (s), matching the data loop's recv cadence.
 _ACCEPT_DEMUX_POLL = 0.1
+
+# Packets the live session could not open, waiting for the in-session
+# accept. Every handshake frame is 1400 bytes, so about 90 KB. When it is
+# full a packet is dropped, like loss on the link.
+_INTAKE_FRAMES = 64
 
 
 class _PerPeerUDPView(UDPTransport):
@@ -159,6 +183,8 @@ async def _run_handshake_worker(
     winner: asyncio.Future[tuple[tuncore.SessionKeyManager, bytes, tuple[str, int]]],
     *,
     who: str,
+    slot: SessionSlot | None = None,
+    session_live: bool = False,
 ) -> None:
     """Run one handshake attempt under the per-attempt deadline.
 
@@ -167,70 +193,108 @@ async def _run_handshake_worker(
     TCP connection. ``who`` names the peer in log lines: its address for
     UDP, as before, and a fixed label for TCP, whose log never named peers.
     A connection error ends only this attempt.
+
+    With ``slot`` (the run's :class:`SessionSlot`), a client that passed
+    every check must also pass the slot's rules before it gets the last
+    handshake frame; ``session_live`` says whether a session runs now. The
+    worker's own task is its mark in the slot, so the accept can tell which
+    attempt passed and must not be cancelled.
     """
     from cryptography.x509.oid import ExtendedKeyUsageOID
 
     from dsm.crypto.handshake import (
         CertAuthError,
         CertRevokedError,
+        ClientRefusedError,
         CNNotAllowedError,
         HandshakeError,
+        VerifiedClient,
         server_handshake,
     )
 
-    try:
-        session_keys, client_pub = await asyncio.wait_for(
-            server_handshake(
-                transport,
-                keystore.identity,
-                attest_key=attest_store.attest_key,
-                cert_der=materials.cert_der,
-                ca_root=materials.ca_root,
-                cn_allowlist=cn_allowlist,
-                crl=materials.crl,
-                required_client_eku=ExtendedKeyUsageOID.CLIENT_AUTH,
-                rotation_packets=config.rotation_packets,
-                rotation_seconds=config.rotation_seconds,
-            ),
-            timeout=_HANDSHAKE_ATTEMPT_DEADLINE,
-        )
-    except TimeoutError:
-        log.info(
-            "handshake attempt from %s exceeded %.0fs deadline — slot reclaimed",
-            who,
-            _HANDSHAKE_ATTEMPT_DEADLINE,
-        )
-        return
-    except (
-        CNNotAllowedError,
-        CertRevokedError,
-        CertAuthError,
-        HandshakeError,
-    ) as e:
-        # Same opaque INFO/WARNING logging as before; detail at DEBUG.
-        if isinstance(e, (CNNotAllowedError, CertRevokedError, CertAuthError)):
-            log.warning("handshake rejected (cert auth) from %s", who)
-        else:
-            log.info("handshake failed from %s", who)
-        log.debug("handshake failure detail (%s): %s", who, e)
-        _emit_handshake_failure(e)
-        return
-    except (FramingError, OSError) as e:
-        # A bad length prefix, a reset or an early close on this connection.
-        log.info("handshake transport error (%s)", type(e).__name__)
-        # Never str(e): asyncio's OSError text can carry addresses. The class
-        # name and the OS error text are enough.
-        detail = type(e).__name__
-        if isinstance(e, OSError) and e.errno:
-            detail = f"{detail}: {os.strerror(e.errno)}"
-        log.debug("handshake transport error detail: %s", detail)
-        return
+    attempt: object = asyncio.current_task() or object()
+    admit_client: Callable[[VerifiedClient], None] | None = None
+    if slot is not None:
+        run_slot = slot
 
-    if not winner.done():
+        def _admit(client: VerifiedClient) -> None:
+            if winner.done():
+                raise ClientRefusedError("another client already won this accept")
+            run_slot.admit(attempt, client, session_live=session_live)
+
+        admit_client = _admit
+
+    try:
+        try:
+            session_keys, client_pub = await asyncio.wait_for(
+                server_handshake(
+                    transport,
+                    keystore.identity,
+                    attest_key=attest_store.attest_key,
+                    cert_der=materials.cert_der,
+                    ca_root=materials.ca_root,
+                    cn_allowlist=cn_allowlist,
+                    crl=materials.crl,
+                    required_client_eku=ExtendedKeyUsageOID.CLIENT_AUTH,
+                    rotation_packets=config.rotation_packets,
+                    rotation_seconds=config.rotation_seconds,
+                    admit_client=admit_client,
+                ),
+                timeout=_HANDSHAKE_ATTEMPT_DEADLINE,
+            )
+        except TimeoutError:
+            log.info(
+                "handshake attempt from %s exceeded %.0fs deadline — slot reclaimed",
+                who,
+                _HANDSHAKE_ATTEMPT_DEADLINE,
+            )
+            return
+        except ClientRefusedError as e:
+            # The slot logged why, rate-limited and without an address; one
+            # line per attempt here would repeat it.
+            log.debug("handshake refused by the session rules: %s", e)
+            _emit_handshake_failure(e)
+            return
+        except (
+            CNNotAllowedError,
+            CertRevokedError,
+            CertAuthError,
+            HandshakeError,
+        ) as e:
+            # Same opaque INFO/WARNING logging as before; detail at DEBUG.
+            if isinstance(e, (CNNotAllowedError, CertRevokedError, CertAuthError)):
+                log.warning("handshake rejected (cert auth) from %s", who)
+            else:
+                log.info("handshake failed from %s", who)
+            log.debug("handshake failure detail (%s): %s", who, e)
+            _emit_handshake_failure(e)
+            return
+        except (FramingError, OSError) as e:
+            # A bad length prefix, a reset or an early close on this connection.
+            log.info("handshake transport error (%s)", type(e).__name__)
+            # Never str(e): asyncio's OSError text can carry addresses. The class
+            # name and the OS error text are enough.
+            detail = type(e).__name__
+            if isinstance(e, OSError) and e.errno:
+                detail = f"{detail}: {os.strerror(e.errno)}"
+            log.debug("handshake transport error detail: %s", detail)
+            return
+
+        if winner.done():
+            log.debug("handshake from %s authenticated after a winner — discarded", who)
+            return
+        if slot is not None:
+            if slot.admitted is not attempt:
+                # server_handshake returned without asking the slot: a bug.
+                # Fail closed rather than let an unchecked client in.
+                log.error("a handshake ended without the session check; dropped it")
+                return
+            slot.confirm(attempt)
         winner.set_result((session_keys, client_pub, peer_addr))
         log.info("handshake winner: %s", who)
-    else:
-        log.debug("handshake from %s authenticated after a winner — discarded", who)
+    finally:
+        if slot is not None:
+            slot.release(attempt)
 
 
 def _is_winner_addr(
@@ -280,6 +344,9 @@ async def _demux_loop(
     semaphore: asyncio.Semaphore,
     inboxes: dict[tuple[str, int], asyncio.Queue[bytes]],
     limiter: SourceLimiter,
+    *,
+    slot: SessionSlot | None = None,
+    session_live: bool = False,
 ) -> None:
     """Route datagrams from the real socket to per-source inboxes.
 
@@ -289,6 +356,9 @@ async def _demux_loop(
     anything but the socket. ``inboxes`` and ``workers`` belong to the
     caller, which re-injects the winner's residual frames and cancels the
     losers.
+
+    ``slot`` and ``session_live`` go to each worker; ``session_live`` also
+    makes each new start need the limiter's in-session budget.
     """
     # (inboxes stays the 11th positional parameter: a test wraps this
     # function and reads it by position.)
@@ -348,7 +418,7 @@ async def _demux_loop(
         # Asked last, so a packet dropped above spends none of its address's
         # budget. From here to the done-callback below nothing awaits, so the
         # slot and the address are always given back.
-        if not limiter.try_start(addr[0]):
+        if not limiter.try_start(addr[0], in_session=session_live):
             semaphore.release()
             continue
 
@@ -382,6 +452,8 @@ async def _demux_loop(
                 addr,
                 winner,
                 who=str(addr),
+                slot=slot,
+                session_live=session_live,
             )
         )
         task.add_done_callback(_end_attempt)
@@ -389,11 +461,20 @@ async def _demux_loop(
         task.add_done_callback(workers.discard)
 
 
-async def _cancel_and_drain(tasks: set[asyncio.Task[None]]) -> None:
-    """Cancel and await ``tasks`` so no loser outlives the accept."""
+async def _cancel_and_drain(
+    tasks: set[asyncio.Task[None]], keep: object | None = None
+) -> None:
+    """Cancel and await ``tasks`` so no loser outlives the accept.
+
+    ``keep`` is the attempt that passed the session check (the run's
+    ``SessionSlot.admitted``), if any. It is awaited, never cancelled: its
+    client may already have the last handshake frame. Its own deadline bounds
+    the wait.
+    """
     pending = [t for t in tasks if not t.done()]
     for task in pending:
-        task.cancel()
+        if task is not keep:
+            task.cancel()
     for task in pending:
         try:
             await task
@@ -401,33 +482,36 @@ async def _cancel_and_drain(tasks: set[asyncio.Task[None]]) -> None:
             pass
 
 
-def _reinject_winner_residual(
+def _drain_inbox(inbox: asyncio.Queue[bytes] | None) -> list[bytes]:
+    """Take every frame out of ``inbox``, oldest first."""
+    frames: list[bytes] = []
+    while inbox is not None and not inbox.empty():
+        frames.append(inbox.get_nowait())
+    return frames
+
+
+def _reinject_frames(
     transport: UDPTransport,
     win_addr: tuple[str, int],
-    inboxes: dict[tuple[str, int], asyncio.Queue[bytes]],
+    frames: list[bytes],
 ) -> None:
     """Put the winner's post-handshake frames back on the real recv queue.
 
     The worker stops reading its inbox after the last handshake message, but
-    the demux may already have routed the client's first DATA packets there;
-    without this they would be lost. They go ahead of anything already queued,
+    the demux may already have routed the client's first DATA packets there
+    (and, in a session, the live session may have handed over more); without
+    this they would be lost. They go ahead of anything already queued,
     because they arrived first. ``UDPTransport`` has no public re-inject API,
-    so this writes its ``_recv_queue`` directly. Loss-free while the residual
-    plus the queued frames fit ``RECV_QUEUE_SIZE``; overflow is logged.
+    so this writes its ``_recv_queue`` directly. Loss-free while the frames
+    plus the queued ones fit ``RECV_QUEUE_SIZE``; overflow is logged.
     """
-    win_inbox = inboxes.get(win_addr)
-    if win_inbox is None or win_inbox.empty():
+    if not frames:
         return
-
-    residual: list[bytes] = []
-    while not win_inbox.empty():
-        residual.append(win_inbox.get_nowait())
-
     real_q = transport._recv_queue  # pylint: disable=protected-access  # pyright: ignore[reportPrivateUsage]  # fmt: skip
     carried: list[tuple[bytes, tuple[str, int]]] = []
     while not real_q.empty():
         carried.append(real_q.get_nowait())
-    for frame in residual:
+    for frame in frames:
         try:
             real_q.put_nowait((frame, win_addr))
         except asyncio.QueueFull:
@@ -439,6 +523,114 @@ def _reinject_winner_residual(
             log.warning("recv queue full restoring carried frame — dropped")
 
 
+def _report_winner(
+    winner: asyncio.Future[tuple[tuncore.SessionKeyManager, bytes, tuple[str, int]]],
+    on_winner: Callable[[tuple[str, int]], None] | None,
+) -> None:
+    """Call ``on_winner`` with the winner's address once it is set.
+
+    A done-callback, so it runs one loop step after the winning worker set
+    the result: before the winner's client can answer the last frame.
+    """
+    if on_winner is None:
+        return
+    report = on_winner
+
+    def _done(
+        fut: asyncio.Future[tuple[tuncore.SessionKeyManager, bytes, tuple[str, int]]],
+    ) -> None:
+        if not fut.cancelled():
+            report(fut.result()[2])
+
+    winner.add_done_callback(_done)
+
+
+async def _accept_round(
+    config: Config,
+    keystore: KeyStore,
+    attest_store: AttestStore,
+    materials: CertAuthMaterials,
+    cn_allowlist: CNAllowlist,
+    transport: UDPTransport,
+    stop: asyncio.Event,
+    limiter: SourceLimiter,
+    *,
+    slot: SessionSlot | None = None,
+    session_live: bool = False,
+    on_winner: Callable[[tuple[str, int]], None] | None = None,
+) -> tuple[
+    tuple[tuncore.SessionKeyManager, bytes, tuple[str, int]] | None, list[bytes]
+]:
+    """One UDP accept: the demux and its workers, until a client wins or
+    ``stop`` is set.
+
+    ``transport`` is the run's socket (idle accept) or an
+    :class:`_IntakeView` (in-session accept). Returns the winner
+    ``(session_keys, client_pub, peer_addr)`` with the frames its inbox
+    still held, oldest first, or ``(None, [])``; re-injecting them is the
+    caller's job. An attempt past the slot's check is waited for, never
+    cancelled, and may still win after ``stop`` is set. ``on_winner`` gets
+    the winner's address one loop step after it won.
+    """
+    loop = asyncio.get_running_loop()
+    winner: asyncio.Future[tuple[tuncore.SessionKeyManager, bytes, tuple[str, int]]]
+    winner = loop.create_future()
+    _report_winner(winner, on_winner)
+    semaphore = asyncio.Semaphore(config.max_inflight_handshakes)
+    workers: set[asyncio.Task[None]] = set()
+    inboxes: dict[tuple[str, int], asyncio.Queue[bytes]] = {}
+
+    stop_wait = asyncio.ensure_future(stop.wait())
+    demux = asyncio.ensure_future(
+        _demux_loop(
+            config,
+            keystore,
+            attest_store,
+            materials,
+            cn_allowlist,
+            transport,
+            winner,
+            stop,
+            workers,
+            semaphore,
+            inboxes,
+            limiter,
+            slot=slot,
+            session_live=session_live,
+        )
+    )
+    try:
+        await asyncio.wait(
+            {winner, demux, stop_wait},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+    finally:
+        # Stop reading first, so the winner's later datagrams stay queued for
+        # the data path (idle) or in the intake (in a session).
+        await _cancel_and_drain({demux})
+        if not stop_wait.done():
+            stop_wait.cancel()
+            try:
+                await stop_wait
+            except asyncio.CancelledError:
+                pass
+        # Copy: the done-callbacks mutate the set.
+        await _cancel_and_drain(
+            set(workers), keep=slot.admitted if slot is not None else None
+        )
+
+    error = None if demux.cancelled() else demux.exception()
+    if error is not None:
+        # A bug in the demux must not look like a quiet end.
+        raise error
+    if winner.done() and not winner.cancelled():
+        win = winner.result()
+        # The demux and all workers have stopped, so nothing else touches
+        # the inboxes now.
+        return win, _drain_inbox(inboxes.get(win[2]))
+    return None, []
+
+
 async def _accept_until_winner(  # pyright: ignore[reportUnusedFunction]  # used by dsm.server
     config: Config,
     keystore: KeyStore,
@@ -448,6 +640,7 @@ async def _accept_until_winner(  # pyright: ignore[reportUnusedFunction]  # used
     transport_obj: UDPTransport,
     process_shutdown: asyncio.Event,
     limiter: SourceLimiter | None = None,
+    slot: SessionSlot | None = None,
 ) -> tuple[
     tuncore.SessionKeyManager | None,
     bytes | None,
@@ -459,67 +652,28 @@ async def _accept_until_winner(  # pyright: ignore[reportUnusedFunction]  # used
     ``transport`` is the same real UDP transport, still holding the winner's
     post-handshake datagrams; or ``(None, None, transport_obj)`` when
     shutdown arrives first. Production passes the run's one
-    :class:`SourceLimiter` so the limits hold across accept cycles; without
-    one, this call makes its own.
+    :class:`SourceLimiter` and :class:`SessionSlot`, so the limits and the
+    session rules hold across accepts; without a limiter this call makes its
+    own, and without a slot every authenticated client may win.
     """
     if limiter is None:
         limiter = SourceLimiter()
-
-    loop = asyncio.get_running_loop()
-    winner: asyncio.Future[tuple[tuncore.SessionKeyManager, bytes, tuple[str, int]]]
-    winner = loop.create_future()
-    semaphore = asyncio.Semaphore(config.max_inflight_handshakes)
-    workers: set[asyncio.Task[None]] = set()
-    inboxes: dict[tuple[str, int], asyncio.Queue[bytes]] = {}
-
-    shutdown_wait = asyncio.ensure_future(process_shutdown.wait())
-    demux = asyncio.ensure_future(
-        _demux_loop(
-            config,
-            keystore,
-            attest_store,
-            materials,
-            cn_allowlist,
-            transport_obj,
-            winner,
-            process_shutdown,
-            workers,
-            semaphore,
-            inboxes,
-            limiter,
-        )
+    win, held = await _accept_round(
+        config,
+        keystore,
+        attest_store,
+        materials,
+        cn_allowlist,
+        transport_obj,
+        process_shutdown,
+        limiter,
+        slot=slot,
     )
-    try:
-        await asyncio.wait(
-            {winner, demux, shutdown_wait},
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        # Stop reading the real socket so the winner's later datagrams stay
-        # queued for the data path.
-        if not demux.done():
-            demux.cancel()
-        try:
-            await demux
-        except asyncio.CancelledError:
-            pass
-        # Copy: the done-callbacks mutate the set.
-        await _cancel_and_drain(set(workers))
-    finally:
-        if not shutdown_wait.done():
-            shutdown_wait.cancel()
-            try:
-                await shutdown_wait
-            except asyncio.CancelledError:
-                pass
-
-    if winner.done() and not winner.cancelled():
-        session_keys, client_pub, peer = winner.result()
-        # The demux and all workers have stopped, so nothing else touches the
-        # inboxes now.
-        _reinject_winner_residual(transport_obj, peer, inboxes)
-        return session_keys, client_pub, transport_obj
-
-    return None, None, transport_obj
+    if win is None:
+        return None, None, transport_obj
+    session_keys, client_pub, peer = win
+    _reinject_frames(transport_obj, peer, held)
+    return session_keys, client_pub, transport_obj
 
 
 async def _tcp_admit_loop(
@@ -534,12 +688,17 @@ async def _tcp_admit_loop(
     semaphore: asyncio.Semaphore,
     open_conns: dict[tuple[str, int], TCPTransport],
     limiter: SourceLimiter,
+    *,
+    slot: SessionSlot | None = None,
+    session_live: bool = False,
 ) -> None:
     """Admit queued TCP connections until a winner is set.
 
     The TCP twin of :func:`_demux_loop`. A connection is closed at once when
     the pool is full or ``limiter`` refuses its address; otherwise it takes a
     slot and a worker. ``open_conns`` and ``workers`` belong to the caller.
+
+    ``slot`` and ``session_live`` work as in :func:`_demux_loop`.
     """
     while not winner.done():
         conn, peer = await connections.get()
@@ -560,7 +719,7 @@ async def _tcp_admit_loop(
         # Asked last, so a connection closed above spends none of its
         # address's budget. From here to the done-callback below nothing
         # awaits, so the slot and the address are always given back.
-        if not limiter.try_start(peer[0]):
+        if not limiter.try_start(peer[0], in_session=session_live):
             semaphore.release()
             conn.close()
             continue
@@ -593,6 +752,8 @@ async def _tcp_admit_loop(
                 peer,
                 winner,
                 who="a TCP client",
+                slot=slot,
+                session_live=session_live,
             )
         )
         task.add_done_callback(_end_attempt)
@@ -609,6 +770,10 @@ async def _accept_until_winner_tcp(  # pyright: ignore[reportUnusedFunction]  # 
     connections: asyncio.Queue[tuple[TCPTransport, tuple[str, int]]],
     process_shutdown: asyncio.Event,
     limiter: SourceLimiter | None = None,
+    slot: SessionSlot | None = None,
+    *,
+    session_live: bool = False,
+    on_winner: Callable[[tuple[str, int]], None] | None = None,
 ) -> tuple[
     tuncore.SessionKeyManager | None,
     bytes | None,
@@ -616,14 +781,16 @@ async def _accept_until_winner_tcp(  # pyright: ignore[reportUnusedFunction]  # 
 ]:
     """Accept one TCP client by checking connections concurrently.
 
-    ``connections`` is fed by the caller's listener
+    ``connections`` is fed by the run's listener
     (:attr:`TCPListener.connections`). Connections share the UDP acceptor's
     pool (``config.max_inflight_handshakes``), per-address limits and
     per-attempt deadline. Returns ``(session_keys, client_pub, transport)``
     for the first connection to authenticate, where ``transport`` is that
-    connection, or ``(None, None, None)`` when shutdown comes first. Every
-    other connection handed over, including any still queued, is closed
-    before return.
+    connection, or ``(None, None, None)`` when ``process_shutdown`` is set
+    first (the process shutdown for the idle accept, the session's end for
+    the in-session one). Every other connection handed over, including any
+    still queued, is closed before return. ``slot``, ``session_live`` and
+    ``on_winner`` work as in :func:`_accept_round`.
     """
     if limiter is None:
         limiter = SourceLimiter()
@@ -631,6 +798,7 @@ async def _accept_until_winner_tcp(  # pyright: ignore[reportUnusedFunction]  # 
     loop = asyncio.get_running_loop()
     winner: asyncio.Future[tuple[tuncore.SessionKeyManager, bytes, tuple[str, int]]]
     winner = loop.create_future()
+    _report_winner(winner, on_winner)
     semaphore = asyncio.Semaphore(config.max_inflight_handshakes)
     workers: set[asyncio.Task[None]] = set()
     open_conns: dict[tuple[str, int], TCPTransport] = {}
@@ -649,6 +817,8 @@ async def _accept_until_winner_tcp(  # pyright: ignore[reportUnusedFunction]  # 
             semaphore,
             open_conns,
             limiter,
+            slot=slot,
+            session_live=session_live,
         )
     )
     try:
@@ -666,7 +836,10 @@ async def _accept_until_winner_tcp(  # pyright: ignore[reportUnusedFunction]  # 
                 pass
         # Copy: the done-callbacks mutate the set. Each worker's callback
         # gives back its slot and address and closes a loser's connection.
-        await _cancel_and_drain(set(workers))
+        # An attempt past the session check is waited for, not cancelled.
+        await _cancel_and_drain(
+            set(workers), keep=slot.admitted if slot is not None else None
+        )
         while not connections.empty():
             queued, _ = connections.get_nowait()
             queued.close()
@@ -687,3 +860,240 @@ async def _accept_until_winner_tcp(  # pyright: ignore[reportUnusedFunction]  # 
     for conn in open_conns.values():
         conn.close()
     return session_keys, client_pub, transport
+
+
+class _IntakeView(UDPTransport):
+    """The live session's leftovers, seen by the demux as a UDP socket.
+
+    ``recv()`` reads the intake that the live session fills with packets it
+    could not open. ``send()`` goes out on the run's real socket, so msg2
+    and the bootstrap reply leave from the server's one UDP port, as in the
+    idle accept. ``__init__`` skips the base initializer: only ``recv`` and
+    ``send`` are ever called on a view.
+    """
+
+    def __init__(  # pylint: disable=super-init-not-called
+        self,
+        real: UDPTransport,
+        intake: asyncio.Queue[tuple[bytes, tuple[str, int]]],
+    ) -> None:
+        self._real = real
+        self._intake = intake
+
+    async def recv(self, timeout: float | None = None) -> tuple[bytes, tuple[str, int]]:
+        if timeout is not None:
+            return await asyncio.wait_for(self._intake.get(), timeout)
+        return await self._intake.get()
+
+    async def send(self, data: bytes, addr: tuple[str, int]) -> None:
+        await self._real.send(data, addr)
+
+
+@dataclass(frozen=True)
+class Winner:
+    """The client that won an in-session accept: the next session's peer."""
+
+    session_keys: tuncore.SessionKeyManager
+    client_pub: bytes
+    # UDP: the run's socket; the winner's packets held so far are back at
+    # the front of its queue. TCP: the winner's own connection.
+    transport: UDPTransport | TCPTransport
+
+
+class SessionWatch:
+    """Accept handshakes while a session is live, so a client that comes back
+    can replace its old session at once (step R).
+
+    The server makes one right before each session (it starts at once) and
+    calls :meth:`stop` after the session ended. UDP (``udp=`` the run's
+    socket): the live session hands over each packet it cannot open through
+    :attr:`offer`; the demux, workers, pool, limits and deadline are the idle
+    accept's. TCP (``tcp=`` the run's listener queue): the idle accept's TCP
+    machinery on the run's one listener. A client that passes the full
+    handshake and the slot's rules sets :attr:`end_session`, so the live
+    session stops, and :meth:`stop` hands it over as the next session's
+    peer. A crash here (a bug) is logged once; the session runs on and just
+    cannot be replaced until it ends.
+    """
+
+    def __init__(
+        self,
+        config: Config,
+        keystore: KeyStore,
+        attest_store: AttestStore,
+        materials: CertAuthMaterials,
+        cn_allowlist: CNAllowlist,
+        limiter: SourceLimiter,
+        slot: SessionSlot,
+        *,
+        udp: UDPTransport | None = None,
+        tcp: asyncio.Queue[tuple[TCPTransport, tuple[str, int]]] | None = None,
+    ) -> None:
+        self.end_session = asyncio.Event()
+        self._stop = asyncio.Event()
+        self._real = udp
+        self._intake: asyncio.Queue[tuple[bytes, tuple[str, int]]] | None = None
+        self._held: list[bytes] = []
+        self._winner_addr: tuple[str, int] | None = None
+        self._full_log = RepeatLog(log, logging.DEBUG)
+        work: Coroutine[Any, Any, Winner | None]
+        if udp is not None:
+            intake: asyncio.Queue[tuple[bytes, tuple[str, int]]] = asyncio.Queue(
+                maxsize=_INTAKE_FRAMES
+            )
+            self._intake = intake
+            work = self._accept_udp(
+                config,
+                keystore,
+                attest_store,
+                materials,
+                cn_allowlist,
+                _IntakeView(udp, intake),
+                udp,
+                limiter,
+                slot,
+            )
+        elif tcp is not None:
+            work = self._accept_tcp(
+                config,
+                keystore,
+                attest_store,
+                materials,
+                cn_allowlist,
+                tcp,
+                limiter,
+                slot,
+            )
+        else:
+            raise ValueError("SessionWatch needs udp= or tcp=")
+        # UDP: give the watch each packet the live session could not open
+        # (run_data_loops' ``unauthenticated``). None for TCP.
+        self.offer: Callable[[bytes, tuple[str, int]], None] | None = (
+            self._offer if udp is not None else None
+        )
+        self._task: asyncio.Task[Winner | None] = asyncio.ensure_future(work)
+        self._task.add_done_callback(self._log_crash)
+
+    async def _accept_udp(
+        self,
+        config: Config,
+        keystore: KeyStore,
+        attest_store: AttestStore,
+        materials: CertAuthMaterials,
+        cn_allowlist: CNAllowlist,
+        view: _IntakeView,
+        real: UDPTransport,
+        limiter: SourceLimiter,
+        slot: SessionSlot,
+    ) -> Winner | None:
+        win, held = await _accept_round(
+            config,
+            keystore,
+            attest_store,
+            materials,
+            cn_allowlist,
+            view,
+            self._stop,
+            limiter,
+            slot=slot,
+            session_live=True,
+            on_winner=self._won,
+        )
+        if win is None:
+            return None
+        session_keys, client_pub, _peer = win
+        self._held = held
+        return Winner(session_keys, client_pub, real)
+
+    async def _accept_tcp(
+        self,
+        config: Config,
+        keystore: KeyStore,
+        attest_store: AttestStore,
+        materials: CertAuthMaterials,
+        cn_allowlist: CNAllowlist,
+        connections: asyncio.Queue[tuple[TCPTransport, tuple[str, int]]],
+        limiter: SourceLimiter,
+        slot: SessionSlot,
+    ) -> Winner | None:
+        session_keys, client_pub, conn = await _accept_until_winner_tcp(
+            config,
+            keystore,
+            attest_store,
+            materials,
+            cn_allowlist,
+            connections,
+            self._stop,
+            limiter,
+            slot,
+            session_live=True,
+            on_winner=self._won,
+        )
+        if session_keys is None or client_pub is None or conn is None:
+            return None
+        return Winner(session_keys, client_pub, conn)
+
+    def _won(self, addr: tuple[str, int]) -> None:
+        self._winner_addr = addr
+        self.end_session.set()
+
+    def _log_crash(self, task: asyncio.Task[Winner | None]) -> None:
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            log.error(
+                "in-session handshake accept failed; this session cannot be "
+                "replaced until it ends",
+                exc_info=error,
+            )
+
+    def _offer(self, data: bytes, addr: tuple[str, int]) -> None:
+        """Take one packet the live session could not open. Never raises."""
+        intake = self._intake
+        if intake is None:
+            return
+        win = self._winner_addr
+        if win is not None:
+            # A client won: keep only its packets, any size, so its first
+            # data packets reach its new session in order.
+            if addr != win:
+                return
+        elif len(data) != HANDSHAKE_FRAME_SIZE or self._task.done():
+            # Before a winner only a full handshake frame can start or feed an
+            # attempt; after a crash nothing reads the intake.
+            return
+        try:
+            intake.put_nowait((data, addr))
+        except asyncio.QueueFull:
+            self._full_log.log("in-session handshake queue full, dropping a frame")
+
+    def _take_intake(self, addr: tuple[str, int]) -> list[bytes]:
+        """Empty the intake; keep the frames from ``addr``, oldest first."""
+        frames: list[bytes] = []
+        intake = self._intake
+        while intake is not None and not intake.empty():
+            data, src = intake.get_nowait()
+            if src == addr:
+                frames.append(data)
+        return frames
+
+    async def stop(self) -> Winner | None:
+        """Stop accepting; return the client that won, if one did.
+
+        Call it once, after the session has ended (nothing reads the socket
+        then). An attempt already past the session check is waited for (its
+        own 12 s deadline bounds that) and may still win; other attempts are
+        cancelled, and queued TCP connections are closed. UDP: the winner's
+        packets held so far go back to the front of the socket queue, oldest
+        first.
+        """
+        self._stop.set()
+        await asyncio.wait({self._task})
+        if self._task.cancelled() or self._task.exception() is not None:
+            return None  # a crash was logged when it happened
+        win = self._task.result()
+        if win is not None and self._real is not None and self._winner_addr is not None:
+            frames = self._held + self._take_intake(self._winner_addr)
+            _reinject_frames(self._real, self._winner_addr, frames)
+        return win
