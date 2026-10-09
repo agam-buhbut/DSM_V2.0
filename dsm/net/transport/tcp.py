@@ -15,6 +15,8 @@ log = logging.getLogger(__name__)
 
 MAX_FRAME_SIZE = 65536
 LEN_PREFIX_SIZE = 4
+# The longest aclose waits for the peer to take the close.
+CLOSE_TIMEOUT_S = 2.0
 
 
 class FramingError(ValueError):
@@ -163,10 +165,19 @@ class TCPTransport:
             self._server.close()
 
     async def aclose(self) -> None:
-        """Close and await the writer's FIN handshake."""
+        """Close and await the writer's FIN handshake, at most CLOSE_TIMEOUT_S."""
         if self._writer and not self._closed:
-            self._writer.close()
-            await self._writer.wait_closed()
+            writer = self._writer
             self._closed = True
+            writer.close()
+            # A close must never hold up a retry or a stop: with a dead peer,
+            # wait_closed waits for unsent data until the kernel's TCP
+            # timeout (minutes). A peer that reset the connection is not an
+            # error at close time. Either way, drop the connection and its
+            # unsent data. (TimeoutError is an OSError.)
+            try:
+                await asyncio.wait_for(writer.wait_closed(), timeout=CLOSE_TIMEOUT_S)
+            except OSError:
+                writer.transport.abort()
         if self._server:
             self._server.close()
