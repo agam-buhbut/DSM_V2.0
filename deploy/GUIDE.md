@@ -867,8 +867,12 @@ unit, never `deploy/dsm.service` (that one runs DSM as a server):
 ```sh
 $ sudo cp deploy/dsm-client.service /etc/systemd/system/dsm-client.service
 $ sudo systemctl daemon-reload
-$ sudo systemctl enable --now dsm-client
+$ sudo systemctl enable dsm-client
 ```
+
+Do not start it yet: the server must know this client first (§4), and
+you start the client in §5. A client that cannot reach a server blocks all
+traffic, SSH too, and keeps trying.
 
 `sudo dsm init client --install-unit` and `install.sh --systemd --client`
 install the same unit. Unlike the server's, the client unit takes the kill
@@ -1397,7 +1401,9 @@ $ sudo pkill -9 -f 'dsm --mode server'
 # plus one 5 s check) the client logs "dead peer", then
 # "no tunnel: all traffic is blocked until DSM connects again; ...".
 $ sudo nft list tables | grep '^table inet dsm_'
-# expect exactly: table inet dsm_killswitch_pre
+# expect table inet dsm_killswitch_pre, and no dsm_killswitch or
+# dsm_dns_leak. A server on the same host also leaves its dsm_server_*
+# tables.
 $ curl -m 5 https://example.com || echo "PASS-blocked"
 # Start the server again: the client connects again by itself within
 # about 30 s and logs "tunnel established".
