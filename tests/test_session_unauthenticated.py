@@ -1,6 +1,11 @@
-"""The live session hands each packet it cannot open (AEAD failed) to the
-server's in-session accept, and nothing else (step R). Review Focus 2: the
-live client's own traffic never goes there.
+"""The live session hands each packet it cannot use (AEAD failed, or already
+seen by the replay window) to the server's in-session accept, and nothing
+else (step R). Review Focus 2: a packet that opened, the live client's own
+traffic, never goes there.
+
+A reconnected client's first packet has seq 1 under the new keys, and the old
+session's window has already seen seq 1, so it is rejected as a replay before
+AEAD. It has to be handed over too.
 
 Real session keys from tuncore (as in test_link_stats.py); fakes elsewhere.
 No sockets; nothing sleeps.
@@ -59,7 +64,7 @@ def _wire(keys: tuncore.SessionKeyManager, seq: int, plaintext: bytes) -> bytes:
     return outer.serialize(OUTER_HEADER_SIZE + len(ct))
 
 
-def test_only_an_aead_failure_is_handed_over() -> None:
+def test_only_packets_the_session_cannot_use_are_handed_over() -> None:
     sender, receiver = _pair()
     replay = tuncore.ReplayWindow()
     handed: list[int] = []
@@ -71,8 +76,6 @@ def test_only_an_aead_failure_is_handed_over() -> None:
     genuine = _wire(sender, 5, _plain(PacketType.DATA, epoch, b"x" * 1360))
     assert len(genuine) == 1400  # a genuine packet the size of a msg1
     assert decrypt_packet(genuine, receiver, replay, on_auth_fail=on_fail) is not None
-    # The same packet again: a replay, dropped before AEAD.
-    assert decrypt_packet(genuine, receiver, replay, on_auth_fail=on_fail) is None
     # Too short to be a packet.
     assert decrypt_packet(bytes(10), receiver, replay, on_auth_fail=on_fail) is None
     # Opens, but the inner part is bad (a reserved flag bit set).
@@ -88,6 +91,31 @@ def test_only_an_aead_failure_is_handed_over() -> None:
     forged[-1] ^= 0x01
     assert decrypt_packet(bytes(forged), receiver, replay, on_auth_fail=on_fail) is None
     assert handed == [1, 1]
+    # Already seen: the replay window rejects it before AEAD, and it is
+    # handed over too (it may be a new key's packet; see the next test).
+    assert decrypt_packet(genuine, receiver, replay, on_auth_fail=on_fail) is None
+    assert handed == [1, 1, 1]
+
+
+def test_a_new_key_packet_the_old_window_already_saw_is_handed_over() -> None:
+    # The exact failure: the client reconnects and sends seq 1 under the new
+    # keys; the old session's window already saw seq 1, so it drops the packet
+    # as a replay before AEAD. The in-session accept must still get it.
+    old_sender, old_receiver = _pair()
+    new_sender, _new_receiver = _pair()
+    replay = tuncore.ReplayWindow()
+    handed: list[int] = []
+    epoch = old_receiver.epoch
+    for seq in (1, 2, 3):
+        old = _wire(old_sender, seq, _plain(PacketType.DATA, epoch, b"old"))
+        assert decrypt_packet(old, old_receiver, replay) is not None
+
+    first_new = _wire(new_sender, 1, _plain(PacketType.DATA, epoch, b"new"))
+    result = decrypt_packet(
+        first_new, old_receiver, replay, on_auth_fail=lambda: handed.append(1)
+    )
+    assert result is None
+    assert handed == [1]
 
 
 def test_without_the_callback_decrypt_works_as_before() -> None:
@@ -132,7 +160,7 @@ def _ctx(
     return ctx, fsm
 
 
-async def test_the_receive_loop_hands_over_only_packets_it_cannot_open() -> None:
+async def test_the_receive_loop_hands_over_only_packets_it_cannot_use() -> None:
     sender, receiver = _pair()
     tun = _Tun()
     ctx, fsm = _ctx(receiver, tun)
@@ -145,7 +173,7 @@ async def test_the_receive_loop_hands_over_only_packets_it_cannot_open() -> None
 
     def unauthenticated(data: bytes, addr: Addr) -> None:
         handed.append((data, addr))
-        if len(handed) == 2:
+        if len(handed) == 3:
             ctx.shutdown.set()
 
     await asyncio.wait_for(
@@ -159,8 +187,9 @@ async def test_the_receive_loop_hands_over_only_packets_it_cannot_open() -> None
         ),
         timeout=5.0,
     )
-    # The session hands over every AEAD failure, any size (the server's
-    # intake filters); the genuine packet and its replay never go there.
-    assert handed == [(MSG1, NEW), (small_junk, NEW)]
+    # The session hands over every packet it cannot use, any size (the
+    # server's intake filters): the replay and the two that do not open. The
+    # genuine packet, which opened, never goes there.
+    assert handed == [(genuine, LIVE), (MSG1, NEW), (small_junk, NEW)]
     assert tun.written == [b"x" * 1360]
     assert fsm.state is State.IDLE

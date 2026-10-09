@@ -506,11 +506,13 @@ def decrypt_packet(
     is dropped later still crossed the link. A packet dropped before that
     (too short, a replay, AEAD failed) counts as junk.
 
-    ``on_auth_fail`` (server, step R) is called when the AEAD check fails,
-    and only then: such a packet is not the live peer's, so the server's
-    in-session accept may want it (a reconnecting client's handshake frame).
-    A short packet, a replay, or a packet that opened (bad inner part, wrong
-    epoch) is the peer's or noise, and never goes there.
+    ``on_auth_fail`` (server, step R) is called for a packet the session
+    cannot use: one that does not open, or one the replay window rejects as
+    already seen. Either may belong to a client that has just reconnected (its
+    handshake frame, or its first packet under new keys, with a sequence
+    number this window has seen), so the server's in-session accept may want
+    it. A packet that opened (even with a bad inner part or a wrong epoch)
+    and a too-short packet never go there.
 
     There are TWO replay windows — this
     Python-side ``replay`` ARG (checked here BEFORE AEAD work) and the
@@ -533,6 +535,8 @@ def decrypt_packet(
     if not replay.check(seq):
         log.debug("replay detected, dropping seq=%d", seq)
         _note_junk(link_stats)
+        if on_auth_fail is not None:
+            on_auth_fail()
         return None
 
     # nonce sits between the 8-byte seq and the ciphertext.
@@ -1051,9 +1055,10 @@ async def run_data_loops(
       decrypted ``inner`` too so it can act on a PATH_RESPONSE; called BEFORE
       ``dispatch_inner`` so the egress decision is made before the payload is
       delivered.
-    * ``unauthenticated`` (server, step R): gets each UDP packet whose AEAD
-      check failed, with its source address, for the in-session accept. The
-      client passes nothing; TCP never calls it.
+    * ``unauthenticated`` (server, step R): gets each UDP packet the session
+      cannot use (AEAD failed, or already seen by the replay window), with
+      its source address, for the in-session accept. The client passes
+      nothing; TCP never calls it.
     * ``extra_loops``: client passes ``auto_mtu_loop(...)`` here; server
       passes nothing.
     * ``shutdown_log``: caller-supplied label so the log line still
