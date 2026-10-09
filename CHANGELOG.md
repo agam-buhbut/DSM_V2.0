@@ -74,7 +74,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   network could cause that by dropping packets for a minute. Now the
   client swaps back to the start-up kill switch in one nft step and
   reconnects by itself (1 s, doubling to 30 s, no limit). The kill switch
-  comes down only on Ctrl-C (a run by hand), `systemctl stop` or
+  comes down on Ctrl-C (a run by hand), `systemctl stop` or
+  `sudo dsm cleanup`. A `systemctl stop` sent while DSM waits to restart
+  (after a crash or a signal sent straight to it) leaves it up: run
   `sudo dsm cleanup`. A crash leaves it up, and the next start replaces it
   in one step. Setup errors at the first start (passphrase, keys, cert, a
   UDP port in use, a read-only resolv.conf) still remove it and exit 1.

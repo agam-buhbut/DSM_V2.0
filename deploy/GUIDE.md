@@ -1240,7 +1240,10 @@ skip the list. Pi-hole has the same limit.
 ### 7i. Client: when the tunnel is down
 
 The client's kill switch is up whenever DSM runs, also while there is no
-tunnel. It comes down only when you stop DSM.
+tunnel. It comes down when you stop DSM. Two cases differ: a setup error at
+the first try also removes it (DSM exits 1), and a `systemctl stop` sent
+while DSM waits to restart (after a crash or a signal sent straight to it)
+leaves it up; run `sudo dsm cleanup`.
 
 - **The tunnel drops** (no packets from the server for 60 s, the server
   restarts or closes the session, a TCP reset, a key change that gives up,
@@ -1260,16 +1263,21 @@ tunnel. It comes down only when you stop DSM.
   take every DSM table down. If DSM is not running but its tables are
   still there (after a crash or `kill -9`, or a `systemctl stop` while
   DSM was waiting to restart after a crash or a signal sent straight to
-  it), run `sudo dsm cleanup`.
+  it), run `sudo dsm cleanup`. That command also sets `net.ipv4.ip_forward`
+  to 0 and turns IPv6 back on, which can break Docker: if you use Docker,
+  restart it after `dsm cleanup`.
 - **Captive portals** (hotel, airport or train Wi-Fi with a login page):
   the login page cannot load while DSM runs. Stop DSM, log in, start DSM.
 - **DSM crashes** (a Python error, exit 1): the kill switch stays up on
   purpose, and the log says so. The next start replaces the old tables in
   the same nft step, so the host is never open in between. Under
   `dsm-client.service`, systemd starts DSM again after 5 s. If it keeps
-  failing, systemd stops trying after 5 starts in 10 minutes and the block
-  stays: read `journalctl -u dsm-client`, then fix the problem or run
-  `sudo dsm cleanup`.
+  failing, systemd gives up after 5 failed starts in 10 minutes. After
+  crashes the block stays; after setup errors (below) it is already gone.
+  Read `journalctl -u dsm-client`, then fix the problem or run
+  `sudo dsm cleanup`. To start DSM again after systemd gave up, run
+  `sudo systemctl reset-failed dsm-client`, then
+  `sudo systemctl start dsm-client`.
 - **Setup errors at the first start** (a wrong passphrase, keys or cert
   that do not match, a UDP `listen_port` in use, a read-only
   `/etc/resolv.conf`): DSM removes the kill switch and exits 1, as before:
@@ -1300,8 +1308,11 @@ tunnel. It comes down only when you stop DSM.
   again and the block stays. A restart can also keep the old server
   address (the block can stop the name lookup, and then DSM uses the saved
   one): after the server's address changed, stop DSM and start it
-  instead. Only `sudo systemctl stop dsm-client`, Ctrl-C on a run by hand,
-  or `sudo dsm cleanup` take the kill switch down.
+  instead. Apart from `sudo dsm cleanup`, only `sudo systemctl stop
+  dsm-client` and Ctrl-C on a run by hand take the kill switch down, with
+  two exceptions: a setup error at the first try also removes it (DSM exits
+  1), and a `systemctl stop` sent while DSM waits to restart (after a crash
+  or a signal sent straight to it) leaves it up; run `sudo dsm cleanup`.
 
 ## 8. Single-Host Loopback Smoke Test
 
