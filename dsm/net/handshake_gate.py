@@ -139,8 +139,20 @@ class SourceLimiter:
         return True
 
     def finish(self, ip: str) -> None:
-        """End one attempt that ``try_start(ip)`` admitted."""
-        self._sources[ip].inflight -= 1
+        """End one attempt that ``try_start(ip)`` admitted.
+
+        Callers must pair each True from ``try_start`` with exactly one
+        ``finish``; a missed ``finish`` is the caller's to prevent.
+
+        Raises:
+            RuntimeError: ``ip`` has no running attempt to end. Nothing
+                changes, so one extra call cannot let an address run more
+                than its share.
+        """
+        src = self._sources.get(ip)
+        if src is None or src.inflight <= 0:
+            raise RuntimeError("finish without a matching try_start")
+        src.inflight -= 1
 
     def _forget_one_idle(self) -> bool:
         """Forget the idle address that started longest ago, if there is one."""

@@ -184,3 +184,24 @@ def test_a_clock_that_steps_back_adds_no_tokens() -> None:
     assert not bucket.ready(50.0)
     assert not bucket.ready(100.5)
     assert bucket.ready(101.0)
+
+
+def test_a_second_finish_is_an_error_and_changes_nothing() -> None:
+    limiter = SourceLimiter(clock=_Clock())
+    ip = "198.51.100.1"
+    assert limiter.try_start(ip)
+    limiter.finish(ip)
+    with pytest.raises(RuntimeError, match="finish without a matching try_start"):
+        limiter.finish(ip)
+    # Still nothing running, so exactly two can start, not three.
+    assert limiter.try_start(ip)
+    assert limiter.try_start(ip)
+    assert not limiter.try_start(ip)
+
+
+def test_finish_for_an_address_never_admitted_is_an_error() -> None:
+    limiter = SourceLimiter(clock=_Clock())
+    assert limiter.try_start("10.0.0.1")
+    with pytest.raises(RuntimeError, match="finish without a matching try_start"):
+        limiter.finish("10.0.0.2")
+    assert len(limiter) == 1
