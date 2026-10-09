@@ -33,6 +33,8 @@ MIN_TTL = 60
 MAX_TTL = 3600
 DOH_TIMEOUT = 2.0
 DOT_TIMEOUT = 2.0
+# The longest a TLS connection's close waits for the peer to take it.
+CLOSE_TIMEOUT = 2.0
 
 # RFC 8467 §4.1: block-length policy. Clients pad queries to the next
 # multiple of 128 bytes. Makes query size a coarse lattice a passive TLS
@@ -252,11 +254,7 @@ class DNSResolver:
                 verify_pin_on_ssl_object(ssl_obj, self._pins[provider], provider)
             return await send_recv(reader, writer)
         finally:
-            writer.close()
-            try:
-                await writer.wait_closed()
-            except (ConnectionError, OSError):
-                pass
+            await _close_writer(writer)
 
     async def _resolve_doh(self, url: str, hostname: str) -> DnsResult:
         """DNS-over-HTTPS query with SPKI pin checked BEFORE the qname
@@ -489,6 +487,22 @@ _HTTP_HEADER_MAX_BYTES = 8 * 1024
 _HTTP_BODY_MAX_BYTES = 64 * 1024
 
 
+async def _close_writer(writer: asyncio.StreamWriter) -> None:
+    """Close a TLS connection, waiting at most ``CLOSE_TIMEOUT`` seconds.
+
+    With a dead peer and unsent data, ``wait_closed`` waits until the
+    kernel's TCP timeout (minutes), which would hold up the query that
+    called this. A peer that reset the connection is not an error at close
+    time. Either way the connection and its unsent data are dropped and no
+    error is raised. (``TimeoutError`` is an ``OSError``.)
+    """
+    writer.close()
+    try:
+        await asyncio.wait_for(writer.wait_closed(), timeout=CLOSE_TIMEOUT)
+    except OSError:
+        writer.transport.abort()
+
+
 async def _open_pinned_tls_connection(
     host: str,
     port: int,
@@ -575,11 +589,7 @@ async def _open_pinned_tls_connection(
             )
         verify_pin_on_ssl_object(ssl_obj, expected_pins, provider_label)
     except BaseException:
-        writer.close()
-        try:
-            await writer.wait_closed()
-        except (ConnectionError, OSError):
-            pass
+        await _close_writer(writer)
         raise
 
     return reader, writer
