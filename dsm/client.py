@@ -40,7 +40,7 @@ from dsm.net.nftables import (
     TcpTimestampsDisabler,
 )
 from dsm.net.resolv_conf import ResolvConfError, ResolvConfManager
-from dsm.net.transport.tcp import TCPTransport
+from dsm.net.transport.tcp import FramingError, TCPTransport
 from dsm.net.transport.udp import UDPTransport
 from dsm.net.tunnel import SrcValidMarkEnabler, TunDevice
 from dsm.session import (
@@ -608,8 +608,16 @@ async def run_client(
                     _emit_handshake_failure(e)
                     fsm.transition(State.TEARDOWN)
                     return _End.FAILED
-                except OSError as e:
-                    reason = os.strerror(e.errno) if e.errno else type(e).__name__
+                except (OSError, FramingError) as e:
+                    # A bad TCP length prefix (FramingError) is as much the
+                    # network's doing as a reset: an attacker on the path can
+                    # send one at will. Keep the block and try again. Only the
+                    # error text from the OS or the class name is logged.
+                    reason = (
+                        os.strerror(e.errno)
+                        if isinstance(e, OSError) and e.errno
+                        else type(e).__name__
+                    )
                     log.error("handshake failed: %s", reason)
                     _emit_handshake_failure(e)
                     fsm.transition(State.TEARDOWN)

@@ -31,6 +31,7 @@ from dsm.crypto.handshake import (
     HandshakeError,
 )
 from dsm.net.resolv_conf import ResolvConfError
+from dsm.net.transport.tcp import FramingError
 
 
 def _config(**changes: Any) -> Config:
@@ -352,6 +353,29 @@ async def test_a_stop_during_the_handshake_ends_it_at_once() -> None:
     assert cancelled == [True]
     assert run.waits == []
     assert run.events[-1] == "pre.remove"
+
+
+async def test_a_bad_tcp_frame_in_the_handshake_keeps_the_block_and_tries_again(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Someone on the path can reset the connection and then send a length
+    # over the limit. That must not end the retry loop.
+    run = _Run()
+    bad_frame = FramingError("frame length 4294967295 exceeds max 65536")
+    run.handshakes = [bad_frame, bad_frame]
+    run.stop_at_wait = 2
+    caplog.set_level(logging.ERROR, logger="dsm")
+
+    rc = await run.run(_config(transport="tcp"))
+
+    assert rc == 0
+    assert run.events.count("handshake") == 2
+    assert run.waits == [1.0, 2.0]
+    assert run.blocked_during_waits == [True, True]
+    assert run.events[-1] == "pre.remove"
+    messages = [r.getMessage() for r in caplog.records]
+    assert "handshake failed: FramingError" in messages
+    assert not any("4294967295" in m for m in messages)
 
 
 async def test_a_tcp_connect_error_is_retried_and_names_no_address(
