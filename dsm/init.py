@@ -34,6 +34,12 @@ from dsm.crypto.tpm_preflight import TpmPreflightError, preflight_tpm
 _STATE_NAME = ".dsm-init-state.json"
 _STATE_SCHEMA = 1
 
+# Where `--install-unit` copies from and to. Module names so tests can point
+# them at a temporary folder.
+_DEPLOY_DIR = Path(__file__).resolve().parent.parent / "deploy"
+_SYSTEMD_DIR = Path("/etc/systemd/system")
+_CRED_FILE = Path("/etc/dsm/passphrase")
+
 
 def _fail(msg: str) -> NoReturn:
     print(f"dsm init: {msg}", file=sys.stderr)
@@ -358,34 +364,43 @@ def _phase_b(role: str, args: argparse.Namespace) -> int:
         )
 
     if state.get("install_unit"):
-        _install_unit()
+        _install_unit(role)
 
     state_path.unlink()
-    print("Done. Verify with: systemctl status dsm  (deploy/GUIDE.md §6)")
+    print(
+        f"Done. Verify with: systemctl status {_unit_name(role)}  "
+        "(deploy/GUIDE.md §6)"
+    )
     return 0
 
 
-def _install_unit() -> None:
-    # deploy/dsm.service exists only in a source checkout; a wheel-only
-    # install gets instructions instead of a FileNotFoundError.
-    src = Path(__file__).resolve().parent.parent / "deploy" / "dsm.service"
+def _unit_name(role: str) -> str:
+    """The systemd unit for ``role``. A client must never get the server
+    unit: it runs DSM as a server."""
+    return "dsm-client" if role == "client" else "dsm"
+
+
+def _install_unit(role: str = "server") -> None:
+    # deploy/ exists only in a source checkout; a wheel-only install gets
+    # instructions instead of a FileNotFoundError.
+    name = _unit_name(role)
+    src = _DEPLOY_DIR / f"{name}.service"
     if not src.is_file():
         print(
-            "dsm.service not found at the expected location.\n"
+            f"{name}.service not found at the expected location.\n"
             "Copy it manually from the DSM release tarball to "
-            "/etc/systemd/system/dsm.service, then run:\n"
-            "  sudo systemctl daemon-reload && sudo systemctl enable --now dsm",
+            f"/etc/systemd/system/{name}.service, then run:\n"
+            "  sudo systemctl daemon-reload && "
+            f"sudo systemctl enable --now {name}",
             file=sys.stderr,
         )
         return
-    dst = Path("/etc/systemd/system/dsm.service")
-    shutil.copyfile(src, dst)
-    Path("/etc/dsm").mkdir(parents=True, exist_ok=True)
-    cred = Path("/etc/dsm/passphrase")
-    if not cred.exists():
-        cred.touch(mode=0o600)
+    shutil.copyfile(src, _SYSTEMD_DIR / f"{name}.service")
+    _CRED_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if not _CRED_FILE.exists():
+        _CRED_FILE.touch(mode=0o600)
     subprocess.run(["systemctl", "daemon-reload"], check=True)
-    print("Installed dsm.service. Start with: sudo systemctl enable --now dsm")
+    print(f"Installed {name}.service. Start with: sudo systemctl enable --now {name}")
 
 
 def _build_parser() -> argparse.ArgumentParser:

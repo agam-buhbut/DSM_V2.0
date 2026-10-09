@@ -19,17 +19,19 @@
 #     A release host can still withhold a NEWER release (a freeze/downgrade-by-
 #     omission attack), but cannot substitute a different validly-signed wheel
 #     for the version this script pins. Bump DSM_VERSION per release.
-#   * --systemd also installs a daily download of a DNS block list for the
-#     server (default: StevenBlack/hosts) and runs it once right away. That
-#     list is NOT minisign-verified: it comes over HTTPS from the list's own
-#     host, so you trust that host for it. dsm only reads it as names to
-#     block, never runs it: a bad list can make names fail to resolve
-#     (deploy/GUIDE.md §7h).
+#   * --systemd (not with --client) also installs a daily download of a DNS
+#     block list for the server (default: StevenBlack/hosts) and runs it
+#     once right away. That list is NOT minisign-verified: it comes over
+#     HTTPS from the list's own host, so you trust that host for it. dsm
+#     only reads it as names to block, never runs it: a bad list can make
+#     names fail to resolve (deploy/GUIDE.md §7h).
 #
 # Usage:  curl -fsSL <release>/install.sh | sudo sh
 #         curl -fsSL <release>/install.sh | sudo sh -s -- --eval
 #         curl -fsSL <release>/install.sh | sudo sh -s -- --systemd
-#         (flags may be combined and given in any order)
+#         curl -fsSL <release>/install.sh | sudo sh -s -- --systemd --client
+#         (flags may be combined and given in any order; --systemd installs
+#         the server unit, --systemd --client the client unit)
 set -eu
 
 # Pinned release this script installs. The wheel name and its signed
@@ -48,15 +50,17 @@ die() { echo "install.sh: $*" >&2; exit 1; }
 # Argument parsing: flags in any order; unknown flags are rejected.
 EVAL=0
 SYSTEMD=0
+CLIENT=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --eval)    EVAL=1 ;;
     --systemd) SYSTEMD=1 ;;
+    --client)  CLIENT=1 ;;
     -h|--help)
-      echo "Usage: install.sh [--eval] [--systemd]" >&2
+      echo "Usage: install.sh [--eval] [--systemd] [--client]" >&2
       exit 0
       ;;
-    *) die "unknown argument: $1 (supported: --eval, --systemd, --help)" ;;
+    *) die "unknown argument: $1 (supported: --eval, --systemd, --client, --help)" ;;
   esac
   shift
 done
@@ -222,8 +226,8 @@ ln -sf "$VENV/bin/dsm" /usr/local/bin/dsm || die "could not symlink dsm into /us
 if [ "$EVAL" = 0 ]; then
   getent group tss >/dev/null 2>&1 || groupadd --system tss || die "could not create the tss group"
   echo "Note: the dsm daemon must be in the 'tss' group to reach /dev/tpmrm0." >&2
-  echo "      The shipped deploy/dsm.service sets SupplementaryGroups=tss already." >&2
-  if [ "$SYSTEMD" = 1 ]; then
+  echo "      deploy/dsm.service and deploy/dsm-client.service set SupplementaryGroups=tss already." >&2
+  if [ "$SYSTEMD" = 1 ] && [ "$CLIENT" = 0 ]; then
     UNIT_SRC=""
     for c in /opt/dsm/deploy/dsm.service ./deploy/dsm.service; do
       [ -f "$c" ] && { UNIT_SRC="$c"; break; }
@@ -269,6 +273,21 @@ if [ "$EVAL" = 0 ]; then
     else
       echo "install.sh: WARNING — --systemd requested but deploy/dsm.service not found locally; skipping unit install." >&2
     fi
+  elif [ "$SYSTEMD" = 1 ] && [ "$CLIENT" = 1 ]; then
+    # A client gets only the client unit: never dsm.service (it runs DSM as
+    # a server) and never the server's DNS block list download.
+    UNIT_SRC=""
+    for c in /opt/dsm/deploy/dsm-client.service ./deploy/dsm-client.service; do
+      [ -f "$c" ] && { UNIT_SRC="$c"; break; }
+    done
+    if [ -n "$UNIT_SRC" ]; then
+      install -m 0644 "$UNIT_SRC" /etc/systemd/system/dsm-client.service \
+        || die "could not install dsm-client.service"
+      systemctl daemon-reload || die "systemctl daemon-reload failed"
+      echo "Installed dsm-client.service. Start with: sudo systemctl enable --now dsm-client" >&2
+    else
+      echo "install.sh: WARNING — --systemd --client requested but deploy/dsm-client.service not found locally; skipping unit install." >&2
+    fi
   fi
 elif [ "$SYSTEMD" = 1 ]; then
   echo "install.sh: WARNING — --systemd is ignored in --eval mode (no production unit installed)." >&2
@@ -276,6 +295,8 @@ fi
 
 if [ "$EVAL" = 1 ]; then
   echo "Eval install complete (EVALUATION ONLY). Try: sudo dsm init client" >&2
+elif [ "$CLIENT" = 1 ]; then
+  echo "Install complete. Next: sudo dsm init client" >&2
 else
   echo "Install complete. Next: sudo dsm init server" >&2
 fi

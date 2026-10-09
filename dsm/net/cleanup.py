@@ -1,10 +1,13 @@
 """Idempotent host-state cleanup for crash / forced-stop recovery.
 
-Run by systemd ``ExecStopPost=`` on BOTH clean and crash stops so a SIGKILL /
-OOM that bypasses the in-process AsyncExitStack unwind does not leave the
-host with a kill switch up, a dead resolv.conf, a stale table-100 route /
-ip rule, or modified sysctls. Every operation is best-effort: a missing
-table / rule / file is fine — the goal is to converge on a clean state.
+The server unit (deploy/dsm.service) runs it as ``ExecStopPost=`` on every
+stop, so a SIGKILL / OOM that bypasses the in-process AsyncExitStack unwind
+does not leave the host with a dead resolv.conf, a stale table-100 route /
+ip rule, or modified sysctls. The client unit (deploy/dsm-client.service)
+does not: after a client crash the kill switch must stay up, so that unit
+only deletes the client's kill-switch tables, and only after a stop the
+user asked for. Every operation is best-effort: a missing table / rule /
+file is fine — the goal is to converge on a clean state.
 
 GAP (crash-only restore precision): the in-process teardown restores the
 EXACT prior sysctl values it captured (see ``dsm.core.sysctl.SysctlOverride``)
@@ -22,9 +25,9 @@ have, and the precise restore still happens whenever the clean teardown runs.
 The client's ``net.ipv4.conf.all.src_valid_mark`` is the exception: its
 prior value IS saved to disk (``SrcValidMarkEnabler.STATE_PATH``) and is
 restored exactly. Forcing a default of 0 would break other tools that need
-it on (wg-quick sets it to 1), and under the systemd unit this runs on every
-stop, not only after a crash. A client run by hand has no ExecStopPost, so
-there ``dsm cleanup`` must be run by hand after a crash.
+it on (wg-quick sets it to 1), and under the server unit this runs on every
+stop, not only after a crash. No client unit runs it, so on a client
+``dsm cleanup`` is run by hand after a crash.
 """
 
 from __future__ import annotations
