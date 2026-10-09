@@ -494,6 +494,7 @@ def decrypt_packet(
     replay: tuncore.ReplayWindow,
     *,
     link_stats: LinkStats | None = None,
+    on_auth_fail: Callable[[], None] | None = None,
 ) -> tuple[InnerPacket, bool] | None:
     """Parse, replay-check, decrypt, and validate an incoming packet.
 
@@ -504,6 +505,12 @@ def decrypt_packet(
     with a new seq, before the inner packet is parsed: a genuine packet that
     is dropped later still crossed the link. A packet dropped before that
     (too short, a replay, AEAD failed) counts as junk.
+
+    ``on_auth_fail`` (server, step R) is called when the AEAD check fails,
+    and only then: such a packet is not the live peer's, so the server's
+    in-session accept may want it (a reconnecting client's handshake frame).
+    A short packet, a replay, or a packet that opened (bad inner part, wrong
+    epoch) is the peer's or noise, and never goes there.
 
     There are TWO replay windows — this
     Python-side ``replay`` ARG (checked here BEFORE AEAD work) and the
@@ -536,6 +543,8 @@ def decrypt_packet(
     result = _decrypt_with_fallback(session_keys, nonce_bytes, ciphertext, aad, seq)
     if result is None:
         _note_junk(link_stats)
+        if on_auth_fail is not None:
+            on_auth_fail()
         return None
     plaintext, decrypted_prev_epoch = result
 
@@ -1020,6 +1029,7 @@ async def run_data_loops(
     post_authenticate: (
         Callable[[tuple[str, int], InnerPacket], Awaitable[None]] | None
     ) = None,
+    unauthenticated: Callable[[bytes, tuple[str, int]], None] | None = None,
     shutdown_log: str = "shutting down",
 ) -> None:
     """Drive the steady-state recv/tun_send/liveness/link-report loops to completion.
@@ -1041,6 +1051,9 @@ async def run_data_loops(
       decrypted ``inner`` too so it can act on a PATH_RESPONSE; called BEFORE
       ``dispatch_inner`` so the egress decision is made before the payload is
       delivered.
+    * ``unauthenticated`` (server, step R): gets each UDP packet whose AEAD
+      check failed, with its source address, for the in-session accept. The
+      client passes nothing; TCP never calls it.
     * ``extra_loops``: client passes ``auto_mtu_loop(...)`` here; server
       passes nothing.
     * ``shutdown_log``: caller-supplied label so the log line still
@@ -1093,7 +1106,15 @@ async def run_data_loops(
                     return
 
                 result = decrypt_packet(
-                    data, session_keys, replay, link_stats=ctx.link_stats
+                    data,
+                    session_keys,
+                    replay,
+                    link_stats=ctx.link_stats,
+                    on_auth_fail=(
+                        None
+                        if unauthenticated is None or recv_addr is None
+                        else functools.partial(unauthenticated, data, recv_addr)
+                    ),
                 )
                 if result is None:
                     continue
