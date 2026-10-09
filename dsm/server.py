@@ -77,16 +77,18 @@ class ListenError(Exception):
 async def _backoff_or_shutdown(
     consecutive_failures: int, process_shutdown: asyncio.Event
 ) -> bool:
-    """Sleep the jittered handshake-retry backoff, or return early on
-    shutdown.
+    """Sleep the jittered backoff after an unexpected accept error, or return
+    early on shutdown.
+
+    Failed handshakes do not come here: they end only their own attempt.
 
     Returns:
         ``True`` if ``process_shutdown`` was set during the wait (the caller
         must abandon the accept), ``False`` if the backoff elapsed normally.
     """
     # Doubles per failure up to _HANDSHAKE_RETRY_BACKOFF_MAX, with ±50%
-    # jitter so a flood of bad handshakes does not produce a deterministic
-    # retry cadence an attacker can synchronize to.
+    # jitter so an accept error that repeats does not retry on a fixed beat
+    # an attacker can synchronize to.
     base = min(
         _HANDSHAKE_RETRY_BACKOFF_BASE * (2 ** min(consecutive_failures - 1, 4)),
         _HANDSHAKE_RETRY_BACKOFF_MAX,

@@ -9,8 +9,10 @@ handshake from a slow bogus one.
 Here a bounded pool of workers validates handshakes concurrently. Only one
 session is ever admitted (one TUN, one forwarding/MASQUERADE setup, one DNS
 proxy, one socket): the first worker to authenticate wins and the others are
-cancelled. While a session is live the acceptor is not running, so new
-handshake traffic queues on the kernel socket.
+cancelled. While a session is live the acceptor is not running. For UDP, new
+handshake traffic then queues on the kernel socket; for TCP, the listener is
+closed before the session starts, so new connections are refused until the
+next accept opens a fresh listener.
 
 * :func:`_demux_loop` is the only caller of the real ``transport.recv()``. It
   routes each datagram to a bounded per-source inbox. A new source must open
@@ -39,6 +41,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from typing import TYPE_CHECKING
 
 from dsm.core.log import RepeatLog
@@ -56,6 +59,10 @@ if TYPE_CHECKING:
     from dsm.crypto.keystore import KeyStore
 
 log = logging.getLogger(__name__)
+
+# One line per 10 s at most: a flood of connections would otherwise log one
+# line per connection.
+_tcp_full_log = RepeatLog(log, logging.DEBUG)
 
 
 def _emit_handshake_failure(err: Exception) -> None:
@@ -210,7 +217,13 @@ async def _run_handshake_worker(
         return
     except (FramingError, OSError) as e:
         # A bad length prefix, a reset or an early close on this connection.
-        log.info("handshake connection failed (%s)", type(e).__name__)
+        log.info("handshake transport error (%s)", type(e).__name__)
+        # Never str(e): asyncio's OSError text can carry addresses. The class
+        # name and the OS error text are enough.
+        detail = type(e).__name__
+        if isinstance(e, OSError) and e.errno:
+            detail = f"{detail}: {os.strerror(e.errno)}"
+        log.debug("handshake transport error detail: %s", detail)
         return
 
     if not winner.done():
@@ -236,8 +249,9 @@ def _promote_winner_inbox(
 ) -> None:
     """Swap the winner's inbox for a wider queue holding the same frames.
 
-    Called from the winning worker's done-callback, which runs before the
-    accept wakes to re-inject. The demux may route one last frame into the
+    Called from the winning worker's done-callback, which normally runs
+    before the accept re-injects. If not, the re-inject drains the old
+    queue, so nothing is lost. The demux may route one last frame into the
     old queue first (it stops once it sees the winner); it is copied over
     with the rest.
     """
@@ -348,13 +362,14 @@ async def _demux_loop(
         # still run, exactly once.
         def _end_attempt(_task: asyncio.Task[None], a: tuple[str, int] = addr) -> None:
             semaphore.release()
-            limiter.finish(a[0])
             # Evict so failing sources cannot grow ``inboxes``. The winner's
             # inbox stays, widened, for the residual re-injection.
             if not _is_winner_addr(winner, a):
                 inboxes.pop(a, None)
             else:
                 _promote_winner_inbox(inboxes, a)
+            # Last, so an error in ``finish`` cannot leave a dead inbox.
+            limiter.finish(a[0])
 
         task = asyncio.ensure_future(
             _run_handshake_worker(
@@ -532,7 +547,7 @@ async def _tcp_admit_loop(
             conn.close()
             return
         if semaphore.locked():
-            log.debug("handshake pool saturated — closing a new TCP connection")
+            _tcp_full_log.log("handshake pool saturated — closing a new TCP connection")
             conn.close()
             continue
         # TCP gives each open connection its own peer address; this check
@@ -561,10 +576,11 @@ async def _tcp_admit_loop(
             p: tuple[str, int] = peer,
         ) -> None:
             semaphore.release()
-            limiter.finish(p[0])
             if not _is_winner_addr(winner, p):
                 open_conns.pop(p, None)
                 c.close()
+            # Last, so an error in ``finish`` cannot leave a connection open.
+            limiter.finish(p[0])
 
         task = asyncio.ensure_future(
             _run_handshake_worker(

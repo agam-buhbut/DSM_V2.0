@@ -42,6 +42,7 @@ from cryptography.x509 import Certificate as X509Certificate
 from cryptography.x509 import ObjectIdentifier
 
 from dsm.core import netaudit
+from dsm.core.log import RepeatLog
 from dsm.crypto.attest import (
     AttestError,
     PeerRole,
@@ -58,6 +59,10 @@ if TYPE_CHECKING:
     import tuncore
 
 log = logging.getLogger(__name__)
+
+# One for the whole module, so the count spans attempts: a peer that keeps
+# resending the same message does so across retries too.
+_skip_log = RepeatLog(log, logging.DEBUG)
 
 HANDSHAKE_TIMEOUT = 5.0
 MAX_RETRIES = 3
@@ -589,7 +594,7 @@ async def _recv_one_skipping(
         frame, addr = await _recv_one(transport, remaining)
         if not skip(frame):
             return frame, addr
-        log.debug("handshake: skipped a copy of an earlier handshake message")
+        _skip_log.log("handshake: skipped a copy of an earlier handshake message")
 
 
 async def _recv_with_retry(
