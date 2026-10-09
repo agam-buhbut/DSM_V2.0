@@ -27,7 +27,9 @@ Companion files in this directory:
   UNCHANGED by the TPM backend: the CSR and leaf cert have identical
   structure (same P-256 SPKI algorithm, same critical noiseStaticBinding
   extension) whether the key is soft or TPM-resident.
-- `deploy/dsm.service` — systemd unit shipped with the repo.
+- `deploy/dsm.service` — the server's systemd unit.
+- `deploy/dsm-client.service` — the client's systemd unit (§3f). Never put
+  `dsm.service` on a client.
 - `deploy/dsm-blocklist-update.sh`, `.service`, `.timer` — the daily DNS
   block list download for the server (§7h).
 
@@ -796,6 +798,9 @@ sudo python3 -m dsm --mode server \
 
 (ii) systemd LoadCredential (preferred for production):
 
+This is the server's unit. A client uses `deploy/dsm-client.service`
+instead (§3f): `dsm.service` runs DSM as a server.
+
 The shipped deploy/dsm.service already does this:
 
 ```
@@ -856,7 +861,18 @@ $ sudo python3 -m dsm --config /opt/mtun/config.toml \
       enroll --import /tmp/dsm-cert-client.pem
 ```
 
-Stash passphrase as in 3e.
+Stash the passphrase as in 3e (i) or (ii). For (ii) a client uses its own
+unit, never `deploy/dsm.service` (that one runs DSM as a server):
+
+```sh
+$ sudo cp deploy/dsm-client.service /etc/systemd/system/dsm-client.service
+$ sudo systemctl daemon-reload
+$ sudo systemctl enable --now dsm-client
+```
+
+`sudo dsm init client --install-unit` and `install.sh --systemd --client`
+install the same unit. Unlike the server's, the client unit takes the kill
+switch down only after a stop you ask for (`systemctl stop`); see §7i.
 
 Record the client's CN — you need it for §4.
 
@@ -879,8 +895,10 @@ $ echo 'dsm-XXXXXXXX-client' | \
 ```
 
 Restart the server after editing — the allowlist is read once at startup.
-Live SIGHUP reload is on the Phase-2 punch list. To REVOKE: remove the
-CN from the file, restart, and optionally issue a CRL update (§7e).
+Connected clients keep their kill switch up during the restart and connect
+again by themselves. Live SIGHUP reload is on the Phase-2 punch list. To
+REVOKE: remove the CN from the file, restart, and optionally issue a CRL
+update (§7e).
 
 ## 5. Run Both Sides
 
@@ -896,6 +914,8 @@ $ sudo python3 -m dsm --mode server \
 Client:
 
 ```sh
+$ sudo systemctl start dsm-client            # if you installed the client unit (§3f)
+# or
 $ sudo python3 -m dsm --mode client \
       --passphrase-env-file /etc/dsm/passphrase
 ```
@@ -913,6 +933,10 @@ Expected client log lines (log_level = "info"), in order, within ~5 s:
                                                  path actually needs it
                                                  (typical on cellular)
 ```
+
+If the server cannot be reached, the client does not exit. It keeps all
+traffic blocked, logs `no tunnel: all traffic is blocked until DSM connects
+again; ...` and keeps trying (§7i).
 
 Expected server log lines:
 
@@ -944,9 +968,11 @@ $ sudo nft list tables | grep '^table inet dsm_'
 # Server-side, expect:
 #   table inet dsm_server_ratelimit  (per-source-IP handshake limiter)
 #   table inet dsm_server_nat        (MASQUERADE for decrypted client traffic)
-# Client-side, expect:
+# Client-side, while the tunnel is up, expect:
 #   table inet dsm_killswitch        (default-drop output/input + ICMP rate-limit)
 #   table inet dsm_dns_leak          (DNS/DoT/DoH/mDNS/LLMNR blocked off-tunnel)
+# Client-side, while it connects or reconnects, expect only:
+#   table inet dsm_killswitch_pre    (only loopback, DHCP and the server)
 ```
 
 DNS goes through the tunnel and resolves on the server via DoH:
@@ -973,19 +999,23 @@ $ sysctl net.ipv6.conf.all.disable_ipv6      # expect 1
 $ cat /run/dsm/ipv6_state.json               # per-iface snapshot
 ```
 
-Graceful shutdown (Ctrl-C or `systemctl stop`):
+Graceful shutdown of the client (Ctrl-C, or `sudo systemctl stop dsm-client`):
 
 ```sh
-# Within ~1 second, the peer logs:
-#   client side: ... dsm.client: shutting down
-#   server side: ... dsm.server: server shutting down
-# SESSION_CLOSE is received silently (it sets the shutdown event);
-# the visible log line comes from the teardown path that follows.
+# Within ~1 second the server logs: ... dsm.server: server shutting down
+# (SESSION_CLOSE is received silently; the visible line comes from the
+# teardown that follows). On the client:
 $ ip link show mtun0                           # "Device does not exist"
 $ sudo nft list tables | grep '^table inet dsm_'   # no output
 $ cat /etc/resolv.conf | head -2               # restored to pre-VPN
 $ sysctl net.ipv6.conf.all.disable_ipv6        # 0 (restored)
 ```
+
+Stopping the server is not a stop of the client. The client logs
+`dsm.client: shutting down` for the session, then `no tunnel: all traffic
+is blocked until DSM connects again; ...`, keeps `table inet
+dsm_killswitch_pre` up and connects again by itself when the server is
+back (§7i).
 
 ## 7. Common Operator Tasks
 
@@ -1203,6 +1233,72 @@ through the tunnel skips the blocklist. DSM answers "no such name" for
 encrypted DNS, but a Firefox set to always use it, and other apps, still
 skip the list. Pi-hole has the same limit.
 
+### 7i. Client: when the tunnel is down
+
+The client's kill switch is up whenever DSM runs, also while there is no
+tunnel. It comes down only when you stop DSM.
+
+- **The tunnel drops** (no packets from the server for 60 s, the server
+  restarts or closes the session, a TCP reset, a key change that gives up,
+  a handshake that fails). The client goes back to the start-up kill
+  switch, `table inet dsm_killswitch_pre`, in one nft step. It lets
+  through only loopback, DHCP and the server's IP and port. Then it
+  connects again by itself: after 1 s, then 2, 4, 8, 16 and 30 s, then
+  every 30 s, with no limit (plus the time each try takes). It logs this
+  once per outage, and at most once a minute:
+
+  ```
+  no tunnel: all traffic is blocked until DSM connects again; it keeps trying. To get internet back without the VPN, stop DSM: Ctrl-C, or `sudo systemctl stop dsm-client`. If DSM is not running, run `sudo dsm cleanup`.
+  ```
+
+- **Getting internet back without the VPN:** stop DSM. Ctrl-C if you
+  started it by hand, `sudo systemctl stop dsm-client` under systemd. Both
+  take every DSM table down. If DSM is not running but its tables are
+  still there (after a crash or `kill -9`, or a `systemctl stop` while
+  DSM was waiting to restart after a crash or a signal sent straight to
+  it), run `sudo dsm cleanup`.
+- **Captive portals** (hotel, airport or train Wi-Fi with a login page):
+  the login page cannot load while DSM runs. Stop DSM, log in, start DSM.
+- **DSM crashes** (a Python error, exit 1): the kill switch stays up on
+  purpose, and the log says so. The next start replaces the old tables in
+  the same nft step, so the host is never open in between. Under
+  `dsm-client.service`, systemd starts DSM again after 5 s. If it keeps
+  failing, systemd stops trying after 5 starts in 10 minutes and the block
+  stays: read `journalctl -u dsm-client`, then fix the problem or run
+  `sudo dsm cleanup`.
+- **Setup errors at the first start** (a wrong passphrase, keys or cert
+  that do not match, a UDP `listen_port` in use, a read-only
+  `/etc/resolv.conf`): DSM removes the kill switch and exits 1, as before:
+  you are there, and nothing was protected yet. The same errors on a
+  later reconnect keep the block, and DSM tries again.
+- **Server cert or CN errors** (`server CN check failed`, `server cert
+  auth failed`, `server cert revoked`) keep the block too: someone on the
+  network can send them. If your config is wrong, stop DSM, fix it, start
+  it again.
+- **A DDNS server name:** DSM looks the name up once, at start, and keeps
+  that address while it reconnects; no lookup goes out through the block.
+  If the server's address changes during an outage, the client logs
+  `server IP may have changed ...` after 5 failed tries: stop DSM, then
+  start it. Once a handshake with a looked-up address works, DSM saves
+  the name and that address in `/run/dsm/server-endpoint.json` (root only;
+  gone at reboot; `dsm cleanup` leaves it). A run whose handshake never
+  works leaves the file as it was. If a later start cannot look the name
+  up, for example because a kill switch left by a crash blocks the lookup,
+  DSM uses the saved address and logs `could not look up the server name;
+  using the last address it had`. A lookup that works always wins, and
+  its address replaces the saved one once a handshake with it works. With
+  no saved address for that name, DSM exits with `could not resolve
+  server endpoint`: run `sudo dsm cleanup`, then start DSM.
+- **`systemctl restart dsm-client`** keeps the kill switch up: the old run
+  leaves the start-up kill switch in place and the new start replaces it
+  in one nft step, so the host is never open. The same goes for a signal
+  sent straight to DSM (`kill`, `systemctl kill`): systemd starts DSM
+  again and the block stays. A restart can also keep the old server
+  address (the block can stop the name lookup, and then DSM uses the saved
+  one): after the server's address changed, stop DSM and start it
+  instead. Only `sudo systemctl stop dsm-client`, Ctrl-C on a run by hand,
+  or `sudo dsm cleanup` take the kill switch down.
+
 ## 8. Single-Host Loopback Smoke Test
 
 Bring a client/server pair up on ONE Linux host (or one host + one VM)
@@ -1297,10 +1393,18 @@ expected output AND graceful shutdown leaves NO residue.
 
 ```sh
 $ sudo pkill -9 -f 'dsm --mode server'
-# On the client, watch the log for ~60 s. The client should detect
-# a dead peer after DEAD_PEER_TIMEOUT (60 s) and tear down the
-# tunnel automatically.
+# On the client, watch the log. After about 60-65 s (DEAD_PEER_TIMEOUT
+# plus one 5 s check) the client logs "dead peer", then
+# "no tunnel: all traffic is blocked until DSM connects again; ...".
+$ sudo nft list tables | grep '^table inet dsm_'
+# expect exactly: table inet dsm_killswitch_pre
+$ curl -m 5 https://example.com || echo "PASS-blocked"
+# Start the server again: the client connects again by itself within
+# about 30 s and logs "tunnel established".
 ```
+
+PASS: the kill switch never comes down: traffic is blocked while the
+server is gone and flows again after the reconnect.
 
 8h.2 — Client crash
 
@@ -1308,12 +1412,15 @@ $ sudo pkill -9 -f 'dsm --mode server'
 $ sudo pkill -9 -f 'dsm --mode client'
 # Expected host state on the client side after crash:
 #   - mtun0 is gone (kernel reaps the TUN when the owning fd closes)
-#   - nftables rules ARE STILL PRESENT (no crash-recovery yet)
+#   - the kill switch tables are STILL PRESENT, on purpose: all traffic
+#     stays blocked (fail closed). Starting DSM again replaces them.
 #   - resolv.conf still points at 10.8.0.1; the pre-VPN contents
 #     were captured only in process memory and are lost
 #   - /run/dsm/ipv6_state.json remains (next clean dsm start restores)
-# Manual cleanup:
-$ for t in dsm_killswitch dsm_dns_leak dsm_server_ratelimit dsm_server_nat; do
+# To get the host back without DSM:
+$ sudo dsm cleanup
+# Or by hand:
+$ for t in dsm_killswitch_pre dsm_killswitch dsm_dns_leak dsm_server_ratelimit dsm_server_nat; do
       sudo nft delete table inet "$t" 2>/dev/null
   done
 $ sudo $EDITOR /etc/resolv.conf            # restore pre-VPN nameserver by hand
@@ -1657,8 +1764,9 @@ With a DDNS hostname the client makes ONE cleartext DNS A-lookup at startup
 reveals the *hostname* to the local network. It is NOT a trust anchor: the
 server is still authenticated by Noise + the cert/CN pin, so a spoofed or
 poisoned DNS answer makes the handshake fail CLOSED rather than redirecting
-you to an attacker. Set `server_ip` to a literal IPv4 if you want to avoid
-even that single lookup.
+you to an attacker. While the tunnel is down the client keeps that first
+address and does not look the name up again (§7i). Set `server_ip` to a
+literal IPv4 if you want to avoid even that single lookup.
 
 ## 11. Debugging by Symptom
 
@@ -1738,8 +1846,9 @@ prints "ok".
   likely with default pmtu_discover=false).
 - On cellular: the link was down when the handshake started. Each
   retry adds 5 s of timeout + (1, 2) s of backoff (3 attempts; the
-  third raises without sleeping) — total budget ~18 s. A longer outage
-  exceeds the budget; restart the client once the link is back up.
+  third raises without sleeping) — about 18 s per try. After a failed
+  try the client keeps the kill switch up and tries again by itself
+  (1 s, doubling to 30 s, no limit; §7i). You do not need to restart it.
 
 ### Server log shows "handshake rejected (CNNotAllowedError): client CN '...' not in allowlist"
 
@@ -1754,6 +1863,9 @@ presents — compare exactly against the CN the client's `dsm enroll
 The client's expected_server_cn does not match the cert the server
 presents. Either correct the client's config, or roll the server back
 if the CN changed unexpectedly (implies unauthorized re-enrollment).
+
+The client keeps the kill switch up and keeps trying (someone on the
+network could send a wrong cert). Stop it, fix the config, start it again.
 
 ### "server cert auth failed: ..." or "client cert auth failed: ..."
 
@@ -1838,7 +1950,9 @@ On a clean exit the client puts `src_valid_mark` back to the value it found
 at start. It also saves the old value in `/run/dsm/src_valid_mark.orig`.
 If the client crashes, run `sudo dsm cleanup`: it puts the saved value back
 and then deletes the file. (The server's systemd unit runs `dsm cleanup`
-on every stop; a client you start by hand does not, so run it yourself.)
+on every stop. On a client nothing runs it after a crash, by hand or under
+dsm-client.service, because it would take the kill switch down; run it
+yourself when you want the host back without DSM.)
 If a file from a crash is still there when the client starts, the client
 keeps it and logs a warning. Run `sudo dsm cleanup` after that run to get
 the value from before the crash back.
@@ -1867,8 +1981,8 @@ permission to write it).
 REKEY_ACK never reached the initiator. Check the peer log for
 "rekey completed as responder" — if missing, the server never
 processed the INIT (network drop). If present, the ACK was dropped in
-the reverse direction. Session tears down on purpose; restart to
-re-handshake.
+the reverse direction. The session ends on purpose; a client keeps the
+kill switch up and makes a new handshake by itself (§7i).
 
 ### "DNS resolve failed for qname-tag=<hex>"
 
@@ -2011,10 +2125,17 @@ $ sudo sysctl -w net.ipv6.conf.all.disable_ipv6=0
 
 ### nftables rules stuck after a crashed client
 
-No crash-recovery is shipped; clean up manually:
+That is on purpose: after a crash the kill switch stays up (fail closed,
+§7i). Start DSM again (it replaces the old tables), or take them down:
 
 ```sh
-$ for t in dsm_killswitch dsm_dns_leak dsm_server_ratelimit dsm_server_nat; do
+$ sudo dsm cleanup
+```
+
+By hand:
+
+```sh
+$ for t in dsm_killswitch_pre dsm_killswitch dsm_dns_leak dsm_server_ratelimit dsm_server_nat; do
       sudo nft delete table inet "$t" 2>/dev/null
   done
 ```
@@ -2052,11 +2173,12 @@ $ sudo /usr/bin/python3 -m pip install --break-system-packages \
 ## 12. Uninstall
 
 ```sh
-$ sudo systemctl disable --now dsm
-$ sudo systemctl disable --now dsm-blocklist-update.timer
+$ sudo systemctl disable --now dsm                          # server
+$ sudo systemctl disable --now dsm-blocklist-update.timer   # server
+$ sudo systemctl disable --now dsm-client                   # client
 $ sudo rm -rf /opt/mtun /etc/dsm /run/dsm
 $ sudo /usr/bin/python3 -m pip uninstall --break-system-packages dsm   # if pip-installed
-$ sudo rm /etc/systemd/system/dsm.service
+$ sudo rm -f /etc/systemd/system/dsm.service /etc/systemd/system/dsm-client.service
 $ sudo rm /etc/systemd/system/dsm-blocklist-update.service \
       /etc/systemd/system/dsm-blocklist-update.timer \
       /usr/local/sbin/dsm-blocklist-update
@@ -2066,7 +2188,7 @@ $ sudo systemctl daemon-reload
 Paranoid firewall / TUN reset (in case dsm wasn't shut down cleanly):
 
 ```sh
-$ for t in dsm_killswitch dsm_dns_leak dsm_server_ratelimit dsm_server_nat; do
+$ for t in dsm_killswitch_pre dsm_killswitch dsm_dns_leak dsm_server_ratelimit dsm_server_nat; do
       sudo nft delete table inet "$t" 2>/dev/null
   done
 $ sudo ip link delete mtun0 2>/dev/null
@@ -2091,12 +2213,14 @@ $ for iface in $(ls /sys/class/net); do
 /opt/mtun/allowed_cns.txt             # server only: one CN per line (0o600)
 /etc/dsm/passphrase                   # non-interactive passphrase source (0o600)
 /run/dsm/ipv6_state.json              # per-iface IPv6 state snapshot
+/run/dsm/server-endpoint.json         # client: last address of server_ip's name
 /opt/mtun/dns/sources.txt             # server: DNS block list URLs (0o600)
 /opt/mtun/dns/block/*.txt             # server: DNS block lists (0o600)
 /opt/mtun/dns/allow.txt               # server: names never blocked (0o600)
 /usr/local/sbin/dsm-blocklist-update  # server: block list download script
 /etc/systemd/system/dsm-blocklist-update.{service,timer}  # daily download
-/etc/systemd/system/dsm.service       # (optional) systemd unit
+/etc/systemd/system/dsm.service       # (optional) server unit
+/etc/systemd/system/dsm-client.service  # (optional) client unit
 ```
 
 ## 14. CLI Reference
@@ -2109,6 +2233,10 @@ python3 -m dsm --debug-net                       Emit JSON audit events on
 python3 -m dsm --passphrase-fd N                 Read passphrase from FD N
 python3 -m dsm --passphrase-env-file PATH        Read passphrase from a
                                                  0600-mode file at PATH
+python3 -m dsm --stop-keeps-block                Client: Ctrl-C or SIGTERM
+                                                 leaves the start-up kill
+                                                 switch up (dsm-client.service
+                                                 passes it)
 
 python3 -m dsm enroll --csr-out PATH             Provision identity +
                                                  attest key, write a CSR
@@ -2121,4 +2249,8 @@ python3 -m dsm enroll --role {client,server}     Set the role suffix when
 
 python3 -m dsm show-pubkey                       Print the local identity's
                                                  Noise static pubkey (hex)
+
+python3 -m dsm cleanup                           Remove every DSM table, rule
+                                                 and setting (gets the host
+                                                 back after a crash)
 ```

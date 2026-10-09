@@ -27,6 +27,8 @@ server_ip = "203.0.113.1"                    # Server endpoint: literal IPv4 OR 
 #     the handshake CLOSED rather than redirecting you to an attacker. IPv6
 #     literals are unsupported (AF_INET-only transport) — use an A-record
 #     hostname instead. See "Running over the internet" in deploy/GUIDE.md.
+#     While the client reconnects it keeps that first address and never
+#     looks the name up again; if the address changes, stop and start DSM.
 server_port = 51820                          # Server's service port
 listen_port = 0                              # client: 0 = ephemeral; server: real bind port
 

@@ -66,6 +66,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   blocklist (below).
 
 ### Security
+- **Behavior change:** the client no longer fails open. Before, every end
+  of a session the user did not ask for (a failed handshake, 60 s without
+  packets from the server, the server closing the session, a TCP reset, a
+  key change that gave up, an error in a data loop) removed the kill
+  switch and exited, so all traffic went out in the clear; someone on the
+  network could cause that by dropping packets for a minute. Now the
+  client swaps back to the start-up kill switch in one nft step and
+  reconnects by itself (1 s, doubling to 30 s, no limit). The kill switch
+  comes down only on Ctrl-C (a run by hand), `systemctl stop` or
+  `sudo dsm cleanup`. A crash leaves it up, and the next start replaces it
+  in one step. Setup errors at the first start (passphrase, keys, cert, a
+  UDP port in use, a read-only resolv.conf) still remove it and exit 1.
+  Server cert and CN errors in the handshake now keep the block and retry,
+  because someone on the network can send them. Once a handshake with it
+  works, the address found for a server name is saved in
+  `/run/dsm/server-endpoint.json`; a later start whose lookup is blocked
+  (for example by a kill switch a crash left up) uses it instead of
+  exiting.
 - A malformed or truncated TCP frame from an unauthenticated peer (oversized
   length prefix, zero-length frame, or EOF mid-frame) no longer crashes the
   server: the accept loop logs it and keeps serving, and the attempt's
@@ -157,6 +175,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with the usual one-line config error naming the key, not a traceback.
 
 ### Added
+- `deploy/dsm-client.service`, a systemd unit for clients (`--mode client`,
+  `Restart=always`). It removes the kill switch only for `systemctl stop`;
+  `systemctl restart dsm-client` and a signal sent straight to DSM keep it
+  up (new flag `--stop-keeps-block`, which the unit passes).
+  `install.sh --systemd --client` and `dsm init client --install-unit`
+  install it; before, every install path put the server unit on a client,
+  where it could not start.
 - Server DNS blocklist, on by default (`dns_blocklist`). The server answers
   "no such name" (NXDOMAIN, which devices remember for 5 minutes) for every
   name on the lists in `/opt/mtun/dns/block/*.txt` and every name under

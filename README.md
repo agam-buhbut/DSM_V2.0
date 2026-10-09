@@ -25,8 +25,10 @@ means your offline CA signs the device's certificate request.
 ```sh
 # 1. Install (downloads + minisign-verifies the wheel, apt-installs the TPM
 #    runtime libs, creates /opt/dsm/venv, symlinks `dsm`). Add `--systemd`
-#    to also install the dsm.service unit and the daily DNS block list
-#    download, and to fetch the default block list once.
+#    to also install the server unit (dsm.service) and the daily DNS block
+#    list download, and to fetch the default block list once. On a client,
+#    add `--systemd --client` instead: that installs the client unit
+#    (dsm-client.service) and no block list.
 curl -fsSL https://github.com/agam-buhbut/DSM_V2.0/releases/download/v0.1.0/install.sh | sudo sh -s -- --systemd
 
 # 2. Provision config + CA-pin + enroll (orchestrates config + TPM preflight +
@@ -40,8 +42,10 @@ sudo dsm init server \
 #   CSR to the CA, sign it, then resume with the returned cert:
 sudo dsm init server --resume --signed-cert <signed.crt>
 
-# 3. Start it.
+# 3. Start it. Server:
 sudo systemctl enable --now dsm
+#    Client (never the server unit: it runs DSM as a server):
+sudo systemctl enable --now dsm-client
 ```
 
 **Trying DSM without a TPM:** releases will also carry a clearly named
@@ -146,6 +150,11 @@ SESSION_CLOSE packet.
   within 110 s, it switches to the new keys anyway.
 - DSM does not resend lost data packets. It relies on the protocol inside
   the tunnel, or on TCP.
+- When a client session ends without you stopping DSM (no packets from the
+  server for 60 s, the server closes the session, a TCP reset, a key change
+  that gives up, or a handshake that fails), the client keeps its kill
+  switch up and connects again by itself: it waits 1 s, then twice as long
+  each time up to 30 s, with no limit on tries. See Leak Prevention.
 
 ### Fragmentation
 
@@ -461,7 +470,16 @@ defaults, and each end shapes only what it sends.
 ### Leak Prevention
 
 - An nftables kill switch blocks all traffic that does not go through the
-  VPN.
+  VPN. On the client it stays up while the tunnel is down, too: when a
+  session drops, the client goes back to the start-up kill switch (it lets
+  through only the path to the server) in one step and reconnects.
+  `sudo systemctl restart dsm-client` keeps it up as well. It comes down
+  only when you stop DSM: Ctrl-C on a run by hand,
+  `sudo systemctl stop dsm-client`, or `sudo dsm cleanup`. If DSM stops on
+  an error (a crash), the kill switch stays up; the next start replaces
+  it. While the tunnel is down you have no internet, and a hotel or
+  airport Wi-Fi login page cannot load: stop DSM, log in, then start it
+  again.
 - mDNS (5353) and LLMNR (5355) are blocked, so they cannot be used to map
   the local network.
 - DNS (53/udp+tcp) and DoT/DoQ (853; DNS over TLS or QUIC) are always
@@ -619,8 +637,10 @@ The config file is TOML, at `/opt/mtun/config.toml`.
 - server_ip: a literal IPv4 address, or a DNS hostname (for example a DDNS
   name for a home server). The client looks the hostname up once at
   startup, before the kill switch is installed. That one lookup is sent in
-  the clear; use a literal address to avoid it. IPv6 is rejected (the
-  transport is AF_INET-only, that is, IPv4 only).
+  the clear; use a literal address to avoid it. While the client
+  reconnects it keeps that first address and does not look the name up
+  again; if the server's address changes, stop and start DSM. IPv6 is
+  rejected (the transport is AF_INET-only, that is, IPv4 only).
 - server_port, listen_port
 - key_file: path to the Argon2id-wrapped X25519 Noise static key
 - cert_file: path to the device's CA-signed leaf certificate (PEM or DER)
