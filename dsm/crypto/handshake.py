@@ -36,6 +36,7 @@ import asyncio
 import logging
 import os
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, TypeVar
 
 from cryptography.x509 import Certificate as X509Certificate
@@ -121,6 +122,24 @@ class CertRevokedError(CertAuthError):
     """Peer's cert serial appears in the CRL."""
 
 
+class ClientRefusedError(HandshakeError):
+    """The server's rules refused a client that passed every check.
+
+    Raised by an ``admit_client`` hook (see :func:`server_handshake`), for
+    example while another client holds the server's one session.
+    """
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedClient:
+    """A client that passed every handshake check: certificate chain, attest
+    signature, CN allowlist and CRL."""
+
+    cn: str
+    # 32 bytes. The client's certificate binds its TPM attest key to it.
+    noise_static: bytes
+
+
 def _pad_to_frame(data: bytes, expected_size: int) -> bytes:
     """Pad a handshake ciphertext to HANDSHAKE_FRAME_SIZE with CSPRNG bytes."""
     if len(data) != expected_size:
@@ -178,6 +197,45 @@ def _translate_noise_errors(what: str, call: Callable[[], _NoiseT]) -> _NoiseT:
         return call()
     except RuntimeError as e:
         raise HandshakeError(f"{what}: {e}") from e
+
+
+async def _attest_payload_in_thread(
+    *,
+    attest_key: tuncore.AttestKey,
+    cert_der: bytes,
+    handshake_hash: bytes,
+    our_static_pub: bytes,
+    our_role: PeerRole,
+) -> bytes:
+    """Run ``build_attest_payload`` in a worker thread, off the event loop.
+
+    Its signature took about 0.2 s on the server box's TPM, and the server
+    can be serving a live session meanwhile; ``AttestKey.sign`` releases the
+    GIL, so the session's packets keep moving. A cancelled handshake still
+    waits for the thread to finish: the server zeroizes the attest key when
+    it stops, and that must not happen while a signature is using it.
+    """
+    work = asyncio.ensure_future(
+        asyncio.to_thread(
+            build_attest_payload,
+            attest_key=attest_key,
+            cert_der=cert_der,
+            handshake_hash=handshake_hash,
+            our_static_pub=our_static_pub,
+            our_role=our_role,
+        )
+    )
+    try:
+        return await asyncio.shield(work)
+    except asyncio.CancelledError:
+        # The thread cannot be stopped; wait it out (one signature at most),
+        # then let the cancel go on. A second cancel does not cut the wait.
+        while not work.done():
+            try:
+                await asyncio.wait({work})
+            except asyncio.CancelledError:
+                continue
+        raise
 
 
 async def client_handshake(
@@ -388,8 +446,16 @@ async def server_handshake(
     client_addr: tuple[str, int] | None = None,
     rotation_packets: int | None = None,
     rotation_seconds: int | None = None,
+    admit_client: Callable[[VerifiedClient], None] | None = None,
 ) -> tuple[tuncore.SessionKeyManager, bytes]:
     """Perform Noise XX handshake as responder (server).
+
+    ``admit_client`` (optional) is the caller's last say on a client that
+    passed every check (certificate chain, attest signature, allowlist,
+    CRL). It runs once, after the client's bootstrap frame is read and
+    checked, and before the bootstrap reply, the last handshake frame, is
+    made and sent. It may raise :class:`ClientRefusedError`; then no reply
+    goes out and no session keys are made. Without it nothing changes.
 
     Returns:
         (SessionKeyManager, client_static_pubkey)
@@ -398,6 +464,7 @@ async def server_handshake(
         HandshakeError on transport/protocol failure.
         CertAuthError / CNNotAllowedError / CertRevokedError on cert
             policy failure.
+        ClientRefusedError when ``admit_client`` refuses the client.
     """
     import tuncore
 
@@ -427,7 +494,8 @@ async def server_handshake(
 
     # Message 2: <- e, ee, s, es [+ server attest payload]
     binding_hash_for_msg2 = bytes(responder.get_handshake_hash())
-    our_attest_payload = build_attest_payload(
+    # Off the event loop: the server may be serving a live session (step R).
+    our_attest_payload = await _attest_payload_in_thread(
         attest_key=attest_key,
         cert_der=cert_der,
         handshake_hash=binding_hash_for_msg2,
@@ -507,6 +575,13 @@ async def server_handshake(
     )
     if len(client_public) != 32:
         raise HandshakeError("invalid bootstrap ephemeral from client")
+
+    # The caller's last say, after every check passed and before the last
+    # frame: once the reply is out, the client thinks it is connected.
+    if admit_client is not None:
+        admit_client(
+            VerifiedClient(cn=client_cert.subject_cn, noise_static=client_static)
+        )
 
     server_ephemeral = tuncore.BootstrapEphemeral.generate()
     bootstrap_resp_ct = bytes(
