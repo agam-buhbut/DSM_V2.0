@@ -179,8 +179,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - `deploy/dsm-client.service`, a systemd unit for clients (`--mode client`,
   `Restart=always`). It removes the kill switch only for `systemctl stop`;
-  `systemctl restart dsm-client` and a signal sent straight to DSM keep it
-  up (new flag `--stop-keeps-block`, which the unit passes).
+  `systemctl restart dsm-client`, a signal sent straight to DSM and a
+  shutdown or reboot keep it up (new flag `--stop-keeps-block`, which the
+  unit passes).
   `install.sh --systemd --client` and `dsm init client --install-unit`
   install it; before, every install path put the server unit on a client,
   where it could not start.

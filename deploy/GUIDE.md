@@ -1305,14 +1305,16 @@ leaves it up; run `sudo dsm cleanup`.
   leaves the start-up kill switch in place and the new start replaces it
   in one nft step, so the host is never open. The same goes for a signal
   sent straight to DSM (`kill`, `systemctl kill`): systemd starts DSM
-  again and the block stays. A restart can also keep the old server
-  address (the block can stop the name lookup, and then DSM uses the saved
-  one): after the server's address changed, stop DSM and start it
-  instead. Apart from `sudo dsm cleanup`, only `sudo systemctl stop
-  dsm-client` and Ctrl-C on a run by hand take the kill switch down, with
-  two exceptions: a setup error at the first try also removes it (DSM exits
-  1), and a `systemctl stop` sent while DSM waits to restart (after a crash
-  or a signal sent straight to it) leaves it up; run `sudo dsm cleanup`.
+  again and the block stays. A shutdown or reboot keeps it up too, so apps
+  that still run cannot send in the clear; the tables are gone after boot.
+  A restart can also keep the old server address (the block can stop the
+  name lookup, and then DSM uses the saved one): after the server's address
+  changed, stop DSM and start it instead. Apart from `sudo dsm cleanup`,
+  only `sudo systemctl stop dsm-client` and Ctrl-C on a run by hand take
+  the kill switch down, with two exceptions: a setup error at the first try
+  also removes it (DSM exits 1), and a `systemctl stop` sent while DSM
+  waits to restart (after a crash or a signal sent straight to it) leaves
+  it up; run `sudo dsm cleanup`.
 
 ## 8. Single-Host Loopback Smoke Test
 

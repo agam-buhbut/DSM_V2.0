@@ -38,6 +38,7 @@ _STOP_POST = (
     "queued=$$(systemctl list-jobs --no-legend --plain dsm-client.service "
     '2>/dev/null) || queued=""; '
     'case "$$queued" in *" stop "*) '
+    '[ "$$(systemctl is-system-running 2>/dev/null)" = stopping ] || '
     "for t in dsm_killswitch_pre dsm_killswitch dsm_dns_leak; do "
     'nft delete table inet "$$t" 2>/dev/null; done ;; esac; fi; '
     "exit 0'"
@@ -142,13 +143,18 @@ def test_the_stop_step_line_checks_for_a_stop_job() -> None:
 
 
 def _stop_step(
-    tmp_path: Path, service_result: str | None, jobs: str, systemctl_rc: int | None
+    tmp_path: Path,
+    service_result: str | None,
+    jobs: str,
+    systemctl_rc: int | None,
+    state: str = "running",
 ) -> list[str]:
     """Run the unit's ExecStopPost script with fake systemctl and nft.
 
     ``service_result`` None leaves SERVICE_RESULT unset; ``systemctl_rc`` None
-    leaves systemctl off PATH (the shell then fails with 127). Returns the nft
-    calls it made.
+    leaves systemctl off PATH (the shell then fails with 127). ``state`` is
+    what ``systemctl is-system-running`` prints. Returns the nft calls it
+    made.
     """
     head = "ExecStopPost=/bin/sh -c '"
     line = _unit_line("ExecStopPost")
@@ -158,7 +164,12 @@ def _stop_step(
     fakes.mkdir()
     if systemctl_rc is not None:
         (fakes / "systemctl").write_text(
-            '#!/bin/sh\nprintf "%s\\n" "$FAKE_JOBS"\nexit "$FAKE_SYSTEMCTL_RC"\n'
+            "#!/bin/sh\n"
+            'case "$1" in\n'
+            '  list-jobs) printf "%s\\n" "$FAKE_JOBS" ;;\n'
+            '  is-system-running) printf "%s\\n" "${FAKE_STATE:-running}" ;;\n'
+            "esac\n"
+            'exit "$FAKE_SYSTEMCTL_RC"\n'
         )
     (fakes / "nft").write_text('#!/bin/sh\necho "$*" >>"$FAKE_NFT_LOG"\n')
     for fake in fakes.iterdir():
@@ -172,6 +183,7 @@ def _stop_step(
             "PATH": str(fakes),
             **({} if service_result is None else {"SERVICE_RESULT": service_result}),
             "FAKE_JOBS": jobs,
+            "FAKE_STATE": state,
             "FAKE_SYSTEMCTL_RC": str(systemctl_rc),
             "FAKE_NFT_LOG": str(nft_log),
         },
@@ -214,3 +226,22 @@ def test_the_stop_step_takes_the_block_down_only_for_a_stop_job(
     deleted: list[str],
 ) -> None:
     assert _stop_step(tmp_path, service_result, jobs, systemctl_rc) == deleted
+
+
+@pytest.mark.parametrize(
+    ("state", "deleted"),
+    [
+        # Shutdown or reboot: the stop job is part of it. Keep the block up
+        # until the host is gone (nft tables do not survive a boot).
+        ("stopping", []),
+        # A `systemctl stop` on a running host takes it down.
+        ("running", _DELETED),
+        # Any other state behaves as before.
+        ("degraded", _DELETED),
+    ],
+)
+def test_the_stop_step_keeps_the_block_while_the_host_shuts_down(
+    tmp_path: Path, state: str, deleted: list[str]
+) -> None:
+    jobs = "42 dsm-client.service stop running"
+    assert _stop_step(tmp_path, "success", jobs, 0, state) == deleted
