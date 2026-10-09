@@ -211,9 +211,10 @@ class Config:
     # `mtu` is already correct.
     auto_mtu: bool = False
     pmtu_check_interval_s: float = 30.0
-    # Server only: handshake attempts the UDP acceptor validates concurrently
-    # (dsm.net.handshake_acceptor), so one stalled bogus msg1 cannot starve a
-    # real client. Bounds the peak NoiseResponder count and CPU.
+    # Server only: handshake attempts the acceptor validates concurrently,
+    # over UDP or TCP (dsm.net.handshake_acceptor), so one stalled bogus
+    # attempt cannot starve a real client. Bounds the peak NoiseResponder
+    # count and CPU.
     max_inflight_handshakes: int = 8
     config_dir: Path = field(default_factory=lambda: Path("/opt/mtun/"))
 

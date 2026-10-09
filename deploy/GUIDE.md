@@ -2041,6 +2041,30 @@ $ sudo systemctl reset-failed dsm
 $ sudo systemctl start dsm
 ```
 
+### Server log: "new handshake refused: ..."
+
+The server limits how many handshakes can start, so one address cannot take
+every handshake slot. The limits are the same for UDP and TCP:
+
+- "that address already has 2 running": one address may have at most 2
+  handshakes going at once.
+- "that address started too many lately": one address may start 3 at once,
+  then 1 every 4 s.
+- "too many new handshakes overall": all addresses together may start 8 at
+  once, then 4 a second.
+
+A real client starts about one handshake every 10-30 s, so it should never
+see these. A few lines while someone scans or floods the port are normal;
+the refused packets get no answer. Devices behind one home router share one
+address: if several of them connect to this server at the same moment, some
+may need their next retry. These lines never show the address, and each
+reason is logged at most once every 10 s, with a count.
+
+With `transport = "tcp"` the server keeps listening while handshakes run,
+so a silent connection no longer holds up other clients. It keeps at most 2
+connections per address and closes each one that has not finished its
+handshake after 12 s.
+
 ### "config: dns_provider_pins has entries that are not in dns_providers: ..."
 
 The names after the colon sit in the `[dns_provider_pins]` table but are not

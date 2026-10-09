@@ -677,9 +677,11 @@ The config file is TOML, at `/opt/mtun/config.toml`.
 - allowed_cns_file: server only; one allowed client subject CN per line. The
   file must have no group or world access bits and must be owned by the
   daemon's uid. Otherwise startup refuses to load it.
-- max_inflight_handshakes: server only; how many handshake attempts the UDP
-  acceptor checks at the same time (default: 8, allowed 1-4096, warns above
-  1024). One stalled attempt cannot block a real client.
+- max_inflight_handshakes: server only; how many handshake attempts the
+  server checks at the same time, over UDP or TCP (default: 8, allowed
+  1-4096, warns above 1024). One stalled attempt cannot block a real client.
+  Each source address may also run at most 2 at once and start 1 every 4 s
+  (3 at once); these limits are fixed, not settings.
 - transport: udp | tcp (default: udp)
 - dns_providers: DoH/DoT URLs (server mode)
 - dns_provider_pins: SPKI SHA-256 pins for each provider (server mode,

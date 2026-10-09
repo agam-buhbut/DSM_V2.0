@@ -87,10 +87,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `/run/dsm/server-endpoint.json`; a later start whose lookup is blocked
   (for example by a kill switch a crash left up) uses it instead of
   exiting.
+- Handshake hardening on the server (no wire change):
+  - A new UDP sender must open with a full 1400-byte handshake frame.
+    Anything else is dropped before it can take a handshake slot.
+  - Failed handshakes no longer pause the server. Before, after 3 failures
+    in a row it stopped reading all handshake packets for about 1.5-6 s
+    for every new sender, so a few junk packets could stall real clients.
+  - One address may run at most 2 handshakes at once and start 3 at once,
+    then 1 every 4 s; all addresses together may start 8 at once, then 4 a
+    second. Refused packets get no answer. The log says why, without the
+    address, at most once per 10 s per reason.
+  - TCP: the server keeps one listener open while handshakes run and checks
+    connections side by side, with the same limits and the same 12 s cutoff
+    per attempt as UDP. Before, one silent connection held the port for up
+    to 30-48 s and every other client was refused.
 - A malformed or truncated TCP frame from an unauthenticated peer (oversized
   length prefix, zero-length frame, or EOF mid-frame) no longer crashes the
-  server: the accept loop logs it and keeps serving, and the attempt's
-  listener is closed so bad frames cannot leak sockets.
+  server: only that connection is closed and the server keeps serving.
 - The kill switch accepts ICMP only on the tunnel interface, so the host no
   longer sends or answers ICMP from its real address on the WAN. The one
   exception, in both the full and the pre-handshake rulesets, is inbound
@@ -113,6 +126,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   packets instead of DSM.
 
 ### Fixed
+- A client that resends its first handshake message, because the server's
+  reply was lost or slow, no longer makes the server drop the attempt. The
+  server skips the copy and goes on waiting for the client's next message.
+- A client whose third handshake message is slow no longer fails when the
+  server sends its second message again: the client skips the copy and
+  goes on waiting for the server's last handshake message.
 - The client no longer loses the server's packets after each key change.
   It moves to a new port then, and the server keeps sending to the old one
   until the new one passes its address check. The old port closed after
