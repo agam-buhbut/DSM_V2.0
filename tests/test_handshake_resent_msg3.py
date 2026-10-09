@@ -67,7 +67,7 @@ def _pki() -> _Pki:
 
 
 async def test_a_resent_msg3_during_the_bootstrap_wait_is_skipped(pki: _Pki) -> None:
-    """(red today) The copy is skipped and the handshake completes."""
+    """The copy is skipped and the handshake completes."""
     client_end, server_end = _link(lambda msg3: msg3)
     client_task, server_task, pending = await _run_pair(pki, client_end, server_end)
     server_task.result()
