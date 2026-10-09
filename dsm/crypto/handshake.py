@@ -79,6 +79,22 @@ HANDSHAKE_FRAME_SIZE = 1400
 # NoiseTransport.encrypt(32) -> 32 + 16 (GCM tag) = 48 bytes.
 BOOTSTRAP_CIPHERTEXT_SIZE = 32 + 16
 
+# Bytes [0:32] of msg1 are the client's Noise ephemeral key. A client that
+# hears no msg2 resends msg1, and the copy can reach the server while it
+# waits for msg3 or for the bootstrap frame. A later handshake message
+# repeats those 32 bytes only by chance (2**-256). Only they are compared,
+# so a resend whose padding differs still matches.
+_MSG1_EPHEMERAL_SIZE = 32
+
+
+def _is_resent_msg1(frame: bytes, msg1: bytes) -> bool:
+    """True if ``frame`` is a copy of ``msg1`` (same size, same ephemeral)."""
+    # The ephemeral key is public, so a plain compare is fine.
+    return (
+        len(frame) == HANDSHAKE_FRAME_SIZE
+        and frame[:_MSG1_EPHEMERAL_SIZE] == msg1[:_MSG1_EPHEMERAL_SIZE]
+    )
+
 
 class HandshakeError(Exception):
     pass
@@ -394,6 +410,9 @@ async def server_handshake(
     _translate_noise_errors("read msg1", lambda: responder.read_message_1(msg1))
     addr = recv_addr or client_addr
 
+    def _resent_msg1(frame: bytes) -> bool:
+        return _is_resent_msg1(frame, msg1)
+
     # Message 2: <- e, ee, s, es [+ server attest payload]
     binding_hash_for_msg2 = bytes(responder.get_handshake_hash())
     our_attest_payload = build_attest_payload(
@@ -407,10 +426,17 @@ async def server_handshake(
     await _send(transport, msg2, addr)
 
     # Message 3: -> s, se [+ client attest payload]
+    # A client that hears nothing for HANDSHAKE_TIMEOUT resends msg1. That
+    # copy is skipped, never read as msg3. It does not trigger a msg2 resend:
+    # the retry below already resends msg2 at about the same moment, and
+    # older clients fail on a second msg2 that reaches them while they wait
+    # for the bootstrap reply (newer ones skip it).
     async def _retransmit_msg2() -> None:
         await _send(transport, msg2, addr)
 
-    msg3, msg3_addr = await _recv_with_retry(transport, retransmit=_retransmit_msg2)
+    msg3, msg3_addr = await _recv_with_retry(
+        transport, retransmit=_retransmit_msg2, skip=_resent_msg1
+    )
     _pin_source(transport, msg3_addr, addr, "msg3")
 
     binding_hash_for_msg3 = bytes(responder.get_handshake_hash())
@@ -446,7 +472,8 @@ async def server_handshake(
 
     noise_transport = responder.into_transport()
 
-    bootstrap_init_frame, bs_addr = await _recv_with_retry(transport)
+    # A copy of msg1 that was slow on the way can still land after msg3.
+    bootstrap_init_frame, bs_addr = await _recv_with_retry(transport, skip=_resent_msg1)
     # Pin source: msg1 + msg3 are already source-pinned to ``addr``; the
     # bootstrap_init must come from the same peer. AEAD blocks content forge,
     # but a UDP-spoofed bootstrap frame would otherwise fail AEAD and abort
@@ -534,20 +561,47 @@ async def _recv_one(
     return bytes(frame), None
 
 
+async def _recv_one_skipping(
+    transport: UDPTransport | TCPTransport,
+    timeout: float,
+    skip: Callable[[bytes], bool] | None,
+) -> tuple[bytes, tuple[str, int] | None]:
+    """Like ``_recv_one``, but drops frames for which ``skip`` returns True.
+
+    A dropped frame does not restart the wait: it still ends ``timeout``
+    seconds after it began. Raises ``TimeoutError`` like ``_recv_one``.
+    """
+    if skip is None:
+        return await _recv_one(transport, timeout)
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while True:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            raise TimeoutError
+        frame, addr = await _recv_one(transport, remaining)
+        if not skip(frame):
+            return frame, addr
+        log.debug("handshake: skipped a copy of an earlier handshake message")
+
+
 async def _recv_with_retry(
     transport: UDPTransport | TCPTransport,
     retransmit: Callable[[], Awaitable[None]] | None = None,
+    skip: Callable[[bytes], bool] | None = None,
 ) -> tuple[bytes, tuple[str, int] | None]:
     """Per-message handshake recv with bounded retries.
 
     ``retransmit`` (optional) resends the last outgoing message between
     retries so the peer gets another chance to respond if our send was
-    lost. After ``MAX_RETRIES`` consecutive ``HANDSHAKE_TIMEOUT`` waits,
-    raises ``HandshakeError`` so callers can surface a typed failure.
+    lost. ``skip`` (optional) picks frames to drop unread, such as a copy
+    of an earlier message; dropping one does not restart the wait. After
+    ``MAX_RETRIES`` consecutive ``HANDSHAKE_TIMEOUT`` waits, raises
+    ``HandshakeError`` so callers can surface a typed failure.
     """
     for attempt in range(MAX_RETRIES):
         try:
-            return await _recv_one(transport, HANDSHAKE_TIMEOUT)
+            return await _recv_one_skipping(transport, HANDSHAKE_TIMEOUT, skip)
         except TimeoutError:
             if attempt == MAX_RETRIES - 1:
                 raise HandshakeError(
