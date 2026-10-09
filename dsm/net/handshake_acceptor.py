@@ -21,6 +21,10 @@ handshake traffic queues on the kernel socket.
   nothing but the socket, so no source can pause routing for the others.
 * Workers run under a semaphore of ``config.max_inflight_handshakes``, each
   with a hard per-attempt deadline.
+* :func:`_accept_until_winner_tcp` does the same for TCP. The caller's
+  :class:`~dsm.net.transport.tcp.TCPListener` queues each accepted
+  connection, and :func:`_tcp_admit_loop` gives it a slot and a worker under
+  the same pool, limits and deadline, or closes it at once.
 
 Handoff: once a winner is chosen the demux stops reading the real socket, so
 the client's first post-handshake datagrams stay queued for the data path.
@@ -40,6 +44,7 @@ from typing import TYPE_CHECKING
 from dsm.core.log import RepeatLog
 from dsm.crypto.handshake import HANDSHAKE_FRAME_SIZE
 from dsm.net.handshake_gate import SourceLimiter
+from dsm.net.transport.tcp import FramingError, TCPTransport
 from dsm.net.transport.udp import UDPTransport
 
 if TYPE_CHECKING:
@@ -49,7 +54,6 @@ if TYPE_CHECKING:
     from dsm.crypto.auth_loader import CertAuthMaterials
     from dsm.crypto.cert_allowlist import CNAllowlist
     from dsm.crypto.keystore import KeyStore
-    from dsm.net.transport.tcp import TCPTransport
 
 log = logging.getLogger(__name__)
 
@@ -58,8 +62,9 @@ def _emit_handshake_failure(err: Exception) -> None:
     """Emit the failed-handshake netaudit event with a coarse error label.
 
     Every ``CertAuthError`` subclass collapses to ``"cert_auth"`` so the audit
-    stream cannot tell an allowlist miss from a CRL hit. Duplicates
-    ``dsm.server._emit_handshake_failure`` to avoid an import cycle.
+    stream cannot tell an allowlist miss from a CRL hit (the human log lines
+    hide that too). Other errors keep their class name; the exception
+    message is never emitted (``tests/test_netaudit_no_leak.py``).
     """
     from dsm.core import netaudit
     from dsm.crypto.handshake import CertAuthError
@@ -142,13 +147,19 @@ async def _run_handshake_worker(
     attest_store: AttestStore,
     materials: CertAuthMaterials,
     cn_allowlist: CNAllowlist,
-    view: _PerPeerUDPView,
+    transport: UDPTransport | TCPTransport,
     peer_addr: tuple[str, int],
     winner: asyncio.Future[tuple[tuncore.SessionKeyManager, bytes, tuple[str, int]]],
+    *,
+    who: str,
 ) -> None:
-    """Run one peer's handshake under the per-attempt deadline.
+    """Run one handshake attempt under the per-attempt deadline.
 
-    The first success sets ``winner``; a later success is discarded.
+    The first success sets ``winner`` with ``peer_addr``; a later success is
+    discarded. ``transport`` is a :class:`_PerPeerUDPView` or one accepted
+    TCP connection. ``who`` names the peer in log lines: its address for
+    UDP, as before, and a fixed label for TCP, whose log never named peers.
+    A connection error ends only this attempt.
     """
     from cryptography.x509.oid import ExtendedKeyUsageOID
 
@@ -163,7 +174,7 @@ async def _run_handshake_worker(
     try:
         session_keys, client_pub = await asyncio.wait_for(
             server_handshake(
-                view,  # type: ignore[arg-type]  # virtual UDPTransport subclass
+                transport,
                 keystore.identity,
                 attest_key=attest_store.attest_key,
                 cert_der=materials.cert_der,
@@ -179,7 +190,7 @@ async def _run_handshake_worker(
     except TimeoutError:
         log.info(
             "handshake attempt from %s exceeded %.0fs deadline — slot reclaimed",
-            peer_addr,
+            who,
             _HANDSHAKE_ATTEMPT_DEADLINE,
         )
         return
@@ -189,22 +200,24 @@ async def _run_handshake_worker(
         CertAuthError,
         HandshakeError,
     ) as e:
-        # Same opaque INFO/WARNING logging as the serial path; detail at DEBUG.
+        # Same opaque INFO/WARNING logging as before; detail at DEBUG.
         if isinstance(e, (CNNotAllowedError, CertRevokedError, CertAuthError)):
-            log.warning("handshake rejected (cert auth) from %s", peer_addr)
+            log.warning("handshake rejected (cert auth) from %s", who)
         else:
-            log.info("handshake failed from %s", peer_addr)
-        log.debug("handshake failure detail (%s): %s", peer_addr, e)
+            log.info("handshake failed from %s", who)
+        log.debug("handshake failure detail (%s): %s", who, e)
         _emit_handshake_failure(e)
+        return
+    except (FramingError, OSError) as e:
+        # A bad length prefix, a reset or an early close on this connection.
+        log.info("handshake connection failed (%s)", type(e).__name__)
         return
 
     if not winner.done():
         winner.set_result((session_keys, client_pub, peer_addr))
-        log.info("handshake winner: %s", peer_addr)
+        log.info("handshake winner: %s", who)
     else:
-        log.debug(
-            "handshake from %s authenticated after a winner — discarded", peer_addr
-        )
+        log.debug("handshake from %s authenticated after a winner — discarded", who)
 
 
 def _is_winner_addr(
@@ -353,6 +366,7 @@ async def _demux_loop(
                 view,
                 addr,
                 winner,
+                who=str(addr),
             )
         )
         task.add_done_callback(_end_attempt)
@@ -491,3 +505,169 @@ async def _accept_until_winner(  # pyright: ignore[reportUnusedFunction]  # used
         return session_keys, client_pub, transport_obj
 
     return None, None, transport_obj
+
+
+async def _tcp_admit_loop(
+    config: Config,
+    keystore: KeyStore,
+    attest_store: AttestStore,
+    materials: CertAuthMaterials,
+    cn_allowlist: CNAllowlist,
+    connections: asyncio.Queue[tuple[TCPTransport, tuple[str, int]]],
+    winner: asyncio.Future[tuple[tuncore.SessionKeyManager, bytes, tuple[str, int]]],
+    workers: set[asyncio.Task[None]],
+    semaphore: asyncio.Semaphore,
+    open_conns: dict[tuple[str, int], TCPTransport],
+    limiter: SourceLimiter,
+) -> None:
+    """Admit queued TCP connections until a winner is set.
+
+    The TCP twin of :func:`_demux_loop`. A connection is closed at once when
+    the pool is full or ``limiter`` refuses its address; otherwise it takes a
+    slot and a worker. ``open_conns`` and ``workers`` belong to the caller.
+    """
+    while not winner.done():
+        conn, peer = await connections.get()
+        if winner.done():
+            conn.close()
+            return
+        if semaphore.locked():
+            log.debug("handshake pool saturated — closing a new TCP connection")
+            conn.close()
+            continue
+        # TCP gives each open connection its own peer address; this check
+        # only keeps open_conns one-to-one.
+        if peer in open_conns:
+            conn.close()
+            continue
+        # Never waits: the pool has a free slot (checked above).
+        await semaphore.acquire()
+        # Asked last, so a connection closed above spends none of its
+        # address's budget. From here to the done-callback below nothing
+        # awaits, so the slot and the address are always given back.
+        if not limiter.try_start(peer[0]):
+            semaphore.release()
+            conn.close()
+            continue
+        open_conns[peer] = conn
+
+        # A done-callback, not a ``finally`` in the worker: a task cancelled
+        # before its first step never runs its body, but its done-callbacks
+        # still run, exactly once. The close is the sync one; nothing here
+        # may await.
+        def _end_attempt(
+            _task: asyncio.Task[None],
+            c: TCPTransport = conn,
+            p: tuple[str, int] = peer,
+        ) -> None:
+            semaphore.release()
+            limiter.finish(p[0])
+            if not _is_winner_addr(winner, p):
+                open_conns.pop(p, None)
+                c.close()
+
+        task = asyncio.ensure_future(
+            _run_handshake_worker(
+                config,
+                keystore,
+                attest_store,
+                materials,
+                cn_allowlist,
+                conn,
+                peer,
+                winner,
+                who="a TCP client",
+            )
+        )
+        task.add_done_callback(_end_attempt)
+        workers.add(task)
+        task.add_done_callback(workers.discard)
+
+
+async def _accept_until_winner_tcp(  # pyright: ignore[reportUnusedFunction]  # used by dsm.server
+    config: Config,
+    keystore: KeyStore,
+    attest_store: AttestStore,
+    materials: CertAuthMaterials,
+    cn_allowlist: CNAllowlist,
+    connections: asyncio.Queue[tuple[TCPTransport, tuple[str, int]]],
+    process_shutdown: asyncio.Event,
+    limiter: SourceLimiter | None = None,
+) -> tuple[
+    tuncore.SessionKeyManager | None,
+    bytes | None,
+    TCPTransport | None,
+]:
+    """Accept one TCP client by checking connections concurrently.
+
+    ``connections`` is fed by the caller's listener
+    (:attr:`TCPListener.connections`). Connections share the UDP acceptor's
+    pool (``config.max_inflight_handshakes``), per-address limits and
+    per-attempt deadline. Returns ``(session_keys, client_pub, transport)``
+    for the first connection to authenticate, where ``transport`` is that
+    connection, or ``(None, None, None)`` when shutdown comes first. Every
+    other connection handed over, including any still queued, is closed
+    before return.
+    """
+    if limiter is None:
+        limiter = SourceLimiter()
+
+    loop = asyncio.get_running_loop()
+    winner: asyncio.Future[tuple[tuncore.SessionKeyManager, bytes, tuple[str, int]]]
+    winner = loop.create_future()
+    semaphore = asyncio.Semaphore(config.max_inflight_handshakes)
+    workers: set[asyncio.Task[None]] = set()
+    open_conns: dict[tuple[str, int], TCPTransport] = {}
+
+    shutdown_wait = asyncio.ensure_future(process_shutdown.wait())
+    admit = asyncio.ensure_future(
+        _tcp_admit_loop(
+            config,
+            keystore,
+            attest_store,
+            materials,
+            cn_allowlist,
+            connections,
+            winner,
+            workers,
+            semaphore,
+            open_conns,
+            limiter,
+        )
+    )
+    try:
+        await asyncio.wait(
+            {winner, admit, shutdown_wait},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+    finally:
+        await _cancel_and_drain({admit})
+        if not shutdown_wait.done():
+            shutdown_wait.cancel()
+            try:
+                await shutdown_wait
+            except asyncio.CancelledError:
+                pass
+        # Copy: the done-callbacks mutate the set. Each worker's callback
+        # gives back its slot and address and closes a loser's connection.
+        await _cancel_and_drain(set(workers))
+        while not connections.empty():
+            queued, _ = connections.get_nowait()
+            queued.close()
+
+    win = winner.result() if winner.done() and not winner.cancelled() else None
+    error = None if admit.cancelled() else admit.exception()
+    if error is not None or win is None:
+        for conn in open_conns.values():
+            conn.close()
+        if error is not None:
+            # A bug in the admit loop must not look like a shutdown.
+            raise error
+        return None, None, None
+    session_keys, client_pub, peer = win
+    transport = open_conns.pop(peer)
+    # A loser's done-callback can run one loop pass after the drain, so close
+    # what is left here too (a second close does nothing).
+    for conn in open_conns.values():
+        conn.close()
+    return session_keys, client_pub, transport

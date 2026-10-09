@@ -10,9 +10,6 @@ from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from cryptography.x509.oid import ExtendedKeyUsageOID
-
-from dsm.core import netaudit
 from dsm.core.config import Config
 from dsm.core.fsm import ProtocolError, SessionFSM, State
 from dsm.core.preflight import check_clock_sync
@@ -33,9 +30,16 @@ from dsm.net.forwarding import IPForwardingManager, MasqueradeManager
 from dsm.net.handshake_acceptor import (
     _accept_until_winner,  # pyright: ignore[reportPrivateUsage]
 )
+
+# isort: split
+# Its own statement: isort and ruff disagree on one shared import whose
+# names each carry a pyright pragma.
+from dsm.net.handshake_acceptor import (
+    _accept_until_winner_tcp,  # pyright: ignore[reportPrivateUsage]
+)
 from dsm.net.handshake_gate import SourceLimiter
 from dsm.net.nftables import ServerRateLimitManager, TcpTimestampsDisabler
-from dsm.net.transport.tcp import TCPTransport
+from dsm.net.transport.tcp import TCPListener, TCPTransport
 from dsm.net.transport.udp import UDPTransport
 from dsm.net.tunnel import TunDevice
 from dsm.session import (
@@ -56,12 +60,9 @@ if TYPE_CHECKING:
     import tuncore
     from dsm.crypto.auth_loader import CertAuthMaterials
 
-# Backoff parameters for failed handshake retries. UDP retries cycle very
-# fast because there's no kernel-side rate limit on bad packets reaching
-# the handshake coroutine; TCP retries are gated by the kernel's accept
-# queue but a malicious peer racing the listen() can still burn slots in
-# a tight loop. A small jittered sleep between retries gives legitimate
-# clients a chance to win against a flood.
+# Backoff after an unexpected accept error (see the accept loop in
+# run_server), so an error that repeats cannot spin. Failed handshakes do
+# not back off: the acceptors drop and rate-limit them without waiting.
 _HANDSHAKE_RETRY_BACKOFF_BASE = 0.5  # seconds
 _HANDSHAKE_RETRY_BACKOFF_MAX = 5.0  # seconds
 _HANDSHAKE_RETRY_BACKOFF_JITTER = 0.5  # ±this fraction of base
@@ -71,29 +72,6 @@ log = logging.getLogger(__name__)
 
 class ListenError(Exception):
     """The TCP listening socket could not be opened (e.g. the port is in use)."""
-
-
-def _emit_handshake_failure(err: Exception) -> None:
-    """Emit the failed-handshake audit event WITHOUT the exception message,
-    and with a COARSE family label for cert-auth rejections.
-
-    The human WARNING/DEBUG logs already hide cert-auth detail so
-    a journald reader can't distinguish CNNotAllowedError (allowlist miss)
-    from CertRevokedError (CRL hit) from a binding mismatch and enumerate the
-    allowlist / CRL. The netaudit stream (enabled by --debug-net) must apply
-    the SAME redaction: collapse every CertAuthError subclass to "cert_auth".
-    Non-cert HandshakeErrors keep their precise class (no enumeration risk).
-    The client side stays precise — a client owns its server.
-    """
-    from dsm.crypto.handshake import CertAuthError
-
-    error_label = "cert_auth" if isinstance(err, CertAuthError) else type(err).__name__
-    netaudit.emit(
-        "handshake_end",
-        role="server",
-        outcome="failed",
-        error=error_label,
-    )
 
 
 async def _backoff_or_shutdown(
@@ -136,110 +114,63 @@ async def _accept_one_session(
     cn_allowlist: CNAllowlist,
     transport_obj: UDPTransport | TCPTransport | None,
     process_shutdown: asyncio.Event,
+    limiter: SourceLimiter | None = None,
 ) -> tuple[
     tuncore.SessionKeyManager | None,
     bytes | None,
     UDPTransport | TCPTransport | None,
 ]:
-    """Accept exactly one client via the handshake retry loop.
+    """Accept exactly one TCP client.
 
-    Drives the handshake (with jittered backoff between rejected attempts)
-    until a client authenticates or ``process_shutdown`` is set. The FSM is
-    expected to be in ``CONNECTING`` on entry.
+    One listener stays open for the whole accept, and
+    ``_accept_until_winner_tcp`` checks its connections side by side under
+    the same pool, per-address limits and 12 s attempt deadline as UDP. The
+    listener is closed before return, so the port refuses connections while
+    the session runs. The FSM is expected to be in ``CONNECTING`` on entry.
+    ``transport_obj`` is the previous session's connection, or None; it is
+    closed first. ``limiter`` is the run's one :class:`SourceLimiter`.
 
     Returns:
-        ``(session_keys, client_pub, transport)`` on success. On shutdown
-        during the accept wait, returns ``(None, None, transport_obj)`` so
-        the caller can break the outer loop and unwind cleanly. ``transport``
-        is the (possibly re-created, for TCP) transport that the handshake
-        succeeded on.
+        ``(session_keys, client_pub, transport)`` on success, where
+        ``transport`` is the winning connection. On shutdown during the
+        accept wait, returns ``(None, None, None)`` with the FSM back in
+        IDLE, so the caller can break the outer loop and unwind cleanly.
 
     Raises:
         ListenError: the TCP listener could not be opened.
     """
-    from dsm.crypto.handshake import (
-        CertAuthError,
-        CertRevokedError,
-        CNNotAllowedError,
-        HandshakeError,
-        server_handshake,
-    )
+    if transport_obj is not None:
+        # Its session stack normally closed it already; aclose() is safe twice.
+        await transport_obj.aclose()
 
-    consecutive_failures = 0
-    while not process_shutdown.is_set():
-        # For TCP, re-create the listening transport on each attempt (and
-        # close any previous failed-attempt transport).
-        if config.transport == "tcp":
-            if transport_obj is not None:
-                await transport_obj.aclose()
-            transport_obj = TCPTransport()
-            try:
-                await transport_obj.listen(port=config.listen_port)
-            except OSError as e:
-                await transport_obj.aclose()
-                reason = os.strerror(e.errno) if e.errno else str(e)
-                raise ListenError(
-                    f"cannot listen on TCP port {config.listen_port}: {reason}"
-                ) from e
-            log.info("server listening on TCP port %d", config.listen_port)
+    listener = TCPListener()
+    try:
+        await listener.start(port=config.listen_port)
+    except OSError as e:
+        listener.close()
+        reason = os.strerror(e.errno) if e.errno else str(e)
+        raise ListenError(
+            f"cannot listen on TCP port {config.listen_port}: {reason}"
+        ) from e
+    log.info("server listening on TCP port %d", config.listen_port)
 
-        fsm.transition(State.HANDSHAKING)
-        if transport_obj is None:
-            # Unreachable in practice — UDP path sets it once before the
-            # outer loop, TCP path sets it on every iteration above. Explicit
-            # check keeps the type narrowing for the handshake call.
-            raise RuntimeError("internal: handshake reached with no transport")
-        try:
-            session_keys, client_pub = await server_handshake(
-                transport_obj,
-                keystore.identity,
-                attest_key=attest_store.attest_key,
-                cert_der=materials.cert_der,
-                ca_root=materials.ca_root,
-                cn_allowlist=cn_allowlist,
-                crl=materials.crl,
-                required_client_eku=ExtendedKeyUsageOID.CLIENT_AUTH,
-                rotation_packets=config.rotation_packets,
-                rotation_seconds=config.rotation_seconds,
-            )
-            return session_keys, client_pub, transport_obj
-        except (
-            CNNotAllowedError,
-            CertRevokedError,
-            CertAuthError,
-            HandshakeError,
-        ) as e:
-            err_name = type(e).__name__
-            # Anti-information-leak: at INFO/WARNING, log only an opaque
-            # "cert auth failed" so an attacker who can read journald (or a
-            # log shipper) cannot distinguish "this cert is on the CRL" from
-            # "this CN is not in the allowlist" from "binding mismatch" —
-            # each of those would otherwise let them enumerate the negative
-            # space of the allowlist or partially recover CRL contents
-            # through trial. The specific class name (and the exception
-            # message) is only emitted at DEBUG.
-            if isinstance(e, (CNNotAllowedError, CertRevokedError, CertAuthError)):
-                log.warning("handshake rejected (cert auth) — waiting for next client")
-                log.debug("cert auth detail: %s: %s", err_name, e)
-            else:
-                log.info("handshake failed — waiting for next client")
-                log.debug("handshake failure detail: %s: %s", err_name, e)
-            _emit_handshake_failure(e)
-            fsm.transition(State.TEARDOWN)
-            fsm.transition(State.IDLE)
-            fsm.transition(State.CONNECTING)
-
-            consecutive_failures += 1
-            if await _backoff_or_shutdown(consecutive_failures, process_shutdown):
-                break
-        except BaseException:
-            # Close this attempt's listener before propagating, so a flood of
-            # bad frames cannot leak one socket per attempt.
-            if config.transport == "tcp":
-                await transport_obj.aclose()
-            raise
-
-    return None, None, transport_obj
+    fsm.transition(State.HANDSHAKING)
+    try:
+        session_keys, client_pub, transport = await _accept_until_winner_tcp(
+            config,
+            keystore,
+            attest_store,
+            materials,
+            cn_allowlist,
+            listener.connections,
+            process_shutdown,
+            limiter,
+        )
+    finally:
+        listener.close()
+    if session_keys is None:
+        _drive_fsm_to_idle(fsm)
+    return session_keys, client_pub, transport
 
 
 def _drive_fsm_to_idle(fsm: SessionFSM) -> None:
@@ -659,10 +590,10 @@ async def run_server(
         setup_signal_handlers(process_shutdown)
 
         # Transport: the UDP transport lives for the whole run (bound once,
-        # here, on the outer stack). TCP needs a fresh listening transport per
-        # accept because listen() accepts one connection and closes its server
-        # socket — that re-creation happens inside _accept_one_session, and the
-        # accepted TCP transport is registered on the per-session stack.
+        # here, on the outer stack). TCP opens a listener for each accept
+        # inside _accept_one_session and closes it once a client wins, so the
+        # port refuses connections during a session; the winning connection
+        # is registered on the per-session stack.
         transport_obj: UDPTransport | TCPTransport | None
         if config.transport == "udp":
             transport_obj = UDPTransport()
@@ -734,6 +665,7 @@ async def run_server(
                         cn_allowlist,
                         transport_obj,
                         process_shutdown,
+                        limiter,
                     )
             except Exception as e:
                 if isinstance(e, ListenError) and not served:
@@ -742,9 +674,10 @@ async def run_server(
                     # restart us after its delay instead of retrying here.
                     log.error("%s; exiting", e)
                     return 1
-                # Anything else raised before authentication (e.g. a
-                # FramingError from a malformed length prefix) must not take
-                # the daemon down for every later client. Reset, wait the
+                # Anything else raised by the accept (a bug, or the host out
+                # of a resource such as file descriptors) must not take the
+                # daemon down for every later client. A bad frame no longer
+                # gets here: it ends only its own attempt. Reset, wait the
                 # usual jittered backoff so a repeating error cannot spin,
                 # then accept again on a fresh listener.
                 log.exception("accept failed; retrying after a backoff")
@@ -760,9 +693,8 @@ async def run_server(
 
             if session_keys is None or client_pub is None or transport_obj is None:
                 # process_shutdown arrived while waiting for a handshake; the
-                # UDP transport unwinds with the outer stack. A held TCP
-                # listening transport was never registered anywhere, so close
-                # it manually here.
+                # UDP transport unwinds with the outer stack, and the TCP
+                # accept has already closed its listener and connections.
                 if config.transport == "tcp" and transport_obj is not None:
                     await transport_obj.aclose()
                 break
