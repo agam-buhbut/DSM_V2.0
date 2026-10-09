@@ -10,6 +10,7 @@ waits on the wall clock.
 from __future__ import annotations
 
 import asyncio
+import errno
 import logging
 from typing import Any
 from unittest.mock import patch
@@ -265,6 +266,50 @@ async def test_stop_waits_for_an_attempt_past_the_check_and_it_wins() -> None:
     assert win is not None
     assert win.client_pub == b"pub-198.51.100.7:40001"
     assert run.slot.admitted is None
+
+
+class _FailsOnceAfterCheck(_Script):
+    """The first attempt passes the session check, then its bootstrap reply
+    cannot be sent. Later attempts run as in :class:`_Script`."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.failed = False
+
+    async def __call__(
+        self, view: Any, *a: Any, admit_client: Any = None, **k: Any
+    ) -> tuple[object, bytes]:
+        if self.failed:
+            return await super().__call__(view, *a, admit_client=admit_client, **k)
+        self.failed = True
+        peer: Addr = view._peer_addr
+        self.started.append(peer)
+        await view.recv()
+        await view.send(MSG2, peer)
+        assert admit_client is not None
+        admit_client(VerifiedClient(cn=HOLDER.cn, noise_static=HOLDER.noise_static))
+        self.admitted.append(peer)
+        raise OSError(errno.EPIPE, "send failed")
+
+
+async def test_an_attempt_that_fails_after_the_check_gives_the_slot_back() -> None:
+    """Else the slot stays taken and every later handshake is refused until
+    the server restarts."""
+    script = _FailsOnceAfterCheck()
+    async with _Udp(script) as run:
+        assert run.watch is not None
+        run.offer(BACK, 0)
+        assert await _spin(lambda: script.admitted == [BACK])
+        await _yield()
+        assert run.slot.admitted is None
+        assert not run.watch.end_session.is_set()
+        run.offer(BACK, 1)  # the client resends msg1: a new attempt
+        assert await _spin(run.watch.end_session.is_set)
+        win = await run.stop()
+    assert win is not None
+    assert script.admitted == [BACK, BACK]
+    assert run.slot.admitted is None
+    assert run.slot.holder == HOLDER
 
 
 async def test_in_a_session_new_handshakes_start_at_most_once_a_second() -> None:
