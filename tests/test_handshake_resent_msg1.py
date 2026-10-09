@@ -93,7 +93,7 @@ def _pki() -> _Pki:
 async def _run_pair(
     pki: _Pki, client_end: _End, server_end: _End
 ) -> tuple[asyncio.Task[Any], asyncio.Task[Any], set[asyncio.Task[Any]]]:
-    client_task = asyncio.ensure_future(
+    client_task: asyncio.Task[Any] = asyncio.ensure_future(
         client_handshake(
             client_end,
             pki.client.identity,
@@ -105,7 +105,7 @@ async def _run_pair(
             required_server_eku=ExtendedKeyUsageOID.SERVER_AUTH,
         )
     )
-    server_task = asyncio.ensure_future(
+    server_task: asyncio.Task[Any] = asyncio.ensure_future(
         server_handshake(
             server_end,
             pki.server.identity,
