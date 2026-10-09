@@ -1,0 +1,153 @@
+"""Limits on starting server handshake attempts.
+
+Each admitted msg1 costs the server an attest-key signature (a TPM call on
+TPM builds) and holds one of ``max_inflight_handshakes`` slots for up to
+12 s. These limits stop one address, or a burst of new ones, from taking all
+of that. They live on the server only and change nothing on the wire.
+
+Limits are keyed by source IP, not port: a client gets a new port each time
+it restarts. The server binds IPv4 only; an IPv6 listener would need to key
+by /64.
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from collections.abc import Callable
+from dataclasses import dataclass
+
+from dsm.core.log import RepeatLog
+
+log = logging.getLogger(__name__)
+
+# One client needs one attempt at a time. The second covers a client that
+# restarts while its old attempt still holds a slot.
+PER_SOURCE_INFLIGHT = 2
+# New attempts per address: one every 4 s, up to 3 saved up. A client that
+# systemd restarts every 10 s stays well inside this.
+PER_SOURCE_RATE = 0.25  # tokens per second
+PER_SOURCE_BURST = 3.0
+# New attempts from all addresses together: a safety net for signing time.
+# Retune once the TPM signature time has been measured on the server box.
+GLOBAL_START_RATE = 4.0  # tokens per second
+GLOBAL_START_BURST = 8.0
+# Addresses remembered at once. When full, the idle address that started an
+# attempt longest ago is forgotten; one with an attempt running never is.
+MAX_TRACKED_SOURCES = 4096
+
+
+class TokenBucket:
+    """``rate`` tokens a second, holding at most ``burst``; starts full."""
+
+    def __init__(self, rate: float, burst: float, now: float) -> None:
+        self._rate = rate
+        self._burst = burst
+        self._tokens = burst
+        self._stamp = now
+
+    def ready(self, now: float) -> bool:
+        """Refill up to ``now``; True if a whole token can be taken."""
+        # A clock that steps back adds nothing and is not counted twice.
+        if now > self._stamp:
+            self._tokens = min(
+                self._burst, self._tokens + (now - self._stamp) * self._rate
+            )
+            self._stamp = now
+        return self._tokens >= 1.0
+
+    def take(self) -> None:
+        """Spend one token. Call only after ``ready`` returned True."""
+        self._tokens -= 1.0
+
+
+@dataclass
+class _Source:
+    inflight: int
+    bucket: TokenBucket
+
+
+class SourceLimiter:
+    """Per-address and overall limits on new handshake attempts.
+
+    ``run_server`` makes one per run and hands it to every accept cycle, so
+    the limits hold across cycles. ``try_start`` and ``finish`` never await:
+    a check and the slot it admits happen in one step on the event loop.
+    Refusals are logged at INFO, at most one line per 10 s per reason, never
+    with the address.
+    """
+
+    def __init__(
+        self,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        max_sources: int = MAX_TRACKED_SOURCES,
+    ) -> None:
+        self._clock = clock
+        self._max_sources = max_sources
+        # Oldest start first: try_start moves an address to the end.
+        self._sources: dict[str, _Source] = {}
+        self._overall = TokenBucket(GLOBAL_START_RATE, GLOBAL_START_BURST, clock())
+        self._busy_log = RepeatLog(log, logging.INFO, clock=clock)
+        self._rate_log = RepeatLog(log, logging.INFO, clock=clock)
+        self._overall_log = RepeatLog(log, logging.INFO, clock=clock)
+
+    def __len__(self) -> int:
+        """How many addresses are remembered now."""
+        return len(self._sources)
+
+    def try_start(self, ip: str) -> bool:
+        """Admit a new attempt from ``ip`` if every limit allows it.
+
+        All or nothing: a refusal spends no token and remembers nothing.
+        Pair every True with exactly one ``finish(ip)``.
+        """
+        now = self._clock()
+        src = self._sources.get(ip)
+        if src is not None and src.inflight >= PER_SOURCE_INFLIGHT:
+            self._busy_log.log(
+                "new handshake refused: that address already has %d running",
+                PER_SOURCE_INFLIGHT,
+            )
+            return False
+        if src is not None and not src.bucket.ready(now):
+            self._rate_log.log(
+                "new handshake refused: that address started too many lately"
+            )
+            return False
+        if not self._overall.ready(now):
+            self._overall_log.log(
+                "new handshake refused: too many new handshakes overall"
+            )
+            return False
+        if src is None:
+            if len(self._sources) >= self._max_sources and not self._forget_one_idle():
+                self._overall_log.log(
+                    "new handshake refused: too many new handshakes overall"
+                )
+                return False
+            src = _Source(
+                inflight=0,
+                bucket=TokenBucket(PER_SOURCE_RATE, PER_SOURCE_BURST, now),
+            )
+        else:
+            del self._sources[ip]  # added back below, as the newest
+        src.bucket.take()
+        self._overall.take()
+        src.inflight += 1
+        self._sources[ip] = src
+        return True
+
+    def finish(self, ip: str) -> None:
+        """End one attempt that ``try_start(ip)`` admitted."""
+        self._sources[ip].inflight -= 1
+
+    def _forget_one_idle(self) -> bool:
+        """Forget the idle address that started longest ago, if there is one."""
+        idle = next(
+            (ip for ip, src in self._sources.items() if src.inflight == 0), None
+        )
+        if idle is None:
+            return False
+        del self._sources[idle]
+        return True
