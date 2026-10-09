@@ -40,6 +40,13 @@ _DEPLOY_DIR = Path(__file__).resolve().parent.parent / "deploy"
 _SYSTEMD_DIR = Path("/etc/systemd/system")
 _CRED_FILE = Path("/etc/dsm/passphrase")
 
+# A client the server does not know yet blocks all traffic, SSH too, and
+# keeps trying. So the client unit is enabled now and started later.
+_CLIENT_START_NOTE = (
+    "Start it only after the server has this client's CN (deploy/GUIDE.md "
+    "§4). Until then it blocks all traffic, SSH too."
+)
+
 
 def _fail(msg: str) -> NoReturn:
     print(f"dsm init: {msg}", file=sys.stderr)
@@ -385,13 +392,15 @@ def _install_unit(role: str = "server") -> None:
     # instructions instead of a FileNotFoundError.
     name = _unit_name(role)
     src = _DEPLOY_DIR / f"{name}.service"
+    client = role == "client"
     if not src.is_file():
+        enable = f"enable {name}" if client else f"enable --now {name}"
         print(
             f"{name}.service not found at the expected location.\n"
             "Copy it manually from the DSM release tarball to "
             f"/etc/systemd/system/{name}.service, then run:\n"
-            "  sudo systemctl daemon-reload && "
-            f"sudo systemctl enable --now {name}",
+            f"  sudo systemctl daemon-reload && sudo systemctl {enable}"
+            + (f"\n{_CLIENT_START_NOTE}" if client else ""),
             file=sys.stderr,
         )
         return
@@ -400,7 +409,16 @@ def _install_unit(role: str = "server") -> None:
     if not _CRED_FILE.exists():
         _CRED_FILE.touch(mode=0o600)
     subprocess.run(["systemctl", "daemon-reload"], check=True)
-    print(f"Installed {name}.service. Start with: sudo systemctl enable --now {name}")
+    if client:
+        print(
+            f"Installed {name}.service. Enable it with: sudo systemctl enable {name}\n"
+            f"{_CLIENT_START_NOTE}\n"
+            f"Then start it with: sudo systemctl start {name}"
+        )
+    else:
+        print(
+            f"Installed {name}.service. Start with: sudo systemctl enable --now {name}"
+        )
 
 
 def _build_parser() -> argparse.ArgumentParser:

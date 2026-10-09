@@ -44,8 +44,12 @@ sudo dsm init server --resume --signed-cert <signed.crt>
 
 # 3. Start it. Server:
 sudo systemctl enable --now dsm
-#    Client (never the server unit: it runs DSM as a server):
-sudo systemctl enable --now dsm-client
+#    Client (never the server unit: it runs DSM as a server). Enable it now,
+#    but start it only after the server has the client's CN in its
+#    allowed_cns file (deploy/GUIDE.md §4). A client the server does not know
+#    blocks all traffic, SSH too, and keeps trying.
+sudo systemctl enable dsm-client
+sudo systemctl start dsm-client
 ```
 
 **Trying DSM without a TPM:** releases will also carry a clearly named
@@ -474,10 +478,13 @@ defaults, and each end shapes only what it sends.
   session drops, the client goes back to the start-up kill switch (it lets
   through only the path to the server) in one step and reconnects.
   `sudo systemctl restart dsm-client` keeps it up as well. It comes down
-  only when you stop DSM: Ctrl-C on a run by hand,
-  `sudo systemctl stop dsm-client`, or `sudo dsm cleanup`. If DSM stops on
-  an error (a crash), the kill switch stays up; the next start replaces
-  it. While the tunnel is down you have no internet, and a hotel or
+  when you stop DSM: Ctrl-C on a run by hand,
+  `sudo systemctl stop dsm-client`, or `sudo dsm cleanup`. Two cases differ:
+  a setup error at the first try also removes it (DSM exits 1), and a
+  `systemctl stop` sent while DSM waits to restart (after a crash or a
+  signal sent straight to it) leaves it up; run `sudo dsm cleanup`. If DSM
+  stops on an error (a crash), the kill switch stays up; the next start
+  replaces it. While the tunnel is down you have no internet, and a hotel or
   airport Wi-Fi login page cannot load: stop DSM, log in, then start it
   again.
 - mDNS (5353) and LLMNR (5355) are blocked, so they cannot be used to map

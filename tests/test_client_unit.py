@@ -106,7 +106,11 @@ def test_install_sh_puts_only_the_client_unit_on_a_client() -> None:
     assert 'install -m 0644 "$UNIT_SRC" /etc/systemd/system/dsm-client.service' in block
     assert "/etc/systemd/system/dsm.service" not in block
     assert "dsm-blocklist-update" not in block
-    assert "sudo systemctl enable --now dsm-client" in block
+    # Enabled at install, started later: a client the server does not know
+    # yet blocks all traffic.
+    assert "sudo systemctl enable dsm-client" in block
+    assert "enable --now dsm-client" not in block
+    assert "sudo systemctl start dsm-client" in block
 
 
 def test_install_sh_names_the_client_steps() -> None:
@@ -147,7 +151,27 @@ def test_dsm_init_client_installs_the_client_unit(
     assert not (units / "dsm.service").exists()
     assert runs == [["systemctl", "daemon-reload"]]
     assert (tmp_path / "etc-dsm" / "passphrase").stat().st_mode & 0o777 == 0o600
-    assert "sudo systemctl enable --now dsm-client" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "sudo systemctl enable dsm-client" in out
+    assert "enable --now" not in out
+    assert "sudo systemctl start dsm-client" in out
+    assert "the server has this client's CN" in out
+
+
+def test_dsm_init_client_without_the_unit_file_says_enable_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _point_init_at(tmp_path, monkeypatch)
+    (tmp_path / "deploy" / "dsm-client.service").unlink()
+
+    init._install_unit("client")
+
+    err = capsys.readouterr().err
+    assert "sudo systemctl enable dsm-client" in err
+    assert "enable --now" not in err
+    assert "the server has this client's CN" in err
 
 
 def test_dsm_init_server_still_installs_the_server_unit(

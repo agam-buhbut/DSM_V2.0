@@ -284,7 +284,8 @@ if [ "$EVAL" = 0 ]; then
       install -m 0644 "$UNIT_SRC" /etc/systemd/system/dsm-client.service \
         || die "could not install dsm-client.service"
       systemctl daemon-reload || die "systemctl daemon-reload failed"
-      echo "Installed dsm-client.service. Start with: sudo systemctl enable --now dsm-client" >&2
+      echo "Installed dsm-client.service. Enable it with: sudo systemctl enable dsm-client" >&2
+      echo "Start it only after the server has this client's CN (deploy/GUIDE.md §4); until then it blocks all traffic, SSH too. Then: sudo systemctl start dsm-client" >&2
     else
       echo "install.sh: WARNING — --systemd --client requested but deploy/dsm-client.service not found locally; skipping unit install." >&2
     fi
