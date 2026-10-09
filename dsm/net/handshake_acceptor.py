@@ -1,10 +1,10 @@
-"""Bounded-concurrent UDP handshake acceptor.
+"""Bounded-concurrent handshake acceptor.
 
-The serial accept path drives one ``server_handshake`` at a time over the
-shared UDP socket, so a single well-formed msg1 followed by silence parks the
-responder across its retries (~18 s), and a slow trickle of such attempts
-starves a legitimate client. nftables rate-limiting bounds the packet rate but
-cannot tell a slow genuine handshake from a slow bogus one.
+The serial accept path drove one ``server_handshake`` at a time, so a single
+well-formed msg1 followed by silence parked the responder across its retries
+(~18 s), and a slow trickle of such attempts starved a legitimate client.
+nftables rate-limiting bounds the packet rate but cannot tell a slow genuine
+handshake from a slow bogus one.
 
 Here a bounded pool of workers validates handshakes concurrently. Only one
 session is ever admitted (one TUN, one forwarding/MASQUERADE setup, one DNS
@@ -13,10 +13,12 @@ cancelled. While a session is live the acceptor is not running, so new
 handshake traffic queues on the kernel socket.
 
 * :func:`_demux_loop` is the only caller of the real ``transport.recv()``. It
-  routes each datagram to a bounded per-source inbox; the first datagram from
-  a new source spawns a worker on a :class:`_PerPeerUDPView`, which gives
-  ``server_handshake`` the transport surface it expects with the source
-  address pinned.
+  routes each datagram to a bounded per-source inbox. A new source must open
+  with a full handshake frame, find a free slot and pass the run's
+  :class:`~dsm.net.handshake_gate.SourceLimiter`; then it gets a worker on a
+  :class:`_PerPeerUDPView`, which gives ``server_handshake`` the transport
+  surface it expects with the source address pinned. The demux awaits
+  nothing but the socket, so no source can pause routing for the others.
 * Workers run under a semaphore of ``config.max_inflight_handshakes``, each
   with a hard per-attempt deadline.
 
@@ -33,9 +35,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING
 
+from dsm.core.log import RepeatLog
+from dsm.crypto.handshake import HANDSHAKE_FRAME_SIZE
+from dsm.net.handshake_gate import SourceLimiter
 from dsm.net.transport.udp import UDPTransport
 
 if TYPE_CHECKING:
@@ -48,11 +52,6 @@ if TYPE_CHECKING:
     from dsm.net.transport.tcp import TCPTransport
 
 log = logging.getLogger(__name__)
-
-# Jittered retry backoff, as dsm.server._backoff_or_shutdown: returns True iff
-# process_shutdown fired during the wait. Injected by the caller because
-# importing dsm.server here would be an import cycle.
-BackoffFn = Callable[[int, "asyncio.Event"], Awaitable[bool]]
 
 
 def _emit_handshake_failure(err: Exception) -> None:
@@ -74,25 +73,6 @@ def _emit_handshake_failure(err: Exception) -> None:
     )
 
 
-async def _default_backoff(
-    consecutive_failures: int, process_shutdown: asyncio.Event
-) -> bool:
-    """Fallback backoff for direct calls; same timing as the server's."""
-    from dsm.core.rand import csprng_float
-
-    base = min(
-        _DEFAULT_BACKOFF_BASE * (2 ** min(consecutive_failures - 1, 4)),
-        _DEFAULT_BACKOFF_MAX,
-    )
-    jitter = (csprng_float() - 0.5) * _DEFAULT_BACKOFF_JITTER * base
-    delay = max(0.0, base + jitter)
-    try:
-        await asyncio.wait_for(process_shutdown.wait(), timeout=delay)
-        return True
-    except TimeoutError:
-        return False
-
-
 # Per-attempt deadline (s): room for one lost-and-retransmitted message within
 # server_handshake's own retry budget, while capping how long one bogus msg1
 # can hold a worker slot.
@@ -110,20 +90,11 @@ _WINNER_INBOX_FRAMES = 256
 
 # Hard cap on tracked sources, against a spoofed-source flood. The semaphore
 # normally binds first: an inbox only outlives its worker until the worker's
-# finally evicts it.
+# done-callback evicts it.
 _MAX_INBOXES = 4096
 
 # Shutdown/winner check cadence (s), matching the data loop's recv cadence.
 _ACCEPT_DEMUX_POLL = 0.1
-
-# Consecutive failed attempts before new-worker spawns are paced by the
-# backoff, so a flood of doomed attempts cannot tight-loop.
-_ALL_FAIL_BACKOFF_THRESHOLD = 3
-
-# Same values as dsm.server._HANDSHAKE_RETRY_BACKOFF_* (not imported: cycle).
-_DEFAULT_BACKOFF_BASE = 0.5  # seconds
-_DEFAULT_BACKOFF_MAX = 5.0  # seconds
-_DEFAULT_BACKOFF_JITTER = 0.5  # ±this fraction of base
 
 
 class _PerPeerUDPView(UDPTransport):
@@ -165,15 +136,6 @@ class _PerPeerUDPView(UDPTransport):
         await self._real.send(data, self._peer_addr)
 
 
-class _AcceptState:
-    """Failure count for one accept cycle; drives the all-fail backoff."""
-
-    __slots__ = ("consecutive_failures",)
-
-    def __init__(self) -> None:
-        self.consecutive_failures = 0
-
-
 async def _run_handshake_worker(
     config: Config,
     keystore: KeyStore,
@@ -183,7 +145,6 @@ async def _run_handshake_worker(
     view: _PerPeerUDPView,
     peer_addr: tuple[str, int],
     winner: asyncio.Future[tuple[tuncore.SessionKeyManager, bytes, tuple[str, int]]],
-    state: _AcceptState,
 ) -> None:
     """Run one peer's handshake under the per-attempt deadline.
 
@@ -221,7 +182,6 @@ async def _run_handshake_worker(
             peer_addr,
             _HANDSHAKE_ATTEMPT_DEADLINE,
         )
-        state.consecutive_failures += 1
         return
     except (
         CNNotAllowedError,
@@ -236,12 +196,10 @@ async def _run_handshake_worker(
             log.info("handshake failed from %s", peer_addr)
         log.debug("handshake failure detail (%s): %s", peer_addr, e)
         _emit_handshake_failure(e)
-        state.consecutive_failures += 1
         return
 
     if not winner.done():
         winner.set_result((session_keys, client_pub, peer_addr))
-        state.consecutive_failures = 0
         log.info("handshake winner: %s", peer_addr)
     else:
         log.debug(
@@ -265,9 +223,10 @@ def _promote_winner_inbox(
 ) -> None:
     """Swap the winner's inbox for a wider queue holding the same frames.
 
-    Called from the winning worker's ``finally`` with no await after
-    ``winner.set_result``, so the demux cannot route into the old queue in
-    between.
+    Called from the winning worker's done-callback, which runs before the
+    accept wakes to re-inject. The demux may route one last frame into the
+    old queue first (it stops once it sees the winner); it is copied over
+    with the rest.
     """
     old = inboxes.get(win_addr)
     if old is None or old.maxsize >= _WINNER_INBOX_FRAMES:
@@ -293,16 +252,20 @@ async def _demux_loop(
     workers: set[asyncio.Task[None]],
     semaphore: asyncio.Semaphore,
     inboxes: dict[tuple[str, int], asyncio.Queue[bytes]],
-    state: _AcceptState,
-    backoff: BackoffFn,
+    limiter: SourceLimiter,
 ) -> None:
     """Route datagrams from the real socket to per-source inboxes.
 
     Runs until a winner is set or shutdown is requested. A datagram from an
-    unknown source spawns a worker if a slot is free. ``inboxes`` and
-    ``workers`` belong to the caller, which re-injects the winner's residual
-    frames and cancels the losers.
+    unknown source starts a worker only if it is a full handshake frame, a
+    slot is free and ``limiter`` admits its address. Nothing here awaits
+    anything but the socket. ``inboxes`` and ``workers`` belong to the
+    caller, which re-injects the winner's residual frames and cancels the
+    losers.
     """
+    # (inboxes stays the 11th positional parameter: a test wraps this
+    # function and reads it by position.)
+    size_drops = RepeatLog(log, logging.DEBUG)
     while not winner.done() and not process_shutdown.is_set():
         try:
             data, addr = await transport.recv(timeout=_ACCEPT_DEMUX_POLL)
@@ -332,11 +295,11 @@ async def _demux_loop(
                 log.debug("per-peer inbox full for %s — dropping frame", addr)
             continue
 
-        if state.consecutive_failures >= _ALL_FAIL_BACKOFF_THRESHOLD:
-            if await backoff(state.consecutive_failures, process_shutdown):
-                return
-            if winner.done() or process_shutdown.is_set():
-                continue
+        # A new source must open with a full handshake frame. Scanners,
+        # probes and stray packets are dropped before they can take a slot.
+        if len(data) != HANDSHAKE_FRAME_SIZE:
+            size_drops.log("dropped a new-source datagram of the wrong size")
+            continue
 
         # New source without a free slot: drop it. A genuine client's msg1
         # retransmit gets in once a slot frees.
@@ -353,38 +316,46 @@ async def _demux_loop(
                 addr,
             )
             continue
-
+        # Never waits: the pool has a free slot (checked above).
         await semaphore.acquire()
+        # Asked last, so a packet dropped above spends none of its address's
+        # budget. From here to the done-callback below nothing awaits, so the
+        # slot and the address are always given back.
+        if not limiter.try_start(addr[0]):
+            semaphore.release()
+            continue
+
         new_inbox: asyncio.Queue[bytes] = asyncio.Queue(maxsize=_PER_PEER_INBOX_FRAMES)
         new_inbox.put_nowait(data)
         inboxes[addr] = new_inbox
         view = _PerPeerUDPView(transport, addr, new_inbox)
 
-        async def _slot_scoped(
-            v: _PerPeerUDPView = view, a: tuple[str, int] = addr
-        ) -> None:
-            try:
-                await _run_handshake_worker(
-                    config,
-                    keystore,
-                    attest_store,
-                    materials,
-                    cn_allowlist,
-                    v,
-                    a,
-                    winner,
-                    state,
-                )
-            finally:
-                semaphore.release()
-                # Evict so failing sources cannot grow ``inboxes``. The
-                # winner's inbox stays, widened, for the residual re-injection.
-                if not _is_winner_addr(winner, a):
-                    inboxes.pop(a, None)
-                else:
-                    _promote_winner_inbox(inboxes, a)
+        # A done-callback, not a ``finally`` in the worker: a task cancelled
+        # before its first step never runs its body, but its done-callbacks
+        # still run, exactly once.
+        def _end_attempt(_task: asyncio.Task[None], a: tuple[str, int] = addr) -> None:
+            semaphore.release()
+            limiter.finish(a[0])
+            # Evict so failing sources cannot grow ``inboxes``. The winner's
+            # inbox stays, widened, for the residual re-injection.
+            if not _is_winner_addr(winner, a):
+                inboxes.pop(a, None)
+            else:
+                _promote_winner_inbox(inboxes, a)
 
-        task = asyncio.ensure_future(_slot_scoped())
+        task = asyncio.ensure_future(
+            _run_handshake_worker(
+                config,
+                keystore,
+                attest_store,
+                materials,
+                cn_allowlist,
+                view,
+                addr,
+                winner,
+            )
+        )
+        task.add_done_callback(_end_attempt)
         workers.add(task)
         task.add_done_callback(workers.discard)
 
@@ -447,7 +418,7 @@ async def _accept_until_winner(  # pyright: ignore[reportUnusedFunction]  # used
     cn_allowlist: CNAllowlist,
     transport_obj: UDPTransport,
     process_shutdown: asyncio.Event,
-    backoff: BackoffFn | None = None,
+    limiter: SourceLimiter | None = None,
 ) -> tuple[
     tuncore.SessionKeyManager | None,
     bytes | None,
@@ -455,15 +426,15 @@ async def _accept_until_winner(  # pyright: ignore[reportUnusedFunction]  # used
 ]:
     """Accept one UDP client by validating handshakes concurrently.
 
-    Same contract as ``dsm.server._accept_one_session``: returns
-    ``(session_keys, client_pub, transport)`` for the winner, where
+    Returns ``(session_keys, client_pub, transport)`` for the winner, where
     ``transport`` is the same real UDP transport, still holding the winner's
     post-handshake datagrams; or ``(None, None, transport_obj)`` when
-    shutdown arrives first. Production passes ``dsm.server._backoff_or_shutdown``
-    as ``backoff``; it defaults to :func:`_default_backoff`.
+    shutdown arrives first. Production passes the run's one
+    :class:`SourceLimiter` so the limits hold across accept cycles; without
+    one, this call makes its own.
     """
-    if backoff is None:
-        backoff = _default_backoff
+    if limiter is None:
+        limiter = SourceLimiter()
 
     loop = asyncio.get_running_loop()
     winner: asyncio.Future[tuple[tuncore.SessionKeyManager, bytes, tuple[str, int]]]
@@ -471,7 +442,6 @@ async def _accept_until_winner(  # pyright: ignore[reportUnusedFunction]  # used
     semaphore = asyncio.Semaphore(config.max_inflight_handshakes)
     workers: set[asyncio.Task[None]] = set()
     inboxes: dict[tuple[str, int], asyncio.Queue[bytes]] = {}
-    state = _AcceptState()
 
     shutdown_wait = asyncio.ensure_future(process_shutdown.wait())
     demux = asyncio.ensure_future(
@@ -487,8 +457,7 @@ async def _accept_until_winner(  # pyright: ignore[reportUnusedFunction]  # used
             workers,
             semaphore,
             inboxes,
-            state,
-            backoff,
+            limiter,
         )
     )
     try:

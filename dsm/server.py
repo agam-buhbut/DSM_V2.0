@@ -33,6 +33,7 @@ from dsm.net.forwarding import IPForwardingManager, MasqueradeManager
 from dsm.net.handshake_acceptor import (
     _accept_until_winner,  # pyright: ignore[reportPrivateUsage]
 )
+from dsm.net.handshake_gate import SourceLimiter
 from dsm.net.nftables import ServerRateLimitManager, TcpTimestampsDisabler
 from dsm.net.transport.tcp import TCPTransport
 from dsm.net.transport.udp import UDPTransport
@@ -686,6 +687,10 @@ async def run_server(
         else:
             transport_obj = None
 
+        # Limits on starting handshake attempts, per source address and
+        # overall. One for the whole run, so they hold across accept cycles.
+        limiter = SourceLimiter()
+
         fsm.transition(State.CONNECTING)
 
         # OUTER re-accept loop: accept one client, serve it to session-end,
@@ -713,7 +718,7 @@ async def run_server(
                         cn_allowlist,
                         transport_obj,
                         process_shutdown,
-                        _backoff_or_shutdown,
+                        limiter,
                     )
                     if session_keys is None:
                         # Shutdown during accept: leave HANDSHAKING so the
