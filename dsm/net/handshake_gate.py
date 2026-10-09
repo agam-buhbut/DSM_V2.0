@@ -29,9 +29,16 @@ PER_SOURCE_INFLIGHT = 2
 PER_SOURCE_RATE = 0.25  # tokens per second
 PER_SOURCE_BURST = 3.0
 # New attempts from all addresses together: a safety net for signing time.
-# Retune once the TPM signature time has been measured on the server box.
+# Measured on the server box's TPM (2026-10-09): 0.21 s a signature while
+# each sign made its parent key again; step R keeps the parent loaded and
+# signs off the event loop.
 GLOBAL_START_RATE = 4.0  # tokens per second
 GLOBAL_START_BURST = 8.0
+# New attempts from all addresses together while a session runs, on top of
+# the limits above (owner decision 2026-10-09). Each admitted attempt costs
+# a TPM signature; this caps that work while a session is live.
+IN_SESSION_START_RATE = 1.0  # tokens per second
+IN_SESSION_START_BURST = 1.0
 # Addresses remembered at once. When full, the idle address that started an
 # attempt longest ago is forgotten; one with an attempt running never is.
 MAX_TRACKED_SOURCES = 4096
@@ -87,20 +94,27 @@ class SourceLimiter:
         self._max_sources = max_sources
         # Oldest start first: try_start moves an address to the end.
         self._sources: dict[str, _Source] = {}
-        self._overall = TokenBucket(GLOBAL_START_RATE, GLOBAL_START_BURST, clock())
+        now = clock()
+        self._overall = TokenBucket(GLOBAL_START_RATE, GLOBAL_START_BURST, now)
+        self._in_session = TokenBucket(
+            IN_SESSION_START_RATE, IN_SESSION_START_BURST, now
+        )
         self._busy_log = RepeatLog(log, logging.INFO, clock=clock)
         self._rate_log = RepeatLog(log, logging.INFO, clock=clock)
         self._overall_log = RepeatLog(log, logging.INFO, clock=clock)
+        self._in_session_log = RepeatLog(log, logging.INFO, clock=clock)
 
     def __len__(self) -> int:
         """How many addresses are remembered now."""
         return len(self._sources)
 
-    def try_start(self, ip: str) -> bool:
+    def try_start(self, ip: str, *, in_session: bool = False) -> bool:
         """Admit a new attempt from ``ip`` if every limit allows it.
 
         All or nothing: a refusal spends no token and remembers nothing.
-        Pair every True with exactly one ``finish(ip)``.
+        Pair every True with exactly one ``finish(ip)``. ``in_session`` is
+        True for the accept that runs while a session is live: such a start
+        also needs the in-session budget (one a second).
         """
         now = self._clock()
         src = self._sources.get(ip)
@@ -120,6 +134,11 @@ class SourceLimiter:
                 "new handshake refused: too many new handshakes overall"
             )
             return False
+        if in_session and not self._in_session.ready(now):
+            self._in_session_log.log(
+                "new handshake refused: too many new handshakes while a session runs"
+            )
+            return False
         if src is None:
             if len(self._sources) >= self._max_sources and not self._forget_one_idle():
                 self._overall_log.log(
@@ -134,6 +153,8 @@ class SourceLimiter:
             del self._sources[ip]  # added back below, as the newest
         src.bucket.take()
         self._overall.take()
+        if in_session:
+            self._in_session.take()
         src.inflight += 1
         self._sources[ip] = src
         return True
