@@ -500,13 +500,12 @@ impl TpmAttestKey {
                     .map_err(|e| SignError::Other(format!("wrap TPM auth value: {e}")))
             })
             .transpose()?;
-        let mut connection = match kept.take() {
-            Some(connection) => connection,
-            None => {
-                let connection = TpmConnection::open(&self.tcti)?;
-                self.parents_made.fetch_add(1, Ordering::Relaxed);
-                connection
-            }
+        let mut connection = if let Some(connection) = kept.take() {
+            connection
+        } else {
+            let connection = TpmConnection::open(&self.tcti)?;
+            self.parents_made.fetch_add(1, Ordering::Relaxed);
+            connection
         };
         let result = connection.sign(
             self.child_public.clone(),
