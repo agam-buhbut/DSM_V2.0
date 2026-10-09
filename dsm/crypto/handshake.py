@@ -315,8 +315,15 @@ async def client_handshake(
         await _send(transport, msg3, server_addr)
         await _send(transport, bootstrap_init_frame, server_addr)
 
+    # When msg3 is slow, the server's timer resends msg2, and the copy can
+    # land here. It is the msg2 already read, byte for byte, so skip it and
+    # keep waiting; any other frame is still read as the reply. msg2's bytes
+    # crossed the wire in the clear, so a plain compare is fine.
+    def _resent_msg2(frame: bytes) -> bool:
+        return frame == msg2
+
     bootstrap_resp_frame, bs_addr = await _recv_with_retry(
-        transport, retransmit=_retransmit_bootstrap
+        transport, retransmit=_retransmit_bootstrap, skip=_resent_msg2
     )
     # Pin source on the bootstrap response. AEAD already rejects forged
     # content, but a UDP-spoofed bootstrap frame from any source would
