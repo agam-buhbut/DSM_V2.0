@@ -37,8 +37,13 @@ from dsm.net.handshake_acceptor import (
 from dsm.net.handshake_acceptor import (
     _accept_until_winner_tcp,  # pyright: ignore[reportPrivateUsage]
 )
+
+# isort: split
+# Its own statement too: isort would merge it into the one above.
+from dsm.net.handshake_acceptor import SessionWatch, Winner
 from dsm.net.handshake_gate import SourceLimiter
 from dsm.net.nftables import ServerRateLimitManager, TcpTimestampsDisabler
+from dsm.net.session_slot import SessionSlot
 from dsm.net.transport.tcp import TCPListener, TCPTransport
 from dsm.net.transport.udp import UDPTransport
 from dsm.net.tunnel import TunDevice
@@ -107,44 +112,12 @@ async def _backoff_or_shutdown(
         return False
 
 
-async def _accept_one_session(
-    config: Config,
-    fsm: SessionFSM,
-    keystore: KeyStore,
-    attest_store: AttestStore,
-    materials: CertAuthMaterials,
-    cn_allowlist: CNAllowlist,
-    transport_obj: UDPTransport | TCPTransport | None,
-    process_shutdown: asyncio.Event,
-    limiter: SourceLimiter | None = None,
-) -> tuple[
-    tuncore.SessionKeyManager | None,
-    bytes | None,
-    UDPTransport | TCPTransport | None,
-]:
-    """Accept exactly one TCP client.
-
-    One listener stays open for the whole accept, and
-    ``_accept_until_winner_tcp`` checks its connections side by side under
-    the same pool, per-address limits and 12 s attempt deadline as UDP. The
-    listener is closed before return, so the port refuses connections while
-    the session runs. The FSM is expected to be in ``CONNECTING`` on entry.
-    ``transport_obj`` is the previous session's connection, or None; it is
-    closed first. ``limiter`` is the run's one :class:`SourceLimiter`.
-
-    Returns:
-        ``(session_keys, client_pub, transport)`` on success, where
-        ``transport`` is the winning connection. On shutdown during the
-        accept wait, returns ``(None, None, None)`` with the FSM back in
-        IDLE, so the caller can break the outer loop and unwind cleanly.
+async def _open_tcp_listener(config: Config) -> TCPListener:
+    """Open the run's one TCP listener on ``listen_port`` (TCP mode only).
 
     Raises:
-        ListenError: the TCP listener could not be opened.
+        ListenError: the port cannot be opened (for example, it is in use).
     """
-    if transport_obj is not None:
-        # Its session stack normally closed it already; aclose() is safe twice.
-        await transport_obj.aclose()
-
     listener = TCPListener()
     try:
         await listener.start(port=config.listen_port)
@@ -154,25 +127,99 @@ async def _accept_one_session(
         raise ListenError(
             f"cannot listen on TCP port {config.listen_port}: {reason}"
         ) from e
-    log.info("server listening on TCP port %d", config.listen_port)
+    return listener
+
+
+async def _accept_one_session(
+    config: Config,
+    fsm: SessionFSM,
+    keystore: KeyStore,
+    attest_store: AttestStore,
+    materials: CertAuthMaterials,
+    cn_allowlist: CNAllowlist,
+    transport_obj: UDPTransport | TCPTransport | None,
+    process_shutdown: asyncio.Event,
+    limiter: SourceLimiter,
+    listener: TCPListener,
+    slot: SessionSlot,
+) -> tuple[
+    tuncore.SessionKeyManager | None,
+    bytes | None,
+    UDPTransport | TCPTransport | None,
+]:
+    """Accept exactly one TCP client on the run's listener.
+
+    ``_accept_until_winner_tcp`` checks the listener's connections side by
+    side under the same pool, per-address limits and 12 s attempt deadline
+    as UDP. The listener was opened once at start and stays open, also while
+    the session runs (the in-session accept reads the same queue). The FSM
+    is expected to be in ``CONNECTING`` on entry. ``transport_obj`` is the
+    previous session's connection, or None; it is closed first. ``limiter``
+    and ``slot`` are the run's.
+
+    Returns:
+        ``(session_keys, client_pub, transport)`` on success, where
+        ``transport`` is the winning connection. On shutdown during the
+        accept wait, returns ``(None, None, None)`` with the FSM back in
+        IDLE, so the caller can break the outer loop and unwind cleanly.
+    """
+    if transport_obj is not None:
+        # Its session stack normally closed it already; aclose() is safe twice.
+        await transport_obj.aclose()
 
     fsm.transition(State.HANDSHAKING)
-    try:
-        session_keys, client_pub, transport = await _accept_until_winner_tcp(
+    session_keys, client_pub, transport = await _accept_until_winner_tcp(
+        config,
+        keystore,
+        attest_store,
+        materials,
+        cn_allowlist,
+        listener.connections,
+        process_shutdown,
+        limiter,
+        slot,
+    )
+    if session_keys is None:
+        _drive_fsm_to_idle(fsm)
+    return session_keys, client_pub, transport
+
+
+def _start_watch(
+    config: Config,
+    keystore: KeyStore,
+    attest_store: AttestStore,
+    materials: CertAuthMaterials,
+    cn_allowlist: CNAllowlist,
+    transport_obj: UDPTransport | TCPTransport,
+    listener: TCPListener | None,
+    limiter: SourceLimiter,
+    slot: SessionSlot,
+) -> SessionWatch:
+    """Start the accept that runs while the next session is live (step R):
+    on the run's UDP socket, or on the run's one TCP listener."""
+    if config.transport == "udp":
+        assert isinstance(transport_obj, UDPTransport)
+        return SessionWatch(
             config,
             keystore,
             attest_store,
             materials,
             cn_allowlist,
-            listener.connections,
-            process_shutdown,
             limiter,
+            slot,
+            udp=transport_obj,
         )
-    finally:
-        listener.close()
-    if session_keys is None:
-        _drive_fsm_to_idle(fsm)
-    return session_keys, client_pub, transport
+    assert listener is not None
+    return SessionWatch(
+        config,
+        keystore,
+        attest_store,
+        materials,
+        cn_allowlist,
+        limiter,
+        slot,
+        tcp=listener.connections,
+    )
 
 
 def _drive_fsm_to_idle(fsm: SessionFSM) -> None:
@@ -227,6 +274,8 @@ async def _run_one_session(
     transport: UDPTransport | TCPTransport,
     process_shutdown: asyncio.Event,
     blocklist: DnsBlocklist | None = None,
+    end_session: asyncio.Event | None = None,
+    unauthenticated: Callable[[bytes, tuple[str, int]], None] | None = None,
 ) -> None:
     """Stand up per-session host state, run the data loops, then unwind.
 
@@ -238,13 +287,16 @@ async def _run_one_session(
     empty replay window — carrying stale state across sessions would be a
     nonce-reuse / replay-bypass bug.
 
-    A fresh ``session_shutdown`` event drives ``run_data_loops``; a bridge
-    task propagates ``process_shutdown`` into it so a signal arriving during
-    a live session also stops the loops. The bridge is cancelled when the
-    session ends.
+    A fresh ``session_shutdown`` event drives ``run_data_loops``; bridge
+    tasks set it when ``process_shutdown`` is set (a signal) or when
+    ``end_session`` is set (the in-session accept found a client that takes
+    the session over, step R). The bridges are cancelled when the session
+    ends.
 
     ``blocklist`` is the daemon's one DNS blocklist (None when
     ``dns_blocklist`` is off); this session's DNS proxy answers from it.
+    ``unauthenticated`` gets each UDP packet this session cannot open
+    (``SessionWatch.offer``); None for TCP.
     """
     import tuncore
 
@@ -319,31 +371,38 @@ async def _run_one_session(
         liveness = LivenessState()
         reassembly = ReassemblyBuffer()
 
-        # Fresh session_shutdown drives run_data_loops; the bridge propagates
-        # a process-shutdown signal into it so a SIGTERM during this live
-        # session also stops the loops. The bridge is cancelled in the
-        # session_stack unwind (registered below) so it does not leak across
-        # sessions.
+        # Fresh session_shutdown drives run_data_loops. Bridges set it when a
+        # SIGTERM comes (process_shutdown) or when a client takes the session
+        # over (end_session). They are cancelled in the session_stack unwind
+        # (registered below) so they do not leak across sessions.
         session_shutdown = asyncio.Event()
 
         async def _propagate(src: asyncio.Event, dst: asyncio.Event) -> None:
             await src.wait()
             dst.set()
 
-        bridge = asyncio.ensure_future(_propagate(process_shutdown, session_shutdown))
+        bridges = [
+            asyncio.ensure_future(_propagate(process_shutdown, session_shutdown))
+        ]
+        if end_session is not None:
+            bridges.append(
+                asyncio.ensure_future(_propagate(end_session, session_shutdown))
+            )
 
-        async def _cancel_bridge() -> None:
-            # Cancel AND await so the task is fully retired before the next
-            # session is accepted — a bare .cancel() would leave a pending
-            # task and (on a session that ended without a signal) emit a
-            # "Task was destroyed but it is pending" warning.
-            bridge.cancel()
-            try:
-                await bridge
-            except asyncio.CancelledError:
-                pass
+        async def _cancel_bridges() -> None:
+            # Cancel AND await so each task is fully retired before the next
+            # session starts — a bare .cancel() would leave a pending task and
+            # (on a session that ended without a signal) emit a "Task was
+            # destroyed but it is pending" warning.
+            for bridge in bridges:
+                bridge.cancel()
+            for bridge in bridges:
+                try:
+                    await bridge
+                except asyncio.CancelledError:
+                    pass
 
-        session_stack.push_async_callback(_cancel_bridge)
+        session_stack.push_async_callback(_cancel_bridges)
 
         # One-element cell holding the committed egress addr. None until the
         # first authenticated packet; post_authenticate may later overwrite it
@@ -456,6 +515,7 @@ async def _run_one_session(
             replay,
             fsm,
             post_authenticate=_post_authenticate,
+            unauthenticated=unauthenticated,
             shutdown_log="server shutting down",
         )
 
@@ -591,12 +651,15 @@ async def run_server(
         process_shutdown = asyncio.Event()
         setup_signal_handlers(process_shutdown)
 
-        # Transport: the UDP transport lives for the whole run (bound once,
-        # here, on the outer stack). TCP opens a listener for each accept
-        # inside _accept_one_session and closes it once a client wins, so the
-        # port refuses connections during a session; the winning connection
-        # is registered on the per-session stack.
-        transport_obj: UDPTransport | TCPTransport | None
+        # Transport. UDP mode: one UDP socket for the whole run, and no TCP
+        # port is opened at all. TCP mode: one TCP listener for the whole run,
+        # open also while a session runs, so a client that comes back can
+        # replace its old session; each session's connection lives on its
+        # session stack. Either way a port that cannot be opened is one ERROR
+        # line and exit 1: retrying cannot fix it, and systemd restarts us
+        # after its delay.
+        transport_obj: UDPTransport | TCPTransport | None = None
+        listener: TCPListener | None = None
         if config.transport == "udp":
             transport_obj = UDPTransport()
             try:
@@ -605,9 +668,6 @@ async def run_server(
                     pmtu_discover=config.pmtu_discover,
                 )
             except OSError as e:
-                # Like a TCP listener that cannot open: retrying cannot fix
-                # it, so log one line and exit, and let systemd restart us
-                # after its delay.
                 reason = os.strerror(e.errno) if e.errno else str(e)
                 log.error(
                     "cannot listen on UDP port %d: %s; exiting",
@@ -618,91 +678,131 @@ async def run_server(
             stack.push_async_callback(transport_obj.aclose)
             log.info("server listening on UDP port %d", config.listen_port)
         else:
-            transport_obj = None
+            try:
+                listener = await _open_tcp_listener(config)
+            except ListenError as e:
+                log.error("%s; exiting", e)
+                return 1
+            stack.callback(listener.close)
+            log.info("server listening on TCP port %d", config.listen_port)
 
         # Limits on starting handshake attempts, per source address and
         # overall. One for the whole run, so they hold across accept cycles.
         limiter = SourceLimiter()
+        # Who holds the session and who may take it over (step R). One for
+        # the whole run, handed to every accept.
+        slot = SessionSlot()
 
         fsm.transition(State.CONNECTING)
 
-        # OUTER re-accept loop: accept one client, serve it to session-end,
-        # then loop back and accept the next. Exits only on process_shutdown.
+        # OUTER loop: accept a client, serve it until its session ends, then
+        # serve the next. While a session runs, a SessionWatch keeps accepting
+        # handshakes. A client that passes the full handshake and the slot's
+        # rules (the session's CN: the same client coming back) ends the
+        # session and is served next without a new accept ("pending").
+        # Exits only on process_shutdown.
         accept_failures = 0
-        served = False
+        pending: Winner | None = None
         while not process_shutdown.is_set():
-            try:
-                if config.transport == "udp":
-                    # Validate handshakes concurrently so one stalled bogus
-                    # msg1 cannot starve a real client. The acceptor does no
-                    # per-attempt FSM churn: HANDSHAKING here, CONNECTING at
-                    # the loop tail. UDP binds one transport before this loop.
-                    assert isinstance(transport_obj, UDPTransport)
-                    fsm.transition(State.HANDSHAKING)
-                    (
-                        session_keys,
-                        client_pub,
-                        transport_obj,
-                    ) = await _accept_until_winner(
-                        config,
-                        keystore,
-                        attest_store,
-                        materials,
-                        cn_allowlist,
-                        transport_obj,
-                        process_shutdown,
-                        limiter,
-                    )
-                    if session_keys is None:
-                        # Shutdown during accept: leave HANDSHAKING so the
-                        # unwind below is clean.
-                        _drive_fsm_to_idle(fsm)
-                else:
-                    session_keys, client_pub, transport_obj = await _accept_one_session(
-                        config,
-                        fsm,
-                        keystore,
-                        attest_store,
-                        materials,
-                        cn_allowlist,
-                        transport_obj,
-                        process_shutdown,
-                        limiter,
-                    )
-            except Exception as e:
-                if isinstance(e, ListenError) and not served:
-                    # Nothing has been served yet, so the listener cannot work
-                    # at all (e.g. the port is taken). Exit and let systemd
-                    # restart us after its delay instead of retrying here.
-                    log.error("%s; exiting", e)
-                    return 1
-                # Anything else raised by the accept (a bug, or the host out
-                # of a resource such as file descriptors) must not take the
-                # daemon down for every later client. A bad frame no longer
-                # gets here: it ends only its own attempt. Reset, wait the
-                # usual jittered backoff so a repeating error cannot spin,
-                # then accept again on a fresh listener.
-                log.exception("accept failed; retrying after a backoff")
-                _drive_fsm_to_idle(fsm)
-                if config.transport == "tcp" and transport_obj is not None:
-                    await transport_obj.aclose()
-                    transport_obj = None
-                accept_failures += 1
-                await _backoff_or_shutdown(accept_failures, process_shutdown)
-                if not process_shutdown.is_set():
-                    fsm.transition(State.CONNECTING)
-                continue
+            if pending is not None:
+                session_keys = pending.session_keys
+                client_pub = pending.client_pub
+                transport_obj = pending.transport
+                pending = None
+                fsm.transition(State.HANDSHAKING)
+            else:
+                try:
+                    if config.transport == "udp":
+                        # Validate handshakes concurrently so one stalled bogus
+                        # msg1 cannot starve a real client. The acceptor does no
+                        # per-attempt FSM churn: HANDSHAKING here, CONNECTING at
+                        # the loop tail.
+                        assert isinstance(transport_obj, UDPTransport)
+                        fsm.transition(State.HANDSHAKING)
+                        (
+                            session_keys,
+                            client_pub,
+                            transport_obj,
+                        ) = await _accept_until_winner(
+                            config,
+                            keystore,
+                            attest_store,
+                            materials,
+                            cn_allowlist,
+                            transport_obj,
+                            process_shutdown,
+                            limiter,
+                            slot,
+                        )
+                        if session_keys is None:
+                            # Shutdown during accept: leave HANDSHAKING so the
+                            # unwind below is clean.
+                            _drive_fsm_to_idle(fsm)
+                    else:
+                        assert listener is not None
+                        (
+                            session_keys,
+                            client_pub,
+                            transport_obj,
+                        ) = await _accept_one_session(
+                            config,
+                            fsm,
+                            keystore,
+                            attest_store,
+                            materials,
+                            cn_allowlist,
+                            transport_obj,
+                            process_shutdown,
+                            limiter,
+                            listener,
+                            slot,
+                        )
+                except Exception:
+                    # Anything raised by the accept (a bug, or the host out of
+                    # a resource such as file descriptors) must not take the
+                    # daemon down for every later client. A bad frame does not
+                    # get here: it ends only its own attempt. Reset, wait the
+                    # usual jittered backoff so a repeating error cannot spin,
+                    # then accept again (TCP: on the same listener).
+                    log.exception("accept failed; retrying after a backoff")
+                    _drive_fsm_to_idle(fsm)
+                    if config.transport == "tcp" and transport_obj is not None:
+                        await transport_obj.aclose()
+                        transport_obj = None
+                    accept_failures += 1
+                    await _backoff_or_shutdown(accept_failures, process_shutdown)
+                    if not process_shutdown.is_set():
+                        fsm.transition(State.CONNECTING)
+                    continue
 
-            if session_keys is None or client_pub is None or transport_obj is None:
-                # process_shutdown arrived while waiting for a handshake; the
-                # UDP transport unwinds with the outer stack, and the TCP
-                # accept has already closed its listener and connections.
-                if config.transport == "tcp" and transport_obj is not None:
-                    await transport_obj.aclose()
-                break
+                if (
+                    session_keys is None
+                    or client_pub is None
+                    or transport_obj is None
+                    or process_shutdown.is_set()
+                ):
+                    # Shutdown came during the accept, or as a client won it
+                    # (that client is not served). The UDP socket and the TCP
+                    # listener unwind with the outer stack; a TCP winner's
+                    # connection is closed here.
+                    _drive_fsm_to_idle(fsm)
+                    if config.transport == "tcp" and transport_obj is not None:
+                        await transport_obj.aclose()
+                    break
+                accept_failures = 0
 
-            accept_failures = 0
-            served = True
+            watch = _start_watch(
+                config,
+                keystore,
+                attest_store,
+                materials,
+                cn_allowlist,
+                transport_obj,
+                listener,
+                limiter,
+                slot,
+            )
+            dns_clash: DNSProxyPortInUseError | None = None
             try:
                 await _run_one_session(
                     config,
@@ -713,17 +813,11 @@ async def run_server(
                     transport_obj,
                     process_shutdown,
                     blocklist,
+                    watch.end_session,
+                    watch.offer,
                 )
             except DNSProxyPortInUseError as e:
-                # A host resolver holds :53. Retrying cannot fix that and would
-                # loop on the same bind error, so exit with a clear message.
-                log.error(
-                    "FATAL: DNS proxy port conflict — %s. "
-                    "Stop the host resolver or change the TUN address, "
-                    "then restart dsm.",
-                    e,
-                )
-                return 1
+                dns_clash = e
             except Exception:
                 # A per-session host-setup failure (TUN open/configure, DNS-proxy
                 # bind, forwarding sysctls) previously propagated out of this
@@ -737,14 +831,39 @@ async def run_server(
                     "next client"
                 )
                 _drive_fsm_to_idle(fsm)
+            finally:
+                # Always, also on a fatal error or a cancel: no handshake task
+                # may outlive the session it watched.
+                pending = await watch.stop()
 
-            # The session ended. If it was a process shutdown, the loop
-            # condition breaks below. Otherwise (dead-peer / SESSION_CLOSE /
-            # roam) the FSM is already back in IDLE (run_data_loops drove
-            # TEARDOWN → IDLE), so move it to CONNECTING for the next accept.
-            # For UDP we keep the same outer transport; for TCP
-            # _accept_one_session re-creates the listener next iteration.
-            if not process_shutdown.is_set():
-                fsm.transition(State.CONNECTING)
+            if dns_clash is not None or process_shutdown.is_set():
+                if pending is not None and config.transport == "tcp":
+                    # A client that won during this session is not served.
+                    await pending.transport.aclose()
+                if dns_clash is not None:
+                    # A host resolver holds :53. Retrying cannot fix that and
+                    # would loop on the same bind error, so exit with a clear
+                    # message.
+                    log.error(
+                        "FATAL: DNS proxy port conflict — %s. "
+                        "Stop the host resolver or change the TUN address, "
+                        "then restart dsm.",
+                        dns_clash,
+                    )
+                    return 1
+                break
+            if pending is None:
+                # Nobody took the session over: the next accept is open to any
+                # allowed client.
+                slot.clear()
+            # The session ended (dead peer, SESSION_CLOSE, a takeover, a setup
+            # error); run_data_loops or _drive_fsm_to_idle left the FSM in
+            # IDLE. The UDP socket and the TCP listener serve on.
+            fsm.transition(State.CONNECTING)
+            if pending is not None:
+                # LocalDNSProxy.stop() closes its socket one loop step later,
+                # and the next session binds the same address at once; a clash
+                # there is fatal. Give asyncio that step.
+                await asyncio.sleep(0)
 
     return 0
