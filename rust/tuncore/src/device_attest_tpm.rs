@@ -19,12 +19,15 @@
 //! can lock the exact bitmask.
 
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
 use hkdf::Hkdf;
 use sha2::{Digest as _, Sha256};
 use tss_esapi::attributes::ObjectAttributes;
 use tss_esapi::constants::tss::{TPM2_RH_NULL, TPM2_ST_HASHCHECK};
 use tss_esapi::constants::{StartupType, Tss2ResponseCodeKind};
+use tss_esapi::handles::KeyHandle;
 use tss_esapi::interface_types::algorithm::{HashingAlgorithm, PublicAlgorithm};
 use tss_esapi::interface_types::ecc::EccCurve;
 use tss_esapi::interface_types::resource_handles::Hierarchy;
@@ -98,24 +101,176 @@ impl From<tss_esapi::Error> for TpmOpError {
     }
 }
 
+/// Why one sign try failed: a TPM or ESYS error, kept typed so `sign` can
+/// tell a refused passphrase from a stale connection, or anything else.
+enum SignError {
+    Tpm(tss_esapi::Error),
+    Other(String),
+}
+
+impl From<tss_esapi::Error> for SignError {
+    fn from(e: tss_esapi::Error) -> Self {
+        SignError::Tpm(e)
+    }
+}
+
+impl SignError {
+    /// True when the TPM refused the key's authorization (a wrong
+    /// passphrase) or is locked out after such refusals. The TPM counts each
+    /// refused try toward its dictionary-attack lockout, so `sign` never
+    /// tries these again.
+    fn is_refused_auth(&self) -> bool {
+        matches!(
+            self,
+            SignError::Tpm(tss_esapi::Error::Tss2Error(rc))
+                if matches!(
+                    rc.kind(),
+                    Some(
+                        Tss2ResponseCodeKind::AuthFail
+                            | Tss2ResponseCodeKind::BadAuth
+                            | Tss2ResponseCodeKind::Lockout
+                    )
+                )
+        )
+    }
+
+    /// The caller's error text, worded as before step R (`TPM error: ...`).
+    fn into_message(self) -> String {
+        match self {
+            SignError::Tpm(e) => format!("TPM error: {e}"),
+            SignError::Other(s) => s,
+        }
+    }
+}
+
+/// One open TPM connection with the parent (Owner storage primary) loaded.
+///
+/// `TPM2_CreatePrimary` is the slow part of a sign on a real TPM (most of
+/// the 0.21 s measured on the server box). A key that keeps one of these
+/// between signs skips it. Through the kernel resource manager
+/// (`/dev/tpmrm0`) the loaded parent lives in this connection's own space:
+/// no other program can see or use it, and closing the connection frees
+/// it. The attest key's secret never leaves the TPM either way.
+struct TpmConnection {
+    ctx: Context,
+    parent: KeyHandle,
+}
+
+// SAFETY: `Context` is not `Send` only because it owns the raw ESYS context
+// pointer. ESYS keeps no per-thread state; it must only never run two calls
+// at once. A `TpmConnection` is reached only through the `Mutex` in
+// `TpmAttestKey::connection`, so one thread at a time uses it.
+unsafe impl Send for TpmConnection {}
+
+impl TpmConnection {
+    /// Open a connection to `tcti` and make the parent key in it.
+    fn open(tcti: &str) -> Result<Self, SignError> {
+        let mut ctx = open_context(tcti).map_err(SignError::Other)?;
+        let parent = ctx.execute_with_nullauth_session(|ctx| -> Result<KeyHandle, SignError> {
+            // The SAME deterministic Owner storage parent every time: an
+            // identical template under the stable Owner primary seed yields
+            // the identical primary, so the child loads under it.
+            let template = parent_template().map_err(SignError::Other)?;
+            Ok(ctx
+                .create_primary(Hierarchy::Owner, template, None, None, None, None)?
+                .key_handle)
+        })?;
+        Ok(Self { ctx, parent })
+    }
+
+    /// Load the child under the parent, sign `digest`, flush the child.
+    fn sign(
+        &mut self,
+        child_public: Public,
+        child_private: Private,
+        auth: Option<Auth>,
+        digest: Digest,
+    ) -> Result<Signature, SignError> {
+        let parent = self.parent;
+        self.ctx
+            .execute_with_nullauth_session(|ctx| -> Result<Signature, SignError> {
+                // Build the TPM_RC_NULL hashcheck ticket before loading
+                // anything, so an unexpected failure here cannot leak a
+                // transient slot.
+                let validation = build_null_hashcheck().map_err(|e| SignError::Other(e.0))?;
+                let child = ctx.load(parent, child_private, child_public)?;
+                // Bind the operator passphrase as the key's TPM auth: a WRONG
+                // passphrase gives the wrong auth and the TPM rejects the sign
+                // (and counts it toward its lockout). `None` keeps empty auth.
+                // Flush the child on this error path too.
+                if let Some(auth) = auth {
+                    if let Err(e) = ctx.tr_set_auth(child.into(), auth) {
+                        let _ = ctx.flush_context(child.into());
+                        return Err(e.into());
+                    }
+                }
+                let scheme = SignatureScheme::EcDsa {
+                    hash_scheme: HashScheme::new(HashingAlgorithm::Sha256),
+                };
+                // Capture the result without returning early, so the child is
+                // always flushed, even on a sign error.
+                let result = ctx.sign(child, digest, scheme, validation);
+                let _ = ctx.flush_context(child.into());
+                Ok(result?)
+            })
+    }
+}
+
+impl Drop for TpmConnection {
+    fn drop(&mut self) {
+        // Best effort: on a stale connection the flush fails, and through
+        // /dev/tpmrm0 closing the connection frees the parent anyway; swtpm
+        // and a raw /dev/tpm0 need the flush. `Context`'s own drop then
+        // closes the connection.
+        let _ = self.ctx.flush_context(self.parent.into());
+    }
+}
+
+/// True when `tcti` goes through a TPM resource manager, which lets several
+/// connections use the TPM at once: the kernel's `/dev/tpmrm*` or the
+/// tpm2-abrmd daemon. Only then does a key keep its connection by default.
+/// A raw `/dev/tpm*` takes one opener at a time and swtpm serves one
+/// connection at a time, so a kept connection there would lock every other
+/// TPM user out.
+fn tcti_shares_the_tpm(tcti: &str) -> bool {
+    tcti.starts_with("device:/dev/tpmrm") || tcti == "tabrmd" || tcti.starts_with("tabrmd:")
+}
+
+/// Lock a key's kept connection. A sign that panicked while it held the
+/// lock may have left the connection half used, so drop it and go on.
+fn lock_connection(lock: &Mutex<Option<TpmConnection>>) -> MutexGuard<'_, Option<TpmConnection>> {
+    match lock.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            let mut guard = poisoned.into_inner();
+            *guard = None;
+            lock.clear_poison();
+            guard
+        }
+    }
+}
+
 /// In-TPM ECDSA P-256 attestation key. The private scalar is generated by and
 /// never leaves the TPM; signing happens via `TPM2_Sign`.
 ///
 /// Holds the persistable child key material — `Public` (the TPM-exported public
 /// area, whose attribute bitmask IS the residency lock) and `Private` (the
-/// TPM-encrypted sensitive area, the `DSMT` payload) —
-/// plus the cached SPKI and the TCTI string used to reach the owning TPM.
+/// TPM-encrypted sensitive area, the `DSMT` payload) — plus the cached SPKI and
+/// the TCTI string used to reach the owning TPM.
 ///
-/// Note on the Esys context: it is deliberately NOT held here. A live
-/// `tss_esapi::Context` is neither `Send` nor `Sync` (it owns a raw
-/// `ESYS_CONTEXT` pointer), which would make this type — and the
-/// `#[pyclass]` that wraps it — non-`Sync`. The child is created AND loaded
-/// inside [`generate_with_tcti`]'s session (proving it is loadable), and the
-/// transient handles are flushed before the context drops. `sign`
-/// re-opens a context from `tcti` and reloads the child from
-/// `child_public`/`child_private` for each call.
+/// Note on the Esys context: through a resource manager (`/dev/tpmrm*` or
+/// tpm2-abrmd) the key keeps one open connection, with its parent key loaded,
+/// from its first [`sign`] until [`zeroize`] or drop, so a sign skips
+/// `TPM2_CreatePrimary`. A live `tss_esapi::Context` is neither `Send` nor
+/// `Sync`; it sits in a `TpmConnection` behind a `Mutex`, which keeps this
+/// type, and the `#[pyclass]` that wraps it, `Send + Sync`, and makes signs
+/// from several threads take turns. On a raw `/dev/tpm*` or swtpm, which
+/// serve one connection at a time, `sign` opens a connection, makes the
+/// parent, signs and closes again. `generate` and `encrypt_to_store` always
+/// use their own short-lived connection.
 ///
-/// [`generate_with_tcti`]: Self::generate_with_tcti
+/// [`sign`]: Self::sign
+/// [`zeroize`]: Self::zeroize
 pub struct TpmAttestKey {
     // The TCTI to re-reach the owning TPM (used by `sign` / `from_store_blob_with_tcti`),
     // and the child's exported public + TPM-encrypted private areas which reload
@@ -133,6 +288,15 @@ pub struct TpmAttestKey {
     // rejects the sign. Held in a `Zeroizing<[u8;32]>` so it is scrubbed on
     // drop and explicitly cleared in `zeroize`.
     auth: Option<Zeroizing<[u8; TPM_AUTH_LEN]>>,
+    // Keep one TPM connection, with the parent loaded, between signs? On by
+    // default only through a resource manager (`tcti_shares_the_tpm`).
+    keep_connection: bool,
+    // The kept connection, made by the first sign. The Mutex also makes signs
+    // from several threads take turns: one ESYS context must never run two
+    // commands at once, and a raw /dev/tpm0 takes one opener at a time.
+    connection: Mutex<Option<TpmConnection>>,
+    // How many times this key made its parent in the TPM.
+    parents_made: AtomicU64,
 }
 
 impl TpmAttestKey {
@@ -214,6 +378,9 @@ impl TpmAttestKey {
             // succeed without a passphrase. The auth is bound later, at store
             // time, by `encrypt_to_store`.
             auth: None,
+            keep_connection: tcti_shares_the_tpm(tcti),
+            connection: Mutex::new(None),
+            parents_made: AtomicU64::new(0),
         })
     }
 
@@ -259,19 +426,28 @@ impl TpmAttestKey {
     /// The signing scalar NEVER leaves the TPM — only the public `(r, s)` of
     /// the resulting signature is read out and re-encoded.
     ///
+    /// # Connection
+    /// With a kept connection (see [`keeps_connection`]) the first sign opens
+    /// it and makes the parent; later signs only load the child, sign and
+    /// flush the child. Signs from several threads take turns. If the kept
+    /// connection went stale (the TPM was reset, or the resource manager
+    /// restarted), the sign drops it and tries once more on a new one, except
+    /// after a refused authorization. Without a kept connection every sign
+    /// opens its own connection, re-derives the SAME deterministic Owner
+    /// primary, loads the child, signs and closes, as before step R.
+    ///
     /// # Persistence proof
-    /// This method opens its OWN fresh Esys context from `self.tcti` (the
-    /// context used by `generate` was already dropped), re-derives the SAME
-    /// deterministic Owner primary via [`parent_template`], `TPM2_Load`s the
-    /// child from the retained `Public`/`Private`, signs, and flushes both
-    /// transient handles. A successful sign therefore proves the child reloads
-    /// under a freshly re-derived primary — the key truly persists in the TPM.
+    /// The parent is always re-derived from [`parent_template`] (never
+    /// stored), so a successful sign proves the child reloads under a
+    /// re-derived primary — the key truly persists in the TPM.
     ///
     /// # Errors
     /// Returns a `String` if the key has been zeroized, the message exceeds the
     /// cap, the TCTI/TPM command fails, or the TPM returns a non-ECDSA
     /// signature. No raw internal TPM state is leaked beyond the return-code
     /// name and operation context.
+    ///
+    /// [`keeps_connection`]: Self::keeps_connection
     pub fn sign(&self, msg: &[u8]) -> Result<Vec<u8>, String> {
         if self.spki_der.is_empty() {
             return Err("attest key has been zeroized".into());
@@ -286,78 +462,93 @@ impl TpmAttestKey {
         // Hash the whole message to a 32-byte SHA-256 digest — the same input
         // the soft backend's `p256` signer derives internally.
         let digest_bytes = Sha256::digest(msg);
-        let digest = Digest::try_from(digest_bytes.as_slice())
-            .map_err(|e| format!("wrap SHA-256 digest for TPM: {e}"))?;
-        let scheme = SignatureScheme::EcDsa {
-            hash_scheme: HashScheme::new(HashingAlgorithm::Sha256),
+        let mut kept = lock_connection(&self.connection);
+        let reused = kept.is_some();
+        let signature = match self.sign_digest(&mut kept, digest_bytes.as_slice()) {
+            Ok(signature) => signature,
+            // A kept connection can go stale between signs: the TPM was
+            // reset, or the resource manager restarted. Drop it and try once
+            // more on a new one. Never after a refused authorization.
+            Err(e) if reused && !e.is_refused_auth() => {
+                *kept = None;
+                self.sign_digest(&mut kept, digest_bytes.as_slice())
+                    .map_err(SignError::into_message)?
+            }
+            Err(e) => return Err(e.into_message()),
         };
+        ecdsa_signature_to_der(&signature)
+    }
 
-        // Fresh context: `generate`'s context is long gone, so this re-open +
-        // re-derive-primary + reload is the persistence proof.
-        let mut ctx = open_context(&self.tcti)?;
-        let child_public = self.child_public.clone();
-        let child_private = self.child_private.clone();
-        // Build the child's auth value (if any) OUTSIDE the session closure so a
-        // size error surfaces as a typed crate error before touching the TPM.
-        // `Auth::try_from` cannot fail for 32 bytes (well under `Auth::MAX_SIZE`),
-        // but we map it rather than unwrap to honor the no-`unwrap` rule.
+    /// One sign try: on the kept connection, or on a new one, which is kept
+    /// afterwards with `keep_connection` and closed otherwise.
+    fn sign_digest(
+        &self,
+        kept: &mut Option<TpmConnection>,
+        digest_bytes: &[u8],
+    ) -> Result<Signature, SignError> {
+        let digest = Digest::try_from(digest_bytes)
+            .map_err(|e| SignError::Other(format!("wrap SHA-256 digest for TPM: {e}")))?;
+        // Build the child's auth value (if any) before touching the TPM, so a
+        // size error surfaces as a typed crate error. `Auth::try_from` cannot
+        // fail for 32 bytes (well under `Auth::MAX_SIZE`), but it is mapped
+        // rather than unwrapped to honor the no-`unwrap` rule.
         let auth = self
             .auth
             .as_ref()
-            .map(|a| Auth::try_from(a.as_slice()).map_err(|e| format!("wrap TPM auth value: {e}")))
-            .transpose()?;
-        let signature = ctx
-            .execute_with_nullauth_session(|ctx| -> Result<Signature, TpmOpError> {
-                // Re-derive the SAME deterministic Owner storage parent. An
-                // identical template under the stable Owner primary seed yields
-                // the identical primary, so the child loads under it.
-                // Build the TPM_RC_NULL hashcheck ticket up front (the digest is
-                // supplied externally and unrestricted keys sign it without a
-                // ticket). Doing this BEFORE any handle is loaded means an
-                // unexpected failure here cannot leak a transient slot.
-                let validation = build_null_hashcheck()?;
-                let parent = ctx.create_primary(
-                    Hierarchy::Owner,
-                    parent_template().map_err(TpmOpError)?,
-                    None,
-                    None,
-                    None,
-                    None,
-                )?;
-                let child = match ctx.load(parent.key_handle, child_private, child_public) {
-                    Ok(h) => h,
-                    Err(e) => {
-                        // Flush the parent before bubbling up so a load failure
-                        // does not leak a transient slot.
-                        let _ = ctx.flush_context(parent.key_handle.into());
-                        return Err(e.into());
-                    }
-                };
-                // Bind the operator passphrase as the key's TPM auth:
-                // install the derived auth on the child's ESYS handle so the
-                // nullauth HMAC session authorizes the sign with it. A WRONG
-                // passphrase => wrong derived auth => the TPM rejects the sign
-                // with an authorization-HMAC failure (and increments its DA
-                // counter). On `None` the key keeps empty auth (back-compat /
-                // the fresh enroll key). Flush BOTH handles on this error path
-                // too, so a `tr_set_auth` failure cannot leak a transient slot.
-                if let Some(auth) = auth {
-                    if let Err(e) = ctx.tr_set_auth(child.into(), auth) {
-                        let _ = ctx.flush_context(child.into());
-                        let _ = ctx.flush_context(parent.key_handle.into());
-                        return Err(e.into());
-                    }
-                }
-                // Capture the sign result WITHOUT early-returning so both
-                // transient handles are always flushed, even on a sign error.
-                let result = ctx.sign(child, digest, scheme, validation);
-                let _ = ctx.flush_context(child.into());
-                let _ = ctx.flush_context(parent.key_handle.into());
-                Ok(result?)
+            .map(|a| {
+                Auth::try_from(a.as_slice())
+                    .map_err(|e| SignError::Other(format!("wrap TPM auth value: {e}")))
             })
-            .map_err(|e: TpmOpError| e.0)?;
+            .transpose()?;
+        let mut connection = match kept.take() {
+            Some(connection) => connection,
+            None => {
+                let connection = TpmConnection::open(&self.tcti)?;
+                self.parents_made.fetch_add(1, Ordering::Relaxed);
+                connection
+            }
+        };
+        let result = connection.sign(
+            self.child_public.clone(),
+            self.child_private.clone(),
+            auth,
+            digest,
+        );
+        if self.keep_connection {
+            *kept = Some(connection);
+        }
+        result
+    }
 
-        ecdsa_signature_to_der(&signature)
+    /// True when this key keeps one TPM connection, with its parent loaded,
+    /// between signs. On by default only through a resource manager
+    /// (`/dev/tpmrm*` or tpm2-abrmd), where other programs can use the TPM
+    /// at the same time.
+    #[must_use]
+    pub fn keeps_connection(&self) -> bool {
+        self.keep_connection
+    }
+
+    /// Turn the kept connection on or off. Off closes a kept one now.
+    ///
+    /// Turn it on only where the TPM takes several connections at once, or
+    /// where this key is the only TPM user: a raw `/dev/tpm0` takes one
+    /// opener at a time and swtpm serves one connection at a time, so a kept
+    /// connection there blocks every other connection, this key's own
+    /// `encrypt_to_store` included, until the key is zeroized or dropped.
+    pub fn set_keep_connection(&mut self, keep: bool) {
+        self.keep_connection = keep;
+        if !keep {
+            *lock_connection(&self.connection) = None;
+        }
+    }
+
+    /// How many times this key has made its parent key in the TPM: once with
+    /// a kept connection (plus once per recovery from a stale one), once per
+    /// sign without.
+    #[must_use]
+    pub fn parents_made(&self) -> u64 {
+        self.parents_made.load(Ordering::Relaxed)
     }
 
     /// Serialize the persistable reference to the in-TPM key as a versioned
@@ -425,6 +616,9 @@ impl TpmAttestKey {
             // `decrypt_from_store`, which wraps this constructor; the raw
             // no-passphrase `from_store_blob*` path yields an empty-auth key.
             auth: None,
+            keep_connection: tcti_shares_the_tpm(tcti),
+            connection: Mutex::new(None),
+            parents_made: AtomicU64::new(0),
         })
     }
 
@@ -574,12 +768,14 @@ impl TpmAttestKey {
     }
 
     /// Render the key permanently unusable, parity with `SoftAttestKey::zeroize`: every
-    /// accessor then returns `"attest key has been zeroized"`. Clears `child_private` and
-    /// the cached `auth` (both scrub via their inner `Zeroizing`) and `spki_der`, whose
-    /// emptiness is the single "consumed" flag. Idempotent; no TPM handle to release.
+    /// accessor then returns `"attest key has been zeroized"`. Closes the kept TPM
+    /// connection (flushing its parent), clears `child_private` and the cached `auth`
+    /// (both scrub via their inner `Zeroizing`) and `spki_der`, whose emptiness is the
+    /// single "consumed" flag. Idempotent.
     pub fn zeroize(&mut self) {
         use zeroize::Zeroize;
 
+        *lock_connection(&self.connection) = None;
         let old_private = std::mem::take(&mut self.child_private);
         drop(old_private);
         let old_auth = self.auth.take();

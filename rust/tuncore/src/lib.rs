@@ -569,8 +569,13 @@ impl PyAttestKey {
     }
 
     /// Sign `msg` with the attestation key. Returns ASN.1 DER ECDSA signature.
-    fn sign(&self, msg: &[u8]) -> PyResult<Vec<u8>> {
-        self.inner.sign(msg).map_err(py_err)
+    ///
+    /// Runs without the GIL: a TPM signature takes a noticeable time, and the
+    /// server makes it in a worker thread (`asyncio.to_thread`) while its
+    /// event loop keeps serving a live session. The TPM backend makes signs
+    /// on one key take turns; the soft backend needs no turns.
+    fn sign(&self, py: Python<'_>, msg: &[u8]) -> PyResult<Vec<u8>> {
+        py.allow_threads(|| self.inner.sign(msg)).map_err(py_err)
     }
 
     /// Encrypt/seal the attest key to disk, binding the operator passphrase.
