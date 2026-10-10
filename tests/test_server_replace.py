@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator
 from dataclasses import replace
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -240,7 +240,7 @@ def _faked(
     *,
     udp_accept: Any = None,
     tcp_accept: Any = None,
-) -> Iterator[list[dict[str, Any]]]:
+) -> Generator[list[dict[str, Any]], None, None]:
     """Fake every host call of run_server. ``on_session(n, ctx)`` runs when
     session n's data loops start; the loops then wait for the session's
     shutdown event, like the real ones."""

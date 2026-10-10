@@ -98,7 +98,7 @@ async def _run(
     hook: Any = None,
     allowlist: CNAllowlist | None = None,
     crl: CRL | None = None,
-) -> list[Any]:
+) -> tuple[Any, Any]:
     if allowlist is None:  # not ``or``: an empty CNAllowlist is falsy
         allowlist = CNAllowlist(cns=frozenset({CLIENT_CN}))
     return await asyncio.wait_for(
@@ -136,7 +136,7 @@ async def _udp_pair() -> tuple[UDPTransport, UDPTransport, Addr]:
     return server_t, client_t, ("127.0.0.1", port)
 
 
-async def _run_udp(p: _Parties, sent: list[bytes], **kwargs: Any) -> list[Any]:
+async def _run_udp(p: _Parties, sent: list[bytes], **kwargs: Any) -> tuple[Any, Any]:
     server_t, client_t, addr = await _udp_pair()
     try:
         _count_sends(server_t, sent)
@@ -146,7 +146,7 @@ async def _run_udp(p: _Parties, sent: list[bytes], **kwargs: Any) -> list[Any]:
         await server_t.aclose()
 
 
-def _ok(results: list[Any]) -> None:
+def _ok(results: tuple[Any, Any]) -> None:
     for result in results:
         assert not isinstance(result, BaseException), result
 

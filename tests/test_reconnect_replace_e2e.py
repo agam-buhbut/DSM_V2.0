@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from dataclasses import replace
 from typing import Any
 from unittest.mock import patch
@@ -153,7 +153,7 @@ class _World:
 
 
 @contextlib.asynccontextmanager
-async def _server(world: _World) -> AsyncIterator[Addr]:
+async def _server(world: _World) -> AsyncGenerator[Addr, None]:
     """run_server on 127.0.0.1 with fake host state; yields its address."""
     _Tun.written = asyncio.Queue()
     _LoopbackUDP.bound = asyncio.get_running_loop().create_future()
