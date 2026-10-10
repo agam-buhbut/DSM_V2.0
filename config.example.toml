@@ -67,6 +67,11 @@ attest_key_file = "/opt/mtun/attest.key"
 # auto-resolve via the TCTI / TPM2TOOLS_TCTI env vars and finally the
 # in-kernel resource manager at /dev/tpmrm0. Override only for a non-default
 # device or a test TPM. The soft-attest backend ignores this field.
+# Use /dev/tpmrm0 (the default), not the raw /dev/tpm0: only through a
+# resource manager (/dev/tpmrm*, or tpm2-abrmd) does DSM keep its TPM
+# connection, with the parent key loaded, between signatures (a bit faster
+# handshakes). That loaded key is private to DSM's connection. The raw
+# device takes one user at a time, so DSM opens it for each signature.
 #   attest_tpm_tcti = "device:/dev/tpmrm0"     # explicit hardware TPM
 #   attest_tpm_tcti = "swtpm:host=127.0.0.1,port=2321"  # hermetic test TPM
 # attest_tpm_tcti =
@@ -127,6 +132,9 @@ expected_server_cn = "dsm-1234abcd-server"
 # that TCP transport suffers when carrying TCP traffic inside a TCP tunnel.
 # Use transport = "tcp" only as a fallback on networks that block or aggressively
 # mangle UDP (e.g., restrictive corporate firewalls, some mobile carriers).
+# The server listens on one port of this kind only: in UDP mode it opens no
+# TCP port at all; in TCP mode its one TCP listener stays open for the whole
+# run, also while a session runs.
 transport = "udp"                            # "udp" | "tcp"
 tun_name = "mtun0"
 log_level = "warning"                        # "debug" | "info" | "warning" | "error"

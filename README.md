@@ -125,10 +125,15 @@ side under `asyncio.gather`: `recv_loop`, `tun_send_loop` and
 
 ### Connection
 
-Each server instance serves one client. The server opens a single socket.
-Over TCP it checks several connections at once and keeps one session. Over
-UDP it locks onto the first peer address that passes authentication. A
-session ends cleanly with a SESSION_CLOSE packet.
+Each server instance serves one client at a time. It listens on one port: a
+UDP socket, or with `transport = "tcp"` a TCP listener that stays open for
+the whole run (in UDP mode the server opens no TCP port at all). It checks
+several handshakes at once, also while a session runs. A client that
+connects again with the same name (the CN in its certificate), for example
+after a crash, replaces its old session as soon as its full handshake
+passes. Another client waits until the session ends. Over UDP the server
+locks onto the first peer address that passes authentication. A session
+ends cleanly with a SESSION_CLOSE packet.
 
 ### Reliability
 
@@ -159,6 +164,11 @@ session ends cleanly with a SESSION_CLOSE packet.
   that gives up, or a handshake that fails), the client keeps its kill
   switch up and connects again by itself: it waits 1 s, then twice as long
   each time up to 30 s, with no limit on tries. See Leak Prevention.
+- When a client crashes and starts again, the server takes it back within
+  seconds: it ends the old session as soon as the client's new handshake
+  passes, instead of waiting about 65 s for the old session to time out.
+  Each client name may do this 3 times at once, then once a minute. A client
+  with a fixed `listen_port` does not get this (deploy/GUIDE.md §7i).
 
 ### Fragmentation
 
@@ -681,7 +691,8 @@ The config file is TOML, at `/opt/mtun/config.toml`.
   server checks at the same time, over UDP or TCP (default: 8, allowed
   1-4096, warns above 1024). One stalled attempt cannot block a real client.
   Each source address may also run at most 2 at once and start 1 every 4 s
-  (3 at once); these limits are fixed, not settings.
+  (3 at once). While a session runs, all addresses together may start only
+  1 a second. These limits are fixed, not settings.
 - transport: udp | tcp (default: udp)
 - dns_providers: DoH/DoT URLs (server mode)
 - dns_provider_pins: SPKI SHA-256 pins for each provider (server mode,

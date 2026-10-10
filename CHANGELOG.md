@@ -8,6 +8,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- A client that crashes and starts again is back within seconds instead of
+  about 65 s. The server now accepts handshakes while a session runs. A
+  client with the same name (the CN in its certificate) that passes the
+  full handshake replaces its old session at once; another client is
+  refused before the last handshake frame and gets in once the session
+  ends. Each name may replace its session 3 times at once, then once a
+  minute, so two devices that share a name cannot push each other off
+  forever. New log lines: `client reconnected`, `reconnected with a
+  different device key`, `reconnected too often`, `handshake refused:
+  another client is connected`. A client with a fixed `listen_port` gets
+  nothing from this: it still waits for the old session to time out.
+- With `transport = "tcp"` the server opens its TCP port once at start and
+  keeps it open for the whole run, also during a session. In UDP mode it
+  still opens no TCP port.
+- While a session runs, new handshakes may start at most once a second, on
+  top of the existing limits.
+- The server's attest signature no longer blocks its event loop: it runs in
+  a worker thread, without the Python lock. On `/dev/tpmrm*` and with
+  tpm2-abrmd the attest key keeps one TPM connection with its parent key
+  loaded, so a signature no longer makes that key again each time (on the
+  server box's TPM a signature went from about 214 ms to about 175 ms). A
+  raw `/dev/tpm0` and swtpm still open the TPM for each signature; use
+  `/dev/tpmrm0`.
 - A lost key-change reply (REKEY_ACK) no longer breaks the session: the
   side that answers keeps its old keys until the other side uses the new
   ones (at most 110 s), so a resent request can still be answered.

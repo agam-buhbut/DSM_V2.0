@@ -179,6 +179,18 @@ $ tpm2_getrandom --hex 8         # prints 16 hex chars if the TPM works
 (`dsm enroll` runs its own preflight and fails with an actionable
 message if the TPM or the tss group is missing.)
 
+Use `/dev/tpmrm0` (the default), not the raw `/dev/tpm0`. Through the
+resource manager (the kernel's `/dev/tpmrm*`, or the tpm2-abrmd daemon) the
+server keeps one TPM connection open, with the parent key of its attest key
+loaded, so each handshake signature skips making that parent key again. On
+the test box that took a signature from about 214 ms to about 175 ms. That
+loaded key lives in DSM's own connection: no other program can see or use
+it, and it is gone when DSM stops. The attest key's secret never leaves the
+TPM. On a raw `/dev/tpm0`, which takes one user at a time, DSM opens the TPM
+for each signature instead, as before. Signatures run in a worker thread
+with Python's lock released, so a running session keeps moving while the
+server signs for a new handshake.
+
 ### 0f. Clock synchronization (NTP) — both client and server
 
 DSM handshakes include a freshness timestamp. If the two peers' clocks
@@ -904,6 +916,14 @@ again by themselves. Live SIGHUP reload is on the Phase-2 punch list. To
 REVOKE: remove the CN from the file, restart, and optionally issue a CRL
 update (§7e).
 
+Use one CN per device. The server serves one client at a time. A client
+that connects again with the same CN while its session runs (for example
+after a crash) replaces that session as soon as its full handshake passes;
+the server logs `client reconnected (client_cn=...)`. A client with another
+CN waits until the session ends. Two devices that share one CN push each
+other off: the server allows 3 quick takeovers per CN, then one a minute,
+and logs a WARNING (§11).
+
 ## 5. Run Both Sides
 
 Server:
@@ -1278,6 +1298,13 @@ leaves it up; run `sudo dsm cleanup`.
   `sudo dsm cleanup`. To start DSM again after systemd gave up, run
   `sudo systemctl reset-failed dsm-client`, then
   `sudo systemctl start dsm-client`.
+  The server takes the restarted client back within seconds: as soon as
+  the new handshake passes, it ends the old session (it logs `client
+  reconnected`). This needs `listen_port = 0` on the client (the default).
+  With a fixed `listen_port` the restarted client comes from the old
+  session's address, the server's packets for the old session reach it
+  during its handshake and spoil it, and it waits for the old session to
+  time out (about 65 s), as before.
 - **Setup errors at the first start** (a wrong passphrase, keys or cert
   that do not match, a UDP `listen_port` in use, a read-only
   `/etc/resolv.conf`): DSM removes the kill switch and exits 1, as before:
@@ -1450,6 +1477,16 @@ $ for iface in $(ls /sys/class/net); do
   done
 $ sudo sysctl -w net.ipv6.conf.all.disable_ipv6=0
 $ sudo rm -f /run/dsm/ipv6_state.json
+```
+
+To see the quick reconnect instead of cleaning up, start the client again
+(under `dsm-client.service` systemd does it after 5 s):
+
+```sh
+$ sudo systemctl start dsm-client
+# Within seconds the client logs "tunnel established" and the server logs
+# "client reconnected (client_cn=...); ending its old session". Before this
+# change the server waited about 65 s for the old session to time out.
 ```
 
 ## 9. Two-Box Demo Across Two Real ISPs
@@ -1870,6 +1907,11 @@ prints "ok".
   third raises without sleeping) — about 18 s per try. After a failed
   try the client keeps the kill switch up and tries again by itself
   (1 s, doubling to 30 s, no limit; §7i). You do not need to restart it.
+- Another client holds the server's one session. The server answers with
+  msg2, then refuses this client before the last frame; its log says
+  `handshake refused: another client is connected (client_cn=...)`. This
+  client connects once the other session ends. One server serves one client
+  at a time.
 
 ### Server log shows "handshake rejected (CNNotAllowedError): client CN '...' not in allowlist"
 
@@ -2023,9 +2065,10 @@ before a restart does not match tags after it. (Older versions logged
 The server could not open its listen port at startup, so it exits with
 status 1. systemd starts it again after `RestartSec` (10 s in the unit
 file) and gives up after 5 failed starts in 10 minutes. With
-`transport = "tcp"` the same line says TCP. Another program holds the
-port. Find it, then stop it or change `listen_port` (and `server_port` on
-the clients):
+`transport = "tcp"` the same line says TCP: the server opens its TCP port
+once, at start, and keeps it open for the whole run. In UDP mode it opens
+no TCP port. Another program holds the port. Find it, then stop it or
+change `listen_port` (and `server_port` on the clients):
 
 ```sh
 $ sudo ss -ulnp | grep ':51820 '        # for TCP: sudo ss -tlnp
@@ -2052,6 +2095,9 @@ every handshake slot. The limits are the same for UDP and TCP:
   then 1 every 4 s.
 - "too many new handshakes overall": all addresses together may start 8 at
   once, then 4 a second.
+- "too many new handshakes while a session runs": while a session is live,
+  all addresses together may start one new handshake a second, on top of
+  the limits above. Each one costs a TPM signature.
 
 These are INFO lines. They show with `log_level = "info"` (the default),
 not with the `"warning"` that `config.example.toml` sets.
@@ -2074,10 +2120,44 @@ refusal ends at most 12 s after that stops. Four real addresses can also
 hold all 8 slots (UDP or TCP). Part 2 of the handshake hardening, with
 cookies that prove the address, closes the spoofed case.
 
-With `transport = "tcp"` the server keeps listening while handshakes run,
-so a silent connection no longer holds up other clients. It keeps at most 2
-connections per address and closes each one that has not finished its
-handshake after 12 s.
+With `transport = "tcp"` the server keeps its one listening socket open for
+the whole run, also while a session runs, so a silent connection does not
+hold up other clients and a client that comes back can take its session
+over. It keeps at most 2 connections per address and closes each one that
+has not finished its handshake after 12 s.
+
+### Server log: "client reconnected (client_cn=...); ending its old session"
+
+Normal after a client crashed or restarted: it came back with the same name
+and passed the full handshake, so the server ended its old session at once
+instead of waiting for it to time out. Nobody without that client's Noise
+key and TPM attest key can cause this line.
+
+### Server log: "client_cn=... reconnected with a different device key ..."
+
+A client with this name connected again, but with another device key (the
+16-hex `noise_static_sha256`). Either the device was enrolled again, or two
+devices share this name. If the line repeats, give each device its own CN
+(§3f, §4).
+
+### Server log: "client_cn=... reconnected too often; keeping its current session ..."
+
+This name took its session over more than 3 times in a short while (then
+once a minute is allowed). The current session stays; the new connection is
+refused and tries again by itself. Usually two devices share one name: give
+each device its own CN.
+
+### Server log: "handshake refused: another client is connected (client_cn=...)"
+
+The server serves one client at a time. Another allowed client tried to
+connect while a session runs; it connects once that session ends. The line
+shows at most once every 10 s, with a count.
+
+### Server log: "in-session handshake accept failed; this session cannot be replaced until it ends"
+
+A bug: the part that accepts handshakes during a session stopped. The
+session goes on, and a client that comes back waits until the session times
+out, as before. Report it with the traceback that follows the line.
 
 ### "config: dns_provider_pins has entries that are not in dns_providers: ..."
 
