@@ -497,10 +497,11 @@ def decrypt_packet(
     ``on_auth_fail`` and ``on_replay`` (server, while a session runs) are
     called for a packet the session cannot use, so the server's in-session
     accept can look at it. ``on_auth_fail``: the packet does not open (no
-    header key matched, the AEAD failed, or this key set's window has seen
-    it); it may be a reconnecting client's handshake frame or its first
-    packets under new keys. ``on_replay``: it opened, but the session-wide
-    window here refuses it as more than 128 behind the newest packet (a
+    header key matched, the AEAD failed, or this key set's window refused
+    it: already seen, or 128 or more behind that key set's newest); it may
+    be a reconnecting client's handshake frame or its first packets under
+    new keys. ``on_replay``: it opened, but the session-wide
+    window here refuses it as 128 or more behind the newest packet (a
     straggler from the previous key set). A packet that opened and then
     failed a later check, and a too-short packet, go to neither. Without
     them nothing changes.
@@ -509,7 +510,7 @@ def decrypt_packet(
     decides: a replay there is a packet that did not open (the AEAD still
     runs once, so a replay and a forgery look the same, audit M3). This
     session-wide ``replay``, checked after ``open_packet``, keeps today's
-    rule across key changes: a packet more than 128 behind the newest is
+    rule across key changes: a packet 128 or more behind the newest is
     dropped. Sequence numbers are one counter for the session, so the two
     agree on what a replay is.
     """
@@ -1039,12 +1040,12 @@ async def run_data_loops(
     * ``unauthenticated`` (server, while a session runs): gets each UDP
       packet the session cannot use, with its source address and ``seen``,
       for the in-session accept. ``seen`` is False when the packet did not
-      open (no header key matched, the AEAD failed, or it was a replay) and
-      True when it opened but the session-wide replay window refused it as
-      too far behind the newest packet (a straggler from the previous key
-      set). It runs inside the receive loop, so it must not block or raise:
-      an exception ends the session. The client passes nothing; TCP never
-      calls it.
+      open (no header key matched, the AEAD failed, or it was a replay or
+      too late for its key set) and True when it opened but the session-wide
+      replay window refused it as too far behind the newest packet (a
+      straggler from the previous key set). It runs inside the receive
+      loop, so it must not block or raise: an exception ends the session.
+      The client passes nothing; TCP never calls it.
     * ``extra_loops``: client passes ``auto_mtu_loop(...)`` here; server
       passes nothing.
     * ``shutdown_log``: caller-supplied label so the log line still
