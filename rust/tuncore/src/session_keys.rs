@@ -486,8 +486,12 @@ impl SessionKeyManager {
     /// depend on whether a grace period is on (audit M1); with no previous
     /// key set the current header key runs twice and the second result is
     /// never used. The AEAD runs only for a key set whose epoch matches, so
-    /// junk costs two AES blocks. Nothing is allocated before the AEAD, and
-    /// a `None` changes no replay window and no grace state (spec §24.1).
+    /// junk costs two AES blocks. Nothing is allocated before the AEAD.
+    ///
+    /// A `None` changes nothing because of the packet: no replay window, no
+    /// grace state, no parked send swap (spec §24.1). The `tick()` that runs
+    /// first still makes its time-driven changes (it can end the grace period
+    /// or force a parked send swap).
     pub fn open(&mut self, wire: &[u8]) -> Option<Opened> {
         self.tick();
         if wire.len() < MIN_WIRE_LEN {
@@ -498,9 +502,14 @@ impl SessionKeyManager {
         let current = self.recv.hp.unprotect(&block);
         let (previous, previous_epoch) = match &self.prev_recv {
             Some(prev) => (prev.hp.unprotect(&block), Some(prev.epoch())),
-            // black_box: the result is never read here, so without it the
-            // optimizer may drop this AES block and break the M1 rule.
-            None => (std::hint::black_box(self.recv.hp.unprotect(&block)), None),
+            // M1: this AES block must really run. black_box on the input
+            // hides that it is the same key and block as `current`, so the
+            // optimizer cannot merge the two; black_box on the output keeps
+            // the result, which nothing reads.
+            None => (
+                std::hint::black_box(self.recv.hp.unprotect(&std::hint::black_box(block))),
+                None,
+            ),
         };
         // A genuine packet matches exactly one key set (but once in 2^32,
         // and then the second try still finds it); junk matches by chance
@@ -1745,6 +1754,10 @@ mod tests {
                 }
                 assert_eq!(aead_runs(), 0, "size {size}, grace {grace}");
             }
+            if grace {
+                // Still on, or the opens above stopped testing the grace case.
+                assert!(server.has_grace_period());
+            }
         }
     }
 
@@ -1983,5 +1996,22 @@ mod tests {
         assert!(server.open(&later).is_some());
         assert!(server.open(&earlier).is_some());
         assert!(server.open(&old).unwrap().used_prev);
+    }
+
+    /// A packet under the new receive key whose header matches but whose tag
+    /// is wrong does not confirm the peer: the responder's new send key stays
+    /// parked.
+    #[test]
+    fn a_failed_new_key_packet_leaves_the_send_swap_parked() {
+        let (mut client, mut server) = make_paired_managers();
+        let (init, server_pub) = responder_applies(&client, &mut server);
+        client
+            .complete_rotation_initiator(init, &server_pub)
+            .unwrap();
+        let mut forged = client.seal(1, b"first new-key packet").unwrap();
+        let last = forged.len() - 1;
+        forged[last] ^= 0x01;
+        assert!(server.open(&forged).is_none());
+        assert!(server.has_pending_send_swap());
     }
 }
