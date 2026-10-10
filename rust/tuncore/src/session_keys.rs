@@ -552,7 +552,8 @@ impl SessionKeyManager {
         })
     }
 
-    /// Decrypt a packet. Tries current epoch first, then previous if in grace period.
+    /// Decrypt one packet under the key set `is_prev_epoch` picks (the AEAD
+    /// step of `open_with`).
     /// `seq` is the sequence number for replay checking.
     ///
     /// To avoid leaking replay-vs-forgery distinction through timing or error
@@ -831,9 +832,8 @@ impl SessionKeyManager {
     ///
     /// L-AUDIT-2: the per-packet call site (`open`) runs inside
     /// `py.allow_threads` (`open_packet` in lib.rs) so the ~10ns branch
-    /// asymmetry between grace-active and grace-
-    /// inactive states isn't observable as wire timing under the
-    /// network-resolution floor. Even so, we sample `Instant::now()`
+    /// asymmetry between grace-active and grace-inactive states isn't
+    /// observable as wire timing under the network-resolution floor. Even so, we sample `Instant::now()`
     /// unconditionally and branch on the comparison only — both
     /// branches do constant per-instance work (taking an Option vs.
     /// leaving it alone), and the secret-dependent path (key swap) is
