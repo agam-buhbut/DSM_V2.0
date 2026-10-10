@@ -204,6 +204,7 @@ async def test_another_client_is_refused_before_the_last_frame(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     caplog.set_level(logging.DEBUG)
+    caplog.set_level(logging.DEBUG, logger="dsm")
     script = _Script({OTHER: "dsm-b-client"})
     async with _Udp(script) as run:
         assert run.watch is not None
@@ -363,6 +364,7 @@ async def test_a_seen_frame_before_a_winner_starts_nothing(
     seen sequence number). Before a client wins it costs no signature and no
     budget, and logs nothing."""
     caplog.set_level(logging.DEBUG)
+    caplog.set_level(logging.DEBUG, logger="dsm")
     limiter = SourceLimiter(clock=_Frozen())
     script = _Script()
     script.stall = {BACK}

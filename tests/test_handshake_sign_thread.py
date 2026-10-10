@@ -123,6 +123,7 @@ async def test_an_error_after_a_cancel_is_dropped_with_one_debug_line(
     """The handshake is over either way, so the error is dropped: asyncio
     must not log it later as "never retrieved", with its text."""
     caplog.set_level(logging.DEBUG)
+    caplog.set_level(logging.DEBUG, logger="dsm")
     started = threading.Event()
     release = threading.Event()
 
