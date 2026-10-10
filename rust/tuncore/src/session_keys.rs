@@ -392,11 +392,14 @@ impl SessionKeyManager {
         })
     }
 
-    /// Encrypt a packet. Returns (nonce, ciphertext) and the current epoch.
+    /// Test-only now: the v1 encrypt, which the inline tests still use;
+    /// `seal` is the one way to make a packet. Returns (nonce, ciphertext)
+    /// and the current epoch.
     ///
     /// H-CRYPT-1: `aad` MUST be exactly `seq.to_be_bytes()` (8 bytes) so wire-seq
     /// and authenticated AAD cannot drift apart; any other length is rejected.
-    pub fn encrypt(
+    #[cfg(test)]
+    pub(crate) fn encrypt(
         &mut self,
         plaintext: &[u8],
         aad: &[u8],
@@ -493,6 +496,10 @@ impl SessionKeyManager {
     /// first still makes its time-driven changes (it can end the grace period
     /// or force a parked send swap).
     pub fn open(&mut self, wire: &[u8]) -> Option<Opened> {
+        // L-CRYPT-4: tick on every packet, so a caller that never calls
+        // tick() cannot keep `prev_recv` alive for ever. Once per packet:
+        // `decrypt` does not tick again, so the key sets cannot change
+        // between the header decryption and the AEAD.
         self.tick();
         if wire.len() < MIN_WIRE_LEN {
             return None;
@@ -560,7 +567,9 @@ impl SessionKeyManager {
     /// expected AAD internally and reject any mismatch via opaque
     /// AUTH_FAILED (so the check is timing-uniform with a real auth
     /// failure — no separate side channel).
-    pub fn decrypt(
+    ///
+    /// Only `open` (and tests) call it now; it does not tick, `open` does.
+    pub(crate) fn decrypt(
         &mut self,
         nonce: &[u8; 12],
         ciphertext: &[u8],
@@ -569,12 +578,6 @@ impl SessionKeyManager {
         is_prev_epoch: bool,
     ) -> Result<Vec<u8>, String> {
         const AUTH_FAILED: &str = "authentication failed";
-
-        // L-CRYPT-4: tick() the grace-period machinery at every decrypt
-        // so a Python caller that forgets to invoke tick() externally
-        // doesn't keep prev_recv alive indefinitely. The cost is one
-        // Instant check per packet — negligible.
-        self.tick();
 
         // H-CRYPT-1: enforce AAD-seq binding contract uniformly with
         // AEAD failure so the rejection path is timing-indistinguishable
@@ -826,8 +829,9 @@ impl SessionKeyManager {
     /// Call periodically to clean up expired grace period keys and to
     /// enforce the hard limit on a deferred send-key swap (H-BUG-2/3).
     ///
-    /// L-AUDIT-2: call site (`decrypt`) wraps in `py.allow_threads` so
-    /// the ~10ns branch asymmetry between grace-active and grace-
+    /// L-AUDIT-2: the per-packet call site (`open`) runs inside
+    /// `py.allow_threads` (`open_packet` in lib.rs) so the ~10ns branch
+    /// asymmetry between grace-active and grace-
     /// inactive states isn't observable as wire timing under the
     /// network-resolution floor. Even so, we sample `Instant::now()`
     /// unconditionally and branch on the comparison only — both

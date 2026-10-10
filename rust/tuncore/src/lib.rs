@@ -50,6 +50,7 @@ pub mod secure_noise;
 pub mod session_keys;
 pub mod shaper;
 pub mod tpm_blob;
+pub mod xchacha;
 
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -81,10 +82,6 @@ fn fixed_from_slice<const N: usize>(data: &[u8], desc: &str) -> PyResult<[u8; N]
     let mut arr = [0u8; N];
     arr.copy_from_slice(data);
     Ok(arr)
-}
-
-fn nonce_from_slice(nonce: &[u8]) -> PyResult<[u8; 12]> {
-    fixed_from_slice::<12>(nonce, "nonce")
 }
 
 fn pub_key_from_slice(data: &[u8]) -> PyResult<[u8; 32]> {
@@ -290,7 +287,7 @@ impl PyNoiseTransport {
 /// Python-visible session key manager with key rotation support.
 // Audit H2: per-direction ownership is a documented invariant; with
 // `py.allow_threads(...)` releasing the GIL during AEAD, a second OS
-// thread calling encrypt/decrypt on the SAME SessionKeyManager would
+// thread calling seal_packet/open_packet on the SAME SessionKeyManager would
 // hit a `&mut self` borrow conflict and PyO3 would panic. `unsendable`
 // fences this at the type system: passing this class to
 // `loop.run_in_executor` / `asyncio.to_thread` raises a clear
@@ -307,7 +304,7 @@ struct PySessionKeyManager {
     pending_responder_rotation: Option<session_keys::ResponderPending>,
 }
 
-// Concurrency invariant for the encrypt/decrypt hot path:
+// Concurrency invariant for the seal_packet/open_packet hot path:
 // Exactly one Python coroutine per direction owns this SessionKeyManager.
 // Concurrent calls from different OS threads on the same instance are
 // undefined behavior. The `&mut self` borrow guards the nonce counter
@@ -332,101 +329,36 @@ impl PySessionKeyManager {
     // path — `BootstrapEphemeral` + `complete_bootstrap` — is reachable
     // from Python.
 
-    /// Encrypt a packet. Returns (nonce, ciphertext, epoch).
-    ///
-    /// The AEAD core runs without holding the GIL (H-PERF-2); see the
-    /// impl-block comment above for the per-direction ownership invariant.
-    /// Returns ciphertext as `PyBytes` directly (H-PERF-3) so Python
-    /// callers can hand it to `struct.unpack_from` / `os.write` without
-    /// a redundant `bytes(...)` copy.
-    fn encrypt<'py>(
+    /// Seal one data packet (wire v2): the protected header block, the 4
+    /// random nonce bytes and the AEAD output, as one `PyBytes` (H-PERF-3).
+    /// The crypto runs without the GIL (H-PERF-2); see the impl-block comment
+    /// for the ownership rule. `RuntimeError` when the nonce counter is used
+    /// up (a key change is overdue).
+    fn seal_packet<'py>(
         &mut self,
         py: Python<'py>,
+        seq: u64,
         plaintext: &[u8],
-        aad: &[u8],
-    ) -> PyResult<(Bound<'py, PyBytes>, Bound<'py, PyBytes>, u32)> {
-        let (nonce, ciphertext, epoch) =
-            py.allow_threads(|| self.inner.encrypt(plaintext, aad).map_err(py_err))?;
-        Ok((
-            PyBytes::new(py, &nonce),
-            PyBytes::new(py, &ciphertext),
-            epoch,
-        ))
-    }
-
-    /// Decrypt a packet. Returns plaintext as `PyBytes`.
-    ///
-    /// The AEAD core runs without holding the GIL (H-PERF-2); see the
-    /// impl-block comment above for the per-direction ownership invariant.
-    fn decrypt<'py>(
-        &mut self,
-        py: Python<'py>,
-        nonce: &[u8],
-        ciphertext: &[u8],
-        aad: &[u8],
-        seq: u64,
-        is_prev_epoch: bool,
     ) -> PyResult<Bound<'py, PyBytes>> {
-        let n = nonce_from_slice(nonce)?;
-        let plaintext = py.allow_threads(|| {
-            self.inner
-                .decrypt(&n, ciphertext, aad, seq, is_prev_epoch)
-                .map_err(py_err)
-        })?;
-        Ok(PyBytes::new(py, &plaintext))
+        let wire = py.allow_threads(|| self.inner.seal(seq, plaintext).map_err(py_err))?;
+        Ok(PyBytes::new(py, &wire))
     }
 
-    /// M-PERF-5: non-raising decrypt that tries current epoch first and
-    /// falls back to prev epoch if grace is active. Returns
-    /// `Some((plaintext, used_prev_epoch))` on success, `None` on auth
-    /// failure — no Python exception is constructed.
-    ///
-    /// Exception-driven control flow in CPython costs ~30µs per
-    /// traceback build. A forgery flood at 100k pkt/s would burn ~3s
-    /// of CPU per real second just on tracebacks. This API lets the
-    /// caller distinguish auth-fail from programming-error without
-    /// paying the traceback tax.
-    fn try_decrypt_with_fallback<'py>(
+    /// Open one data packet (wire v2): `(seq, plaintext, used_prev)`, or
+    /// `None` for anything that does not open. Never raises on peer bytes,
+    /// and builds no Python exception for junk (M-PERF-5). Without the GIL,
+    /// like `seal_packet`.
+    fn open_packet<'py>(
         &mut self,
         py: Python<'py>,
-        nonce: &[u8],
-        ciphertext: &[u8],
-        aad: &[u8],
-        seq: u64,
-    ) -> PyResult<Option<(Bound<'py, PyBytes>, bool)>> {
-        let n = nonce_from_slice(nonce)?;
-        // Audit M1 fix: always attempt the prev-epoch decrypt on the
-        // failure path, even when has_grace_period() would have been
-        // false. Combined with the constant-AEAD-time pattern this
-        // makes the function's timing uniform regardless of whether
-        // grace is active — an adversary probing forgery-reject
-        // latency cannot infer rekey timing. The dummy decrypt against
-        // current keys (when prev_recv is None) costs ~one extra AEAD
-        // tag verify on failure; the success path is unchanged.
-        let result = py.allow_threads(|| {
-            // Try current epoch first.
-            if let Ok(pt) = self.inner.decrypt(&n, ciphertext, aad, seq, false) {
-                return Some((pt, false));
-            }
-            // Prev-epoch attempt (see M1 note above); the grace check itself
-            // is one load + one branch, far cheaper than the AEAD.
-            // A SECOND current-epoch attempt fills in when prev isn't
-            // available, keeping the failure path = 2 AEAD ops regardless
-            // of grace state.
-            if self.inner.has_grace_period() {
-                if let Ok(pt) = self.inner.decrypt(&n, ciphertext, aad, seq, true) {
-                    return Some((pt, true));
-                }
-            } else {
-                // No grace; do a dummy current-epoch decrypt against
-                // the same ciphertext to keep failure-path timing
-                // uniform. Result is discarded (always Err here since
-                // the first attempt also failed).
-                let _ = self.inner.decrypt(&n, ciphertext, aad, seq, false);
-            }
-            None
-        });
-        Ok(result.map(|(pt, used_prev)| (PyBytes::new(py, &pt), used_prev)))
+        wire: &[u8],
+    ) -> Option<(u64, Bound<'py, PyBytes>, bool)> {
+        let opened = py.allow_threads(|| self.inner.open(wire))?;
+        Some((
+            opened.seq,
+            PyBytes::new(py, &opened.plaintext),
+            opened.used_prev,
+        ))
     }
 
     /// Check if key rotation is needed (packet count or time threshold).
@@ -718,6 +650,35 @@ fn complete_bootstrap(
     })
 }
 
+/// XChaCha20-Poly1305 seal for the wire v2 cookie reply. `ValueError` for a
+/// key that is not 32 bytes or a nonce that is not 24 bytes.
+#[pyfunction]
+fn xchacha_seal<'py>(
+    py: Python<'py>,
+    key: &[u8],
+    nonce: &[u8],
+    plaintext: &[u8],
+    aad: &[u8],
+) -> PyResult<Bound<'py, PyBytes>> {
+    let sealed = xchacha::seal(key, nonce, plaintext, aad).map_err(PyValueError::new_err)?;
+    Ok(PyBytes::new(py, &sealed))
+}
+
+/// XChaCha20-Poly1305 open for the wire v2 cookie reply: the plaintext, or
+/// `None` when it does not open. Never raises on peer bytes; `ValueError`
+/// only for a key that is not 32 bytes.
+#[pyfunction]
+fn xchacha_open<'py>(
+    py: Python<'py>,
+    key: &[u8],
+    nonce: &[u8],
+    ciphertext: &[u8],
+    aad: &[u8],
+) -> PyResult<Option<Bound<'py, PyBytes>>> {
+    let opened = xchacha::open(key, nonce, ciphertext, aad).map_err(PyValueError::new_err)?;
+    Ok(opened.map(|plaintext| PyBytes::new(py, &plaintext)))
+}
+
 /// Python-visible tier shaper (see `shaper.rs`), one per session and
 /// direction. Only the scheduling and sizing calls cross the FFI, plus the
 /// tier cap and the tier in use, which are not secrets (the rate shows
@@ -803,6 +764,8 @@ fn tuncore(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyShaper>()?;
     m.add_function(wrap_pyfunction!(harden_process, m)?)?;
     m.add_function(wrap_pyfunction!(complete_bootstrap, m)?)?;
+    m.add_function(wrap_pyfunction!(xchacha_seal, m)?)?;
+    m.add_function(wrap_pyfunction!(xchacha_open, m)?)?;
     m.add(
         "HANDSHAKE_ATTEST_PAYLOAD_SIZE",
         noise_xx::HANDSHAKE_ATTEST_PAYLOAD_SIZE,
@@ -826,6 +789,8 @@ fn tuncore(m: &Bound<'_, PyModule>) -> PyResult<()> {
         "REKEY_PEER_CONFIRM_LIMIT_SECS",
         session_keys::PEER_CONFIRM_LIMIT_SECS,
     )?;
+    // The wire version in the Noise prologue; dsm.core.protocol re-exports it.
+    m.add("WIRE_VERSION", noise_xx::WIRE_VERSION)?;
     Ok(())
 }
 

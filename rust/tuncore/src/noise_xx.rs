@@ -7,9 +7,13 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::secure_noise::SecureResolver;
 
+/// Wire protocol version. The prologue carries it (bytes 3-4, big-endian),
+/// so builds of different wire versions refuse each other at the handshake.
+pub const WIRE_VERSION: u16 = 2;
+
 /// Protocol prologue authenticated by both sides.
-/// Format: "DSM" || version(2 bytes) || initiator_role || responder_role
-const PROLOGUE: &[u8] = b"DSM\x00\x01\x00\x01";
+/// Format: "DSM" || version(2 bytes, `WIRE_VERSION`) || initiator_role || responder_role
+const PROLOGUE: &[u8] = b"DSM\x00\x02\x00\x01";
 
 const NOISE_PATTERN: &str = "Noise_XX_25519_AESGCM_SHA256";
 
@@ -94,18 +98,16 @@ fn validate_ephemeral_not_low_order(pub_bytes: &[u8]) -> Result<(), String> {
 /// Snow data is always placed at offset 0 with a protocol-constant length;
 /// the remainder is uniform random padding. No length field on the wire.
 ///
-/// M-CRYPT-9 SECURITY NOTE: the trailing pad bytes are NOT
-/// authenticated. An on-path attacker can replace them with arbitrary
-/// content; `unpack_handshake` accepts any frame of `HANDSHAKE_PAD_SIZE`
-/// bytes and returns ONLY the `snow_data` prefix to the caller. No
-/// in-tree caller reads past `expected_len`, so the attacker-controlled
-/// trailer is currently inert — but if any future code path reads past
-/// the snow prefix (e.g. extends the attest payload, adds extra header
-/// fields), those bytes MUST be treated as adversary-controlled. The
-/// covert channel cannot be closed without either dropping handshake-
-/// size padding or adding an outer MAC; both are protocol-format
-/// changes. For now, the inert-trailer invariant is the security
-/// guarantee.
+/// M-CRYPT-9 SECURITY NOTE: the trailing pad bytes are NOT authenticated
+/// by Noise. An on-path attacker can replace them with arbitrary content;
+/// `unpack_handshake` accepts any frame of `HANDSHAKE_PAD_SIZE` bytes and
+/// returns ONLY the `snow_data` prefix to the caller. Since wire v2, msg1
+/// bytes 32-63 are read, in Python only, as the handshake gate's mac1 and
+/// mac2 (`dsm/net/handshake_gate.py`): adversary-controlled, used only as
+/// inputs to MACs compared in constant time, and never passed to Noise.
+/// Every other trailer byte is still inert. Closing the covert channel needs
+/// dropping handshake-size padding or an outer MAC over the whole frame;
+/// both are protocol-format changes.
 fn pack_handshake(snow_data: &[u8], expected_len: usize) -> Result<Vec<u8>, String> {
     if snow_data.len() < expected_len {
         return Err("snow produced shorter payload than expected".into());
@@ -878,5 +880,12 @@ mod tests {
         // Initial epoch derived from handshake hash is the same on both sides
         // but not deterministically "1".
         assert_eq!(initial_epoch, server_keys.epoch());
+    }
+
+    /// Spec §16.1 test 14.
+    #[test]
+    fn prologue_carries_the_wire_version() {
+        assert_eq!(WIRE_VERSION, 2);
+        assert_eq!(&PROLOGUE[3..5], &WIRE_VERSION.to_be_bytes());
     }
 }
