@@ -498,7 +498,9 @@ impl SessionKeyManager {
         let current = self.recv.hp.unprotect(&block);
         let (previous, previous_epoch) = match &self.prev_recv {
             Some(prev) => (prev.hp.unprotect(&block), Some(prev.epoch())),
-            None => (self.recv.hp.unprotect(&block), None),
+            // black_box: the result is never read here, so without it the
+            // optimizer may drop this AES block and break the M1 rule.
+            None => (std::hint::black_box(self.recv.hp.unprotect(&block)), None),
         };
         // A genuine packet matches exactly one key set (but once in 2^32,
         // and then the second try still finds it); junk matches by chance
@@ -1637,7 +1639,11 @@ mod tests {
     }
 
     fn hex(bytes: &[u8]) -> String {
-        bytes.iter().map(|b| format!("{b:02x}")).collect()
+        use std::fmt::Write;
+        bytes.iter().fold(String::new(), |mut out, b| {
+            write!(out, "{b:02x}").unwrap();
+            out
+        })
     }
 
     fn fixed_dir(aead: u8, hp: u8) -> DirSecrets {
