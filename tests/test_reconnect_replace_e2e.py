@@ -20,13 +20,7 @@ from unittest.mock import patch
 import pytest
 
 import tuncore
-from dsm.core.protocol import (
-    INNER_STRUCT,
-    OUTER_HEADER_SIZE,
-    SEQ_STRUCT,
-    OuterPacket,
-    PacketType,
-)
+from dsm.core.protocol import INNER_STRUCT, PacketType
 from dsm.crypto import handshake
 from dsm.crypto.cert_allowlist import CNAllowlist
 from dsm.crypto.handshake import HandshakeError, client_handshake
@@ -221,7 +215,7 @@ async def _socket() -> UDPTransport:
 async def _connect(
     world: _World, device: EnrolledDevice, sock: UDPTransport, server: Addr
 ) -> tuncore.SessionKeyManager:
-    keys, _hash, _server_pub = await asyncio.wait_for(
+    keys, _hash, _server_pub, _tunnel = await asyncio.wait_for(
         client_handshake(
             sock,
             device.identity,
@@ -261,9 +255,7 @@ async def _send(
     plaintext = (
         INNER_STRUCT.pack(ptype, (keys.epoch & 0x0F) << 4, len(payload)) + payload
     )
-    nonce, ct, _epoch = keys.encrypt(plaintext, SEQ_STRUCT.pack(seq))
-    outer = OuterPacket(seq=seq, nonce=bytes(nonce), ciphertext=bytes(ct))
-    await sock.send(outer.serialize(OUTER_HEADER_SIZE + len(ct)), server)
+    await sock.send(bytes(keys.seal_packet(seq, plaintext)), server)
 
 
 async def _tun_gets(expected: bytes, timeout: float) -> None:

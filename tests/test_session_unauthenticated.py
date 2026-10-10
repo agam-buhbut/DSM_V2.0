@@ -3,10 +3,12 @@ seen by the replay window) to the server's in-session accept, and nothing
 else. Review Focus 2: a packet that opened, the live client's own traffic,
 never goes there.
 
-A reconnected client's first packet has seq 1 under the new keys, and the old
-session's window has already seen seq 1, so it is rejected as a replay before
-AEAD. It has to be handed over too, marked as seen: the accept wants it only
-once a client won (until then it is the live client's own packet).
+With wire v2 the seq is inside the header block, so nothing is checked
+before the packet opens. A replay is refused by the Rust window inside
+open_packet and so comes back as "did not open", and so does a reconnected
+client's first packet under its new keys. Both are handed over with seen
+False. Seen is True only for a packet that opened and that the Python
+window then refused (more than 128 behind; test_wire_v2.py covers it).
 
 Real session keys from tuncore (as in test_link_stats.py); fakes elsewhere.
 No sockets; nothing sleeps.
@@ -18,13 +20,7 @@ import asyncio
 
 import tuncore
 from dsm.core.fsm import SessionFSM, State
-from dsm.core.protocol import (
-    INNER_STRUCT,
-    OUTER_HEADER_SIZE,
-    SEQ_STRUCT,
-    OuterPacket,
-    PacketType,
-)
+from dsm.core.protocol import INNER_STRUCT, PacketType
 from dsm.net.transport.udp import UDPTransport
 from dsm.session import (
     DataPathContext,
@@ -60,9 +56,7 @@ def _plain(ptype: int, epoch: int, payload: bytes, *, flags: int = 0) -> bytes:
 
 
 def _wire(keys: tuncore.SessionKeyManager, seq: int, plaintext: bytes) -> bytes:
-    nonce, ct, _epoch = keys.encrypt(plaintext, SEQ_STRUCT.pack(seq))
-    outer = OuterPacket(seq=seq, nonce=bytes(nonce), ciphertext=bytes(ct))
-    return outer.serialize(OUTER_HEADER_SIZE + len(ct))
+    return bytes(keys.seal_packet(seq, plaintext))
 
 
 def test_only_packets_the_session_cannot_use_are_handed_over() -> None:
@@ -99,17 +93,17 @@ def test_only_packets_the_session_cannot_use_are_handed_over() -> None:
     forged[-1] ^= 0x01
     assert decrypt(bytes(forged)) is None
     assert (failed, seen) == ([1, 1], [])
-    # Already seen: the replay window rejects it before AEAD. It goes to
-    # on_replay, never on_auth_fail (it may be a new key's packet; see the
-    # next test).
+    # Already seen: the Rust window inside open_packet refuses it, so it did
+    # not open. It goes to on_auth_fail, like any packet that does not open.
     assert decrypt(genuine) is None
-    assert (failed, seen) == ([1, 1], [1])
+    assert (failed, seen) == ([1, 1, 1], [])
 
 
 def test_a_new_key_packet_the_old_window_already_saw_is_handed_over() -> None:
-    # The exact failure: the client reconnects and sends seq 1 under the new
-    # keys; the old session's window already saw seq 1, so it drops the packet
-    # as a replay before AEAD. The in-session accept must still get it.
+    # The client reconnects and sends seq 1 under the new keys; the old
+    # session's window already saw seq 1. Under wire v2 the packet does not
+    # open under the old keys, so the in-session accept gets it as "did not
+    # open".
     old_sender, old_receiver = _pair()
     new_sender, _new_receiver = _pair()
     replay = tuncore.ReplayWindow()
@@ -128,7 +122,7 @@ def test_a_new_key_packet_the_old_window_already_saw_is_handed_over() -> None:
         on_replay=lambda: handed.append(1),
     )
     assert result is None
-    assert handed == [1]
+    assert handed == [0]
 
 
 def test_without_the_callback_decrypt_works_as_before() -> None:
@@ -201,10 +195,11 @@ async def test_the_receive_loop_hands_over_only_packets_it_cannot_use() -> None:
         timeout=5.0,
     )
     # The session hands over every packet it cannot use, any size (the
-    # server's intake filters): the replay, marked as seen, and the two that
-    # do not open. The genuine packet, which opened, never goes there.
+    # server's intake filters): the replay (the Rust window refuses it, so it
+    # did not open) and the two that do not open. The genuine packet, which
+    # opened, never goes there.
     assert handed == [
-        (genuine, LIVE, True),
+        (genuine, LIVE, False),
         (MSG1, NEW, False),
         (small_junk, NEW, False),
     ]
