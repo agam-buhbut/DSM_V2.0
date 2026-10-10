@@ -230,8 +230,9 @@ MAC2_AT = 48
 # mac1 covers w = floor(unix time / 300). The server accepts w-1, w and w+1,
 # so clocks less than 5 minutes apart always pass.
 MAC1_WINDOW_S = 300
-# R, the secret that makes cookies, is replaced this often; the one before
-# still counts, so a cookie lasts 120 to 240 s.
+# R, the secret that makes cookies, is replaced this often, on a fixed grid
+# from the gate's start; the one before still counts, so a cookie lasts 120
+# to 240 s.
 COOKIE_SECRET_LIFETIME_S = 120.0
 # Cookie replies from all addresses together: 20 a second, up to 40 saved up.
 # This caps reflection (a reply is as big as the request) and the work.
@@ -484,9 +485,12 @@ class HandshakeGate:
         return Msg1Verdict.NEED_COOKIE
 
     def cookie_reply(self, frame: bytes, src: tuple[str, int]) -> bytes | None:
-        """A 1400-byte cookie reply to ``frame`` from ``src``; None when the
-        reply budget is spent or ``src`` is not IPv4 (the msg1 is then just
-        dropped)."""
+        """A 1400-byte cookie reply to ``frame`` from ``src``; None when
+        ``frame`` is not 1400 bytes (so a reply is never bigger than its
+        request, whatever the caller does), the reply budget is spent or
+        ``src`` is not IPv4 (the msg1 is then just dropped)."""
+        if len(frame) != FRAME_SIZE:
+            return None
         if not self._replies.ready(self._clock()):
             self._budget_log.log("cookie reply budget spent; dropped a handshake start")
             return None
@@ -516,15 +520,17 @@ class HandshakeGate:
         return False
 
     def _secrets(self) -> tuple[bytes, bytes | None]:
-        """R and the R before it; R is replaced once it is 120 s old."""
-        now = self._clock()
-        age = now - self._secret_born
-        if age >= 2 * COOKIE_SECRET_LIFETIME_S:
+        """R and the R before it. R is replaced on a fixed 120 s grid from
+        the gate's start, not 120 s after the last call, so a cookie lasts
+        at most 240 s even after a quiet spell."""
+        steps = int((self._clock() - self._secret_born) // COOKIE_SECRET_LIFETIME_S)
+        if steps >= 2:
+            # Every R in between was never used: none of them counts.
             self._previous_secret = None
             self._secret = self._rand(_SECRET_SIZE)
-            self._secret_born = now
-        elif age >= COOKIE_SECRET_LIFETIME_S:
+        elif steps == 1:
             self._previous_secret = self._secret
             self._secret = self._rand(_SECRET_SIZE)
-            self._secret_born = now
+        if steps >= 1:
+            self._secret_born += steps * COOKIE_SECRET_LIFETIME_S
         return self._secret, self._previous_secret

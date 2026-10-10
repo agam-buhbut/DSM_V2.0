@@ -2,7 +2,8 @@
 and MACs) and VC1 (the cookie reply seal, through tuncore and through the
 gate); Task 10 adds VT1. The Rust tests check VH1, VP1, VK1, VR1 and VC1. A
 future client (the Android replacement) must reproduce all of them.
-Laptop: yes (the shim's XChaCha stands in; the box run checks tuncore's).
+Laptop: VM1 only (old wheel and shim). The two VC1 tests need tuncore's
+xchacha_seal from the Task 5 wheel; CI checks them.
 """
 
 from __future__ import annotations

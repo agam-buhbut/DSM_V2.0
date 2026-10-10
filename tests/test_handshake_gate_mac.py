@@ -1,7 +1,10 @@
 """The handshake gate (wire v2, spec §7.1-7.5; T10 §3.16 tests 1-8): mac1,
 mac2 and cookies, the cookie reply, the load rule and the client's stamps.
-Unit tests with injected clocks. Laptop: yes (old wheel; the shim's XChaCha
-stands in for tuncore's, which the box run checks).
+Unit tests with injected clocks. Laptop: partly (old wheel and shim). The
+shim has no XChaCha, so the cookie-reply tests (cookie binding and lifetime,
+reply opening, two replies differing, msg2 and random frames, reply budget,
+never raising) need tuncore's xchacha_seal and xchacha_open from the Task 5
+wheel and run in CI.
 """
 
 from __future__ import annotations
@@ -134,6 +137,29 @@ def test_a_cookie_reply_opens_only_with_its_own_mac1() -> None:
     assert open_cookie_reply(reply[:-1], KEYS, first[32:48]) is None
 
 
+def test_a_cookie_ends_on_the_120_s_grid_after_a_quiet_spell() -> None:
+    clock = _Clock()
+    gate = _gate(clock)
+    frame = _with_cookie(gate, _msg1(1))  # at 0 s, under the first R
+    clock.now = 239.0  # the first gate call since: R was replaced at 120 s
+    assert gate.check_msg1(frame, SRC, under_load=True) is Msg1Verdict.ADMIT
+    clock.now = 241.0  # replaced again at 240 s, not 120 s after the last call
+    assert gate.check_msg1(frame, SRC, under_load=True) is Msg1Verdict.NEED_COOKIE
+
+
+def test_two_cookie_replies_to_one_msg1_differ() -> None:
+    gate = _gate()
+    msg1 = _msg1(1)
+    first, second = gate.cookie_reply(msg1, SRC), gate.cookie_reply(msg1, SRC)
+    assert first is not None
+    assert second is not None
+    assert first[:24] != second[:24]  # a fresh nonce
+    assert first[56:] != second[56:]  # a fresh random tail
+    cookie = open_cookie_reply(first, KEYS, msg1[32:48])
+    assert cookie is not None
+    assert open_cookie_reply(second, KEYS, msg1[32:48]) == cookie
+
+
 def test_msg2_frames_and_random_frames_are_never_cookie_replies() -> None:
     mac1 = _msg1(1)[32:48]
     rng = random.Random(9)
@@ -230,6 +256,10 @@ def test_the_gate_never_raises_on_peer_bytes() -> None:
         frame = rng.randbytes(rng.choice((0, 1, 63, 64, 1399, 1400, 1401)))
         for src in sources:
             gate.check_msg1(frame, src, under_load=bool(i % 2))
+            reply = gate.cookie_reply(frame, src)
+            # Only a 1400-byte frame gets a reply, and the reply is no bigger.
+            assert reply is None or len(reply) == len(frame) == FRAME_SIZE
+    gate = _gate()  # a full reply budget: a None below is for the address
     good = _msg1(1)
     v6 = ("::1", 51820)
     assert gate.check_msg1(good, v6, under_load=True) is Msg1Verdict.NEED_COOKIE
@@ -242,7 +272,7 @@ def test_gate_keys_come_from_the_ca_der_and_need_a_cn() -> None:
     assert GateKeys.derive(ca.certificate, CN) == GateKeys.from_ca_der(der, CN)
     with pytest.raises(GateKeyError):
         GateKeys.from_ca_der(CA_DER, "")
-    assert KEYS.mac1_key.hex() not in repr(KEYS)
+    assert repr(KEYS) == "GateKeys()"
 
 
 def test_the_frame_size_matches_the_handshake() -> None:
