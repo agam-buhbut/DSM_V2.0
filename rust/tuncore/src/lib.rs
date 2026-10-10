@@ -39,6 +39,7 @@ pub mod device_attest;
 pub mod device_attest_soft;
 #[cfg(feature = "tpm-attest")]
 pub mod device_attest_tpm;
+pub mod header_key;
 pub mod identity;
 pub mod noise_xx;
 pub mod nonce;

@@ -31,6 +31,11 @@ tpm-attest = ["dep:tss-esapi", "dep:p256"]
 pyo3 = { version = "0.24", features = ["extension-module", "abi3-py311"] }
 snow = "0.9"
 aes-gcm = { version = "0.10", features = ["zeroize"] }
+# The AES block cipher itself, for the header keys (header_key.rs). Already in
+# the tree through aes-gcm; the direct line turns on its own `zeroize`
+# feature, which wipes the round keys on drop. Cargo merges features, so the
+# AES inside AES-GCM is wiped too (aes-gcm's `zeroize` alone does not do it).
+aes = { version = "0.8", features = ["zeroize"] }
 hkdf = "0.12"
 sha2 = "0.10"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
