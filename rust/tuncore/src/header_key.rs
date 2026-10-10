@@ -12,10 +12,11 @@ use crate::secure_memory::LockedKey32;
 /// bytes, no mode, no padding.
 ///
 /// The 32 key bytes sit in a `LockedKey32` (locked in memory, wiped on drop).
-/// The expanded round keys sit in `aes::Aes256` on the normal heap (about
-/// 0.5 KB with AES-NI); the `aes` crate's `zeroize` feature, on in
-/// `Cargo.toml`, wipes them on drop. Fields drop in order: the round keys
-/// first, then the locked key bytes.
+/// The expanded round keys sit in `aes::Aes256` inside this struct, outside
+/// locked memory (about 0.5 KB with AES-NI); the `aes` crate's `zeroize`
+/// feature, on in `Cargo.toml`, wipes them on drop. A move of the struct can
+/// leave an old copy that is not wiped (as with `AesKey`). Fields drop in
+/// order: the round keys first, then the locked key bytes.
 pub struct HeaderKey {
     cipher: Aes256,
     _key: LockedKey32,
