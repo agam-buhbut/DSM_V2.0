@@ -7,12 +7,13 @@ hmac.compare_digest, os.write) MUST coerce with `bytes(...)`. The cost of
 this small lie in the stub is one explicit wrap per call site; the
 benefit is that everything downstream type-checks correctly.
 
-EXCEPTION (H-PERF-3): ``SessionKeyManager.encrypt`` and
-``SessionKeyManager.decrypt`` return ``PyBytes`` directly from Rust — the
-hot path does the conversion once on the Rust side instead of forcing
-every Python caller to allocate again. Those two stubs match reality
-without a coercion lie; callers may pass the returned values straight to
-``struct.unpack_from`` / ``os.write`` / the wire serializer.
+EXCEPTION (H-PERF-3): ``SessionKeyManager.seal_packet``,
+``SessionKeyManager.open_packet``, ``xchacha_seal`` and ``xchacha_open``
+return ``PyBytes`` directly from Rust — the hot path does the conversion
+once on the Rust side instead of forcing every Python caller to allocate
+again. Those stubs match reality without a coercion lie; callers may pass
+the returned values straight to ``struct.unpack_from`` / ``os.write`` /
+the wire serializer.
 """
 
 class IdentityKeyPair:
@@ -77,29 +78,16 @@ class SessionKeyManager:
     Python ``bytes`` object that cannot be reliably zeroed.
     """
 
-    def encrypt(self, plaintext: bytes, aad: bytes) -> tuple[bytes, bytes, int]: ...
-    def decrypt(
-        self,
-        nonce: bytes,
-        ciphertext: bytes,
-        aad: bytes,
-        seq: int,
-        is_prev_epoch: bool,
-    ) -> bytes: ...
-    def try_decrypt_with_fallback(
-        self,
-        nonce: bytes,
-        ciphertext: bytes,
-        aad: bytes,
-        seq: int,
-    ) -> tuple[bytes, bool] | None:
-        """M-PERF-5: non-raising decrypt with grace-period fallback.
+    def seal_packet(self, seq: int, plaintext: bytes) -> bytes:
+        """Seal one wire v2 data packet; returns the whole wire packet
+        (20 + len(plaintext) + 16 bytes). Raises RuntimeError when the nonce
+        counter is used up (a key change is overdue)."""
+        ...
 
-        Returns ``(plaintext, used_prev_epoch)`` on success, ``None`` on
-        auth failure. The failure path executes a constant 2 AEAD ops
-        regardless of grace state so an adversary cannot infer rekey
-        timing via forgery-reject latency (audit M1).
-        """
+    def open_packet(self, wire: bytes) -> tuple[int, bytes, bool] | None:
+        """Open one wire v2 data packet: ``(seq, plaintext, used_prev)``, or
+        ``None`` for anything that does not open (junk, a forgery, a replay,
+        another key set's packet). Never raises on peer bytes."""
         ...
 
     def needs_rotation(self) -> bool: ...
@@ -256,6 +244,19 @@ def complete_bootstrap(
     """
     ...
 
+def xchacha_seal(key: bytes, nonce: bytes, plaintext: bytes, aad: bytes) -> bytes:
+    """XChaCha20-Poly1305 seal (the wire v2 cookie reply). ValueError for a key
+    that is not 32 bytes or a nonce that is not 24 bytes."""
+    ...
+
+def xchacha_open(
+    key: bytes, nonce: bytes, ciphertext: bytes, aad: bytes
+) -> bytes | None:
+    """XChaCha20-Poly1305 open: the plaintext, or None when it does not open.
+    Never raises on peer bytes; ValueError only for a key that is not 32
+    bytes."""
+    ...
+
 # Fixed size of the attestation payload carried in Noise XX msg2 / msg3.
 # Producers must pad cert + binding signature + framing to exactly this many
 # bytes; receivers get exactly this many bytes back from
@@ -280,3 +281,6 @@ CHAFF_PERTURB_DOWN_P: float
 # Longest time a rekey responder keeps the old keys while it waits for the
 # peer to use the new ones (session_keys.rs PEER_CONFIRM_LIMIT_SECS).
 REKEY_PEER_CONFIRM_LIMIT_SECS: int
+
+# The wire version carried in the Noise prologue (2 since wire v2).
+WIRE_VERSION: int

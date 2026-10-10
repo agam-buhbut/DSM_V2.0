@@ -12,15 +12,15 @@ use aes_gcm::{
 ///   rather than per-call — caching cut a measured 2-3x throughput hit on
 ///   the data path where every packet was paying the schedule cost.
 ///
-/// Security note: the cached `Aes256Gcm` holds ~240 bytes of derived
-/// round-key state on the regular (non-mlock'd) heap. The aes-gcm
-/// `zeroize` feature is enabled in `Cargo.toml`, so `Aes256Gcm` runs
-/// `ZeroizeOnDrop` and the round-key buffer is wiped when this struct
-/// drops — preserving the wipe-on-drop guarantee for the lifetime of
-/// the `AesKey`. The cache is still on regular heap (not mlock'd), so
-/// it CAN be swapped to disk under memory pressure; this is mitigated
-/// by the process-wide `disable_core_dumps` + `PR_SET_DUMPABLE=0` hardening
-/// applied at startup.
+/// Security note: the cached `Aes256Gcm` holds the AES-256 round keys
+/// (~240 bytes) and the GHASH key on the regular (non-mlock'd) heap. The
+/// round keys are wiped on drop by the `aes` crate's own `zeroize` feature,
+/// which `Cargo.toml` turns on (wire v2, H6); aes-gcm's `zeroize` feature
+/// only wipes a temporary GHASH key. The GHASH key inside the GCM state is
+/// not wiped (polyval's x86 backend has no wipe support); it cannot decrypt,
+/// and the process-wide `disable_core_dumps` + `PR_SET_DUMPABLE=0`
+/// hardening keeps it out of core dumps. The cache can still be swapped to
+/// disk under memory pressure.
 pub struct AesKey {
     cipher: Aes256Gcm,
     // _key kept around so the LockedKey32's munlock + zeroize on Drop
