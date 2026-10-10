@@ -9,7 +9,7 @@ benefit is that everything downstream type-checks correctly.
 
 EXCEPTION (H-PERF-3): ``SessionKeyManager.seal_packet``,
 ``SessionKeyManager.open_packet``, ``xchacha_seal`` and ``xchacha_open``
-return ``PyBytes`` directly from Rust — the hot path does the conversion
+return ``PyBytes`` directly from Rust — the conversion happens
 once on the Rust side instead of forcing every Python caller to allocate
 again. Those stubs match reality without a coercion lie; callers may pass
 the returned values straight to ``struct.unpack_from`` / ``os.write`` /

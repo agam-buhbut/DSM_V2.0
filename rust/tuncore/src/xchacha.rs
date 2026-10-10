@@ -102,6 +102,8 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(open(&key, &nonce[..23], &sealed, b"aad").unwrap().is_none());
+        // Shorter than the tag: peer bytes, so None, never an error.
+        assert!(open(&key, &nonce, &sealed[..15], b"aad").unwrap().is_none());
         assert!(seal(&key[..31], &nonce, b"x", b"").is_err());
         assert!(seal(&key, &nonce[..23], b"x", b"").is_err());
         assert!(open(&key[..31], &nonce, &sealed, b"aad").is_err());
