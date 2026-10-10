@@ -9,16 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - A client that crashes and starts again is back within seconds instead of
-  about 65 s. The server now accepts handshakes while a session runs. A
-  client with the same name (the CN in its certificate) that passes the
-  full handshake replaces its old session at once; another client is
-  refused before the last handshake frame and gets in once the session
-  ends. Each name may replace its session 3 times at once, then once a
-  minute, so two devices that share a name cannot push each other off
-  forever. New log lines: `client reconnected`, `reconnected with a
+  about 65 s. That wait applied over UDP, or to a TCP connection left half
+  open: over TCP a killed client's connection closes at once, and that
+  ends the old session anyway. The server now accepts handshakes while a
+  session runs. A client with the same name (the CN in its certificate)
+  that passes the full handshake replaces its old session at once; another
+  client is refused before the last handshake frame and gets in once the
+  session ends. Each name may replace its session 3 times at once, then
+  once a minute, so two devices that share a name swap at most once a
+  minute. New log lines: `client reconnected`, `reconnected with a
   different device key`, `reconnected too often`, `handshake refused:
-  another client is connected`. A client with a fixed `listen_port` gets
-  nothing from this: it still waits for the old session to time out.
+  another client is connected`. Over UDP, a client with a fixed
+  `listen_port` gets nothing from this: it still waits for the old session
+  to time out.
 - With `transport = "tcp"` the server opens its TCP port once at start and
   keeps it open for the whole run, also during a session. In UDP mode it
   still opens no TCP port.

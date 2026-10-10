@@ -1300,11 +1300,12 @@ leaves it up; run `sudo dsm cleanup`.
   `sudo systemctl start dsm-client`.
   The server takes the restarted client back within seconds: as soon as
   the new handshake passes, it ends the old session (it logs `client
-  reconnected`). This needs `listen_port = 0` on the client (the default).
-  With a fixed `listen_port` the restarted client comes from the old
-  session's address, the server's packets for the old session reach it
-  during its handshake and spoil it, and it waits for the old session to
-  time out (about 65 s), as before.
+  reconnected`). Over UDP this needs `listen_port = 0` on the client
+  (what `dsm init` and §3f write). With a fixed `listen_port` the
+  restarted client comes from the old session's address, the server's
+  packets for the old session reach it during its handshake and spoil it,
+  and it waits for the old session to time out (about 65 s). Over TCP the
+  client connects from a new port each time.
 - **Setup errors at the first start** (a wrong passphrase, keys or cert
   that do not match, a UDP `listen_port` in use, a read-only
   `/etc/resolv.conf`): DSM removes the kill switch and exits 1, as before:
@@ -1485,8 +1486,13 @@ To see the quick reconnect instead of cleaning up, start the client again
 ```sh
 $ sudo systemctl start dsm-client
 # Within seconds the client logs "tunnel established" and the server logs
-# "client reconnected (client_cn=...); ending its old session". Before this
-# change the server waited about 65 s for the old session to time out.
+# "client reconnected (client_cn=...); ending its old session" at INFO
+# (shown with log_level = "info", the default, not with the "warning" that
+# config.example.toml sets), instead of waiting about 65 s for the old
+# session to time out. That wait applies over UDP, or to a TCP connection
+# left half open: over TCP the killed client's connection closed at once
+# and ended the old session, so the restarted client connects as a new
+# one and the server logs no "client reconnected".
 ```
 
 ## 9. Two-Box Demo Across Two Real ISPs
@@ -1908,10 +1914,10 @@ prints "ok".
   try the client keeps the kill switch up and tries again by itself
   (1 s, doubling to 30 s, no limit; §7i). You do not need to restart it.
 - Another client holds the server's one session. The server answers with
-  msg2, then refuses this client before the last frame; its log says
-  `handshake refused: another client is connected (client_cn=...)`. This
-  client connects once the other session ends. One server serves one client
-  at a time.
+  msg2, then refuses this client before the last frame; the server log
+  says `handshake refused: another client is connected (client_cn=...)`
+  (INFO). This client connects once the other session ends. One server
+  serves one client at a time.
 
 ### Server log shows "handshake rejected (CNNotAllowedError): client CN '...' not in allowlist"
 
@@ -2131,7 +2137,9 @@ has not finished its handshake after 12 s.
 Normal after a client crashed or restarted: it came back with the same name
 and passed the full handshake, so the server ended its old session at once
 instead of waiting for it to time out. Nobody without that client's Noise
-key and TPM attest key can cause this line.
+key and TPM attest key can cause this line. This is an INFO line: it shows
+with `log_level = "info"` (the default), not with the `"warning"` that
+`config.example.toml` sets.
 
 ### Server log: "client_cn=... reconnected with a different device key ..."
 
@@ -2151,7 +2159,9 @@ each device its own CN.
 
 The server serves one client at a time. Another allowed client tried to
 connect while a session runs; it connects once that session ends. The line
-shows at most once every 10 s, with a count.
+shows at most once every 10 s, with a count. This is an INFO line: it
+shows with `log_level = "info"` (the default), not with the `"warning"`
+that `config.example.toml` sets.
 
 ### Server log: "in-session handshake accept failed; this session cannot be replaced until it ends"
 

@@ -167,8 +167,11 @@ ends cleanly with a SESSION_CLOSE packet.
 - When a client crashes and starts again, the server takes it back within
   seconds: it ends the old session as soon as the client's new handshake
   passes, instead of waiting about 65 s for the old session to time out.
-  Each client name may do this 3 times at once, then once a minute. A client
-  with a fixed `listen_port` does not get this (deploy/GUIDE.md §7i).
+  That wait applies over UDP, or to a TCP connection left half open: over
+  TCP a killed client's connection closes at once, and that ends the old
+  session anyway. Each client name may do this 3 times at once, then once
+  a minute. Over UDP, a client with a fixed `listen_port` does not get
+  this (deploy/GUIDE.md §7i).
 
 ### Fragmentation
 
