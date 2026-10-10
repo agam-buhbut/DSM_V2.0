@@ -1,4 +1,5 @@
 use crate::aes_gcm::AesKey;
+use crate::header_key::HeaderKey;
 use crate::nonce::NonceGenerator;
 use crate::replay_window::ReplayWindow;
 use crate::secure_memory::{public_from_locked, LockedKey32};
@@ -7,6 +8,7 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 use sha2::Sha256;
 use std::time::{Duration, Instant};
+use subtle::ConstantTimeEq;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroizing;
 
@@ -43,6 +45,67 @@ pub const PEER_CONFIRM_LIMIT_SECS: u64 = 110;
 /// u64 / i64 boundary cases (`r % (2*j+1)`, `(base as i64) + jitter`).
 const ROTATION_BASE_MAX: u64 = 1 << 48;
 
+/// Bytes before the AEAD output in a wire v2 data packet: the protected
+/// 16-byte block (seq ‖ epoch ‖ counter) and the 4 random nonce bytes.
+pub const HEADER_LEN: usize = 20;
+/// The shortest packet `open` reads: the header and a 16-byte GCM tag.
+pub const MIN_WIRE_LEN: usize = HEADER_LEN + 16;
+
+/// HKDF salt for the keys made at session start. `dsm-v2` is the product
+/// name (DSM 2.0), not the wire version; changing it would change today's
+/// AEAD keys for no gain.
+const BOOTSTRAP_SALT: &[u8] = b"dsm-v2-bootstrap-hkdf";
+
+/// HKDF info labels for the keys of one session start.
+struct StartLabels {
+    initiator: &'static [u8],
+    responder: &'static [u8],
+    initiator_hp: &'static [u8],
+    responder_hp: &'static [u8],
+    epoch: &'static [u8],
+}
+
+/// Wire v2 spec §6.3: the two `-hp` labels are new; the rest are today's.
+const BOOTSTRAP_LABELS: StartLabels = StartLabels {
+    initiator: b"dsm-bootstrap-initiator-send",
+    responder: b"dsm-bootstrap-responder-send",
+    initiator_hp: b"dsm-bootstrap-initiator-hp",
+    responder_hp: b"dsm-bootstrap-responder-hp",
+    epoch: b"dsm-bootstrap-epoch",
+};
+
+/// Labels of the test-only `from_handshake_hash` path.
+#[cfg(test)]
+const HASH_LABELS: StartLabels = StartLabels {
+    initiator: b"dsm-session-initiator",
+    responder: b"dsm-session-responder",
+    initiator_hp: b"dsm-session-initiator-hp",
+    responder_hp: b"dsm-session-responder-hp",
+    epoch: b"dsm-session-epoch",
+};
+
+/// One direction's secrets for one key set: the AEAD key and its header key.
+/// Siblings from the same HKDF secret with their own labels; neither can be
+/// computed from the other.
+pub struct DirSecrets {
+    pub aead: LockedKey32,
+    pub hp: LockedKey32,
+}
+
+/// A packet that `open` read.
+pub struct Opened {
+    pub seq: u64,
+    pub plaintext: Vec<u8>,
+    /// True when the previous key set (grace period) opened it.
+    pub used_prev: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// AEAD runs on this thread, for the tests that check junk runs none.
+    static AEAD_RUNS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 // Manual .min().max() instead of .clamp(1, ROTATION_BASE_MAX): the
 // latter panics if max < min, which is impossible here but adds a panic
 // path on a security-critical rotation-threshold callsite. Prefer the
@@ -76,15 +139,25 @@ fn randomized_threshold(base: u64) -> u64 {
 
 struct DirectionKeys {
     key: AesKey,
+    /// The header key of the same key set: it lives and dies with `key`, so
+    /// it can never be paired with the wrong AEAD key or epoch, also during
+    /// the responder's delayed send swap.
+    hp: HeaderKey,
     nonce_gen: NonceGenerator,
 }
 
 impl DirectionKeys {
-    fn new(key: LockedKey32, epoch: u32) -> Self {
+    fn new(secrets: DirSecrets, epoch: u32) -> Self {
         Self {
-            key: AesKey::from_locked(key),
+            key: AesKey::from_locked(secrets.aead),
+            hp: HeaderKey::from_locked(secrets.hp),
             nonce_gen: NonceGenerator::new(epoch),
         }
+    }
+
+    /// The epoch this key set was made for: the first 4 nonce bytes.
+    fn epoch(&self) -> u32 {
+        self.nonce_gen.epoch()
     }
 }
 
@@ -196,8 +269,8 @@ pub struct RotationComplete {
 pub struct ResponderPending {
     pub our_pub: [u8; 32],
     pub new_epoch: u32,
-    new_send: LockedKey32,
-    new_recv: LockedKey32,
+    new_send: DirSecrets,
+    new_recv: DirSecrets,
 }
 
 impl SessionKeyManager {
@@ -220,10 +293,8 @@ impl SessionKeyManager {
         rotation_seconds: Option<u64>,
     ) -> Result<Self, String> {
         Self::from_hkdf(
-            Hkdf::<Sha256>::new(Some(b"dsm-v2-session-init"), hash),
-            b"dsm-session-initiator",
-            b"dsm-session-responder",
-            b"dsm-session-epoch",
+            &Hkdf::<Sha256>::new(Some(b"dsm-v2-session-init"), hash),
+            &HASH_LABELS,
             is_initiator,
             rotation_packets,
             rotation_seconds,
@@ -256,55 +327,33 @@ impl SessionKeyManager {
             ));
         }
         Self::from_hkdf(
-            Hkdf::<Sha256>::new(Some(b"dsm-v2-bootstrap-hkdf"), shared_secret),
-            b"dsm-bootstrap-initiator-send",
-            b"dsm-bootstrap-responder-send",
-            b"dsm-bootstrap-epoch",
+            &Hkdf::<Sha256>::new(Some(BOOTSTRAP_SALT), shared_secret),
+            &BOOTSTRAP_LABELS,
             is_initiator,
             rotation_packets,
             rotation_seconds,
         )
     }
 
-    /// Shared HKDF-expand-and-build path used by `from_handshake_hash`
-    /// and `from_bootstrap_shared_secret`. Caller picks the salt + IKM
-    /// (encoded into the `Hkdf`) and the per-direction info labels.
-    ///
+    /// Shared HKDF-expand-and-build path used by `from_handshake_hash` and
+    /// `from_bootstrap_shared_secret`. The caller picks the salt and IKM
+    /// (inside `hk`) and the labels.
     fn from_hkdf(
-        hk: Hkdf<Sha256>,
-        initiator_label: &[u8],
-        responder_label: &[u8],
-        epoch_label: &[u8],
+        hk: &Hkdf<Sha256>,
+        labels: &StartLabels,
         is_initiator: bool,
         rotation_packets: Option<u64>,
         rotation_seconds: Option<u64>,
     ) -> Result<Self, String> {
-        let mut key_a = LockedKey32::zeroed()?;
-        let mut key_b = LockedKey32::zeroed()?;
-        hk.expand(initiator_label, key_a.as_mut())
-            .map_err(|e| format!("hkdf key_a: {e}"))?;
-        hk.expand(responder_label, key_b.as_mut())
-            .map_err(|e| format!("hkdf key_b: {e}"))?;
-
-        // Derive initial epoch deterministically from the keying
-        // material so both peers agree without an extra wire byte, and
-        // so the epoch doesn't deterministically start at 1
-        // (audit I3 — linkability).
-        let mut epoch_bytes = [0u8; 4];
-        hk.expand(epoch_label, &mut epoch_bytes)
-            .map_err(|e| format!("hkdf epoch: {e}"))?;
-        // Clamp to the low 28 bits so u32 rotation has ~16M headroom.
-        let initial_epoch = u32::from_be_bytes(epoch_bytes) & 0x0FFF_FFFF;
-
-        let (send_key, recv_key) = if is_initiator {
-            (key_a, key_b)
+        let (initiator, responder, initial_epoch) = expand_start_keys(hk, labels)?;
+        let (send, recv) = if is_initiator {
+            (initiator, responder)
         } else {
-            (key_b, key_a)
+            (responder, initiator)
         };
-
         Self::new(
-            send_key,
-            recv_key,
+            send,
+            recv,
             initial_epoch,
             rotation_packets,
             rotation_seconds,
@@ -312,11 +361,12 @@ impl SessionKeyManager {
     }
 
     /// Create a new session from initial handshake-derived keys.
+    /// Each `DirSecrets` holds a direction's AEAD key and header key.
     /// `rotation_packets` / `rotation_seconds` override the default thresholds;
     /// `None` means use the built-in defaults. Jitter is always applied.
     pub fn new(
-        send_key: LockedKey32,
-        recv_key: LockedKey32,
+        send: DirSecrets,
+        recv: DirSecrets,
         initial_epoch: u32,
         rotation_packets: Option<u64>,
         rotation_seconds: Option<u64>,
@@ -325,8 +375,8 @@ impl SessionKeyManager {
         let time_base = rotation_seconds.unwrap_or(ROTATION_TIME_BASE_SECS);
         Ok(Self {
             epoch: initial_epoch,
-            send: DirectionKeys::new(send_key, initial_epoch),
-            recv: DirectionKeys::new(recv_key, initial_epoch),
+            send: DirectionKeys::new(send, initial_epoch),
+            recv: DirectionKeys::new(recv, initial_epoch),
             replay: ReplayWindow::new(),
             prev_recv: None,
             prev_replay: None,
@@ -370,6 +420,118 @@ impl SessionKeyManager {
         // self.epoch would stamp a NEW nibble on an OLD-key packet and
         // the peer would drop it at the epoch_id check.
         Ok((nonce, ciphertext, self.send.nonce_gen.epoch()))
+    }
+
+    /// Seal one data packet (wire v2, spec §6.4). Returns the whole wire
+    /// packet: `AES-256(header key, seq ‖ epoch ‖ counter)` ‖ the 4 random
+    /// nonce bytes ‖ AES-GCM output with AAD = seq. Uses the send key set,
+    /// which during the responder's delayed swap is still the old one, with
+    /// its header key.
+    ///
+    /// # Errors
+    /// The nonce counter is used up (a key change is overdue).
+    pub fn seal(&mut self, seq: u64, plaintext: &[u8]) -> Result<Vec<u8>, String> {
+        let nonce = self
+            .send
+            .nonce_gen
+            .next()
+            .ok_or("nonce counter exhausted — rotation overdue")?;
+        self.seal_with_nonce(seq, &nonce, plaintext)
+    }
+
+    fn seal_with_nonce(
+        &mut self,
+        seq: u64,
+        nonce: &[u8; 12],
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        let seq_be = seq.to_be_bytes();
+        // H-CRYPT-1: the AAD is the seq, built here, so no caller can pass a
+        // different one.
+        let ciphertext = self.send.key.encrypt(nonce, plaintext, &seq_be)?;
+        let mut block = [0u8; 16];
+        block[..8].copy_from_slice(&seq_be);
+        block[8..].copy_from_slice(&nonce[..8]);
+        let header = self.send.hp.protect(&block);
+        let mut wire = Vec::with_capacity(HEADER_LEN + ciphertext.len());
+        wire.extend_from_slice(&header);
+        wire.extend_from_slice(&nonce[8..]);
+        wire.extend_from_slice(&ciphertext);
+        self.packets_sent += 1;
+        Ok(wire)
+    }
+
+    /// Test-only `seal` with the 4 random nonce bytes fixed, for vector VP1.
+    #[cfg(test)]
+    fn seal_fixed_tail(
+        &mut self,
+        seq: u64,
+        plaintext: &[u8],
+        tail: [u8; 4],
+    ) -> Result<Vec<u8>, String> {
+        let mut nonce = self
+            .send
+            .nonce_gen
+            .next()
+            .ok_or("nonce counter exhausted")?;
+        nonce[8..].copy_from_slice(&tail);
+        self.seal_with_nonce(seq, &nonce, plaintext)
+    }
+
+    /// Open one data packet (wire v2, spec §6.5). `None` for anything that
+    /// does not open: too short, no epoch match, a failed AEAD, or a replay.
+    /// Never panics.
+    ///
+    /// Both header decryptions always run, so the work for junk does not
+    /// depend on whether a grace period is on (audit M1); with no previous
+    /// key set the current header key runs twice and the second result is
+    /// never used. The AEAD runs only for a key set whose epoch matches, so
+    /// junk costs two AES blocks. Nothing is allocated before the AEAD, and
+    /// a `None` changes no replay window and no grace state (spec §24.1).
+    pub fn open(&mut self, wire: &[u8]) -> Option<Opened> {
+        self.tick();
+        if wire.len() < MIN_WIRE_LEN {
+            return None;
+        }
+        let mut block = [0u8; 16];
+        block.copy_from_slice(&wire[..16]);
+        let current = self.recv.hp.unprotect(&block);
+        let (previous, previous_epoch) = match &self.prev_recv {
+            Some(prev) => (prev.hp.unprotect(&block), Some(prev.epoch())),
+            None => (self.recv.hp.unprotect(&block), None),
+        };
+        // A genuine packet matches exactly one key set (but once in 2^32,
+        // and then the second try still finds it); junk matches by chance
+        // once in 2^32 per key set.
+        if epoch_matches(&current, self.recv.epoch()) {
+            if let Some(opened) = self.open_with(&current, wire, false) {
+                return Some(opened);
+            }
+        }
+        if previous_epoch.is_some_and(|epoch| epoch_matches(&previous, epoch)) {
+            return self.open_with(&previous, wire, true);
+        }
+        None
+    }
+
+    /// The per-key-set step of `open`: today's `decrypt` (replay check, the
+    /// AEAD always runs, the window moves only on success, and success under
+    /// the current key confirms a parked send swap).
+    fn open_with(&mut self, block: &[u8; 16], wire: &[u8], is_prev: bool) -> Option<Opened> {
+        let mut seq_be = [0u8; 8];
+        seq_be.copy_from_slice(&block[..8]);
+        let seq = u64::from_be_bytes(seq_be);
+        let mut nonce = [0u8; 12];
+        nonce[..8].copy_from_slice(&block[8..]);
+        nonce[8..].copy_from_slice(&wire[16..HEADER_LEN]);
+        let plaintext = self
+            .decrypt(&nonce, &wire[HEADER_LEN..], &seq_be, seq, is_prev)
+            .ok()?;
+        Some(Opened {
+            seq,
+            plaintext,
+            used_prev: is_prev,
+        })
     }
 
     /// Decrypt a packet. Tries current epoch first, then previous if in grace period.
@@ -566,8 +728,8 @@ impl SessionKeyManager {
     /// Apply new keys, keeping old recv key for grace period.
     fn apply_rotation(
         &mut self,
-        new_send_key: LockedKey32,
-        new_recv_key: LockedKey32,
+        new_send_key: DirSecrets,
+        new_recv_key: DirSecrets,
         new_epoch: u32,
     ) -> Result<RotationComplete, String> {
         self.apply_rotation_with_grace(new_send_key, new_recv_key, new_epoch, false)
@@ -581,8 +743,8 @@ impl SessionKeyManager {
     /// immediate and the grace timer starts now.
     fn apply_rotation_with_grace(
         &mut self,
-        new_send_key: LockedKey32,
-        new_recv_key: LockedKey32,
+        new_send_key: DirSecrets,
+        new_recv_key: DirSecrets,
         new_epoch: u32,
         defer_send: bool,
     ) -> Result<RotationComplete, String> {
@@ -728,6 +890,8 @@ fn try_decrypt_dir(
     aad: &[u8],
     seq: u64,
 ) -> Result<Vec<u8>, String> {
+    #[cfg(test)]
+    AEAD_RUNS.with(|runs| runs.set(runs.get() + 1));
     let replay_ok = replay.check(seq);
     let aead_result = key.decrypt(nonce, ciphertext, aad);
     match (replay_ok, aead_result) {
@@ -739,16 +903,21 @@ fn try_decrypt_dir(
     }
 }
 
-/// Derive send and recv keys from an ephemeral DH shared secret.
-/// Returns (initiator_send_key, initiator_recv_key) — each derived directly
-/// into a mlock'd heap buffer.
+/// Whether a decrypted header block names `epoch` (its bytes 8-11).
+fn epoch_matches(block: &[u8; 16], epoch: u32) -> bool {
+    bool::from(block[8..12].ct_eq(&epoch.to_be_bytes()))
+}
+
+/// Derive both directions' `DirSecrets` from a rotation DH: (send, recv)
+/// from this side's view. Each key is derived directly into a mlock'd heap
+/// buffer.
 fn derive_rotation_keys(
     our_secret: &[u8; 32],
     remote_pub: &[u8; 32],
     our_pub: &[u8; 32],
     is_initiator: bool,
     epoch: u32,
-) -> Result<(LockedKey32, LockedKey32), String> {
+) -> Result<(DirSecrets, DirSecrets), String> {
     // M-CRYPT-3: wrap the dereferenced scalar copy in Zeroizing.
     let scalar = Zeroizing::new(*our_secret);
     let secret = StaticSecret::from(*scalar);
@@ -790,25 +959,58 @@ fn derive_rotation_keys(
         info.extend_from_slice(resp_pub);
         info
     };
-    let expand_key = |info: &[u8], err_label: &str| -> Result<LockedKey32, String> {
-        let mut key = LockedKey32::zeroed()?;
-        hk.expand(info, key.as_mut())
-            .map_err(|e| format!("hkdf {err_label}: {e}"))?;
-        Ok(key)
+
+    // Spec §6.3: each direction's header key is a sibling of its AEAD key;
+    // the `-hp-` labels are 15 bytes like the AEAD ones, so no info string
+    // is a prefix of another.
+    let i2r = DirSecrets {
+        aead: expand_locked(&hk, &build_info(b"dsm-rot-i2r-v2-"), "i2r")?,
+        hp: expand_locked(&hk, &build_info(b"dsm-rot-i2r-hp-"), "i2r hp")?,
     };
-
-    let info_i2r = build_info(b"dsm-rot-i2r-v2-");
-    let info_r2i = build_info(b"dsm-rot-r2i-v2-");
-
+    let r2i = DirSecrets {
+        aead: expand_locked(&hk, &build_info(b"dsm-rot-r2i-v2-"), "r2i")?,
+        hp: expand_locked(&hk, &build_info(b"dsm-rot-r2i-hp-"), "r2i hp")?,
+    };
     if is_initiator {
-        let send_key = expand_key(&info_i2r, "i2r")?;
-        let recv_key = expand_key(&info_r2i, "r2i")?;
-        Ok((send_key, recv_key))
+        Ok((i2r, r2i))
     } else {
-        let send_key = expand_key(&info_r2i, "r2i")?;
-        let recv_key = expand_key(&info_i2r, "i2r")?;
-        Ok((send_key, recv_key))
+        Ok((r2i, i2r))
     }
+}
+
+/// Expand one HKDF output straight into a fresh locked key.
+fn expand_locked(hk: &Hkdf<Sha256>, info: &[u8], what: &str) -> Result<LockedKey32, String> {
+    let mut key = LockedKey32::zeroed()?;
+    hk.expand(info, key.as_mut())
+        .map_err(|e| format!("hkdf {what}: {e}"))?;
+    Ok(key)
+}
+
+/// The keys made at session start: the initiator's, the responder's, and
+/// the initial epoch. The epoch comes from the keying material, so both
+/// peers agree on it without an extra wire byte and it does not start at 1
+/// (audit I3); only its low 28 bits are kept, so u32 rotation has ~16M
+/// headroom.
+fn expand_start_keys(
+    hk: &Hkdf<Sha256>,
+    labels: &StartLabels,
+) -> Result<(DirSecrets, DirSecrets, u32), String> {
+    let initiator = DirSecrets {
+        aead: expand_locked(hk, labels.initiator, "initiator")?,
+        hp: expand_locked(hk, labels.initiator_hp, "initiator hp")?,
+    };
+    let responder = DirSecrets {
+        aead: expand_locked(hk, labels.responder, "responder")?,
+        hp: expand_locked(hk, labels.responder_hp, "responder hp")?,
+    };
+    let mut epoch_bytes = [0u8; 4];
+    hk.expand(labels.epoch, &mut epoch_bytes)
+        .map_err(|e| format!("hkdf epoch: {e}"))?;
+    Ok((
+        initiator,
+        responder,
+        u32::from_be_bytes(epoch_bytes) & 0x0FFF_FFFF,
+    ))
 }
 
 #[cfg(test)]
@@ -1411,5 +1613,369 @@ mod tests {
         assert!(delivers(&mut client, &mut server, 1, b"epoch+2 data"));
         assert_eq!(server.send_epoch(), start + 2);
         assert!(delivers(&mut server, &mut client, 2, b"epoch+2 reply"));
+    }
+
+    // ---- wire v2: seal and open (spec §16.1 tests 4-13) ----
+
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+    use sha2::Digest;
+
+    fn aead_runs() -> u64 {
+        AEAD_RUNS.with(std::cell::Cell::get)
+    }
+
+    fn reset_aead_runs() {
+        AEAD_RUNS.with(|runs| runs.set(0));
+    }
+
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn fixed_dir(aead: u8, hp: u8) -> DirSecrets {
+        DirSecrets {
+            aead: LockedKey32::from_array([aead; 32]).unwrap(),
+            hp: LockedKey32::from_array([hp; 32]).unwrap(),
+        }
+    }
+
+    /// A client and a server on fixed keys, so whether a header matches is
+    /// the same on every run (spec §16.1: the AEAD-counting tests).
+    fn fixed_pair() -> (SessionKeyManager, SessionKeyManager) {
+        let epoch = 0x0123_4567;
+        let client =
+            SessionKeyManager::new(fixed_dir(1, 2), fixed_dir(3, 4), epoch, None, None).unwrap();
+        let server =
+            SessionKeyManager::new(fixed_dir(3, 4), fixed_dir(1, 2), epoch, None, None).unwrap();
+        (client, server)
+    }
+
+    /// Both sides move to fixed new keys at epoch + 1 at once; each keeps its
+    /// old receive keys for the grace period.
+    fn fixed_rotation(client: &mut SessionKeyManager, server: &mut SessionKeyManager) {
+        let next = client.epoch() + 1;
+        client
+            .apply_rotation(fixed_dir(5, 6), fixed_dir(7, 8), next)
+            .unwrap();
+        server
+            .apply_rotation(fixed_dir(7, 8), fixed_dir(5, 6), next)
+            .unwrap();
+    }
+
+    /// `count` packets of `len` pseudo-random bytes from a fixed seed.
+    fn junk(seed: u64, len: usize, count: usize) -> Vec<Vec<u8>> {
+        let mut rng = StdRng::seed_from_u64(seed);
+        (0..count)
+            .map(|_| {
+                let mut packet = vec![0u8; len];
+                rng.fill_bytes(&mut packet);
+                packet
+            })
+            .collect()
+    }
+
+    /// Test 4: round trip both ways; the wire is 36 + plaintext bytes.
+    #[test]
+    fn seal_open_round_trip_both_ways() {
+        let (mut client, mut server) = make_paired_managers();
+        for (seq, len) in [(1u64, 0usize), (2, 92), (3, 1364)] {
+            let msg = vec![0xA5u8; len];
+            let wire = client.seal(seq, &msg).unwrap();
+            assert_eq!(wire.len(), MIN_WIRE_LEN + len);
+            let opened = server.open(&wire).unwrap();
+            assert_eq!(opened.seq, seq);
+            assert_eq!(opened.plaintext, msg);
+            assert!(!opened.used_prev);
+            let back = server.seal(seq, &msg).unwrap();
+            assert_eq!(client.open(&back).unwrap().plaintext, msg);
+        }
+    }
+
+    /// Test 5: every header byte, the tag, the length and the direction.
+    #[test]
+    fn open_rejects_changed_short_and_wrong_direction_packets() {
+        let (mut client, mut server) = make_paired_managers();
+        let wire = client.seal(7, b"payload").unwrap();
+        for i in 0..HEADER_LEN {
+            let mut bad = wire.clone();
+            bad[i] ^= 0x01;
+            assert!(server.open(&bad).is_none(), "header byte {i} flipped");
+        }
+        let mut bad_tag = wire.clone();
+        let last = bad_tag.len() - 1;
+        bad_tag[last] ^= 0x01;
+        assert!(server.open(&bad_tag).is_none());
+        assert!(server.open(&wire[..MIN_WIRE_LEN - 1]).is_none());
+        // A packet this side sealed itself is in the other direction's keys.
+        let own = server.seal(1, b"own").unwrap();
+        assert!(server.open(&own).is_none());
+        // None of the refusals moved anything: the genuine packet opens.
+        assert!(server.open(&wire).is_some());
+    }
+
+    /// Test 6 (audit M1): junk runs no AEAD at all, with or without a grace
+    /// period. Fixed keys and fixed bytes, so a 1-in-2^32 epoch match cannot
+    /// make this flaky.
+    #[test]
+    fn junk_runs_no_aead_with_or_without_grace() {
+        let (mut client, mut server) = fixed_pair();
+        for grace in [false, true] {
+            if grace {
+                fixed_rotation(&mut client, &mut server);
+                assert!(server.has_grace_period());
+            }
+            for &size in &crate::shaper::SIZE_CLASSES {
+                reset_aead_runs();
+                for packet in junk(u64::from(size) + u64::from(grace), usize::from(size), 1000) {
+                    assert!(server.open(&packet).is_none());
+                }
+                assert_eq!(aead_runs(), 0, "size {size}, grace {grace}");
+            }
+        }
+    }
+
+    /// Test 7: the 16-byte block never repeats, even for one seq: the nonce
+    /// counter keeps the input unique.
+    #[test]
+    fn header_blocks_never_repeat() {
+        let (mut client, _server) = make_paired_managers();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..10_000 {
+            let wire = client.seal(1, b"x").unwrap();
+            assert!(seen.insert(wire[..16].to_vec()));
+        }
+    }
+
+    /// Test 8 (audit M3): a replay matches its header, so the AEAD runs once
+    /// for it, and it is refused.
+    #[test]
+    fn a_replay_runs_the_aead_once_and_is_refused() {
+        let (mut client, mut server) = fixed_pair();
+        let wire = client.seal(1, b"once").unwrap();
+        assert!(server.open(&wire).is_some());
+        reset_aead_runs();
+        assert!(server.open(&wire).is_none());
+        assert_eq!(aead_runs(), 1);
+    }
+
+    /// Test 9 (owner Q2): an old-key packet opens during the grace period
+    /// with `used_prev`; after it ends, the next one is refused with no AEAD.
+    #[test]
+    fn an_old_key_packet_opens_in_grace_and_costs_no_aead_after() {
+        let (mut client, mut server) = fixed_pair();
+        let early = client.seal(1, b"early").unwrap();
+        let late = client.seal(2, b"late").unwrap();
+        fixed_rotation(&mut client, &mut server);
+        assert!(server.open(&early).unwrap().used_prev);
+        server.age_for_test(Duration::from_secs(GRACE_PERIOD_SECS));
+        reset_aead_runs();
+        assert!(server.open(&late).is_none());
+        assert!(!server.has_grace_period());
+        assert_eq!(aead_runs(), 0);
+    }
+
+    /// Test 10: during the responder's delayed send swap its packets keep the
+    /// old key set and its header key; the client's first new-key packet
+    /// makes it swap, and from then on it uses the new header key.
+    #[test]
+    fn delayed_send_swap_keeps_the_old_header_key_until_confirmed() {
+        let (mut client, mut server) = make_paired_managers();
+        let (init, server_pub) = responder_applies(&client, &mut server);
+
+        let s1 = server.seal(1, b"before the client applied").unwrap();
+        assert!(!client.open(&s1).unwrap().used_prev);
+
+        client
+            .complete_rotation_initiator(init, &server_pub)
+            .unwrap();
+        let s2 = server.seal(2, b"still the old keys").unwrap();
+        assert!(client.open(&s2).unwrap().used_prev);
+
+        let c1 = client.seal(1, b"first new-key packet").unwrap();
+        assert!(!server.open(&c1).unwrap().used_prev);
+        assert!(!server.has_pending_send_swap());
+
+        let s3 = server.seal(3, b"new keys now").unwrap();
+        assert!(!client.open(&s3).unwrap().used_prev);
+    }
+
+    /// Test 11: the REKEY_ACK is lost; a REKEY_INIT resent under the old keys
+    /// still opens at the server while it waits, and the cached ACK under the
+    /// old send key opens at the client.
+    #[test]
+    fn lost_ack_resend_opens_with_the_old_header_key() {
+        let (mut client, mut server) = make_paired_managers();
+        let (_init, _server_pub) = responder_applies(&client, &mut server);
+        server.age_for_test(Duration::from_secs(PEER_CONFIRM_LIMIT_SECS - 10));
+        server.tick();
+        assert!(server.has_grace_period());
+        let resent_init = client.seal(10, b"resent REKEY_INIT").unwrap();
+        assert!(server.open(&resent_init).unwrap().used_prev);
+        let cached_ack = server.seal(10, b"cached REKEY_ACK").unwrap();
+        assert!(!client.open(&cached_ack).unwrap().used_prev);
+    }
+
+    /// Test 12, VK1 (spec §16.3): bootstrap keys, also today's AEAD keys and
+    /// epoch.
+    #[test]
+    fn vk1_bootstrap_keys() {
+        let shared = unhex("202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f");
+        let hk = Hkdf::<Sha256>::new(Some(BOOTSTRAP_SALT), &shared);
+        let (initiator, responder, epoch) = expand_start_keys(&hk, &BOOTSTRAP_LABELS).unwrap();
+        assert_eq!(
+            hex(initiator.aead.as_array()),
+            "88220f5148079ff91f54719a285399c8e1811e6c9d68afc281a9a7ea13c6a979"
+        );
+        assert_eq!(
+            hex(responder.aead.as_array()),
+            "20ad2743ee98b788954f62a76f205d3822926b499bbb5e83ca2dade71da73e9e"
+        );
+        assert_eq!(
+            hex(initiator.hp.as_array()),
+            "908cda00df7a83348258c102a5ba3cb953030cdb868ee51e9baa69c89538905d"
+        );
+        assert_eq!(
+            hex(responder.hp.as_array()),
+            "31f64011dfcf5a95045a34fa48e492908a0c3f29450d56109a546f4cf882f0f6"
+        );
+        assert_eq!(epoch, 0x07fe_d369);
+    }
+
+    /// Test 12, VR1: rotation keys (X25519 secrets before clamping).
+    #[test]
+    fn vr1_rotation_keys() {
+        let init_secret = [0x11u8; 32];
+        let resp_secret = [0x22u8; 32];
+        let init_pub = *PublicKey::from(&StaticSecret::from(init_secret)).as_bytes();
+        let resp_pub = *PublicKey::from(&StaticSecret::from(resp_secret)).as_bytes();
+        assert_eq!(
+            hex(&init_pub),
+            "7b4e909bbe7ffe44c465a220037d608ee35897d31ef972f07f74892cb0f73f13"
+        );
+        assert_eq!(
+            hex(&resp_pub),
+            "0faa684ed28867b97f4a6a2dee5df8ce974e76b7018e3f22a1c4cf2678570f20"
+        );
+        let new_epoch = 0x0123_4568;
+        let (send, recv) =
+            derive_rotation_keys(&init_secret, &resp_pub, &init_pub, true, new_epoch).unwrap();
+        assert_eq!(
+            hex(send.aead.as_array()),
+            "8f583326eb3b68a9a8caf1b19724d72b7d5ad0be939b5da088b92f51c7dc42c4"
+        );
+        assert_eq!(
+            hex(recv.aead.as_array()),
+            "bb96d00f3e3b331c892bbd6b7fa49a24511a0eee282940518609b7b38327ada9"
+        );
+        assert_eq!(
+            hex(send.hp.as_array()),
+            "f88339633c3b437eea19c6e803411abcb10b444a679b96278bcc3a4c7e99d667"
+        );
+        assert_eq!(
+            hex(recv.hp.as_array()),
+            "d522c1878642596575cf69ce6ec5cb457cdb6e3d78e48b4d15094e2b8e5820f2"
+        );
+        let (r_send, r_recv) =
+            derive_rotation_keys(&resp_secret, &init_pub, &resp_pub, false, new_epoch).unwrap();
+        assert_eq!(r_send.hp.as_array(), recv.hp.as_array());
+        assert_eq!(r_recv.hp.as_array(), send.hp.as_array());
+    }
+
+    /// Test 12, VP1: a full 128-byte packet with fixed random nonce bytes.
+    #[test]
+    fn vp1_full_packet() {
+        let mut hp = [0u8; 32];
+        let mut aead = [0u8; 32];
+        for (i, (h, a)) in hp.iter_mut().zip(aead.iter_mut()).enumerate() {
+            *h = i as u8;
+            *a = 0x40 + i as u8;
+        }
+        let send = DirSecrets {
+            aead: LockedKey32::from_array(aead).unwrap(),
+            hp: LockedKey32::from_array(hp).unwrap(),
+        };
+        let mut keys =
+            SessionKeyManager::new(send, fixed_dir(9, 9), 0x0123_4567, None, None).unwrap();
+        let mut plaintext = vec![0x00, 0x70, 0x00, 0x05];
+        plaintext.extend_from_slice(b"hello");
+        plaintext.resize(92, 0);
+        let wire = keys
+            .seal_fixed_tail(1, &plaintext, [0xde, 0xad, 0xbe, 0xef])
+            .unwrap();
+        assert_eq!(wire.len(), 128);
+        assert_eq!(
+            hex(&wire[..HEADER_LEN]),
+            "2bac181b9b28b24c91fc508da5d7baa5deadbeef"
+        );
+        assert_eq!(
+            hex(&wire[wire.len() - 16..]),
+            "9f6acb6e62011a00d7b39cec3a8020af"
+        );
+        assert_eq!(
+            hex(&Sha256::digest(&wire)),
+            "d280eda98b7a931b039fb2b8f76952003374d39989b9777d05f486b5a87293a2"
+        );
+    }
+
+    /// Test 13: send vs receive header key, epoch E vs E+1, header key vs
+    /// AEAD key all differ.
+    #[test]
+    fn every_key_differs() {
+        let mut shared = [0u8; 32];
+        OsRng.fill_bytes(&mut shared);
+        let hk = Hkdf::<Sha256>::new(Some(BOOTSTRAP_SALT), &shared);
+        let (initiator, responder, _) = expand_start_keys(&hk, &BOOTSTRAP_LABELS).unwrap();
+        assert_ne!(initiator.hp.as_array(), responder.hp.as_array());
+        assert_ne!(initiator.hp.as_array(), initiator.aead.as_array());
+        assert_ne!(responder.hp.as_array(), responder.aead.as_array());
+
+        let mut ours = [0u8; 32];
+        let mut theirs = [0u8; 32];
+        OsRng.fill_bytes(&mut ours);
+        OsRng.fill_bytes(&mut theirs);
+        let our_pub = *PublicKey::from(&StaticSecret::from(ours)).as_bytes();
+        let their_pub = *PublicKey::from(&StaticSecret::from(theirs)).as_bytes();
+        let (epoch5_send, epoch5_recv) =
+            derive_rotation_keys(&ours, &their_pub, &our_pub, true, 5).unwrap();
+        let (epoch6_send, _) = derive_rotation_keys(&ours, &their_pub, &our_pub, true, 6).unwrap();
+        assert_ne!(epoch5_send.hp.as_array(), epoch6_send.hp.as_array());
+        assert_ne!(epoch5_send.hp.as_array(), epoch5_recv.hp.as_array());
+        assert_ne!(epoch5_send.hp.as_array(), epoch5_send.aead.as_array());
+    }
+
+    /// Review Focus 2 (spec §24.1): a packet that does not open changes
+    /// nothing. Multi-client will try a packet on each session in turn; a
+    /// miss must not move that session's replay windows or end its grace.
+    #[test]
+    fn a_none_from_open_changes_nothing() {
+        let (mut client, mut server) = fixed_pair();
+        let old = client.seal(5, b"old key set").unwrap();
+        fixed_rotation(&mut client, &mut server);
+        let mut forged_far = client.seal(300, b"its header matches").unwrap();
+        let last = forged_far.len() - 1;
+        forged_far[last] ^= 0x01;
+        let later = client.seal(9, b"new keys, seq 9").unwrap();
+        let earlier = client.seal(3, b"new keys, seq 3").unwrap();
+        let (mut other, _) = make_paired_managers();
+        let stranger = other.seal(9, b"another session").unwrap();
+
+        for miss in [vec![0x5Au8; 128], stranger, vec![0u8; 20], forged_far] {
+            assert!(server.open(&miss).is_none());
+        }
+        assert!(server.has_grace_period());
+        // Had the forged packet moved the window to 300, seq 3 would now be
+        // too old; it still opens, after seq 9, and the old key set still
+        // opens its packet.
+        assert!(server.open(&later).is_some());
+        assert!(server.open(&earlier).is_some());
+        assert!(server.open(&old).unwrap().used_prev);
     }
 }
