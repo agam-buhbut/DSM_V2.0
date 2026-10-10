@@ -158,7 +158,12 @@ class LocalDNSProxy:
 
     def stop(self) -> None:
         if self._transport is not None:
-            self._transport.close()
+            # abort(), not close(): close() keeps the socket open until a
+            # waiting reply is sent, and after a session takeover the next
+            # session binds this address one loop step later (a clash there
+            # stops the server). A dropped reply is like loss: the client
+            # asks again.
+            self._transport.abort()
             self._transport = None
         for task in list(self._tasks):
             task.cancel()

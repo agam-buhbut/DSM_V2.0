@@ -507,11 +507,12 @@ def decrypt_packet(
     is dropped later still crossed the link. A packet dropped before that
     (too short, a replay, AEAD failed) counts as junk.
 
-    ``on_auth_fail`` and ``on_replay`` (server, step R) are called for a
-    packet the session cannot use, so the server's in-session accept can
-    look at it. ``on_auth_fail``: the packet does not open (AEAD failed); it
-    may be a reconnecting client's handshake frame. ``on_replay``: the replay
-    window rejects it as already seen; it may be that client's first packet
+    ``on_auth_fail`` and ``on_replay`` (server, while a session runs) are
+    called for a packet the session cannot use, so the server's in-session
+    accept can look at it. ``on_auth_fail``: the packet does not open (AEAD
+    failed); it may be a reconnecting client's handshake frame.
+    ``on_replay``: the replay window rejects it as already seen or too old
+    (more than the window behind); it may be that client's first packet
     under its new keys, whose sequence number starts again at 1. A packet
     that opened (even with a bad inner part or a wrong epoch) and a
     too-short packet go to neither. Without them nothing changes.
@@ -1057,11 +1058,13 @@ async def run_data_loops(
       decrypted ``inner`` too so it can act on a PATH_RESPONSE; called BEFORE
       ``dispatch_inner`` so the egress decision is made before the payload is
       delivered.
-    * ``unauthenticated`` (server, step R): gets each UDP packet the session
-      cannot use, with its source address and ``seen``, for the in-session
-      accept. ``seen`` is False when the packet did not open (AEAD failed)
-      and True when the replay window had already seen it. The client
-      passes nothing; TCP never calls it.
+    * ``unauthenticated`` (server, while a session runs): gets each UDP
+      packet the session cannot use, with its source address and ``seen``,
+      for the in-session accept. ``seen`` is False when the packet did not
+      open (AEAD failed) and True when the replay window rejected it as
+      already seen or too old (more than the window behind). It runs inside
+      the receive loop, so it must not block or raise: an exception ends the
+      session. The client passes nothing; TCP never calls it.
     * ``extra_loops``: client passes ``auto_mtu_loop(...)`` here; server
       passes nothing.
     * ``shutdown_log``: caller-supplied label so the log line still

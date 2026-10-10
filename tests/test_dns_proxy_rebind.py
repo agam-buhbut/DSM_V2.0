@@ -1,10 +1,10 @@
 """The DNS proxy's address is free again one event-loop step after stop().
 
 Pins why run_server yields once between a replaced session and the next one
-(step R): LocalDNSProxy.stop() closes its asyncio transport, and asyncio
-closes the socket one loop step later. The next session binds the same
-address at once, and a port clash there stops the server. Real UDP sockets
-on 127.0.0.1 only.
+(an in-session takeover): LocalDNSProxy.stop() aborts its asyncio transport,
+and asyncio closes the socket one loop step later, also when a reply is
+still waiting to be sent. The next session binds the same address at once,
+and a port clash there stops the server. Real UDP sockets on 127.0.0.1 only.
 """
 
 from __future__ import annotations
@@ -63,4 +63,25 @@ async def test_without_that_step_the_bind_fails() -> None:
     second = _proxy(port)
     with pytest.raises(DNSProxyPortInUseError):
         await second.start()
+    await asyncio.sleep(0)
+
+
+async def test_a_reply_waiting_to_be_sent_does_not_hold_the_address() -> None:
+    """A plain close() keeps the socket open until the waiting reply is
+    sent, past the one loop step the next session gets."""
+    port = _free_udp_port()
+    first = _proxy(port)
+    await first.start()
+    transport = first._transport
+    assert transport is not None
+    # The kernel cannot take the reply now (EAGAIN): asyncio keeps it in the
+    # transport's buffer and waits until the socket can send.
+    with patch.object(socket.socket, "sendto", side_effect=BlockingIOError):
+        transport.sendto(b"a DNS reply", ("127.0.0.1", 9))
+    assert transport.get_write_buffer_size() > 0
+    first.stop()
+    await asyncio.sleep(0)
+    second = _proxy(port)
+    await second.start()
+    second.stop()
     await asyncio.sleep(0)

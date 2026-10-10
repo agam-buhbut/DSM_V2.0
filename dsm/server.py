@@ -195,8 +195,8 @@ def _start_watch(
     limiter: SourceLimiter,
     slot: SessionSlot,
 ) -> SessionWatch:
-    """Start the accept that runs while the next session is live (step R):
-    on the run's UDP socket, or on the run's one TCP listener."""
+    """Start the accept that runs while the next session is live: on the
+    run's UDP socket, or on the run's one TCP listener."""
     if config.transport == "udp":
         assert isinstance(transport_obj, UDPTransport)
         return SessionWatch(
@@ -290,7 +290,7 @@ async def _run_one_session(
     A fresh ``session_shutdown`` event drives ``run_data_loops``; bridge
     tasks set it when ``process_shutdown`` is set (a signal) or when
     ``end_session`` is set (the in-session accept found a client that takes
-    the session over, step R). The bridges are cancelled when the session
+    the session over). The bridges are cancelled when the session
     ends.
 
     ``blocklist`` is the daemon's one DNS blocklist (None when
@@ -690,7 +690,7 @@ async def run_server(
         # Limits on starting handshake attempts, per source address and
         # overall. One for the whole run, so they hold across accept cycles.
         limiter = SourceLimiter()
-        # Who holds the session and who may take it over (step R). One for
+        # Who holds the session and who may take it over. One for
         # the whole run, handed to every accept.
         slot = SessionSlot()
 
@@ -841,6 +841,7 @@ async def run_server(
                 if pending is not None and config.transport == "tcp":
                     # A client that won during this session is not served.
                     await pending.transport.aclose()
+                    pending = None
                 if dns_clash is not None:
                     # A host resolver holds :53. Retrying cannot fix that and
                     # would loop on the same bind error, so exit with a clear
@@ -866,5 +867,11 @@ async def run_server(
                 # and the next session binds the same address at once; a clash
                 # there is fatal. Give asyncio that step.
                 await asyncio.sleep(0)
+
+        if pending is not None and config.transport == "tcp":
+            # Shutdown came during that step: the client that took the
+            # session over is not served. (UDP: the run's socket closes with
+            # the stack.)
+            await pending.transport.aclose()
 
     return 0

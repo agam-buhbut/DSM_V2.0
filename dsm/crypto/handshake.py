@@ -36,7 +36,7 @@ import asyncio
 import logging
 import os
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, TypeVar
 
 from cryptography.x509 import Certificate as X509Certificate
@@ -136,8 +136,9 @@ class VerifiedClient:
     signature, CN allowlist and CRL."""
 
     cn: str
-    # 32 bytes. The client's certificate binds its TPM attest key to it.
-    noise_static: bytes
+    # 32 bytes. The client's certificate binds its TPM attest key to it. Out
+    # of repr: a stable device ID, which the logs show only hashed.
+    noise_static: bytes = field(repr=False)
 
 
 def _pad_to_frame(data: bytes, expected_size: int) -> bytes:
@@ -235,6 +236,13 @@ async def _attest_payload_in_thread(
                 await asyncio.wait({work})
             except asyncio.CancelledError:
                 continue
+        # The handshake is over either way and the cancel is what the caller
+        # must see, so an error from the signature is dropped. Read it here,
+        # or asyncio logs it later as "never retrieved", with its text.
+        if not work.cancelled():
+            error = work.exception()
+            if error is not None:
+                log.debug("signature after a cancel failed: %s", type(error).__name__)
         raise
 
 
@@ -494,7 +502,7 @@ async def server_handshake(
 
     # Message 2: <- e, ee, s, es [+ server attest payload]
     binding_hash_for_msg2 = bytes(responder.get_handshake_hash())
-    # Off the event loop: the server may be serving a live session (step R).
+    # Off the event loop: the server may be serving a live session.
     our_attest_payload = await _attest_payload_in_thread(
         attest_key=attest_key,
         cert_der=cert_der,

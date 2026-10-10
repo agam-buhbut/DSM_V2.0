@@ -29,9 +29,10 @@ PER_SOURCE_INFLIGHT = 2
 PER_SOURCE_RATE = 0.25  # tokens per second
 PER_SOURCE_BURST = 3.0
 # New attempts from all addresses together: a safety net for signing time.
-# Measured on the server box's TPM (2026-10-09): 0.21 s a signature while
-# each sign made its parent key again; step R keeps the parent loaded and
-# signs off the event loop.
+# Measured on the server box's TPM (2026-10-09): about 0.21 s a signature.
+# Keeping the parent key loaded saves only about 40 ms of that; the real win
+# is that signing no longer blocks the event loop (its longest stall went
+# from 219 ms to 6 ms).
 GLOBAL_START_RATE = 4.0  # tokens per second
 GLOBAL_START_BURST = 8.0
 # New attempts from all addresses together while a session runs, on top of

@@ -1,5 +1,5 @@
-"""End to end on loopback: a client that comes back replaces its old session
-(step R), and another client waits until the session ends.
+"""End to end on loopback: a client that comes back replaces its old session,
+and another client waits until the session ends.
 
 Real handshakes, the real acceptor, slot, in-session accept, session
 receive loop, shaper and scheduler; the TUN, the host managers and the DNS
@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 from collections.abc import AsyncGenerator
 from dataclasses import replace
 from typing import Any
@@ -269,15 +270,33 @@ async def _tun_gets(expected: bytes, timeout: float) -> None:
     assert await asyncio.wait_for(_Tun.written.get(), timeout) == expected
 
 
+async def _slot_logged(
+    caplog: pytest.LogCaptureFixture, line: str, timeout: float
+) -> bool:
+    """Wait until the session slot has logged ``line``."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        if any(
+            r.name == "dsm.net.session_slot" and r.getMessage() == line
+            for r in caplog.records
+        ):
+            return True
+        await asyncio.sleep(0.01)
+    return False
+
+
 async def test_a_client_that_comes_back_replaces_its_old_session() -> None:
     world = _World({A_CN})
     async with _server(world) as server:
         first = await _socket()
-        a_keys = await _connect(world, world.a, first, server)
-        await _send(first, a_keys, server, 1, PacketType.DATA, b"from A")
-        await _tun_gets(b"from A", 10.0)
-        # A dies as by kill -9: its socket closes, no SESSION_CLOSE.
-        await first.aclose()
+        try:
+            a_keys = await _connect(world, world.a, first, server)
+            await _send(first, a_keys, server, 1, PacketType.DATA, b"from A")
+            await _tun_gets(b"from A", 10.0)
+        finally:
+            # A dies as by kill -9: its socket closes, no SESSION_CLOSE.
+            await first.aclose()
         # A again (same identity, a new socket): the server ends the old
         # session at once, not after the 60 s dead-peer timer.
         again = await _socket()
@@ -289,7 +308,10 @@ async def test_a_client_that_comes_back_replaces_its_old_session() -> None:
             await again.aclose()
 
 
-async def test_another_client_waits_until_the_session_ends() -> None:
+async def test_another_client_waits_until_the_session_ends(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="dsm.net.session_slot")
     world = _World({A_CN, B_CN})
     async with _server(world) as server:
         a_sock = await _socket()
@@ -308,6 +330,12 @@ async def test_another_client_waits_until_the_session_ends() -> None:
                         await _connect(world, world.b, b_sock, server)
                 finally:
                     await b_sock.aclose()
+                assert await _slot_logged(
+                    caplog,
+                    "handshake refused: another client is connected "
+                    f"(client_cn={B_CN})",
+                    5.0,
+                )
                 # A's session is untouched.
                 await _send(a_sock, a_keys, server, 2, PacketType.DATA, b"A still up")
                 await _tun_gets(b"A still up", 5.0)

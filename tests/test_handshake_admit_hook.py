@@ -1,7 +1,6 @@
-"""server_handshake's admit_client hook (step R): it sees each client that
-passed every check, once, before the last handshake frame, and may refuse
-it. Real handshakes over loopback UDP and TCP, like
-test_handshake_integration.py."""
+"""server_handshake's admit_client hook: it sees each client that passed
+every check, once, before the last handshake frame, and may refuse it. Real
+handshakes over loopback UDP and TCP, like test_handshake_integration.py."""
 
 from __future__ import annotations
 

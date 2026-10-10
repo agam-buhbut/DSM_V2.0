@@ -1,7 +1,7 @@
-"""server_handshake makes its attest signature in a worker thread (step R).
+"""server_handshake makes its attest signature in a worker thread.
 
-A TPM signature took about 0.2 s on the server box, and with step R the
-server can be serving a live session meanwhile. These tests patch
+A TPM signature took about 0.2 s on the server box, and the server can be
+serving a live session meanwhile. These tests patch
 build_attest_payload with stand-ins, so they need no tuncore and no
 sockets; a threading.Event stands in for the TPM.
 """
@@ -9,6 +9,8 @@ sockets; a threading.Event stands in for the TPM.
 from __future__ import annotations
 
 import asyncio
+import gc
+import logging
 import threading
 from typing import Any
 from unittest.mock import patch
@@ -113,3 +115,38 @@ async def test_an_error_in_the_thread_reaches_the_handshake() -> None:
     with patch.object(handshake, "build_attest_payload", new=_fails):
         with pytest.raises(RuntimeError, match="TPM error: test"):
             await handshake._attest_payload_in_thread(**_ARGS)
+
+
+async def test_an_error_after_a_cancel_is_dropped_with_one_debug_line(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The handshake is over either way, so the error is dropped: asyncio
+    must not log it later as "never retrieved", with its text."""
+    caplog.set_level(logging.DEBUG)
+    started = threading.Event()
+    release = threading.Event()
+
+    def _fails(**_kwargs: Any) -> bytes:
+        started.set()
+        release.wait(10.0)
+        raise RuntimeError("TPM error: some detail")
+
+    with patch.object(handshake, "build_attest_payload", new=_fails):
+        work = asyncio.ensure_future(handshake._attest_payload_in_thread(**_ARGS))
+        assert await asyncio.to_thread(started.wait, 10.0)
+        work.cancel()
+        await _yield()
+        release.set()
+        await asyncio.wait({work}, timeout=10.0)
+    assert work.cancelled()
+    del work
+    gc.collect()
+    await _yield()
+    lines = [(r.name, r.levelno, r.getMessage()) for r in caplog.records]
+    assert [line for line in lines if line[1] >= logging.ERROR] == []
+    assert (
+        "dsm.crypto.handshake",
+        logging.DEBUG,
+        "signature after a cancel failed: RuntimeError",
+    ) in lines
+    assert all("some detail" not in message for _, _, message in lines)

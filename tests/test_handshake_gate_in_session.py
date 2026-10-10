@@ -1,6 +1,6 @@
 """While a session runs, new handshakes may start at most once a second, on
-top of the per-address and overall limits (step R, owner decision
-2026-10-09). Each admitted attempt costs a TPM signature."""
+top of the per-address and overall limits (owner decision 2026-10-09). Each
+admitted attempt costs a TPM signature."""
 
 from __future__ import annotations
 

@@ -12,7 +12,7 @@ DNS proxy, one socket), and the acceptor runs in two places:
 
 * Between sessions (the idle accept): the first worker to authenticate wins
   and the others are cancelled.
-* While a session runs (:class:`SessionWatch`, step R): over UDP the live
+* While a session runs (:class:`SessionWatch`): over UDP the live
   session still reads every datagram first and hands over each one it
   cannot use (did not open, or already seen); over TCP the run's one
   listener stays open and the watch reads its queue. A client that passes
@@ -49,7 +49,7 @@ intake (``_INTAKE_FRAMES``, 64) — the same backpressure the live data path
 already applies.
 """
 
-# The idle accept and the in-session accept (step R) share the demux, the
+# The idle accept and the in-session accept share the demux, the
 # workers and the TCP machinery, so this module is over pylint's 1000-line
 # ceiling by design.
 # pylint: disable=too-many-lines
@@ -60,7 +60,7 @@ import asyncio
 import logging
 import os
 from collections.abc import Callable, Coroutine
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from dsm.core.log import RepeatLog
@@ -227,8 +227,12 @@ async def _run_handshake_worker(
 
     try:
         try:
-            session_keys, client_pub = await asyncio.wait_for(
-                server_handshake(
+            # Not wait_for: on Python 3.11 it runs the handshake as a second
+            # task and can stop waiting for it when a second cancel lands,
+            # while its signature still runs in a thread. Here the handshake
+            # runs in this task, so its own wait for that thread holds.
+            async with asyncio.timeout(_HANDSHAKE_ATTEMPT_DEADLINE):
+                session_keys, client_pub = await server_handshake(
                     transport,
                     keystore.identity,
                     attest_key=attest_store.attest_key,
@@ -240,9 +244,7 @@ async def _run_handshake_worker(
                     rotation_packets=config.rotation_packets,
                     rotation_seconds=config.rotation_seconds,
                     admit_client=admit_client,
-                ),
-                timeout=_HANDSHAKE_ATTEMPT_DEADLINE,
-            )
+                )
         except TimeoutError:
             log.info(
                 "handshake attempt from %s exceeded %.0fs deadline — slot reclaimed",
@@ -471,16 +473,27 @@ async def _cancel_and_drain(
     ``SessionSlot.admitted``), if any. It is awaited, never cancelled: its
     client may already have the last handshake frame. Its own deadline bounds
     the wait.
+
+    Every task is awaited, even after one failed: a cancelled worker may
+    still wait for its signing thread, and the server zeroizes the attest key
+    once the accept returns. The first error that is not a cancel is raised
+    once all are done.
     """
     pending = [t for t in tasks if not t.done()]
     for task in pending:
         if task is not keep:
             task.cancel()
+    first_error: Exception | None = None
     for task in pending:
         try:
             await task
         except asyncio.CancelledError:
             pass
+        except Exception as e:  # noqa: BLE001  # raised once all are done
+            if first_error is None:
+                first_error = e
+    if first_error is not None:
+        raise first_error
 
 
 def _drain_inbox(inbox: asyncio.Queue[bytes] | None) -> list[bytes]:
@@ -894,7 +907,8 @@ class _IntakeView(UDPTransport):
 class Winner:
     """The client that won an in-session accept: the next session's peer."""
 
-    session_keys: tuncore.SessionKeyManager
+    # Out of repr: it holds the session's keys.
+    session_keys: tuncore.SessionKeyManager = field(repr=False)
     client_pub: bytes
     # UDP: the run's socket; the winner's packets held so far are back at
     # the front of its queue. TCP: the winner's own connection.
@@ -903,7 +917,7 @@ class Winner:
 
 class SessionWatch:
     """Accept handshakes while a session is live, so a client that comes back
-    can replace its old session at once (step R).
+    can replace its old session at once.
 
     The server makes one right before each session (it starts at once) and
     calls :meth:`stop` after the session ended. UDP (``udp=`` the run's
@@ -914,7 +928,8 @@ class SessionWatch:
     listener. A client that passes the full handshake and the slot's rules
     sets :attr:`end_session`, so the live session stops, and :meth:`stop`
     hands it over as the next session's peer. A crash here (a bug) is logged
-    once; the session runs on and just cannot be replaced until it ends.
+    once; the session runs on and just cannot be replaced until it ends
+    (TCP: each new connection is closed at once until :meth:`stop`).
     """
 
     def __init__(
@@ -933,6 +948,9 @@ class SessionWatch:
         self.end_session = asyncio.Event()
         self._stop = asyncio.Event()
         self._real = udp
+        self._tcp = tcp
+        # TCP only, after a crash: closes queued connections until stop().
+        self._closer: asyncio.Task[None] | None = None
         self._intake: asyncio.Queue[tuple[bytes, tuple[str, int]]] | None = None
         self._held: list[bytes] = []
         self._winner_addr: tuple[str, int] | None = None
@@ -1049,12 +1067,25 @@ class SessionWatch:
                 "replaced until it ends",
                 exc_info=error,
             )
+            if self._tcp is not None and not self._stop.is_set():
+                # The listener keeps queueing connections, and nothing reads
+                # them now: close each one, or it waits unanswered for the
+                # rest of the session.
+                self._closer = asyncio.ensure_future(self._close_queued(self._tcp))
+
+    @staticmethod
+    async def _close_queued(
+        connections: asyncio.Queue[tuple[TCPTransport, tuple[str, int]]],
+    ) -> None:
+        while True:
+            conn, _ = await connections.get()
+            conn.close()
 
     def _offer(self, data: bytes, addr: tuple[str, int], seen: bool) -> None:
         """Take one packet the live session cannot use. Never raises.
 
-        ``seen`` is True when the session's replay window had already seen
-        the packet, and False when it did not open.
+        ``seen`` is True when the session's replay window rejected the packet
+        as already seen or too old, and False when it did not open.
         """
         intake = self._intake
         if intake is None:
@@ -1100,10 +1131,15 @@ class SessionWatch:
         """
         self._stop.set()
         await asyncio.wait({self._task})
+        if self._closer is not None:
+            # From here the idle accept reads the listener's queue again.
+            await _cancel_and_drain({self._closer})
+            self._closer = None
         if self._task.cancelled() or self._task.exception() is not None:
             return None  # a crash was logged when it happened
         win = self._task.result()
         if win is not None and self._real is not None and self._winner_addr is not None:
             frames = self._held + self._take_intake(self._winner_addr)
+            self._held = []  # a second call puts nothing back again
             _reinject_frames(self._real, self._winner_addr, frames)
         return win

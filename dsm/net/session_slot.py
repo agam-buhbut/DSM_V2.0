@@ -1,4 +1,4 @@
-"""Who holds the server's one session, and who may take it over (step R).
+"""Who holds the server's one session, and who may take it over.
 
 The server serves one client at a time. While a session runs it still
 accepts handshakes, so a client that crashed and came back does not wait
@@ -11,7 +11,7 @@ have the session:
   next session.
 * While a session runs, only a client with the same CN (the name in its
   certificate) may take it over: that is the same client coming back.
-  Another client is refused, as before step R; it gets in once the session
+  Another client is refused, as it always was; it gets in once the session
   ends.
 * Each CN may take its session over 3 times at once, then once a minute.
   Two devices that share one CN would otherwise push each other off
@@ -35,7 +35,7 @@ log = logging.getLogger(__name__)
 
 # Session takeovers per CN: 3 at once, then 1 a minute (owner decision
 # 2026-10-09). A client that crashes more often than that waits for the old
-# session's dead-peer timer, which is the wait it had before step R.
+# session's dead-peer timer, as it did before a session could be taken over.
 REPLACE_BURST = 3.0
 REPLACE_RATE = 1.0 / 60.0  # tokens per second
 
@@ -151,5 +151,12 @@ class SessionSlot:
             self._admitted = None
 
     def clear(self) -> None:
-        """The session ended with no client waiting to take it over."""
+        """The session ended with no client waiting to take it over.
+
+        Runs only after the accept drained every attempt, so an attempt still
+        marked here is a bug; it is forgotten too, or every later handshake
+        would be refused until a restart. Should it end later, it cannot
+        win: it is no longer marked, so :meth:`confirm` raises for it.
+        """
         self._holder = None
+        self._admitted = None

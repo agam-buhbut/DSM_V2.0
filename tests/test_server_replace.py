@@ -1,4 +1,5 @@
-"""run_server with step R: a client that comes back takes its session over.
+"""run_server with the in-session accept: a client that comes back takes its
+session over.
 
 The in-session accept (SessionWatch) is a scripted stand-in here; its own
 tests are in test_handshake_acceptor_in_session.py. Host state is faked and
@@ -31,6 +32,8 @@ from tests.test_server_dns_fatal import (
 )
 
 events: list[str] = []
+# (session_keys, transport) handed to each session's data loops, in order.
+served: list[tuple[Any, Any]] = []
 CLIENT = VerifiedClient(cn="dsm-a-client", noise_static=b"\x01" * 32)
 ONE_SESSION = [
     "tun.open",
@@ -172,10 +175,12 @@ class _Listener:
 class _Watch:
     """Stands in for SessionWatch. ``plan`` has one entry per session:
     "takeover" (a client takes the session over as soon as it starts) or
-    "none"."""
+    "none". ``after_stop``, when set, runs one loop step after a takeover's
+    stop() returned."""
 
     plan: list[str] = []
     made: list[_Watch] = []
+    after_stop: Callable[[], None] | None = None
 
     def __init__(
         self,
@@ -195,16 +200,17 @@ class _Watch:
         self.udp = udp
         self.tcp = tcp
         self.end_session = asyncio.Event()
-        self.offer: Callable[[bytes, tuple[str, int]], None] | None = (
+        self.offer: Callable[[bytes, tuple[str, int], bool], None] | None = (
             self._offer if udp is not None else None
         )
+        self.winner: Winner | None = None
         self.what = _Watch.plan.pop(0)
         _Watch.made.append(self)
         if self.what == "takeover":
             asyncio.get_running_loop().call_soon(self.end_session.set)
 
-    def _offer(self, data: bytes, addr: tuple[str, int]) -> None:
-        del data, addr
+    def _offer(self, data: bytes, addr: tuple[str, int], seen: bool) -> None:
+        del data, addr, seen
 
     async def stop(self) -> Winner | None:
         events.append("watch.stop")
@@ -213,11 +219,14 @@ class _Watch:
         transport = (
             self.udp if self.udp is not None else _Conn(f"conn{len(_Watch.made) + 1}")
         )
-        return Winner(
+        self.winner = Winner(
             session_keys=object(),  # type: ignore[arg-type]
             client_pub=b"\x02" * 32,
             transport=transport,
         )
+        if _Watch.after_stop is not None:
+            asyncio.get_running_loop().call_soon(_Watch.after_stop)
+        return self.winner
 
 
 async def _no_send(*_a: Any, **_k: Any) -> None:
@@ -245,17 +254,20 @@ def _faked(
     session n's data loops start; the loops then wait for the session's
     shutdown event, like the real ones."""
     events.clear()
+    served.clear()
     _Dns.bound = False
     _Masq.fail_next_remove = False
     _Watch.plan = list(plan)
     _Watch.made = []
+    _Watch.after_stop = None
     _Listener.made = []
     loops_kwargs: list[dict[str, Any]] = []
 
     async def _loops(
-        ctx: Any, _transport: Any, _keys: Any, _replay: Any, fsm: Any, **kwargs: Any
+        ctx: Any, transport: Any, keys: Any, _replay: Any, fsm: Any, **kwargs: Any
     ) -> None:
         loops_kwargs.append(kwargs)
+        served.append((keys, transport))
         events.append("loops")
         on_session(len(loops_kwargs), ctx)
         await ctx.shutdown.wait()
@@ -322,11 +334,17 @@ async def test_udp_a_takeover_ends_the_old_session_before_the_new_one_starts() -
     assert rc == 0, "a DNS port clash here means run_server did not yield"
     assert len(accepts) == 1, "the client that took over needs no new accept"
     assert events == ONE_SESSION + ["watch.stop"] + ONE_SESSION + ["watch.stop"]
+    assert _Listener.made == [], "UDP mode opens no TCP port"
     first, second = _Watch.made
     assert first.udp is accepts[0][5]
     assert second.udp is accepts[0][5]
     assert loops[0]["unauthenticated"] is first.offer
     assert loops[1]["unauthenticated"] is second.offer
+    # Session 2 runs on the keys the takeover's handshake made.
+    assert first.winner is not None
+    assert served[1][0] is first.winner.session_keys
+    assert served[1][0] is not served[0][0]
+    assert served[1][1] is accepts[0][5]
 
 
 async def test_tcp_one_listener_for_the_run_and_the_old_connection_closes_first() -> (
@@ -364,6 +382,9 @@ async def test_tcp_one_listener_for_the_run_and_the_old_connection_closes_first(
         + ["conn2.aclose", "watch.stop", "listener.close"]
     )
     assert loops[0]["unauthenticated"] is None
+    winner = _Watch.made[0].winner
+    assert winner is not None
+    assert served[1] == (winner.session_keys, winner.transport)
 
 
 async def test_shutdown_during_a_takeover_closes_the_waiting_client() -> None:
@@ -460,3 +481,48 @@ async def test_a_fatal_dns_clash_closes_the_client_waiting_to_take_over() -> Non
     assert rc == 1
     assert "loops" not in events
     assert events[-3:] == ["watch.stop", "conn2.aclose", "listener.close"]
+
+
+async def test_a_client_that_wins_the_idle_accept_as_shutdown_comes_is_not_served() -> (
+    None
+):
+    captured: dict[str, Any] = {}
+
+    async def _accept(*args: Any) -> tuple[Any, bytes, Any]:
+        args[1].transition(State.HANDSHAKING)
+        captured["shutdown"].set()  # SIGTERM lands as this client wins
+        return object(), b"\x01" * 32, _Conn("conn1")
+
+    def _on_session(_n: int, _ctx: Any) -> None:
+        raise AssertionError("no session may run")
+
+    with _faked(captured, [], _on_session, tcp_accept=_accept):
+        rc = await asyncio.wait_for(run_server(_config("tcp")), 5.0)
+
+    assert rc == 0
+    assert _Watch.made == []
+    assert events == ["listener.start", "conn1.aclose", "listener.close"]
+
+
+async def test_shutdown_in_the_step_before_the_next_session_closes_the_winner() -> None:
+    """SIGTERM lands in the one loop step between a replaced session and the
+    next one: the client that took over is not served, and its connection
+    is closed."""
+    captured: dict[str, Any] = {}
+
+    async def _accept(*args: Any) -> tuple[Any, bytes, Any]:
+        args[1].transition(State.HANDSHAKING)
+        return object(), b"\x01" * 32, _Conn("conn1")
+
+    def _on_session(_n: int, _ctx: Any) -> None:
+        _Watch.after_stop = captured["shutdown"].set
+
+    with _faked(captured, ["takeover"], _on_session, tcp_accept=_accept):
+        rc = await asyncio.wait_for(run_server(_config("tcp")), 5.0)
+
+    assert rc == 0
+    assert events == (
+        ["listener.start"]
+        + ONE_SESSION
+        + ["conn1.aclose", "watch.stop", "conn2.aclose", "listener.close"]
+    )

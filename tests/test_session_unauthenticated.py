@@ -1,7 +1,7 @@
 """The live session hands each packet it cannot use (AEAD failed, or already
 seen by the replay window) to the server's in-session accept, and nothing
-else (step R). Review Focus 2: a packet that opened, the live client's own
-traffic, never goes there.
+else. Review Focus 2: a packet that opened, the live client's own traffic,
+never goes there.
 
 A reconnected client's first packet has seq 1 under the new keys, and the old
 session's window has already seen seq 1, so it is rejected as a replay before

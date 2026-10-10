@@ -1,5 +1,5 @@
 """SessionSlot: who holds the server's one session and who may take it over
-(step R). A fake clock; no event loop and no sockets."""
+while a session runs. A fake clock; no event loop and no sockets."""
 
 from __future__ import annotations
 
@@ -220,7 +220,8 @@ def test_a_new_device_key_logs_one_warning_with_both_hashes(
         f"(noise_static_sha256={new}, was {old}); if this repeats, two devices "
         f"share this name"
     ]
-    assert all((b"\x02" * 32).hex() not in m for _, m in _lines(caplog))
+    for raw in (b"\x02" * 32, b"\x01" * 32):  # neither raw key, new or old
+        assert all(raw.hex() not in m for _, m in _lines(caplog))
     assert slot.holder == A_NEW_KEY
 
 
@@ -231,4 +232,61 @@ def test_the_same_device_key_logs_no_warning(
     slot = SessionSlot(clock=_Clock())
     _hold(slot, A)
     _take_over(slot, A)
+    assert _lines(caplog) == []
+
+
+def test_clear_also_forgets_an_attempt_still_marked() -> None:
+    """clear() runs only after the accept drained every attempt, so one still
+    marked is a bug. It must not refuse every later handshake until the
+    server restarts; the straggler cannot win."""
+    slot = SessionSlot(clock=_Clock())
+    straggler = object()
+    slot.admit(straggler, A, session_live=False)
+    slot.clear()
+    assert slot.admitted is None
+    assert slot.holder is None
+    slot.admit(object(), B, session_live=False)  # the next accept is open
+    with pytest.raises(RuntimeError):
+        slot.confirm(straggler)
+
+
+def test_release_after_confirm_changes_nothing() -> None:
+    """The worker's ``finally`` releases its attempt also after it won."""
+    slot = SessionSlot(clock=_Clock())
+    won = object()
+    slot.admit(won, A, session_live=False)
+    slot.confirm(won)
+    slot.release(won)
+    assert slot.holder == A
+    assert slot.admitted is None
+    later = object()
+    slot.admit(later, A, session_live=True)
+    slot.release(won)  # not the attempt that holds the mark now
+    assert slot.admitted is later
+    assert slot.holder == A
+
+
+def test_a_second_confirm_raises() -> None:
+    slot = SessionSlot(clock=_Clock())
+    attempt = object()
+    slot.admit(attempt, A, session_live=False)
+    slot.confirm(attempt)
+    with pytest.raises(RuntimeError):
+        slot.confirm(attempt)
+    assert slot.holder == A
+
+
+def test_a_takeover_released_before_it_wins_keeps_the_old_holder(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A takeover that passed the check but failed before it won (say its
+    last frame could not be sent) changes nothing and logs nothing."""
+    caplog.set_level(logging.DEBUG, logger="dsm.net.session_slot")
+    slot = SessionSlot(clock=_Clock())
+    _hold(slot, A)
+    attempt = object()
+    slot.admit(attempt, A_NEW_KEY, session_live=True)
+    slot.release(attempt)
+    assert slot.holder == A
+    assert slot.admitted is None
     assert _lines(caplog) == []

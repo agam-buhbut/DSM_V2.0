@@ -1,4 +1,4 @@
-"""The handshake accept that runs while a session is live (step R).
+"""The handshake accept that runs while a session is live.
 
 SessionWatch reads what the live session cannot use (UDP: did not open, or
 already seen) or the run's listener queue (TCP), with the idle accept's pool,
@@ -511,3 +511,113 @@ async def test_tcp_a_reconnecting_client_wins_on_the_runs_listener() -> None:
     assert back.sent == [MSG2]
     assert other.closed  # a loser: cancelled and closed
     assert slot.holder == HOLDER
+
+
+async def test_the_drain_waits_for_every_task_before_it_raises() -> None:
+    """Review Focus 4: a worker that fails must not cut the drain short. A
+    cancelled worker may still wait for its signing thread, and the server
+    zeroizes the attest key once the accept has returned."""
+    release = asyncio.Event()
+    finished: list[str] = []
+
+    async def _failing() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            raise RuntimeError("a bug in a worker") from None
+
+    async def _slow() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await release.wait()  # as a cancelled worker waits for its thread
+            finished.append("slow")
+            raise
+
+    failing = asyncio.ensure_future(_failing())
+    slow = asyncio.ensure_future(_slow())
+    await _yield()
+    # A list, so the failing worker comes first, whatever the set order.
+    drain = asyncio.ensure_future(hsa._cancel_and_drain([failing, slow]))  # type: ignore[arg-type]
+    try:
+        await _yield()
+        assert not drain.done(), "the drain must wait for the slow worker"
+        release.set()
+        with pytest.raises(RuntimeError, match="a bug in a worker"):
+            await asyncio.wait_for(drain, 5.0)
+        assert finished == ["slow"]
+    finally:
+        release.set()
+        await asyncio.wait({failing, slow, drain})
+
+
+async def test_a_second_stop_puts_nothing_back_again() -> None:
+    script = _Script()
+    gate = asyncio.Event()
+    script.gates[BACK] = gate
+    async with _Udp(script) as run:
+        assert run.watch is not None
+        run.offer(BACK, 0)
+        assert await _spin(lambda: script.admitted == [BACK])
+        run.offer(BACK, 1)  # into its inbox: held when it wins
+        await _yield()
+        gate.set()
+        assert await _spin(run.watch.end_session.is_set)
+        run.offer(BACK, 2, size=300)  # into the intake
+        win = await run.stop()
+        assert win is not None
+        assert _queued(run.real) == [
+            (_frame(BACK, 1), BACK),
+            (_frame(BACK, 2, 300), BACK),
+        ]
+        assert await asyncio.wait_for(run.watch.stop(), 5.0) is win
+        assert _queued(run.real) == []
+
+
+def _tcp_watch(connections: asyncio.Queue[tuple[TCPTransport, Addr]]) -> SessionWatch:
+    return SessionWatch(
+        _Config(8),  # type: ignore[arg-type]
+        _Stub(),  # type: ignore[arg-type]
+        _Stub(),  # type: ignore[arg-type]
+        _Stub(),  # type: ignore[arg-type]
+        _Stub(),  # type: ignore[arg-type]
+        SourceLimiter(clock=_minutes()),
+        _slot(),
+        tcp=connections,
+    )
+
+
+async def test_tcp_after_a_crash_queued_connections_are_closed_until_stop(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Else each new connection would sit open, unanswered, for the rest of
+    the session. After stop() the queue is the idle accept's again."""
+    caplog.set_level(logging.ERROR)
+
+    async def _broken(*_a: Any, **_k: Any) -> None:
+        raise RuntimeError("admit loop bug")
+
+    connections: asyncio.Queue[tuple[TCPTransport, Addr]] = asyncio.Queue()
+    with patch.object(hsa, "_tcp_admit_loop", new=_broken):
+        watch = _tcp_watch(connections)
+        assert await _spin(lambda: bool(caplog.records))
+        late = _Conn(BACK, frames=[b"msg1"])
+        connections.put_nowait((late, BACK))
+        assert await _spin(lambda: late.closed)
+        assert await asyncio.wait_for(watch.stop(), 5.0) is None
+        after = _Conn(OTHER, frames=[b"msg1"])
+        connections.put_nowait((after, OTHER))
+        await _yield()
+    assert not after.closed
+    assert connections.qsize() == 1
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert len(errors) == 1
+
+
+def test_reprs_show_no_key_material() -> None:
+    keys = object()
+    win = Winner(session_keys=keys, client_pub=b"pub", transport=_Transport())  # type: ignore[arg-type]
+    assert repr(keys) not in repr(win)
+    client = VerifiedClient(cn="dsm-a-client", noise_static=b"\xab" * 32)
+    assert "dsm-a-client" in repr(client)
+    assert repr(b"\xab" * 32) not in repr(client)
