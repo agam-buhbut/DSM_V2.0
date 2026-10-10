@@ -1,4 +1,4 @@
-//! swtpm tests for the TPM attest key's kept connection (step R).
+//! swtpm tests for the TPM attest key's kept connection.
 //!
 //! Through a resource manager (`/dev/tpmrm0`) a `TpmAttestKey` keeps one TPM
 //! connection, with its parent key loaded, so a sign skips making the parent
@@ -321,6 +321,34 @@ fn a_wrong_passphrase_is_never_tried_twice() {
     // a second parent; a refused authorization is never retried, because the
     // TPM counts each refused try toward its lockout.
     assert_eq!(key.parents_made(), 1);
+}
+
+#[test]
+fn another_error_on_a_kept_connection_is_tried_once_more() {
+    // A key from another TPM: loading it fails with an integrity error, not
+    // a refused authorization, on every connection.
+    let other = Swtpm::start();
+    let blob = TpmAttestKey::generate_with_tcti(&other.tcti)
+        .expect("generate on the other TPM")
+        .to_store_blob()
+        .expect("blob");
+    let tpm = Swtpm::start();
+    let mut key = TpmAttestKey::from_store_blob_with_tcti(&blob, &tpm.tcti)
+        .expect("restore (no TPM call yet)");
+    key.set_keep_connection(true);
+    for round in 1..=3_u64 {
+        let err = key
+            .sign(b"must not sign")
+            .expect_err("a key from another TPM must not sign");
+        assert!(
+            err.to_ascii_lowercase().contains("integrity check failed"),
+            "round {round}: {err}"
+        );
+        // The first sign had no kept connection: it made one parent and kept
+        // that connection. Each later sign failed on the kept connection,
+        // then once more on a new one: one new parent per sign, never more.
+        assert_eq!(key.parents_made(), round, "round {round}");
+    }
 }
 
 #[test]

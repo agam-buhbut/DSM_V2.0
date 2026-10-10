@@ -134,7 +134,7 @@ impl SignError {
         )
     }
 
-    /// The caller's error text, worded as before step R (`TPM error: ...`).
+    /// The caller's error text, worded as it always was (`TPM error: ...`).
     fn into_message(self) -> String {
         match self {
             SignError::Tpm(e) => format!("TPM error: {e}"),
@@ -145,9 +145,12 @@ impl SignError {
 
 /// One open TPM connection with the parent (Owner storage primary) loaded.
 ///
-/// `TPM2_CreatePrimary` is the slow part of a sign on a real TPM (most of
-/// the 0.21 s measured on the server box). A key that keeps one of these
-/// between signs skips it. Through the kernel resource manager
+/// Without one, each sign makes the parent again with `TPM2_CreatePrimary`.
+/// A key that keeps one of these between signs skips that: on the server
+/// box's TPM it saved about 40 ms of a 214 ms sign (2026-10-09). The bigger
+/// win is elsewhere: the server signs in a thread without the GIL, so a sign
+/// no longer stalls its event loop (longest stall 219 ms before, 6 ms
+/// after). Through the kernel resource manager
 /// (`/dev/tpmrm0`) the loaded parent lives in this connection's own space:
 /// no other program can see or use it, and closing the connection frees
 /// it. The attest key's secret never leaves the TPM either way.
@@ -156,10 +159,12 @@ struct TpmConnection {
     parent: KeyHandle,
 }
 
-// SAFETY: `Context` is not `Send` only because it owns the raw ESYS context
-// pointer. ESYS keeps no per-thread state; it must only never run two calls
-// at once. A `TpmConnection` is reached only through the `Mutex` in
-// `TpmAttestKey::connection`, so one thread at a time uses it.
+// SAFETY: `Context` is not `Send` only because it owns raw pointers: the
+// ESYS context and its TCTI context. Neither keeps per-thread state; they
+// must only never run two calls at once. A kept `TpmConnection` is reached
+// only through the `Mutex` in `TpmAttestKey::connection`, and one that is not
+// kept is made, used and dropped by `sign` while it holds that Mutex's
+// guard, so one thread at a time uses it.
 unsafe impl Send for TpmConnection {}
 
 impl TpmConnection {
@@ -432,9 +437,12 @@ impl TpmAttestKey {
     /// flush the child. Signs from several threads take turns. If the kept
     /// connection went stale (the TPM was reset, or the resource manager
     /// restarted), the sign drops it and tries once more on a new one, except
-    /// after a refused authorization. Without a kept connection every sign
-    /// opens its own connection, re-derives the SAME deterministic Owner
-    /// primary, loads the child, signs and closes, as before step R.
+    /// after a refused authorization. Very rarely the TPM's answer to a
+    /// wrong passphrase is lost on the way (the connection breaks right
+    /// then): the sign sees a connection error, tries once more, and the TPM
+    /// counts the wrong passphrase twice. Without a kept connection every
+    /// sign opens its own connection, re-derives the SAME deterministic
+    /// Owner primary, loads the child, signs and closes.
     ///
     /// # Persistence proof
     /// The parent is always re-derived from [`parent_template`] (never
@@ -507,6 +515,8 @@ impl TpmAttestKey {
             self.parents_made.fetch_add(1, Ordering::Relaxed);
             connection
         };
+        // Clones: `load` takes the child's areas by value, and this key
+        // needs them again for a retry and for every later sign.
         let result = connection.sign(
             self.child_public.clone(),
             self.child_private.clone(),
