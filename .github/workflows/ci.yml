@@ -83,21 +83,28 @@ jobs:
 
       # Python gates, in CLAUDE.md order.
       - name: black (format check)
+        if: ${{ !cancelled() }}
         run: black --check dsm tests
       - name: isort (import-order check)
+        if: ${{ !cancelled() }}
         run: isort --check-only dsm tests
       - name: ruff
+        if: ${{ !cancelled() }}
         run: ruff check dsm tests
       - name: pylint
+        if: ${{ !cancelled() }}
         run: pylint dsm
       - name: pyright
+        if: ${{ !cancelled() }}
         run: pyright
 
       # clippy runs on the soft feature here (this runner has no TSS2 headers);
       # the tpm-attest clippy gate lives in the tpm-attest job below.
       - name: rustfmt (format check)
+        if: ${{ !cancelled() }}
         run: cargo fmt --manifest-path rust/tuncore/Cargo.toml --check
       - name: clippy (soft)
+        if: ${{ !cancelled() }}
         run: >-
           cargo clippy --manifest-path rust/tuncore/Cargo.toml --all-targets
           --no-default-features --features dev-soft-attest --
@@ -105,6 +112,7 @@ jobs:
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
       - name: cargo audit
+        if: ${{ !cancelled() }}
         # RUSTSEC-2026-0176 (OOB read in PyList/PyTuple `nth`/`nth_back`) and
         # RUSTSEC-2026-0177 (missing Sync bound on `PyCFunction::new_closure`)
         # both require pyo3 >= 0.29 (a breaking 0.24 -> 0.29 jump for the FFI
@@ -119,19 +127,23 @@ jobs:
           --ignore RUSTSEC-2026-0177
 
       - name: pip-audit
+        if: ${{ !cancelled() }}
         run: pip-audit --progress-spinner off
 
       - name: Rust tests (soft)
+        if: ${{ !cancelled() }}
         run: >-
           cargo test --manifest-path rust/tuncore/Cargo.toml --release
           --no-default-features --features dev-soft-attest
       - name: Python tests (soft)
+        if: ${{ !cancelled() }}
         env:
           DSM_REQUIRE_TUNCORE: "1"
         run: pytest tests/ -q
 
       # Packaging smoke: the installed dsm must import from any cwd.
       - name: Packaging smoke
+        if: ${{ !cancelled() }}
         run: cd /tmp && python -c "import dsm, tuncore; print('packaging OK')"
 
   # TPM lane: the real tpm-attest backend, exercised against swtpm.
@@ -192,6 +204,7 @@ jobs:
 
       # clippy on the real backend (this runner has the TSS2 headers).
       - name: clippy (tpm)
+        if: ${{ !cancelled() }}
         run: >-
           cargo clippy --manifest-path rust/tuncore/Cargo.toml --all-targets
           --no-default-features --features tpm-attest --
@@ -200,6 +213,7 @@ jobs:
       # swtpm spins up per test; serialize so the per-test TCP port pairs and
       # transient TPM slots don't collide.
       - name: Rust TPM tests (swtpm)
+        if: ${{ !cancelled() }}
         run: >-
           cargo test --manifest-path rust/tuncore/Cargo.toml --release
           --no-default-features --features tpm-attest
@@ -208,4 +222,5 @@ jobs:
       # The TPM-only Python tests self-skip under a soft wheel (they key on
       # ATTEST_BACKEND_IS_SOFTWARE), so they run meaningfully only here.
       - name: Python TPM tests (swtpm)
+        if: ${{ !cancelled() }}
         run: pytest tests/test_tpm_attest_store.py tests/test_tpm_enroll_csr.py -v
