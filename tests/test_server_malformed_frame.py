@@ -30,6 +30,7 @@ import asyncio
 import unittest
 from unittest.mock import MagicMock, patch
 
+from dsm.net.handshake_gate import GateKeys
 from dsm.net.transport.tcp import FramingError
 
 
@@ -85,6 +86,7 @@ class TestRunServerLoopSurvivesFramingError(unittest.IsolatedAsyncioTestCase):
             limiter=None,
             listener=None,
             slot=None,
+            gate=None,
         ):
             nonlocal call_count
             call_count += 1
@@ -136,6 +138,10 @@ class TestRunServerLoopSurvivesFramingError(unittest.IsolatedAsyncioTestCase):
             patch(
                 "dsm.server.load_cert_materials",
                 return_value=mock_materials,
+            ),
+            patch(
+                "dsm.server.server_gate_keys",
+                return_value=GateKeys(mac1_key=bytes(32), cookie_key=bytes(32)),
             ),
             patch(
                 "dsm.server.CNAllowlist.from_file",

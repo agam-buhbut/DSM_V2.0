@@ -24,6 +24,7 @@ from dsm.crypto.handshake import (
     client_handshake,
     server_handshake,
 )
+from dsm.net._addresses import SINGLE_CLIENT_TUNNEL, TunnelAssignment
 from dsm.net.transport.tcp import TCPListener, TCPTransport
 from dsm.net.transport.udp import UDPTransport
 from tests.cert_helpers import SERVER_AUTH_OID, make_enrolled_device, make_test_ca
@@ -64,17 +65,19 @@ class _Parties:
 
 class _Hook:
     """admit_client stand-in: records each client and how many frames the
-    server had sent by then; refuses when told to."""
+    server had sent by then; refuses when told to; returns the one address
+    today's server gives."""
 
     def __init__(self, sent: list[bytes], *, refuse: bool = False) -> None:
         self.sent = sent
         self.refuse = refuse
         self.calls: list[tuple[VerifiedClient, int]] = []
 
-    def __call__(self, client: VerifiedClient) -> None:
+    def __call__(self, client: VerifiedClient) -> TunnelAssignment:
         self.calls.append((client, len(self.sent)))
         if self.refuse:
             raise ClientRefusedError("test refusal")
+        return SINGLE_CLIENT_TUNNEL
 
 
 def _count_sends(transport: Any, sent: list[bytes]) -> None:
@@ -229,13 +232,14 @@ async def test_the_hook_is_not_called_for_a_revoked_client(
 async def test_without_the_hook_nothing_changes() -> None:
     p = _Parties()
     sent: list[bytes] = []
-    (client_keys, _hash, _server_pub), (server_keys, client_static) = await _run_udp(
-        p, sent
+    (client_keys, _hash, _server_pub, tunnel), (server_keys, client_static) = (
+        await _run_udp(p, sent)
     )
     assert bytes(client_static) == bytes(p.client.identity.public_key)
-    aad = (1).to_bytes(8, "big")
-    nonce, ct, _epoch = client_keys.encrypt(b"ping", aad)
-    assert bytes(server_keys.decrypt(bytes(nonce), bytes(ct), aad, 1, False)) == b"ping"
+    assert tunnel == SINGLE_CLIENT_TUNNEL
+    opened = server_keys.open_packet(client_keys.seal_packet(1, b"ping"))
+    assert opened is not None
+    assert opened[1] == b"ping"
 
 
 async def test_the_server_signs_in_a_worker_thread_and_the_client_on_the_loop() -> None:

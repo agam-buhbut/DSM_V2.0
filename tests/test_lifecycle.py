@@ -31,6 +31,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from dsm.core.config import Config
+from dsm.net.handshake_gate import GateKeys
 
 
 def _client_config() -> Config:
@@ -413,6 +414,10 @@ class ServerReAccept(unittest.IsolatedAsyncioTestCase):
             patch("dsm.core.hardening.set_process_nondumpable"),
             patch("dsm.crypto.attest_gate.enforce_attest_backend_policy"),
             patch("dsm.server.load_cert_materials", return_value=_FakeMaterials()),
+            patch(
+                "dsm.server.server_gate_keys",
+                return_value=GateKeys(mac1_key=bytes(32), cookie_key=bytes(32)),
+            ),
             patch("dsm.server.verify_cert_matches_identity"),
             patch(
                 "dsm.server.CNAllowlist.from_file",

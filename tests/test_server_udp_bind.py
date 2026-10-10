@@ -20,6 +20,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import dsm.server as server_mod
+from dsm.net.handshake_gate import GateKeys
 
 
 def _udp_config(port: int) -> MagicMock:
@@ -41,6 +42,10 @@ def _host_patches(rate_limiter: MagicMock) -> list[Any]:
         patch("dsm.core.hardening.set_process_nondumpable", return_value=None),
         patch("dsm.crypto.attest_gate.enforce_attest_backend_policy"),
         patch("dsm.server.load_cert_materials", return_value=MagicMock()),
+        patch(
+            "dsm.server.server_gate_keys",
+            return_value=GateKeys(mac1_key=bytes(32), cookie_key=bytes(32)),
+        ),
         patch("dsm.server.CNAllowlist.from_file", return_value=allowlist),
         patch("dsm.server.KeyStore", return_value=MagicMock()),
         patch("dsm.server.AttestStore", return_value=MagicMock()),

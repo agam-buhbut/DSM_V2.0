@@ -21,7 +21,7 @@ from dsm.core.fsm import State
 from dsm.crypto.handshake import VerifiedClient
 from dsm.net.dns_proxy import DNSProxyPortInUseError
 from dsm.net.handshake_acceptor import Winner
-from dsm.net.handshake_gate import SourceLimiter
+from dsm.net.handshake_gate import GateKeys, SourceLimiter
 from dsm.net.session_slot import SessionSlot
 from dsm.server import run_server
 from tests.test_server_dns_fatal import (
@@ -191,12 +191,14 @@ class _Watch:
         _cn_allowlist: Any,
         limiter: Any,
         slot: Any,
+        gate: Any = None,
         *,
         udp: Any = None,
         tcp: Any = None,
     ) -> None:
         self.limiter = limiter
         self.slot = slot
+        self.gate = gate
         self.udp = udp
         self.tcp = tcp
         self.end_session = asyncio.Event()
@@ -282,6 +284,10 @@ def _faked(
         patch("dsm.core.hardening.set_process_nondumpable"),
         patch("dsm.crypto.attest_gate.enforce_attest_backend_policy"),
         patch("dsm.server.load_cert_materials", return_value=_FakeMaterials()),
+        patch(
+            "dsm.server.server_gate_keys",
+            return_value=GateKeys(mac1_key=bytes(32), cookie_key=bytes(32)),
+        ),
         patch("dsm.server.verify_cert_matches_identity"),
         patch("dsm.server.CNAllowlist.from_file", return_value=_NonEmptyAllowlist()),
         patch("dsm.crypto._stores.load_daemon_stores", return_value=True),

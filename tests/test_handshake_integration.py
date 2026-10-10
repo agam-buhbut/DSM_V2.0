@@ -202,7 +202,7 @@ class TestHandshakeRoundtrip(unittest.IsolatedAsyncioTestCase):
         """Each session must derive its own keys via ephemeral DH; two
         runs with the same identity pairs still produce independent
         SessionKeyManagers (forward secrecy)."""
-        c1_keys, _h1, _spp1 = (await self._run_udp_handshake())[0]
+        c1_keys, _h1, _spp1, _t1 = (await self._run_udp_handshake())[0]
         _, (s2_keys, _) = await self._run_udp_handshake()
         del _
 
