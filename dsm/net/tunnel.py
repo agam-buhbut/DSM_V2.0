@@ -201,6 +201,9 @@ class TunDevice:
         # full (EAGAIN). A dropped packet is recoverable (peer/kernel will
         # retransmit); tearing down the session is not.
         self._tx_drops = 0
+        # A packet read() took from the fd just before its wait was
+        # cancelled; the next read() returns it first.
+        self._held: bytes | None = None
 
     @property
     def name(self) -> str:
@@ -497,7 +500,15 @@ class TunDevice:
         it, ``_readable`` stays registered and the next time the fd
         becomes readable it consumes (and discards) a kernel-buffered
         packet — silent intermittent packet loss every poll cycle.
+
+        A cancel can also land in the same loop turn just after
+        ``_readable`` took a packet from the fd (asyncio runs fd callbacks
+        before due timers). That packet is kept and returned by the next
+        call instead of being dropped.
         """
+        if self._held is not None:
+            data, self._held = self._held, None
+            return data
         loop = asyncio.get_running_loop()
         fut = loop.create_future()
 
@@ -515,6 +526,10 @@ class TunDevice:
         loop.add_reader(self.fd, _readable)
         try:
             return await fut
+        except asyncio.CancelledError:
+            if fut.done() and not fut.cancelled() and fut.exception() is None:
+                self._held = fut.result()
+            raise
         finally:
             loop.remove_reader(self.fd)
 

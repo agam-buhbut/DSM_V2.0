@@ -154,6 +154,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   packets instead of DSM.
 
 ### Fixed
+- Packets sent into the tunnel at a steady beat of about 0.1 or 0.2 s
+  (for example `ping -i 0.2`, or a probe on a 100 ms timer) are no longer
+  lost. One in four or more such packets went missing with no log line,
+  at both ends. DSM gives up waiting for a packet every 0.1 s; when a
+  packet came in at that same moment it was read and then thrown away.
+  It is now kept for the next read. Busy or randomly timed traffic was
+  rarely hit.
 - A client that resends its first handshake message, because the server's
   reply was lost or slow, no longer makes the server drop the attempt. The
   server skips the copy and goes on waiting for the client's next message.
