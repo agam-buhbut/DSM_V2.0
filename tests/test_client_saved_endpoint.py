@@ -59,7 +59,7 @@ async def _start(
     """
     tried: list[tuple[object, str | None]] = []
 
-    async def handshake(*args: object, **_k: object) -> tuple[Any, bytes, bytes]:
+    async def handshake(*args: object, **_k: object) -> tuple[Any, bytes, bytes, Any]:
         # args[2] is (server IP, port).
         tried.append((args[2], _text(client_mod._SERVER_ENDPOINT_FILE)))
         if not handshake_works:

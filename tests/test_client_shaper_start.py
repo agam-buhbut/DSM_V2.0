@@ -18,6 +18,7 @@ from typing import Any
 from unittest.mock import patch
 
 from dsm.core.config import Config
+from dsm.net._addresses import SINGLE_CLIENT_TUNNEL
 from dsm.traffic.scheduler import SendScheduler
 from dsm.traffic.shaper import TrafficShaper
 
@@ -134,9 +135,11 @@ async def test_the_first_poll_after_a_slow_setup_sends_at_most_one_slot() -> Non
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             super().__init__(*args, clock=fake_clock, **kwargs)
 
-    async def _slow_handshake(*_a: object, **_k: object) -> tuple[Any, bytes, bytes]:
+    async def _slow_handshake(
+        *_a: object, **_k: object
+    ) -> tuple[Any, bytes, bytes, Any]:
         fake_clock.now += _SETUP_S
-        return _FakeKeys(), b"", b"\x02" * 32
+        return _FakeKeys(), b"", b"\x02" * 32, SINGLE_CLIENT_TUNNEL
 
     async def _until_first_poll(
         *_a: object,

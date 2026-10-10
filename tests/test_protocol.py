@@ -5,10 +5,8 @@ import struct
 import unittest
 
 from dsm.core.protocol import (
-    OUTER_HEADER_SIZE,
     Fragment,
     InnerPacket,
-    OuterPacket,
     PacketType,
 )
 
@@ -80,30 +78,6 @@ class TestInnerPacket(unittest.TestCase):
         raw = struct.pack("!BBH", 0x00, 0x00, 1501) + b"\x00" * 1501
         with self.assertRaises(ValueError):
             InnerPacket.deserialize(raw)
-
-
-class TestOuterPacket(unittest.TestCase):
-    def test_serialize_roundtrip_length(self) -> None:
-        ct = os.urandom(48)
-        pkt = OuterPacket(seq=42, nonce=os.urandom(12), ciphertext=ct)
-        wire = pkt.serialize()
-        self.assertEqual(len(wire), OUTER_HEADER_SIZE + len(ct))
-
-    def test_serialize_matches_explicit_target(self) -> None:
-        ct = os.urandom(48)
-        pkt = OuterPacket(seq=1, nonce=os.urandom(12), ciphertext=ct)
-        wire = pkt.serialize(target_size=OUTER_HEADER_SIZE + len(ct))
-        self.assertEqual(len(wire), OUTER_HEADER_SIZE + len(ct))
-
-    def test_target_size_mismatch_raises(self) -> None:
-        # Sizing is the shaper's responsibility; OuterPacket must not silently
-        # pad with unauthenticated bytes to reach a larger target.
-        ct = os.urandom(200)
-        pkt = OuterPacket(seq=1, nonce=os.urandom(12), ciphertext=ct)
-        with self.assertRaises(ValueError):
-            pkt.serialize(target_size=10)
-        with self.assertRaises(ValueError):
-            pkt.serialize(target_size=OUTER_HEADER_SIZE + len(ct) + 32)
 
 
 class TestFragment(unittest.TestCase):

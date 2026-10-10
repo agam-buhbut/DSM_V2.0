@@ -40,9 +40,7 @@ import unittest
 from dsm.core.fsm import SessionFSM, State
 from dsm.core.protocol import (
     PATH_TOKEN_SIZE,
-    SEQ_STRUCT,
     InnerPacket,
-    OuterPacket,
     PacketType,
 )
 from dsm.net.transport.udp import UDPTransport
@@ -171,15 +169,14 @@ def _frame(
     payload: bytes,
 ) -> bytes:
     """Build a genuine authenticated wire packet of ``ptype``, the way
-    ``make_send_fn`` does: seq ‖ nonce ‖ AEAD(inner, aad=seq), with the
+    ``make_send_fn`` does: ``seal_packet(seq, inner)``, with the
     live epoch nibble stamped into inner-header byte 1."""
     n = seq_counter.next()
     inner = InnerPacket(ptype=ptype, epoch_id=keys.epoch & 0x0F, payload=payload)
     buf = bytearray(inner.serialize())
     if len(buf) >= 2:
         buf[1] = (buf[1] & 0x0F) | ((keys.epoch & 0x0F) << 4)
-    nonce, ct, _epoch = keys.encrypt(bytes(buf), SEQ_STRUCT.pack(n))
-    return OuterPacket(seq=n, nonce=nonce, ciphertext=ct).serialize()
+    return bytes(keys.seal_packet(n, bytes(buf)))
 
 
 def _extract_token(wire: bytes, client_keys: tuncore.SessionKeyManager) -> bytes:

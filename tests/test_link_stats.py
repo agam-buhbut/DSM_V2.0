@@ -16,10 +16,7 @@ import pytest
 import tuncore
 from dsm.core.protocol import (
     INNER_STRUCT,
-    OUTER_HEADER_SIZE,
-    SEQ_STRUCT,
     LinkReport,
-    OuterPacket,
     PacketType,
 )
 from dsm.session import decrypt_packet
@@ -49,9 +46,7 @@ def _inner(
 
 
 def _wire(keys: tuncore.SessionKeyManager, seq: int, plaintext: bytes) -> bytes:
-    nonce, ct, _epoch = keys.encrypt(plaintext, SEQ_STRUCT.pack(seq))
-    outer = OuterPacket(seq=seq, nonce=bytes(nonce), ciphertext=bytes(ct))
-    return outer.serialize(OUTER_HEADER_SIZE + len(ct))
+    return bytes(keys.seal_packet(seq, plaintext))
 
 
 def test_counts_genuine_packets_and_tracks_the_highest_seq() -> None:

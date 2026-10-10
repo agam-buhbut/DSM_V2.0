@@ -133,27 +133,29 @@ class TestDataPathRoundtrip(unittest.IsolatedAsyncioTestCase):
         )
         server_addr = ("127.0.0.1", server_port)
 
-        (c_keys, _c_hash, _s_static_pub), (s_keys, _c_pub) = await asyncio.wait_for(
-            asyncio.gather(
-                client_handshake(
-                    client_transport,
-                    client.identity,
-                    server_addr,
-                    attest_key=client.attest_key,
-                    cert_der=client.cert_der,
-                    ca_root=ca.certificate,
-                    expected_server_cn="dsm-data-server",
+        (c_keys, _c_hash, _s_static_pub, _tunnel), (s_keys, _c_pub) = (
+            await asyncio.wait_for(
+                asyncio.gather(
+                    client_handshake(
+                        client_transport,
+                        client.identity,
+                        server_addr,
+                        attest_key=client.attest_key,
+                        cert_der=client.cert_der,
+                        ca_root=ca.certificate,
+                        expected_server_cn="dsm-data-server",
+                    ),
+                    server_handshake(
+                        server_transport,
+                        server.identity,
+                        attest_key=server.attest_key,
+                        cert_der=server.cert_der,
+                        ca_root=ca.certificate,
+                        cn_allowlist=CNAllowlist(cns=frozenset({"dsm-data-client"})),
+                    ),
                 ),
-                server_handshake(
-                    server_transport,
-                    server.identity,
-                    attest_key=server.attest_key,
-                    cert_der=server.cert_der,
-                    ca_root=ca.certificate,
-                    cn_allowlist=CNAllowlist(cns=frozenset({"dsm-data-client"})),
-                ),
-            ),
-            timeout=30.0,
+                timeout=30.0,
+            )
         )
 
         # Build DataPathContexts using MockTuns. No scheduler chaff, and a
@@ -750,7 +752,7 @@ class TestRotationThresholdOverride(unittest.TestCase):
             )
             n = 0
             while not sk.needs_rotation() and n < OVERRIDE * 2:
-                sk.encrypt(b"x", b"\x00" * 8)  # encrypt requires an 8-byte AAD
+                sk.seal_packet(n + 1, b"x")  # seal counts packets as encrypt did
                 n += 1
             self.assertGreaterEqual(
                 n,
@@ -777,7 +779,7 @@ class TestRotationThresholdOverride(unittest.TestCase):
             )
             n = 0
             while not sk.needs_rotation() and n < 7000:
-                sk.encrypt(b"x", b"\x00" * 8)  # encrypt requires an 8-byte AAD
+                sk.seal_packet(n + 1, b"x")  # seal counts packets as encrypt did
                 n += 1
             # Default base 5000 ± 20% → [4000, 6000]
             self.assertGreaterEqual(n, 4000)
@@ -795,7 +797,7 @@ class TestDataPathReplayRejection(unittest.TestCase):
     These exercise ``decrypt_packet`` directly with a real
     ``tuncore.SessionKeyManager`` + ``tuncore.ReplayWindow`` (no sockets,
     no event loop) so the replay/epoch logic is locked deterministically.
-    Framing mirrors ``make_send_fn``: seq ‖ nonce ‖ AEAD(inner, aad=seq).
+    Framing mirrors ``make_send_fn``: ``seal_packet(seq, inner)``.
     """
 
     @staticmethod
@@ -812,9 +814,7 @@ class TestDataPathReplayRejection(unittest.TestCase):
     def _frame(keys, seq_counter, payload, ptype=None):
         """Build a wire packet the way ``make_send_fn`` does."""
         from dsm.core.protocol import (
-            SEQ_STRUCT,
             InnerPacket,
-            OuterPacket,
             PacketType,
         )
 
@@ -826,8 +826,7 @@ class TestDataPathReplayRejection(unittest.TestCase):
         # Mirror make_send_fn: stamp the live epoch nibble into byte 1.
         if len(buf) >= 2:
             buf[1] = (buf[1] & 0x0F) | ((keys.epoch & 0x0F) << 4)
-        nonce, ct, _epoch = keys.encrypt(bytes(buf), SEQ_STRUCT.pack(n))
-        wire = OuterPacket(seq=n, nonce=nonce, ciphertext=ct).serialize()
+        wire = bytes(keys.seal_packet(n, bytes(buf)))
         return wire, n
 
     @staticmethod

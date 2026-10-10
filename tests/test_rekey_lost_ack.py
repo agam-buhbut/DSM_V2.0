@@ -19,10 +19,7 @@ except ImportError:
     _HAS_TUNCORE = False
 
 from dsm.core.protocol import (
-    OUTER_HEADER_SIZE,
-    SEQ_STRUCT,
     InnerPacket,
-    OuterPacket,
     PacketType,
 )
 from dsm.session import decrypt_packet
@@ -71,12 +68,7 @@ class RekeyAckEpochExempt(unittest.TestCase):
             ptype=PacketType.REKEY_ACK, epoch_id=new_eid, payload=ack_payload
         )
         plaintext = inner.serialize()
-        seq = 1
-        aad = SEQ_STRUCT.pack(seq)
-        nonce, ct, _e = responder.encrypt(plaintext, aad)
-        wire = OuterPacket(seq=seq, nonce=bytes(nonce), ciphertext=bytes(ct)).serialize(
-            OUTER_HEADER_SIZE + len(ct)
-        )
+        wire = bytes(responder.seal_packet(1, plaintext))
 
         # Initiator is still at start_epoch: its current-epoch recv key matches
         # the responder's grace send key, so AEAD succeeds — but the inner
@@ -97,12 +89,7 @@ class RekeyAckEpochExempt(unittest.TestCase):
         wrong_eid = (sender.epoch + 1) & 0x0F
         inner = InnerPacket(ptype=PacketType.DATA, epoch_id=wrong_eid, payload=b"hello")
         plaintext = inner.serialize()
-        seq = 1
-        aad = SEQ_STRUCT.pack(seq)
-        nonce, ct, _epoch = sender.encrypt(plaintext, aad)
-        wire = OuterPacket(seq=seq, nonce=bytes(nonce), ciphertext=bytes(ct)).serialize(
-            OUTER_HEADER_SIZE + len(ct)
-        )
+        wire = bytes(sender.seal_packet(1, plaintext))
         replay = tuncore.ReplayWindow()
         self.assertIsNone(decrypt_packet(wire, receiver, replay))
 

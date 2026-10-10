@@ -47,21 +47,13 @@ class TestBootstrapSessionDH(unittest.TestCase):
         a_keys = tuncore.complete_bootstrap(a_eph, b_public, is_initiator=True)
         b_keys = tuncore.complete_bootstrap(b_eph, a_public, is_initiator=False)
 
-        # A (initiator) sends -> B (responder) decrypts with is_prev_epoch=False.
-        # tuncore.encrypt returns list[int] for Vec<u8>; decrypt wants PyBytes.
-        # Seq starts at 1 to satisfy the replay window
-        # (see Rust test_from_handshake_hash_roundtrip).
-        aad = (1).to_bytes(
-            8, "big"
-        )  # AAD must equal the seq passed to decrypt (H-CRYPT-1)
-        nonce, ct, _epoch = a_keys.encrypt(b"hello from initiator", aad)
-        pt = b_keys.decrypt(bytes(nonce), bytes(ct), aad, 1, False)
-        self.assertEqual(bytes(pt), b"hello from initiator")
-
-        # B (responder) sends -> A (initiator) decrypts
-        nonce2, ct2, _epoch2 = b_keys.encrypt(b"hello back", aad)
-        pt2 = a_keys.decrypt(bytes(nonce2), bytes(ct2), aad, 1, False)
-        self.assertEqual(bytes(pt2), b"hello back")
+        # A (initiator) seals -> B (responder) opens, then the other way.
+        opened = b_keys.open_packet(a_keys.seal_packet(1, b"hello from initiator"))
+        assert opened is not None
+        self.assertEqual(opened[1], b"hello from initiator")
+        opened2 = a_keys.open_packet(b_keys.seal_packet(1, b"hello back"))
+        assert opened2 is not None
+        self.assertEqual(opened2[1], b"hello back")
 
     def test_bootstrap_keys_specific_to_inputs(self) -> None:
         """Regression guard: bootstrap DH key material is specific to its
@@ -88,15 +80,11 @@ class TestBootstrapSessionDH(unittest.TestCase):
             is_initiator=False,
         )
 
-        aad = (1).to_bytes(
-            8, "big"
-        )  # AAD must equal the seq passed to decrypt (H-CRYPT-1)
-        nonce, ct, _epoch = bootstrap_keys.encrypt(b"secret", aad)
+        wire = bootstrap_keys.seal_packet(1, b"secret")
 
-        # The unrelated peer should NOT be able to decrypt the bootstrap
-        # ciphertext. decrypt raises RuntimeError on auth failure.
-        with self.assertRaises(Exception):
-            unrelated_keys.decrypt(bytes(nonce), bytes(ct), aad, 1, False)
+        # The unrelated peer must NOT be able to open the bootstrap packet.
+        # open_packet returns None for anything that does not open.
+        self.assertIsNone(unrelated_keys.open_packet(wire))
 
     def test_low_order_point_rejected(self) -> None:
         """A peer public key of all-zeros is a well-known low-order point that
@@ -149,13 +137,11 @@ class TestBootstrapSessionDH(unittest.TestCase):
             tuncore.complete_bootstrap(eph, peer_pub, is_initiator=True)
 
     def test_session_key_manager_encrypt_decrypt_return_bytes(self) -> None:
-        """H-PERF-3 contract: ``SessionKeyManager.encrypt`` returns a
-        ``(bytes, bytes, int)`` tuple and ``SessionKeyManager.decrypt``
-        returns ``bytes``. The Rust side returns ``PyBytes`` directly so
-        Python callers can drop the historical ``bytes(...)`` coercion on
-        the AEAD hot path. Regression guard: if a future Rust change
-        reverts to ``Vec<u8>``, this test trips and ``struct.unpack_from``
-        downstream of decrypt starts failing in production.
+        """H-PERF-3 contract, now on the wire v2 calls: ``seal_packet``
+        returns the whole wire packet as ``bytes`` and ``open_packet`` returns
+        ``(int, bytes, bool)``. The Rust side returns ``PyBytes`` directly so
+        Python callers need no ``bytes(...)`` copy on the hot path. (Named for
+        the calls it replaced.)
         """
         a_eph = tuncore.BootstrapEphemeral.generate()
         b_eph = tuncore.BootstrapEphemeral.generate()
@@ -164,18 +150,17 @@ class TestBootstrapSessionDH(unittest.TestCase):
         a_keys = tuncore.complete_bootstrap(a_eph, b_pub, is_initiator=True)
         b_keys = tuncore.complete_bootstrap(b_eph, a_pub, is_initiator=False)
 
-        aad = (1).to_bytes(
-            8, "big"
-        )  # AAD must equal the seq passed to decrypt (H-CRYPT-1)
-        nonce, ct, epoch = a_keys.encrypt(b"payload", aad)
-        self.assertIsInstance(nonce, bytes)
-        self.assertIsInstance(ct, bytes)
-        self.assertIsInstance(epoch, int)
-        self.assertEqual(len(nonce), 12)
+        wire = a_keys.seal_packet(1, b"payload")
+        self.assertIsInstance(wire, bytes)
+        self.assertEqual(len(wire), 20 + len(b"payload") + 16)
 
-        pt = b_keys.decrypt(nonce, ct, aad, 1, False)
+        opened = b_keys.open_packet(wire)
+        assert opened is not None
+        seq, pt, used_prev = opened
+        self.assertIsInstance(seq, int)
         self.assertIsInstance(pt, bytes)
-        self.assertEqual(pt, b"payload")
+        self.assertIsInstance(used_prev, bool)
+        self.assertEqual((seq, pt, used_prev), (1, b"payload", False))
 
 
 if __name__ == "__main__":

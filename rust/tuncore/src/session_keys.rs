@@ -910,14 +910,24 @@ mod tests {
 
         // Cross-direction agreement: each peer's send == other's recv.
         assert_eq!(
-            init_send.as_array(),
-            resp_recv.as_array(),
+            init_send.aead.as_array(),
+            resp_recv.aead.as_array(),
             "initiator send key must equal responder recv key (i2r channel)",
         );
         assert_eq!(
-            init_recv.as_array(),
-            resp_send.as_array(),
+            init_recv.aead.as_array(),
+            resp_send.aead.as_array(),
             "responder send key must equal initiator recv key (r2i channel)",
+        );
+        assert_eq!(
+            init_send.hp.as_array(),
+            resp_recv.hp.as_array(),
+            "the i2r header keys must pair up like the i2r AEAD keys",
+        );
+        assert_eq!(
+            init_recv.hp.as_array(),
+            resp_send.hp.as_array(),
+            "the r2i header keys must pair up like the r2i AEAD keys",
         );
         // Direction separation: send key MUST differ from recv key.
         // Without role binding the previous code had this property only
@@ -925,13 +935,13 @@ mod tests {
         // labels were caller-controlled. With role binding it's
         // unconditional.
         assert_ne!(
-            init_send.as_array(),
-            init_recv.as_array(),
+            init_send.aead.as_array(),
+            init_recv.aead.as_array(),
             "initiator send and recv MUST be derived from different HKDF info",
         );
         assert_ne!(
-            resp_send.as_array(),
-            resp_recv.as_array(),
+            resp_send.aead.as_array(),
+            resp_recv.aead.as_array(),
             "responder send and recv MUST be derived from different HKDF info",
         );
     }
@@ -962,38 +972,36 @@ mod tests {
         // anything B derived.
         let (b_send, b_recv) = derive_rotation_keys(&b_secret, &a_pub, &b_pub, true, 1).unwrap();
         // Either of these two must differ — most likely both.
-        let a_send_eq_b_send = a_send.as_array() == b_send.as_array();
-        let a_send_eq_b_recv = a_send.as_array() == b_recv.as_array();
+        let a_send_eq_b_send = a_send.aead.as_array() == b_send.aead.as_array();
+        let a_send_eq_b_recv = a_send.aead.as_array() == b_recv.aead.as_array();
         assert!(
             !(a_send_eq_b_send && a_send_eq_b_recv),
             "two parties both claiming initiator must not converge on same key in both directions",
         );
+        let hp_send_eq = a_send.hp.as_array() == b_send.hp.as_array();
+        let hp_recv_eq = a_send.hp.as_array() == b_recv.hp.as_array();
+        assert!(
+            !(hp_send_eq && hp_recv_eq),
+            "two parties both claiming initiator must not share header keys either",
+        );
     }
 
     fn make_paired_managers() -> (SessionKeyManager, SessionKeyManager) {
-        let mut send_bytes = [0u8; 32];
-        let mut recv_bytes = [0u8; 32];
-        OsRng.fill_bytes(&mut send_bytes);
-        OsRng.fill_bytes(&mut recv_bytes);
+        // Each direction: an AEAD key and its header key.
+        let mut c2s = [[0u8; 32]; 2];
+        let mut s2c = [[0u8; 32]; 2];
+        for key in c2s.iter_mut().chain(s2c.iter_mut()) {
+            OsRng.fill_bytes(key);
+        }
+        let dir = |keys: [[u8; 32]; 2]| DirSecrets {
+            aead: LockedKey32::from_array(keys[0]).unwrap(),
+            hp: LockedKey32::from_array(keys[1]).unwrap(),
+        };
 
-        // Client sends with send_bytes, server receives with send_bytes
-        // Server sends with recv_bytes, client receives with recv_bytes
-        let client = SessionKeyManager::new(
-            LockedKey32::from_array(send_bytes).unwrap(),
-            LockedKey32::from_array(recv_bytes).unwrap(),
-            1,
-            None,
-            None,
-        )
-        .unwrap();
-        let server = SessionKeyManager::new(
-            LockedKey32::from_array(recv_bytes).unwrap(),
-            LockedKey32::from_array(send_bytes).unwrap(),
-            1,
-            None,
-            None,
-        )
-        .unwrap();
+        // Client sends with c2s, server receives with c2s.
+        // Server sends with s2c, client receives with s2c.
+        let client = SessionKeyManager::new(dir(c2s), dir(s2c), 1, None, None).unwrap();
+        let server = SessionKeyManager::new(dir(s2c), dir(c2s), 1, None, None).unwrap();
         (client, server)
     }
 
@@ -1360,27 +1368,18 @@ mod tests {
     /// No new rotation starts while the last one waits for the peer.
     #[test]
     fn no_rotation_due_while_waiting_for_peer() {
-        let mut send_bytes = [0u8; 32];
-        let mut recv_bytes = [0u8; 32];
-        OsRng.fill_bytes(&mut send_bytes);
-        OsRng.fill_bytes(&mut recv_bytes);
-        let client = SessionKeyManager::new(
-            LockedKey32::from_array(send_bytes).unwrap(),
-            LockedKey32::from_array(recv_bytes).unwrap(),
-            1,
-            None,
-            None,
-        )
-        .unwrap();
+        let mut c2s = [[0u8; 32]; 2];
+        let mut s2c = [[0u8; 32]; 2];
+        for key in c2s.iter_mut().chain(s2c.iter_mut()) {
+            OsRng.fill_bytes(key);
+        }
+        let dir = |keys: [[u8; 32]; 2]| DirSecrets {
+            aead: LockedKey32::from_array(keys[0]).unwrap(),
+            hp: LockedKey32::from_array(keys[1]).unwrap(),
+        };
+        let client = SessionKeyManager::new(dir(c2s), dir(s2c), 1, None, None).unwrap();
         // Rotation due after 1 or 2 packets.
-        let mut server = SessionKeyManager::new(
-            LockedKey32::from_array(recv_bytes).unwrap(),
-            LockedKey32::from_array(send_bytes).unwrap(),
-            1,
-            Some(1),
-            None,
-        )
-        .unwrap();
+        let mut server = SessionKeyManager::new(dir(s2c), dir(c2s), 1, Some(1), None).unwrap();
         let _ = responder_applies(&client, &mut server);
         for seq in 1..=3u64 {
             server.encrypt(b"x", &seq.to_be_bytes()).unwrap();
