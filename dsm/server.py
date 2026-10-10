@@ -275,7 +275,7 @@ async def _run_one_session(
     process_shutdown: asyncio.Event,
     blocklist: DnsBlocklist | None = None,
     end_session: asyncio.Event | None = None,
-    unauthenticated: Callable[[bytes, tuple[str, int]], None] | None = None,
+    unauthenticated: Callable[[bytes, tuple[str, int], bool], None] | None = None,
 ) -> None:
     """Stand up per-session host state, run the data loops, then unwind.
 
@@ -295,7 +295,8 @@ async def _run_one_session(
 
     ``blocklist`` is the daemon's one DNS blocklist (None when
     ``dns_blocklist`` is off); this session's DNS proxy answers from it.
-    ``unauthenticated`` gets each UDP packet this session cannot open
+    ``unauthenticated`` gets each UDP packet this session cannot use (did
+    not open, or already seen), with ``seen`` set for the second
     (``SessionWatch.offer``); None for TCP.
     """
     import tuncore

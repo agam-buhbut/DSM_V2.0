@@ -14,8 +14,9 @@ DNS proxy, one socket), and the acceptor runs in two places:
   and the others are cancelled.
 * While a session runs (:class:`SessionWatch`, step R): over UDP the live
   session still reads every datagram first and hands over each one it
-  cannot open; over TCP the run's one listener stays open and the watch
-  reads its queue. A client that passes the full handshake and the run's
+  cannot use (did not open, or already seen); over TCP the run's one
+  listener stays open and the watch reads its queue. A client that passes
+  the full handshake and the run's
   :class:`~dsm.net.session_slot.SessionSlot` (the live session's CN, so the
   same client coming back) ends the session and becomes the next one.
   Another client is refused before the last handshake frame.
@@ -127,9 +128,9 @@ _MAX_INBOXES = 4096
 # Shutdown/winner check cadence (s), matching the data loop's recv cadence.
 _ACCEPT_DEMUX_POLL = 0.1
 
-# Packets the live session could not open, waiting for the in-session
-# accept. Every handshake frame is 1400 bytes, so about 90 KB. When it is
-# full a packet is dropped, like loss on the link.
+# Packets the live session cannot use (did not open, or already seen),
+# waiting for the in-session accept. Every handshake frame is 1400 bytes, so
+# about 90 KB. When it is full a packet is dropped, like loss on the link.
 _INTAKE_FRAMES = 64
 
 
@@ -866,10 +867,10 @@ class _IntakeView(UDPTransport):
     """The live session's leftovers, seen by the demux as a UDP socket.
 
     ``recv()`` reads the intake that the live session fills with packets it
-    could not open. ``send()`` goes out on the run's real socket, so msg2
-    and the bootstrap reply leave from the server's one UDP port, as in the
-    idle accept. ``__init__`` skips the base initializer: only ``recv`` and
-    ``send`` are ever called on a view.
+    cannot use (did not open, or already seen). ``send()`` goes out on the
+    run's real socket, so msg2 and the bootstrap reply leave from the
+    server's one UDP port, as in the idle accept. ``__init__`` skips the base
+    initializer: only ``recv`` and ``send`` are ever called on a view.
     """
 
     def __init__(  # pylint: disable=super-init-not-called
@@ -906,14 +907,14 @@ class SessionWatch:
 
     The server makes one right before each session (it starts at once) and
     calls :meth:`stop` after the session ended. UDP (``udp=`` the run's
-    socket): the live session hands over each packet it cannot open through
-    :attr:`offer`; the demux, workers, pool, limits and deadline are the idle
-    accept's. TCP (``tcp=`` the run's listener queue): the idle accept's TCP
-    machinery on the run's one listener. A client that passes the full
-    handshake and the slot's rules sets :attr:`end_session`, so the live
-    session stops, and :meth:`stop` hands it over as the next session's
-    peer. A crash here (a bug) is logged once; the session runs on and just
-    cannot be replaced until it ends.
+    socket): the live session hands over each packet it cannot use (did not
+    open, or already seen) through :attr:`offer`; the demux, workers, pool,
+    limits and deadline are the idle accept's. TCP (``tcp=`` the run's
+    listener queue): the idle accept's TCP machinery on the run's one
+    listener. A client that passes the full handshake and the slot's rules
+    sets :attr:`end_session`, so the live session stops, and :meth:`stop`
+    hands it over as the next session's peer. A crash here (a bug) is logged
+    once; the session runs on and just cannot be replaced until it ends.
     """
 
     def __init__(
@@ -966,9 +967,10 @@ class SessionWatch:
             )
         else:
             raise ValueError("SessionWatch needs udp= or tcp=")
-        # UDP: give the watch each packet the live session could not open
-        # (run_data_loops' ``unauthenticated``). None for TCP.
-        self.offer: Callable[[bytes, tuple[str, int]], None] | None = (
+        # UDP: give the watch each packet the live session cannot use (did
+        # not open, or already seen; run_data_loops' ``unauthenticated``).
+        # None for TCP.
+        self.offer: Callable[[bytes, tuple[str, int], bool], None] | None = (
             self._offer if udp is not None else None
         )
         self._task: asyncio.Task[Winner | None] = asyncio.ensure_future(work)
@@ -1048,20 +1050,28 @@ class SessionWatch:
                 exc_info=error,
             )
 
-    def _offer(self, data: bytes, addr: tuple[str, int]) -> None:
-        """Take one packet the live session could not open. Never raises."""
+    def _offer(self, data: bytes, addr: tuple[str, int], seen: bool) -> None:
+        """Take one packet the live session cannot use. Never raises.
+
+        ``seen`` is True when the session's replay window had already seen
+        the packet, and False when it did not open.
+        """
         intake = self._intake
         if intake is None:
             return
         win = self._winner_addr
         if win is not None:
-            # A client won: keep only its packets, any size, so its first
-            # data packets reach its new session in order.
+            # A client won: keep only its packets, any size, seen or not, so
+            # its first data packets (their sequence numbers start again at
+            # 1) reach its new session in order.
             if addr != win:
                 return
-        elif len(data) != HANDSHAKE_FRAME_SIZE or self._task.done():
+        elif seen or len(data) != HANDSHAKE_FRAME_SIZE or self._task.done():
             # Before a winner only a full handshake frame can start or feed an
-            # attempt; after a crash nothing reads the intake.
+            # attempt. A seen packet is the live client's own (a handshake
+            # frame starts with 8 random bytes, never a seen sequence number),
+            # so it costs no signature and no budget. After a crash nothing
+            # reads the intake.
             return
         try:
             intake.put_nowait((data, addr))

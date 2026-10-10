@@ -495,6 +495,7 @@ def decrypt_packet(
     *,
     link_stats: LinkStats | None = None,
     on_auth_fail: Callable[[], None] | None = None,
+    on_replay: Callable[[], None] | None = None,
 ) -> tuple[InnerPacket, bool] | None:
     """Parse, replay-check, decrypt, and validate an incoming packet.
 
@@ -506,13 +507,14 @@ def decrypt_packet(
     is dropped later still crossed the link. A packet dropped before that
     (too short, a replay, AEAD failed) counts as junk.
 
-    ``on_auth_fail`` (server, step R) is called for a packet the session
-    cannot use: one that does not open, or one the replay window rejects as
-    already seen. Either may belong to a client that has just reconnected (its
-    handshake frame, or its first packet under new keys, with a sequence
-    number this window has seen), so the server's in-session accept may want
-    it. A packet that opened (even with a bad inner part or a wrong epoch)
-    and a too-short packet never go there.
+    ``on_auth_fail`` and ``on_replay`` (server, step R) are called for a
+    packet the session cannot use, so the server's in-session accept can
+    look at it. ``on_auth_fail``: the packet does not open (AEAD failed); it
+    may be a reconnecting client's handshake frame. ``on_replay``: the replay
+    window rejects it as already seen; it may be that client's first packet
+    under its new keys, whose sequence number starts again at 1. A packet
+    that opened (even with a bad inner part or a wrong epoch) and a
+    too-short packet go to neither. Without them nothing changes.
 
     There are TWO replay windows — this
     Python-side ``replay`` ARG (checked here BEFORE AEAD work) and the
@@ -535,8 +537,8 @@ def decrypt_packet(
     if not replay.check(seq):
         log.debug("replay detected, dropping seq=%d", seq)
         _note_junk(link_stats)
-        if on_auth_fail is not None:
-            on_auth_fail()
+        if on_replay is not None:
+            on_replay()
         return None
 
     # nonce sits between the 8-byte seq and the ciphertext.
@@ -1033,7 +1035,7 @@ async def run_data_loops(
     post_authenticate: (
         Callable[[tuple[str, int], InnerPacket], Awaitable[None]] | None
     ) = None,
-    unauthenticated: Callable[[bytes, tuple[str, int]], None] | None = None,
+    unauthenticated: Callable[[bytes, tuple[str, int], bool], None] | None = None,
     shutdown_log: str = "shutting down",
 ) -> None:
     """Drive the steady-state recv/tun_send/liveness/link-report loops to completion.
@@ -1056,9 +1058,10 @@ async def run_data_loops(
       ``dispatch_inner`` so the egress decision is made before the payload is
       delivered.
     * ``unauthenticated`` (server, step R): gets each UDP packet the session
-      cannot use (AEAD failed, or already seen by the replay window), with
-      its source address, for the in-session accept. The client passes
-      nothing; TCP never calls it.
+      cannot use, with its source address and ``seen``, for the in-session
+      accept. ``seen`` is False when the packet did not open (AEAD failed)
+      and True when the replay window had already seen it. The client
+      passes nothing; TCP never calls it.
     * ``extra_loops``: client passes ``auto_mtu_loop(...)`` here; server
       passes nothing.
     * ``shutdown_log``: caller-supplied label so the log line still
@@ -1110,16 +1113,22 @@ async def run_data_loops(
                     ctx.shutdown.set()
                     return
 
+                on_auth_fail: Callable[[], None] | None = None
+                on_replay: Callable[[], None] | None = None
+                if unauthenticated is not None and recv_addr is not None:
+                    on_auth_fail = functools.partial(
+                        unauthenticated, data, recv_addr, False
+                    )
+                    on_replay = functools.partial(
+                        unauthenticated, data, recv_addr, True
+                    )
                 result = decrypt_packet(
                     data,
                     session_keys,
                     replay,
                     link_stats=ctx.link_stats,
-                    on_auth_fail=(
-                        None
-                        if unauthenticated is None or recv_addr is None
-                        else functools.partial(unauthenticated, data, recv_addr)
-                    ),
+                    on_auth_fail=on_auth_fail,
+                    on_replay=on_replay,
                 )
                 if result is None:
                     continue

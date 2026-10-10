@@ -5,7 +5,8 @@ traffic, never goes there.
 
 A reconnected client's first packet has seq 1 under the new keys, and the old
 session's window has already seen seq 1, so it is rejected as a replay before
-AEAD. It has to be handed over too.
+AEAD. It has to be handed over too, marked as seen: the accept wants it only
+once a client won (until then it is the live client's own packet).
 
 Real session keys from tuncore (as in test_link_stats.py); fakes elsewhere.
 No sockets; nothing sleeps.
@@ -67,34 +68,42 @@ def _wire(keys: tuncore.SessionKeyManager, seq: int, plaintext: bytes) -> bytes:
 def test_only_packets_the_session_cannot_use_are_handed_over() -> None:
     sender, receiver = _pair()
     replay = tuncore.ReplayWindow()
-    handed: list[int] = []
+    failed: list[int] = []
+    seen: list[int] = []
 
-    def on_fail() -> None:
-        handed.append(1)
+    def decrypt(data: bytes) -> object:
+        return decrypt_packet(
+            data,
+            receiver,
+            replay,
+            on_auth_fail=lambda: failed.append(1),
+            on_replay=lambda: seen.append(1),
+        )
 
     epoch = receiver.epoch
     genuine = _wire(sender, 5, _plain(PacketType.DATA, epoch, b"x" * 1360))
     assert len(genuine) == 1400  # a genuine packet the size of a msg1
-    assert decrypt_packet(genuine, receiver, replay, on_auth_fail=on_fail) is not None
+    assert decrypt(genuine) is not None
     # Too short to be a packet.
-    assert decrypt_packet(bytes(10), receiver, replay, on_auth_fail=on_fail) is None
+    assert decrypt(bytes(10)) is None
     # Opens, but the inner part is bad (a reserved flag bit set).
     bad_inner = _wire(sender, 6, _plain(PacketType.DATA, epoch, b"x", flags=0x01))
-    assert decrypt_packet(bad_inner, receiver, replay, on_auth_fail=on_fail) is None
+    assert decrypt(bad_inner) is None
     # Opens, but the epoch nibble is wrong.
     wrong_epoch = _wire(sender, 7, _plain(PacketType.DATA, epoch + 3, b"x"))
-    assert decrypt_packet(wrong_epoch, receiver, replay, on_auth_fail=on_fail) is None
-    assert handed == []
+    assert decrypt(wrong_epoch) is None
+    assert (failed, seen) == ([], [])
     # Does not open: a new client's msg1, and a forged packet.
-    assert decrypt_packet(MSG1, receiver, replay, on_auth_fail=on_fail) is None
+    assert decrypt(MSG1) is None
     forged = bytearray(_wire(sender, 8, _plain(PacketType.DATA, epoch, b"y")))
     forged[-1] ^= 0x01
-    assert decrypt_packet(bytes(forged), receiver, replay, on_auth_fail=on_fail) is None
-    assert handed == [1, 1]
-    # Already seen: the replay window rejects it before AEAD, and it is
-    # handed over too (it may be a new key's packet; see the next test).
-    assert decrypt_packet(genuine, receiver, replay, on_auth_fail=on_fail) is None
-    assert handed == [1, 1, 1]
+    assert decrypt(bytes(forged)) is None
+    assert (failed, seen) == ([1, 1], [])
+    # Already seen: the replay window rejects it before AEAD. It goes to
+    # on_replay, never on_auth_fail (it may be a new key's packet; see the
+    # next test).
+    assert decrypt(genuine) is None
+    assert (failed, seen) == ([1, 1], [1])
 
 
 def test_a_new_key_packet_the_old_window_already_saw_is_handed_over() -> None:
@@ -112,7 +121,11 @@ def test_a_new_key_packet_the_old_window_already_saw_is_handed_over() -> None:
 
     first_new = _wire(new_sender, 1, _plain(PacketType.DATA, epoch, b"new"))
     result = decrypt_packet(
-        first_new, old_receiver, replay, on_auth_fail=lambda: handed.append(1)
+        first_new,
+        old_receiver,
+        replay,
+        on_auth_fail=lambda: handed.append(0),
+        on_replay=lambda: handed.append(1),
     )
     assert result is None
     assert handed == [1]
@@ -169,10 +182,10 @@ async def test_the_receive_loop_hands_over_only_packets_it_cannot_use() -> None:
     small_junk = b"\x7f" * 300
     for item in ((genuine, LIVE), (genuine, LIVE), (MSG1, NEW), (small_junk, NEW)):
         transport._recv_queue.put_nowait(item)
-    handed: list[tuple[bytes, Addr]] = []
+    handed: list[tuple[bytes, Addr, bool]] = []
 
-    def unauthenticated(data: bytes, addr: Addr) -> None:
-        handed.append((data, addr))
+    def unauthenticated(data: bytes, addr: Addr, seen: bool) -> None:
+        handed.append((data, addr, seen))
         if len(handed) == 3:
             ctx.shutdown.set()
 
@@ -188,8 +201,12 @@ async def test_the_receive_loop_hands_over_only_packets_it_cannot_use() -> None:
         timeout=5.0,
     )
     # The session hands over every packet it cannot use, any size (the
-    # server's intake filters): the replay and the two that do not open. The
-    # genuine packet, which opened, never goes there.
-    assert handed == [(genuine, LIVE), (MSG1, NEW), (small_junk, NEW)]
+    # server's intake filters): the replay, marked as seen, and the two that
+    # do not open. The genuine packet, which opened, never goes there.
+    assert handed == [
+        (genuine, LIVE, True),
+        (MSG1, NEW, False),
+        (small_junk, NEW, False),
+    ]
     assert tun.written == [b"x" * 1360]
     assert fsm.state is State.IDLE

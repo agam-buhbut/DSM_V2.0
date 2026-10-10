@@ -1,7 +1,8 @@
 """The handshake accept that runs while a session is live (step R).
 
-SessionWatch reads what the live session could not open (UDP) or the run's
-listener queue (TCP), with the idle accept's pool, limits and deadline. The
+SessionWatch reads what the live session cannot use (UDP: did not open, or
+already seen) or the run's listener queue (TCP), with the idle accept's pool,
+limits and deadline. The
 handshake is a scripted fake that asks the session check (admit_client) as
 the real one does; the slot and the limiter are real. No sockets; nothing
 waits on the wall clock.
@@ -143,9 +144,16 @@ class _Udp:
         finally:
             self._patch.stop()
 
-    def offer(self, addr: Addr, n: int = 0, size: int = HANDSHAKE_FRAME_SIZE) -> None:
+    def offer(
+        self,
+        addr: Addr,
+        n: int = 0,
+        size: int = HANDSHAKE_FRAME_SIZE,
+        *,
+        seen: bool = False,
+    ) -> None:
         assert self.watch is not None and self.watch.offer is not None
-        self.watch.offer(_frame(addr, n, size), addr)
+        self.watch.offer(_frame(addr, n, size), addr, seen)
 
     async def stop(self) -> Winner | None:
         assert self.watch is not None
@@ -345,6 +353,50 @@ async def test_before_a_winner_only_full_size_frames_get_in() -> None:
         await _yield()
         assert script.started == []
         assert await run.stop() is None
+
+
+async def test_a_seen_frame_before_a_winner_starts_nothing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A packet the live session's replay window already saw is the live
+    client's own (a real handshake frame starts with 8 random bytes, never a
+    seen sequence number). Before a client wins it costs no signature and no
+    budget, and logs nothing."""
+    caplog.set_level(logging.DEBUG)
+    limiter = SourceLimiter(clock=_Frozen())
+    script = _Script()
+    script.stall = {BACK}
+    async with _Udp(script, limiter=limiter) as run:
+        run.offer(OTHER, 0, seen=True)
+        await _yield()
+        assert script.started == []
+        assert len(limiter) == 0  # its address spent nothing
+        assert [r for r in caplog.records if r.name.startswith("dsm.")] == []
+        # The clock is frozen, so this start needs the in-session token the
+        # seen frame must not have spent.
+        run.offer(BACK, 0)
+        assert await _spin(lambda: script.started == [BACK])
+        assert await run.stop() is None
+
+
+async def test_after_a_win_a_seen_frame_from_the_winner_is_held() -> None:
+    """The winner's first packets under its new keys restart at seq 1, which
+    the old session's window has seen; they must still reach its new
+    session, in order."""
+    script = _Script()
+    async with _Udp(script) as run:
+        assert run.watch is not None
+        run.offer(BACK, 0)
+        assert await _spin(run.watch.end_session.is_set)
+        run.offer(BACK, 1, size=300, seen=True)
+        run.offer(OTHER, 0, seen=True)  # not the winner's: dropped
+        run.offer(BACK, 2, size=300)
+        win = await run.stop()
+    assert win is not None
+    assert _queued(run.real) == [
+        (_frame(BACK, 1, 300), BACK),
+        (_frame(BACK, 2, 300), BACK),
+    ]
 
 
 async def test_a_full_intake_drops_with_one_debug_line(
