@@ -31,6 +31,7 @@ import pytest
 from dsm.core import sysctl
 from dsm.core.config import Config
 from dsm.net import cleanup, nftables
+from dsm.net._addresses import SINGLE_CLIENT_TUNNEL
 from dsm.net.nftables import NFTablesManager
 from dsm.net.transport._fwmark import SO_MARK_VALUE
 
@@ -515,8 +516,8 @@ async def test_client_sets_src_valid_mark_around_the_policy_route() -> None:
     class _FakeKeys:
         epoch = 0
 
-    async def _handshake(*_a: object, **_k: object) -> tuple[Any, bytes, bytes]:
-        return _FakeKeys(), b"", b"\x02" * 32
+    async def _handshake(*_a: object, **_k: object) -> tuple[Any, bytes, bytes, Any]:
+        return _FakeKeys(), b"", b"\x02" * 32, SINGLE_CLIENT_TUNNEL
 
     async def _no_send(_data: bytes, _target_size: int) -> None:
         pass

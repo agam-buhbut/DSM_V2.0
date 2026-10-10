@@ -22,10 +22,7 @@ except ImportError:
     _HAS_TUNCORE = False
 
 from dsm.core.protocol import (
-    OUTER_HEADER_SIZE,
-    SEQ_STRUCT,
     InnerPacket,
-    OuterPacket,
     PacketType,
 )
 from dsm.session import decrypt_packet
@@ -68,12 +65,7 @@ class ResponderGraceSendEpochStamp(unittest.TestCase):
         inner = InnerPacket(
             ptype=PacketType.DATA, epoch_id=eid, payload=b"grace-window data"
         )
-        seq = 1
-        aad = SEQ_STRUCT.pack(seq)
-        nonce, ct, _e = responder.encrypt(inner.serialize(), aad)
-        wire = OuterPacket(seq=seq, nonce=bytes(nonce), ciphertext=bytes(ct)).serialize(
-            OUTER_HEADER_SIZE + len(ct)
-        )
+        wire = bytes(responder.seal_packet(1, inner.serialize()))
 
         replay = tuncore.ReplayWindow()
         result = decrypt_packet(wire, initiator, replay)
@@ -94,12 +86,7 @@ class ResponderGraceSendEpochStamp(unittest.TestCase):
         inner = InnerPacket(
             ptype=PacketType.DATA, epoch_id=wrong_eid, payload=b"grace-window data"
         )
-        seq = 1
-        aad = SEQ_STRUCT.pack(seq)
-        nonce, ct, _e = responder.encrypt(inner.serialize(), aad)
-        wire = OuterPacket(seq=seq, nonce=bytes(nonce), ciphertext=bytes(ct)).serialize(
-            OUTER_HEADER_SIZE + len(ct)
-        )
+        wire = bytes(responder.seal_packet(1, inner.serialize()))
 
         replay = tuncore.ReplayWindow()
         self.assertIsNone(decrypt_packet(wire, initiator, replay))

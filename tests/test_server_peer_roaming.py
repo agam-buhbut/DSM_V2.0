@@ -44,6 +44,7 @@ deterministic — no sleeps, no network.
 from __future__ import annotations
 
 import asyncio
+import os
 import unittest
 
 from dsm.core.fsm import SessionFSM, State
@@ -51,9 +52,7 @@ from dsm.core.protocol import (
     GCM_TAG_SIZE,
     OUTER_HEADER_SIZE,
     PATH_TOKEN_SIZE,
-    SEQ_STRUCT,
     InnerPacket,
-    OuterPacket,
     PacketType,
 )
 from dsm.net.transport.udp import UDPTransport
@@ -180,7 +179,7 @@ class _ChallengeShaper:
         wire_inner = inner.serialize()
         target = 128
         # plaintext slot = target - OUTER_HEADER - GCM_TAG (so after AEAD +
-        # OuterPacket framing the wire is exactly `target`).
+        # the 20-byte header the wire is exactly `target`).
         slot = target - OUTER_HEADER_SIZE - GCM_TAG_SIZE
         buf = bytearray(slot)
         buf[: len(wire_inner)] = wire_inner
@@ -214,15 +213,14 @@ def _frame(
     payload: bytes,
 ) -> bytes:
     """Build a genuine authenticated wire packet of ``ptype`` the way
-    ``make_send_fn`` does: seq ‖ nonce ‖ AEAD(inner, aad=seq), with the live
+    ``make_send_fn`` does: ``seal_packet(seq, inner)``, with the live
     epoch nibble stamped into inner-header byte 1."""
     n = seq_counter.next()
     inner = InnerPacket(ptype=ptype, epoch_id=keys.epoch & 0x0F, payload=payload)
     buf = bytearray(inner.serialize())
     if len(buf) >= 2:
         buf[1] = (buf[1] & 0x0F) | ((keys.epoch & 0x0F) << 4)
-    nonce, ct, _epoch = keys.encrypt(bytes(buf), SEQ_STRUCT.pack(n))
-    return OuterPacket(seq=n, nonce=nonce, ciphertext=ct).serialize()
+    return bytes(keys.seal_packet(n, bytes(buf)))
 
 
 def _extract_token(wire: bytes, client_keys: tuncore.SessionKeyManager) -> bytes:
@@ -243,14 +241,10 @@ def _extract_token(wire: bytes, client_keys: tuncore.SessionKeyManager) -> bytes
     return inner.payload
 
 
-def _forged_packet(seq: int, body_len: int = 64) -> bytes:
-    """A well-formed-looking outer packet (valid framing, length >=
-    OUTER_HEADER_SIZE) whose ciphertext is garbage, so AEAD authentication
-    fails. This is what an off-path attacker can produce: they can pick the
-    seq and the source addr but cannot forge a tag under the session key."""
-    nonce = b"\x00" * 12
-    ciphertext = b"\xab" * body_len
-    return OuterPacket(seq=seq, nonce=nonce, ciphertext=ciphertext).serialize()
+def _forged_packet(size: int = 128) -> bytes:
+    """What an off-path attacker can send: random bytes of a size class. With
+    wire v2 it cannot pick the seq either; the packet does not open."""
+    return os.urandom(size)
 
 
 @unittest.skipUnless(
@@ -417,7 +411,7 @@ class ServerPeerRoaming(unittest.IsolatedAsyncioTestCase):
         # Off-path attacker forges a packet (fails AEAD) from a spoofed addr,
         # then the genuine authenticated packet arrives from the real client.
         inbound = [
-            (_forged_packet(seq=1), _SPOOFED_ADDR),  # fails AEAD → ignored
+            (_forged_packet(), _SPOOFED_ADDR),  # does not open → ignored
             (genuine, _ROAMED_ADDR),  # authenticates → addr committed
         ]
 
@@ -626,7 +620,7 @@ class ServerPeerRoaming(unittest.IsolatedAsyncioTestCase):
         # must be addressed to the roamed addr.
         transport.sent.clear()
         # make_send_fn encrypts the 16-byte body to 16+GCM_TAG=32 ciphertext;
-        # wire size = OUTER_HEADER_SIZE(20) + 32 = 52 (serialize's exact check).
+        # wire size = OUTER_HEADER_SIZE(20) + 32 = 52 (make_send_fn's exact-size check).
         await send_fn(b"\x00" * 16, 52)
         self.assertEqual(len(transport.sent), 1, "reply must be sent")
         _wire, dest = transport.sent[0]

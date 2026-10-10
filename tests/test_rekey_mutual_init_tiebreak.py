@@ -181,10 +181,9 @@ class MutualInitTieBreakTest(unittest.IsolatedAsyncioTestCase):
         # KEY PROPERTY: both peers converged to the SAME epoch (one rotation,
         # one winner) and their keys still interoperate — no split-brain.
         self.assertEqual(winner.keys.epoch, loser.keys.epoch)
-        aad = (1).to_bytes(8, "big")
-        nonce, ct, _epoch = winner.keys.encrypt(b"post-rekey", aad)
-        pt = loser.keys.decrypt(bytes(nonce), bytes(ct), aad, 1, False)
-        self.assertEqual(bytes(pt), b"post-rekey")
+        opened = loser.keys.open_packet(winner.keys.seal_packet(1, b"post-rekey"))
+        assert opened is not None
+        self.assertEqual(opened[1], b"post-rekey")
 
     async def test_winner_is_lower_pub_either_order(self) -> None:
         # Determinism: whichever side has the lower pub keeps its INIT, and

@@ -22,6 +22,7 @@ import pytest
 
 from dsm.core.config import Config
 from dsm.net import cleanup, resolv_conf
+from dsm.net._addresses import SINGLE_CLIENT_TUNNEL
 from dsm.net.resolv_conf import DSM_MARKER, ResolvConfError, ResolvConfManager
 
 NAMESERVER = "10.8.0.1"
@@ -235,8 +236,8 @@ async def test_client_exits_with_one_line_when_resolv_conf_cannot_be_written(
     class _FakeKeys:
         epoch = 0
 
-    async def _handshake(*_a: object, **_k: object) -> tuple[Any, bytes, bytes]:
-        return _FakeKeys(), b"", b"\x02" * 32
+    async def _handshake(*_a: object, **_k: object) -> tuple[Any, bytes, bytes, Any]:
+        return _FakeKeys(), b"", b"\x02" * 32, SINGLE_CLIENT_TUNNEL
 
     patches = [
         patch("tuncore.harden_process"),

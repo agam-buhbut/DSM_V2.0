@@ -30,6 +30,7 @@ from dsm.crypto.handshake import (
     CNMismatchError,
     HandshakeError,
 )
+from dsm.net._addresses import SINGLE_CLIENT_TUNNEL
 from dsm.net.resolv_conf import ResolvConfError
 from dsm.net.transport.tcp import FramingError
 
@@ -192,12 +193,14 @@ class _Run:
 
         return _FakeTcp
 
-    async def handshake(self, *_a: object, **_k: object) -> tuple[Any, bytes, bytes]:
+    async def handshake(
+        self, *_a: object, **_k: object
+    ) -> tuple[Any, bytes, bytes, Any]:
         self.events.append("handshake")
         error = self.handshakes.pop(0) if self.handshakes else None
         if error is not None:
             raise error
-        return _FakeKeys(), b"", b"\x02" * 32
+        return _FakeKeys(), b"", b"\x02" * 32, SINGLE_CLIENT_TUNNEL
 
     async def data_loops(
         self, *_a: object, extra_loops: tuple[Any, ...] = (), **_k: object

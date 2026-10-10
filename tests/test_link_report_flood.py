@@ -27,11 +27,8 @@ from dsm.core.config import Config
 from dsm.core.fsm import SessionFSM, State
 from dsm.core.protocol import (
     INNER_STRUCT,
-    OUTER_HEADER_SIZE,
-    SEQ_STRUCT,
     InnerPacket,
     LinkReport,
-    OuterPacket,
     PacketType,
 )
 from dsm.net.transport.udp import RECV_QUEUE_SIZE, UDPTransport
@@ -168,9 +165,7 @@ def _pair() -> tuple[tuncore.SessionKeyManager, tuncore.SessionKeyManager]:
 
 def _wire(keys: tuncore.SessionKeyManager, seq: int, ptype: int) -> bytes:
     plaintext = INNER_STRUCT.pack(ptype, (keys.epoch & 0x0F) << 4, 1) + b"x"
-    nonce, ct, _epoch = keys.encrypt(plaintext, SEQ_STRUCT.pack(seq))
-    outer = OuterPacket(seq=seq, nonce=bytes(nonce), ciphertext=bytes(ct))
-    return outer.serialize(OUTER_HEADER_SIZE + len(ct))
+    return bytes(keys.seal_packet(seq, plaintext))
 
 
 # --- the rule ----------------------------------------------------------------

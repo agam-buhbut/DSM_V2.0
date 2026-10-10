@@ -180,7 +180,7 @@ class TestHandshakeRoundtrip(unittest.IsolatedAsyncioTestCase):
     async def test_roundtrip_establishes_matching_session_keys(
         self,
     ) -> None:
-        (client_keys, _client_hash, _server_static_pub), (
+        (client_keys, _client_hash, _server_static_pub, _tunnel), (
             server_keys,
             client_static_seen,
         ) = await self._run_udp_handshake()
@@ -188,18 +188,15 @@ class TestHandshakeRoundtrip(unittest.IsolatedAsyncioTestCase):
         # Server sees the client's Noise static post-handshake.
         self.assertEqual(len(bytes(client_static_seen)), 32)
 
-        # Both sides agreed on key material: ciphertext from one side
-        # decrypts on the other.
-        aad = (1).to_bytes(
-            8, "big"
-        )  # AAD must equal the seq passed to decrypt (H-CRYPT-1)
-        nonce, ct, _epoch = client_keys.encrypt(b"ping", aad)
-        pt = server_keys.decrypt(bytes(nonce), bytes(ct), aad, 1, False)
-        self.assertEqual(bytes(pt), b"ping")
+        # Both sides agreed on key material: a packet from one side opens on
+        # the other.
+        opened = server_keys.open_packet(client_keys.seal_packet(1, b"ping"))
+        assert opened is not None
+        self.assertEqual(opened[1], b"ping")
 
-        nonce2, ct2, _ = server_keys.encrypt(b"pong", aad)
-        pt2 = client_keys.decrypt(bytes(nonce2), bytes(ct2), aad, 1, False)
-        self.assertEqual(bytes(pt2), b"pong")
+        opened2 = client_keys.open_packet(server_keys.seal_packet(1, b"pong"))
+        assert opened2 is not None
+        self.assertEqual(opened2[1], b"pong")
 
     async def test_two_sessions_derive_different_keys(self) -> None:
         """Each session must derive its own keys via ephemeral DH; two
@@ -209,13 +206,9 @@ class TestHandshakeRoundtrip(unittest.IsolatedAsyncioTestCase):
         _, (s2_keys, _) = await self._run_udp_handshake()
         del _
 
-        aad = (1).to_bytes(
-            8, "big"
-        )  # AAD must equal the seq passed to decrypt (H-CRYPT-1)
-        nonce, ct, _ = c1_keys.encrypt(b"session-1-secret", aad)
-        # Session-1 ciphertext must NOT decrypt under session-2 keys.
-        with self.assertRaises(Exception):
-            s2_keys.decrypt(bytes(nonce), bytes(ct), aad, 1, False)
+        wire = c1_keys.seal_packet(1, b"session-1-secret")
+        # A session-1 packet must NOT open under session-2 keys.
+        self.assertIsNone(s2_keys.open_packet(wire))
 
 
 @unittest.skipUnless(
@@ -426,18 +419,15 @@ class TestHandshakeRoundtripTCP(unittest.IsolatedAsyncioTestCase):
             timeout=30.0,
         )
         server_keys, client_static_seen = server_result
-        client_keys, _client_hash, _server_static_pub = client_result
+        client_keys, _client_hash, _server_static_pub, _tunnel = client_result
 
         self.assertEqual(len(bytes(client_static_seen)), 32)
-        aad = (1).to_bytes(
-            8, "big"
-        )  # AAD must equal the seq passed to decrypt (H-CRYPT-1)
-        nonce, ct, _ = client_keys.encrypt(b"ping-tcp", aad)
-        pt = server_keys.decrypt(bytes(nonce), bytes(ct), aad, 1, False)
-        self.assertEqual(bytes(pt), b"ping-tcp")
-        nonce2, ct2, _ = server_keys.encrypt(b"pong-tcp", aad)
-        pt2 = client_keys.decrypt(bytes(nonce2), bytes(ct2), aad, 1, False)
-        self.assertEqual(bytes(pt2), b"pong-tcp")
+        opened = server_keys.open_packet(client_keys.seal_packet(1, b"ping-tcp"))
+        assert opened is not None
+        self.assertEqual(opened[1], b"ping-tcp")
+        opened2 = client_keys.open_packet(server_keys.seal_packet(1, b"pong-tcp"))
+        assert opened2 is not None
+        self.assertEqual(opened2[1], b"pong-tcp")
 
 
 @unittest.skipUnless(

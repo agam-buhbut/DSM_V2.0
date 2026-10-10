@@ -52,11 +52,11 @@ class _FakeSessionKeys:
     def tick(self) -> None:
         pass
 
-    def encrypt(self, data: bytes, aad: bytes) -> tuple[bytes, bytes, int]:
-        # Echo the plaintext as ciphertext so the caller can size target_size
-        # as OUTER_HEADER_SIZE + len(data) and pass OuterPacket.serialize's
-        # exact-size check.
-        return (b"\x00" * 12, data, 0)
+    def seal_packet(self, seq: int, data: bytes) -> bytes:
+        # 20 filler bytes stand for the header, so the wire is exactly
+        # OUTER_HEADER_SIZE + len(data) and passes make_send_fn's size check.
+        del seq
+        return b"\x00" * 20 + data
 
 
 class _FakeShaper:
