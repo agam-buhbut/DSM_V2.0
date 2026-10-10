@@ -1,13 +1,16 @@
 """DSM packet format: serialization and deserialization.
 
-Outer packet (visible to observer):
-    [Sequence Number: 8 bytes][Nonce: 12 bytes]
-    [Ciphertext + GCM Tag: variable][Random Padding]
+Outer packet, wire v2 (what a watcher sees):
+    [Header block: 16 bytes] AES-256 of seq(8) ‖ epoch(4) ‖ counter(4),
+                             under this direction's header key
+    [Nonce tail: 4 bytes]    the random part of the AES-GCM nonce
+    [Ciphertext + GCM Tag: variable]
+Only tuncore builds and reads it (``SessionKeyManager.seal_packet`` /
+``open_packet``). The AES-GCM nonce is epoch ‖ counter ‖ tail; AAD = seq
+(8 bytes). Size-class padding sits inside the AEAD (inner padding).
 
 Inner plaintext (after AEAD decryption):
     [Type: 1 byte][Epoch|Flags: 1 byte][Inner Length: 2 bytes][Payload][Inner Padding]
-
-AAD = sequence number (8 bytes).  Nonce is bound as the GCM IV.
 
 Inner types: every version drops an inner packet whose type it does not
 know, quietly (one DEBUG line, no error count, no teardown). Newer versions
@@ -34,7 +37,7 @@ import tuncore
 
 log = logging.getLogger(__name__)
 
-# Outer header: 8 (seq) + 12 (nonce) = 20 bytes
+# Outer header: 16 (protected block) + 4 (random nonce tail) = 20 bytes
 OUTER_HEADER_SIZE = 20
 # Inner header: 1 (type) + 1 (flags) + 2 (inner_length) = 4 bytes
 INNER_HEADER_SIZE = 4
@@ -55,6 +58,10 @@ SIZE_CLASS_WEIGHTS: tuple[int, ...] = tuncore.SIZE_CLASS_WEIGHTS
 INNER_STRUCT = struct.Struct("!BBH")
 SEQ_STRUCT = struct.Struct("!Q")
 FRAG_STRUCT = struct.Struct("!HBB")
+
+# The wire version in the Noise prologue: builds of different versions refuse
+# each other at the handshake. tuncore owns the one copy.
+WIRE_VERSION: int = tuncore.WIRE_VERSION
 
 
 class PacketType(IntEnum):
@@ -155,40 +162,6 @@ class InnerPacket:
         payload = data[INNER_HEADER_SIZE:payload_end]
         # Remaining bytes are inner padding — ignored
         return cls(ptype=ptype, epoch_id=epoch_id, payload=payload)
-
-
-@dataclass(slots=True)
-class OuterPacket:
-    """Wire-format outer packet."""
-
-    seq: int  # 64-bit sequence number
-    nonce: bytes  # 12 bytes
-    ciphertext: bytes  # includes GCM tag
-
-    def serialize(self, target_size: int | None = None) -> bytes:
-        """Serialize to wire format: header || ciphertext.
-
-        Callers that want size-class shaping must size the ciphertext (via
-        inner padding inside the AEAD envelope) so the wire output lands on
-        the desired size. Outer padding is never added here because it would
-        be unauthenticated and would be included by the receiver in the
-        ciphertext passed to AEAD, breaking tag validation.
-
-        If `target_size` is supplied, the final wire length must equal it;
-        any mismatch means inner-padding sizing is wrong and is reported as
-        a programming error rather than silently papered over.
-        """
-        wire_size = OUTER_HEADER_SIZE + len(self.ciphertext)
-
-        if target_size is not None and target_size != wire_size:
-            raise ValueError(
-                f"ciphertext sizing mismatch: wire={wire_size}, target={target_size}"
-            )
-        buf = bytearray(wire_size)
-        SEQ_STRUCT.pack_into(buf, 0, self.seq)
-        buf[8:OUTER_HEADER_SIZE] = self.nonce
-        buf[OUTER_HEADER_SIZE:] = self.ciphertext
-        return bytes(buf)
 
 
 # Fragment format within inner payload (Type=FRAGMENT):

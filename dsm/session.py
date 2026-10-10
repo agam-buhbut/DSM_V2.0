@@ -27,12 +27,10 @@ from dsm.core.protocol import (
     GCM_TAG_SIZE,
     OUTER_HEADER_SIZE,
     PATH_TOKEN_SIZE,
-    SEQ_STRUCT,
     SIZE_CLASSES,
     Fragment,
     InnerPacket,
     LinkReport,
-    OuterPacket,
     PacketType,
     ReassemblyBuffer,
     fragment_ip_packet,
@@ -71,9 +69,9 @@ LIVENESS_CHECK_INTERVAL = 5.0  # cadence at which liveness_loop wakes
 # discovered path MTU to size the inner TUN MTU.
 WIRE_OVERHEAD = 68
 
-# Outer header layout: seq(SEQ_STRUCT.size=8) ‖ nonce(12) ‖ ciphertext, with
-# the nonce occupying the bytes between the sequence number and the start of
-# the ciphertext (OUTER_HEADER_SIZE=20).
+# Wire v2 outer packet: a 16-byte block (AES-256 of seq ‖ epoch ‖ counter under
+# the direction's header key) ‖ 4 random nonce bytes ‖ AES-GCM output, AAD =
+# seq. Only tuncore builds or reads it (seal_packet / open_packet).
 
 # The outer DSM packet rides inside IP(20)+UDP(8), so a kernel path MTU
 # converts to a wire size-class ceiling by subtracting this.
@@ -167,6 +165,22 @@ class FragmentIdCounter:
         return self.value
 
 
+def _check_wire_size(wire: bytes, target_size: int) -> None:
+    """Refuse a packet that is not the size class it was padded for.
+
+    The plaintext is padded inside the AEAD so the wire lands on a size
+    class; padding outside it would be unauthenticated, so a mismatch is a
+    sizing bug and is never papered over.
+
+    Raises:
+        ValueError: ``wire`` is not ``target_size`` bytes.
+    """
+    if len(wire) != target_size:
+        raise ValueError(
+            f"ciphertext sizing mismatch: wire={len(wire)}, target={target_size}"
+        )
+
+
 def make_send_fn(  # pylint: disable=unused-argument  # `liveness` kept for call-site compatibility
     session_keys: tuncore.SessionKeyManager,
     transport: UDPTransport | TCPTransport,
@@ -214,7 +228,7 @@ def make_send_fn(  # pylint: disable=unused-argument  # `liveness` kept for call
         # session_keys.send_epoch right before encryption. During a
         # responder deferred send-swap the SEND key still lags self.epoch,
         # so we stamp the send-direction epoch to match the key actually
-        # used by encrypt(). CHAFF packets are
+        # used by seal_packet(). CHAFF packets are
         # exempt from the receiver's check, but patching them is
         # harmless.
         #
@@ -237,7 +251,7 @@ def make_send_fn(  # pylint: disable=unused-argument  # `liveness` kept for call
         if tcp_fixed_size and len(data) < tcp_inner_target:
             # Fixed-size TCP framing: extend the inner plaintext to
             # tcp_inner_target so that after AEAD (+GCM_TAG_SIZE) and
-            # OuterPacket framing (+OUTER_HEADER_SIZE) the wire packet
+            # the 20-byte header (+OUTER_HEADER_SIZE) the wire packet
             # is exactly tcp_fixed_size. Random pad bytes go INSIDE the
             # AEAD envelope and are therefore authenticated.
             pad_len = tcp_inner_target - len(data)
@@ -246,16 +260,14 @@ def make_send_fn(  # pylint: disable=unused-argument  # `liveness` kept for call
             buf[len(data) :] = os.urandom(pad_len)
             data = bytes(buf)
             target_size = tcp_fixed_size
-        aad = SEQ_STRUCT.pack(n)
         try:
-            nonce, ct, _epoch = session_keys.encrypt(data, aad)
+            wire = session_keys.seal_packet(n, data)
         except RuntimeError as e:
             log.error("AEAD nonce exhausted: %s — triggering shutdown", e)
             if shutdown is not None:
                 shutdown.set()
             return
-        outer = OuterPacket(seq=n, nonce=nonce, ciphertext=ct)
-        wire = outer.serialize(target_size)
+        _check_wire_size(wire, target_size)
         if isinstance(transport, UDPTransport):
             addr = dest_addr()
             if addr is None:
@@ -291,8 +303,8 @@ def make_addr_send_fn(
     closure instead of its own send function) and WITHOUT mutating the
     committed egress.
 
-    The AEAD/seq/nonce framing is byte-identical to ``make_send_fn`` — only
-    the destination resolution differs — so the probe is indistinguishable on
+    The packet is sealed exactly as in ``make_send_fn`` — only the
+    destination resolution differs — so the probe is indistinguishable on
     the wire from any other size-128 control packet. TCP has a single
     connection (no per-packet addr), so the ``addr`` argument is ignored and
     ``transport.send`` is used directly; in practice path validation is a
@@ -304,7 +316,7 @@ def make_addr_send_fn(
             n = seq.next()
         except RuntimeError as e:
             # Parity with make_send_fn: seq.next() overflows at 2**64. Same
-            # graceful-drop rationale as the encrypt() guard below — this
+            # graceful-drop rationale as the seal guard below — this
             # closure has no shutdown handle, but the shared data-path send
             # hits the same exhaustion and drives teardown; drop the probe
             # with a clear log line rather than letting the traceback reach
@@ -317,9 +329,8 @@ def make_addr_send_fn(
                 buf = bytearray(data)
                 buf[1] = want_byte1
                 data = bytes(buf)
-        aad = SEQ_STRUCT.pack(n)
         try:
-            nonce, ct, _epoch = session_keys.encrypt(data, aad)
+            wire = session_keys.seal_packet(n, data)
         except RuntimeError as e:
             # Parity with make_send_fn's nonce-exhaustion handling. This
             # closure has no shutdown handle, but it shares session_keys and
@@ -329,8 +340,7 @@ def make_addr_send_fn(
             # loop that sends it.
             log.error("AEAD nonce exhausted on path-challenge send: %s", e)
             return
-        outer = OuterPacket(seq=n, nonce=nonce, ciphertext=ct)
-        wire = outer.serialize(target_size)
+        _check_wire_size(wire, target_size)
         if isinstance(transport, UDPTransport):
             await transport.send(wire, addr)
         else:
@@ -458,30 +468,6 @@ class PathValidationState:
         return hmac.compare_digest(token, self.token)
 
 
-def _decrypt_with_fallback(
-    session_keys: tuncore.SessionKeyManager,
-    nonce: bytes,
-    ciphertext: bytes,
-    aad: bytes,
-    seq: int,
-) -> tuple[bytes, bool] | None:
-    """Try current-epoch decrypt, then previous-epoch if in grace period.
-
-    Returns (plaintext, used_prev_epoch) or None on failure.
-
-    Prefer the Rust-side `try_decrypt_with_fallback` which
-    returns `None` on auth failure instead of raising. Constructing a
-    Python exception + traceback on every dropped packet costs ~30µs
-    of CPU each; at any meaningful forgery-flood rate this dominates
-    the recv-side cost.
-    """
-    result = session_keys.try_decrypt_with_fallback(nonce, ciphertext, aad, seq)
-    if result is None:
-        log.debug("decrypt failed, dropping packet")
-        return None
-    return result
-
-
 def _note_junk(link_stats: LinkStats | None) -> None:
     """Count a packet that was not the peer's (slow-link auto cap)."""
     if link_stats is not None:
@@ -497,64 +483,56 @@ def decrypt_packet(
     on_auth_fail: Callable[[], None] | None = None,
     on_replay: Callable[[], None] | None = None,
 ) -> tuple[InnerPacket, bool] | None:
-    """Parse, replay-check, decrypt, and validate an incoming packet.
+    """Open, replay-check and validate an incoming packet (wire v2).
 
     Returns (inner_packet, decrypted_prev_epoch) or None if the packet
-    should be dropped (too short, replay, auth failure, malformed, epoch mismatch).
+    should be dropped (too short, did not open, a replay, malformed, epoch
+    mismatch).
 
-    ``link_stats`` (slow-link auto cap) counts every packet that passed AEAD
-    with a new seq, before the inner packet is parsed: a genuine packet that
-    is dropped later still crossed the link. A packet dropped before that
-    (too short, a replay, AEAD failed) counts as junk.
+    ``link_stats`` (slow-link auto cap) counts every packet that opened with
+    a new seq, before the inner packet is parsed: a genuine packet that is
+    dropped later still crossed the link. A packet dropped before that (too
+    short, did not open, a replay) counts as junk.
 
     ``on_auth_fail`` and ``on_replay`` (server, while a session runs) are
     called for a packet the session cannot use, so the server's in-session
-    accept can look at it. ``on_auth_fail``: the packet does not open (AEAD
-    failed); it may be a reconnecting client's handshake frame.
-    ``on_replay``: the replay window rejects it as already seen or too old
-    (more than the window behind); it may be that client's first packet
-    under its new keys, whose sequence number starts again at 1. A packet
-    that opened (even with a bad inner part or a wrong epoch) and a
-    too-short packet go to neither. Without them nothing changes.
+    accept can look at it. ``on_auth_fail``: the packet does not open (no
+    header key matched, the AEAD failed, or this key set's window has seen
+    it); it may be a reconnecting client's handshake frame or its first
+    packets under new keys. ``on_replay``: it opened, but the session-wide
+    window here refuses it as more than 128 behind the newest packet (a
+    straggler from the previous key set). A packet that opened and then
+    failed a later check, and a too-short packet, go to neither. Without
+    them nothing changes.
 
-    There are TWO replay windows — this
-    Python-side ``replay`` ARG (checked here BEFORE AEAD work) and the
-    Rust-side window INSIDE ``session_keys.decrypt``. The Python check
-    saves the AEAD cost on replays; the Rust check is the authoritative
-    replay window (it's per-epoch and cleared on rotation, where the
-    Python window is monotonic across rotations). Both are kept on
-    purpose: removing the Python pre-check would burn AEAD on every
-    forgery; removing the Rust window would break per-epoch isolation
-    after rotation. Sequence numbers are monotonic across rotations
-    (one SequenceCounter for the session) so the two windows agree on
-    what's a replay.
+    Two replay windows. The Rust one, per key set, inside ``open_packet``,
+    decides: a replay there is a packet that did not open (the AEAD still
+    runs once, so a replay and a forgery look the same, audit M3). This
+    session-wide ``replay``, checked after ``open_packet``, keeps today's
+    rule across key changes: a packet more than 128 behind the newest is
+    dropped. Sequence numbers are one counter for the session, so the two
+    agree on what a replay is.
     """
-    if len(data) < OUTER_HEADER_SIZE:
+    if len(data) < OUTER_HEADER_SIZE + GCM_TAG_SIZE:
         log.debug("packet too short, dropping")
         _note_junk(link_stats)
         return None
 
-    seq = SEQ_STRUCT.unpack_from(data)[0]
+    result = session_keys.open_packet(data)
+    if result is None:
+        log.debug("packet did not open, dropping")
+        _note_junk(link_stats)
+        if on_auth_fail is not None:
+            on_auth_fail()
+        return None
+    seq, plaintext, decrypted_prev_epoch = result
+
     if not replay.check(seq):
         log.debug("replay detected, dropping seq=%d", seq)
         _note_junk(link_stats)
         if on_replay is not None:
             on_replay()
         return None
-
-    # nonce sits between the 8-byte seq and the ciphertext.
-    nonce_bytes = data[SEQ_STRUCT.size : OUTER_HEADER_SIZE]
-    ciphertext = data[OUTER_HEADER_SIZE:]
-    aad = SEQ_STRUCT.pack(seq)
-
-    result = _decrypt_with_fallback(session_keys, nonce_bytes, ciphertext, aad, seq)
-    if result is None:
-        _note_junk(link_stats)
-        if on_auth_fail is not None:
-            on_auth_fail()
-        return None
-    plaintext, decrypted_prev_epoch = result
-
     replay.update(seq)
     if link_stats is not None:
         link_stats.note(seq)
@@ -1061,10 +1039,12 @@ async def run_data_loops(
     * ``unauthenticated`` (server, while a session runs): gets each UDP
       packet the session cannot use, with its source address and ``seen``,
       for the in-session accept. ``seen`` is False when the packet did not
-      open (AEAD failed) and True when the replay window rejected it as
-      already seen or too old (more than the window behind). It runs inside
-      the receive loop, so it must not block or raise: an exception ends the
-      session. The client passes nothing; TCP never calls it.
+      open (no header key matched, the AEAD failed, or it was a replay) and
+      True when it opened but the session-wide replay window refused it as
+      too far behind the newest packet (a straggler from the previous key
+      set). It runs inside the receive loop, so it must not block or raise:
+      an exception ends the session. The client passes nothing; TCP never
+      calls it.
     * ``extra_loops``: client passes ``auto_mtu_loop(...)`` here; server
       passes nothing.
     * ``shutdown_log``: caller-supplied label so the log line still
