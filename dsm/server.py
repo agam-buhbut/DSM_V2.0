@@ -296,8 +296,8 @@ async def _run_one_session(
     ``blocklist`` is the daemon's one DNS blocklist (None when
     ``dns_blocklist`` is off); this session's DNS proxy answers from it.
     ``unauthenticated`` gets each UDP packet this session cannot use (did
-    not open, or already seen), with ``seen`` set for the second
-    (``SessionWatch.offer``); None for TCP.
+    not open, or opened but too far behind the newest), with ``seen`` set
+    for the second (``SessionWatch.offer``); None for TCP.
     """
     import tuncore
 
