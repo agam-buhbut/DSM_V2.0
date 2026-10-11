@@ -147,6 +147,31 @@ def test_a_cookie_ends_on_the_120_s_grid_after_a_quiet_spell() -> None:
     assert gate.check_msg1(frame, SRC, under_load=True) is Msg1Verdict.NEED_COOKIE
 
 
+def test_a_gap_of_two_or_more_r_changes_ends_every_cookie() -> None:
+    clock = _Clock()
+    gate = _gate(clock)
+    first = _with_cookie(gate, _msg1(1))  # at 0 s, under the first R
+    clock.now = 250.0  # the first gate call since: R changed at 120 and 240 s
+    assert gate.check_msg1(first, SRC, under_load=True) is Msg1Verdict.NEED_COOKIE
+    second = _with_cookie(gate, _msg1(2))  # at 250 s, under the R of 240 s
+    clock.now = 251.0
+    assert gate.check_msg1(second, SRC, under_load=True) is Msg1Verdict.ADMIT
+    clock.now = 370.0  # one change, at 360 s: second's R is now the previous
+    assert gate.check_msg1(second, SRC, under_load=True) is Msg1Verdict.ADMIT
+    clock.now = 1000.0  # five changes since: neither cookie counts
+    assert gate.check_msg1(first, SRC, under_load=True) is Msg1Verdict.NEED_COOKIE
+    assert gate.check_msg1(second, SRC, under_load=True) is Msg1Verdict.NEED_COOKIE
+
+
+def test_wrong_size_frames_spend_no_cookie_reply_budget() -> None:
+    gate = _gate()
+    good = _msg1(1)
+    for _ in range(100):
+        assert gate.cookie_reply(good[:-1], SRC) is None
+    replies = [gate.cookie_reply(good, SRC) for _ in range(int(COOKIE_REPLY_BURST))]
+    assert all(r is not None for r in replies)
+
+
 def test_two_cookie_replies_to_one_msg1_differ() -> None:
     gate = _gate()
     msg1 = _msg1(1)
