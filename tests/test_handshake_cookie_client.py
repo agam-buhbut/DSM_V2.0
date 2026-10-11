@@ -1,12 +1,13 @@
 """The client's side of the handshake gate (wire v2, spec §7.5; T10 §3.16
 tests 17-18): it stamps msg1, answers a cookie reply at once with the same e
 and a valid mac2, keeps the latest mac2 for its timer resends, gives up after
-two cookie replies, and reads a frame that is not a cookie reply as msg2.
-Real client_handshake over loopback UDP, against the real acceptor or a
-scripted server. Laptop: no (old wheel and shim). Every test here sends or
-opens a cookie reply, and the client tries each frame as one, so all of them
-need tuncore's xchacha_seal and xchacha_open from the Task 5 wheel and run in
-CI.
+two cookie replies, reads a frame that is not a cookie reply as msg2, skips a
+cookie reply that comes after msg2, and turns an empty server CN into a
+HandshakeError. Real client_handshake over loopback UDP, against the real
+acceptor or a scripted server. Laptop: partly (old wheel and shim). Every
+test but the empty-CN one sends or opens a cookie reply, and the client tries
+each frame as one, so those need tuncore's xchacha_seal and xchacha_open from
+the Task 5 wheel and run in CI.
 """
 
 from __future__ import annotations
@@ -20,7 +21,12 @@ import pytest
 
 from dsm.crypto import handshake
 from dsm.crypto.cert_allowlist import CNAllowlist
-from dsm.crypto.handshake import HANDSHAKE_FRAME_SIZE, HandshakeError, client_handshake
+from dsm.crypto.handshake import (
+    HANDSHAKE_FRAME_SIZE,
+    HandshakeError,
+    client_handshake,
+    server_handshake,
+)
 from dsm.net import handshake_acceptor as hsa
 from dsm.net.handshake_gate import (
     GateKeys,
@@ -52,9 +58,10 @@ def _no_so_mark() -> Iterator[None]:
 
 @pytest.fixture
 def fast_retries() -> Iterator[None]:
-    """A timer resend after about 0.2 s instead of 5 s."""
+    """A timer resend after about 1 s instead of 5 s: far enough that a
+    stalled test machine still sees the resend at once come first."""
     with (
-        patch.object(handshake, "HANDSHAKE_TIMEOUT", 0.2),
+        patch.object(handshake, "HANDSHAKE_TIMEOUT", 1.0),
         patch.object(handshake, "BACKOFF_BASE", 0.01),
     ):
         yield
@@ -81,6 +88,33 @@ class _Recording(UDPTransport):
         return data, addr
 
     async def send(self, data: bytes, addr: Addr) -> None:
+        self.sent.append(bytes(data))
+        await super().send(data, addr)
+
+
+class _LateCookie(UDPTransport):
+    """The server's socket: sends a cookie reply to msg1 just before its
+    second frame, the bootstrap reply, as if the network had held it back."""
+
+    def __init__(self, gate: HandshakeGate) -> None:
+        super().__init__()
+        self._gate = gate
+        self._msg1: bytes | None = None
+        self.sent: list[bytes] = []
+
+    async def recv(self, timeout: float | None = None) -> tuple[bytes, Addr]:
+        data, addr = await super().recv(timeout)
+        if self._msg1 is None:
+            self._msg1 = bytes(data)
+        return data, addr
+
+    async def send(self, data: bytes, addr: Addr) -> None:
+        if len(self.sent) == 1:
+            assert self._msg1 is not None
+            reply = self._gate.cookie_reply(self._msg1, addr)
+            assert reply is not None
+            self.sent.append(reply)
+            await super().send(reply, addr)
         self.sent.append(bytes(data))
         await super().send(data, addr)
 
@@ -266,10 +300,61 @@ async def test_a_reply_sealed_for_another_mac1_is_read_as_msg2() -> None:
         reply = gate.cookie_reply(bytes(other), peer)
         assert reply is not None
         await server_t.send(reply, peer)
-        with pytest.raises(HandshakeError):
+        with pytest.raises(HandshakeError, match="read msg2"):
             await asyncio.wait_for(attempt, 10.0)
     finally:
         attempt.cancel()
         await asyncio.gather(attempt, return_exceptions=True)
         await client_t.aclose()
         await server_t.aclose()
+
+
+async def test_a_late_cookie_reply_in_the_bootstrap_wait_is_skipped() -> None:
+    # A cookie reply that arrives after msg2 is not the bootstrap reply.
+    ca = make_test_ca()
+    server = make_enrolled_device(ca, subject_cn=SERVER_CN, eku=SERVER_AUTH_OID)
+    device = make_enrolled_device(ca, subject_cn=CLIENT_CN)
+    server_t = _LateCookie(HandshakeGate(GateKeys.derive(ca.certificate, SERVER_CN)))
+    client_t, addr = await _pair(server_t)
+    serve = asyncio.ensure_future(
+        server_handshake(
+            server_t,
+            server.identity,
+            attest_key=server.attest_key,
+            cert_der=server.cert_der,
+            ca_root=ca.certificate,
+            cn_allowlist=CNAllowlist(cns=frozenset({CLIENT_CN})),
+        )
+    )
+    try:
+        result = await asyncio.wait_for(_client(ca, device, client_t, addr), 30.0)
+        session_keys, _client_pub = await asyncio.wait_for(serve, 30.0)
+    finally:
+        serve.cancel()
+        await asyncio.gather(serve, return_exceptions=True)
+        await client_t.aclose()
+        await server_t.aclose()
+    assert result[0] is not None
+    assert session_keys is not None
+    assert len(server_t.sent) == 3  # msg2, the late cookie reply, bootstrap reply
+
+
+async def test_an_empty_server_cn_is_a_handshake_error() -> None:
+    # The gate keys need a CN; callers still see one error type.
+    ca = make_test_ca()
+    device = make_enrolled_device(ca, subject_cn=CLIENT_CN)
+    sock = UDPTransport()
+    await sock.bind("127.0.0.1", 0)
+    try:
+        with pytest.raises(HandshakeError, match="gate keys could not be made"):
+            await client_handshake(
+                sock,
+                device.identity,
+                ("127.0.0.1", 9),
+                attest_key=device.attest_key,
+                cert_der=device.cert_der,
+                ca_root=ca.certificate,
+                expected_server_cn="",
+            )
+    finally:
+        await sock.aclose()
