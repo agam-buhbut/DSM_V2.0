@@ -33,7 +33,6 @@ from dsm.crypto.auth_loader import (
     verify_cert_matches_identity,
 )
 from dsm.crypto.keystore import KeyStore
-from dsm.net._addresses import SERVER_TUN_IP
 from dsm.net.nftables import (
     NFTablesManager,
     PreHandshakeKillSwitch,
@@ -630,7 +629,7 @@ async def run_client(
                     return _End.FAILED
                 if handshake is None:
                     return _End.FAILED  # the user stopped DSM first
-                session_keys, _handshake_hash, server_static_pub = handshake
+                session_keys, _handshake_hash, server_static_pub, tunnel = handshake
 
                 fsm.transition(State.ESTABLISHED)
 
@@ -680,13 +679,19 @@ async def run_client(
                 tun = TunDevice(config.tun_name)
                 tun.open()
                 try:
-                    tun.configure(mtu=config.mtu)
+                    # Wire v2: the address and the prefix come from the
+                    # server's last handshake frame, not a built-in default.
+                    tun.configure(
+                        local_ip=str(tunnel.client),
+                        netmask=tunnel.prefix_len,
+                        mtu=config.mtu,
+                    )
                     nft = NFTablesManager(
                         server_ip, config.server_port, config.tun_name
                     )
                     nft.apply()
                     try:
-                        resolv = ResolvConfManager(nameserver=SERVER_TUN_IP)
+                        resolv = ResolvConfManager(nameserver=str(tunnel.server))
                         resolv.apply()
                     except ResolvConfError:
                         if not first_try:

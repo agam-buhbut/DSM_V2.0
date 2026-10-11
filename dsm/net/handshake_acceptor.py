@@ -75,6 +75,7 @@ from typing import TYPE_CHECKING, Any
 
 from dsm.core.log import RepeatLog
 from dsm.crypto.handshake import HANDSHAKE_FRAME_SIZE
+from dsm.net._addresses import SINGLE_CLIENT_TUNNEL, TunnelAssignment
 from dsm.net.handshake_gate import HandshakeGate, Msg1Verdict, SourceLimiter
 from dsm.net.transport.tcp import FramingError, TCPTransport
 from dsm.net.transport.udp import UDPTransport
@@ -270,14 +271,17 @@ async def _run_handshake_worker(
     )
 
     attempt: object = asyncio.current_task() or object()
-    admit_client: Callable[[VerifiedClient], None] | None = None
+    admit_client: Callable[[VerifiedClient], TunnelAssignment] | None = None
     if slot is not None:
         run_slot = slot
 
-        def _admit(client: VerifiedClient) -> None:
+        def _admit(client: VerifiedClient) -> TunnelAssignment:
             if winner.done():
                 raise ClientRefusedError("another client already won this accept")
             run_slot.admit(attempt, client, session_live=session_live)
+            # One client at a time: it always gets the same address. A server
+            # with several clients picks one per CN here (spec §24).
+            return SINGLE_CLIENT_TUNNEL
 
         admit_client = _admit
 

@@ -54,6 +54,7 @@ from dsm.crypto.attest import (
 from dsm.crypto.cert import CertError
 from dsm.crypto.cert_allowlist import CNAllowlist
 from dsm.crypto.crl import CRL, CRLError
+from dsm.net._addresses import SINGLE_CLIENT_TUNNEL, TunnelAssignment
 from dsm.net.transport.tcp import TCPTransport
 from dsm.net.transport.udp import UDPTransport
 
@@ -83,9 +84,14 @@ MSG1_WAIT_TIMEOUT = 30.0
 # returns only the ciphertext+tag.
 HANDSHAKE_FRAME_SIZE = 1400
 
-# Bootstrap exchange: plaintext is a 32-byte X25519 public key.
+# Bootstrap init (client to server): a 32-byte X25519 public key;
 # NoiseTransport.encrypt(32) -> 32 + 16 (GCM tag) = 48 bytes.
 BOOTSTRAP_CIPHERTEXT_SIZE = 32 + 16
+
+# Bootstrap reply (server to client, wire v2): the server's 32-byte X25519
+# public key and the client's 9-byte tunnel assignment = 41 bytes, + 16 (GCM
+# tag) = 57. Fixed length, no version byte: changing it is a new wire version.
+BOOTSTRAP_REPLY_CIPHERTEXT_SIZE = 32 + TunnelAssignment.SIZE + 16
 
 # Bytes [0:32] of msg1 are the client's Noise ephemeral key. A client that
 # hears no msg2 resends msg1, and the copy can reach the server while it
@@ -185,6 +191,41 @@ def _unpad_from_frame(blob: bytes, expected_size: int) -> bytes:
     return bytes(blob[:expected_size])
 
 
+def _tunnel_field(tunnel: object) -> bytes:
+    """The 9 tunnel-address bytes of the bootstrap reply.
+
+    Raises:
+        ValueError: ``admit_client`` gave something that is not a valid
+            ``TunnelAssignment``: a bug, and nothing is sent.
+    """
+    if not isinstance(tunnel, TunnelAssignment):
+        raise ValueError(
+            "admit_client must return a TunnelAssignment, "
+            f"not {type(tunnel).__name__}"
+        )
+    return tunnel.to_bytes()
+
+
+def _read_bootstrap_reply(plaintext: bytes) -> tuple[bytes, TunnelAssignment]:
+    """Split the bootstrap reply into the server's key and the tunnel.
+
+    Raises:
+        HandshakeError: the reply is the wrong size or the tunnel fails the
+            client's checks. Peer bytes never escape as ``ValueError``.
+    """
+    expected = 32 + TunnelAssignment.SIZE
+    if len(plaintext) != expected:
+        raise HandshakeError(
+            "server sent a bad tunnel address: the reply holds "
+            f"{len(plaintext)} bytes, not {expected}"
+        )
+    try:
+        tunnel = TunnelAssignment.from_bytes(plaintext[32:])
+    except ValueError as e:
+        raise HandshakeError(f"server sent a bad tunnel address: {e}") from e
+    return plaintext[:32], tunnel
+
+
 _NoiseT = TypeVar("_NoiseT")
 
 
@@ -266,7 +307,7 @@ async def client_handshake(
     required_server_eku: ObjectIdentifier | None = None,
     rotation_packets: int | None = None,
     rotation_seconds: int | None = None,
-) -> tuple[tuncore.SessionKeyManager, bytes, bytes]:
+) -> tuple[tuncore.SessionKeyManager, bytes, bytes, TunnelAssignment]:
     """Perform Noise XX handshake as initiator (client).
 
     msg1 carries the server gate's mac1 (wire v2), made from ``ca_root`` and
@@ -274,10 +315,12 @@ async def client_handshake(
     the client resends the same msg1 with mac2 at once, at most
     ``MAX_COOKIE_REPLIES`` times, within the same retry budget.
 
-    Returns ``(session_keys, handshake_hash, server_static_pub)``.
+    Returns ``(session_keys, handshake_hash, server_static_pub, tunnel)``.
     ``server_static_pub`` is the 32-byte X25519 Noise static recovered
     from msg2 and used by the caller for the M-BUG-1 mutual-rekey
-    tie-break.
+    tie-break. ``tunnel`` is the client's place in the tunnel from the
+    bootstrap reply (wire v2): the caller sets its TUN address and DNS
+    server from it.
 
     Args:
         transport: UDPTransport or TCPTransport.
@@ -297,7 +340,8 @@ async def client_handshake(
             cert (typically id-kp-serverAuth).
 
     Returns:
-        (SessionKeyManager, handshake_hash) on success.
+        (SessionKeyManager, handshake_hash, server_static_pub,
+        TunnelAssignment) on success.
 
     Raises:
         HandshakeError on transport/protocol failure, or when the gate
@@ -478,13 +522,13 @@ async def client_handshake(
     # the server's legitimate response is the only one that lands here.
     _pin_source(transport, bs_addr, server_addr, "bootstrap response")
     bootstrap_resp_ct = _unpad_from_frame(
-        bootstrap_resp_frame, BOOTSTRAP_CIPHERTEXT_SIZE
+        bootstrap_resp_frame, BOOTSTRAP_REPLY_CIPHERTEXT_SIZE
     )
-    server_public = _translate_noise_errors(
+    reply = _translate_noise_errors(
         "decrypt bootstrap response", lambda: noise_transport.decrypt(bootstrap_resp_ct)
     )
-    if len(server_public) != 32:
-        raise HandshakeError("invalid bootstrap ephemeral from server")
+    # Checked before any session key is made: a bad field fails the attempt.
+    server_public, tunnel = _read_bootstrap_reply(bytes(reply))
 
     session_keys = _translate_noise_errors(
         "bootstrap key derivation (client)",
@@ -512,8 +556,8 @@ async def client_handshake(
     )
     # Return the server's Noise static pub too so
     # the data path can plumb it into DataPathContext for the
-    # mutual-rekey tie-break.
-    return session_keys, handshake_hash, bytes(server_static)
+    # mutual-rekey tie-break, and the tunnel address.
+    return session_keys, handshake_hash, bytes(server_static), tunnel
 
 
 async def server_handshake(
@@ -529,7 +573,7 @@ async def server_handshake(
     client_addr: tuple[str, int] | None = None,
     rotation_packets: int | None = None,
     rotation_seconds: int | None = None,
-    admit_client: Callable[[VerifiedClient], None] | None = None,
+    admit_client: Callable[[VerifiedClient], TunnelAssignment] | None = None,
 ) -> tuple[tuncore.SessionKeyManager, bytes]:
     """Perform Noise XX handshake as responder (server).
 
@@ -538,7 +582,10 @@ async def server_handshake(
     CRL). It runs once, after the client's bootstrap frame is read and
     checked, and before the bootstrap reply, the last handshake frame, is
     made and sent. It may raise :class:`ClientRefusedError`; then no reply
-    goes out and no session keys are made. Without it nothing changes.
+    goes out and no session keys are made. It returns the client's tunnel
+    address, which goes into the bootstrap reply (wire v2); without a hook
+    every client gets ``SINGLE_CLIENT_TUNNEL``. A value that is not a valid
+    ``TunnelAssignment`` raises ``ValueError`` (a bug) and nothing is sent.
 
     Returns:
         (SessionKeyManager, client_static_pubkey)
@@ -548,6 +595,7 @@ async def server_handshake(
         CertAuthError / CNNotAllowedError / CertRevokedError on cert
             policy failure.
         ClientRefusedError when ``admit_client`` refuses the client.
+        ValueError when ``admit_client`` returns a bad value.
     """
     import tuncore
 
@@ -660,17 +708,22 @@ async def server_handshake(
         raise HandshakeError("invalid bootstrap ephemeral from client")
 
     # The caller's last say, after every check passed and before the last
-    # frame: once the reply is out, the client thinks it is connected.
+    # frame: once the reply is out, the client thinks it is connected. The
+    # hook also picks the client's tunnel address (wire v2).
+    tunnel: object = SINGLE_CLIENT_TUNNEL
     if admit_client is not None:
-        admit_client(
+        tunnel = admit_client(
             VerifiedClient(cn=client_cert.subject_cn, noise_static=client_static)
         )
+    tunnel_field = _tunnel_field(tunnel)
 
     server_ephemeral = tuncore.BootstrapEphemeral.generate()
     bootstrap_resp_ct = bytes(
-        noise_transport.encrypt(bytes(server_ephemeral.public_key_bytes))
+        noise_transport.encrypt(bytes(server_ephemeral.public_key_bytes) + tunnel_field)
     )
-    bootstrap_resp_frame = _pad_to_frame(bootstrap_resp_ct, BOOTSTRAP_CIPHERTEXT_SIZE)
+    bootstrap_resp_frame = _pad_to_frame(
+        bootstrap_resp_ct, BOOTSTRAP_REPLY_CIPHERTEXT_SIZE
+    )
     await _send(transport, bootstrap_resp_frame, addr)
 
     session_keys = _translate_noise_errors(

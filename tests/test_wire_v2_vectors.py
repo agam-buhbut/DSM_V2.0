@@ -1,16 +1,19 @@
 """Interop vectors (wire v2 spec §16.3), Python side: VM1 (the gate's keys
-and MACs) and VC1 (the cookie reply seal, through tuncore and through the
-gate); Task 10 adds VT1. The Rust tests check VH1, VP1, VK1, VR1 and VC1. A
-future client (the Android replacement) must reproduce all of them.
-Laptop: VM1 only (old wheel and shim). The two VC1 tests need tuncore's
-xchacha_seal from the Task 5 wheel; CI checks them.
+and MACs), VC1 (the cookie reply seal, through tuncore and through the
+gate) and VT1 (the bootstrap reply's tunnel field). The Rust tests check
+VH1, VP1, VK1, VR1 and VC1. A future client (the Android replacement) must
+reproduce all of them.
+Laptop: VM1 and VT1 only (old wheel and shim). The two VC1 tests need
+tuncore's xchacha_seal from the Task 5 wheel; CI checks them.
 """
 
 from __future__ import annotations
 
+import ipaddress
 import os
 
 import tuncore
+from dsm.net._addresses import TunnelAssignment
 from dsm.net.handshake_gate import (
     GateKeys,
     HandshakeGate,
@@ -70,3 +73,13 @@ def test_vc1_through_the_gate() -> None:
     assert reply is not None
     assert reply[:24] == NONCE
     assert reply[24:56].hex() == SEALED
+
+
+def test_vt1_tunnel_field() -> None:
+    a = ipaddress.IPv4Address
+    home = TunnelAssignment(client=a("10.8.0.2"), server=a("10.8.0.1"), prefix_len=24)
+    other = TunnelAssignment(
+        client=a("172.16.5.9"), server=a("172.16.5.1"), prefix_len=20
+    )
+    assert home.to_bytes().hex() == "0a0800020a08000118"
+    assert other.to_bytes().hex() == "ac100509ac10050114"
