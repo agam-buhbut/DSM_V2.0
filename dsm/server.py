@@ -41,7 +41,12 @@ from dsm.net.handshake_acceptor import (
 # isort: split
 # Its own statement too: isort would merge it into the one above.
 from dsm.net.handshake_acceptor import SessionWatch, Winner
-from dsm.net.handshake_gate import SourceLimiter
+from dsm.net.handshake_gate import (
+    GateKeyError,
+    HandshakeGate,
+    SourceLimiter,
+    server_gate_keys,
+)
 from dsm.net.nftables import ServerRateLimitManager, TcpTimestampsDisabler
 from dsm.net.session_slot import SessionSlot
 from dsm.net.transport.tcp import TCPListener, TCPTransport
@@ -142,6 +147,7 @@ async def _accept_one_session(
     limiter: SourceLimiter,
     listener: TCPListener,
     slot: SessionSlot,
+    gate: HandshakeGate | None = None,
 ) -> tuple[
     tuncore.SessionKeyManager | None,
     bytes | None,
@@ -154,8 +160,8 @@ async def _accept_one_session(
     as UDP. The listener was opened once at start and stays open, also while
     the session runs (the in-session accept reads the same queue). The FSM
     is expected to be in ``CONNECTING`` on entry. ``transport_obj`` is the
-    previous session's connection, or None; it is closed first. ``limiter``
-    and ``slot`` are the run's.
+    previous session's connection, or None; it is closed first. ``limiter``,
+    ``slot`` and ``gate`` are the run's.
 
     Returns:
         ``(session_keys, client_pub, transport)`` on success, where
@@ -178,6 +184,7 @@ async def _accept_one_session(
         process_shutdown,
         limiter,
         slot,
+        gate,
     )
     if session_keys is None:
         _drive_fsm_to_idle(fsm)
@@ -194,6 +201,7 @@ def _start_watch(
     listener: TCPListener | None,
     limiter: SourceLimiter,
     slot: SessionSlot,
+    gate: HandshakeGate,
 ) -> SessionWatch:
     """Start the accept that runs while the next session is live: on the
     run's UDP socket, or on the run's one TCP listener."""
@@ -207,6 +215,7 @@ def _start_watch(
             cn_allowlist,
             limiter,
             slot,
+            gate,
             udp=transport_obj,
         )
     assert listener is not None
@@ -218,6 +227,7 @@ def _start_watch(
         cn_allowlist,
         limiter,
         slot,
+        gate,
         tcp=listener.connections,
     )
 
@@ -549,6 +559,16 @@ async def run_server(
         log.error("cert auth materials missing or invalid: %s", e)
         return 1
 
+    # The handshake gate's keys come from the CA certificate and this
+    # server's CN (wire v2): a client must know both before the server
+    # answers it at all. A certificate without one usable CN stops here,
+    # before any host state changes.
+    try:
+        gate_keys = server_gate_keys(materials)
+    except GateKeyError as e:
+        log.error("handshake gate keys could not be made: %s", e)
+        return 1
+
     if not config.allowed_cns_file:
         log.error(
             "server mode requires allowed_cns_file in config "
@@ -693,6 +713,9 @@ async def run_server(
         # Who holds the session and who may take it over. One for
         # the whole run, handed to every accept.
         slot = SessionSlot()
+        # The gate in front of new handshakes: mac1, cookies, the load rule.
+        # One for the whole run, handed to every accept, idle or in session.
+        gate = HandshakeGate(gate_keys)
 
         fsm.transition(State.CONNECTING)
 
@@ -734,6 +757,7 @@ async def run_server(
                             process_shutdown,
                             limiter,
                             slot,
+                            gate,
                         )
                         if session_keys is None:
                             # Shutdown during accept: leave HANDSHAKING so the
@@ -757,6 +781,7 @@ async def run_server(
                             limiter,
                             listener,
                             slot,
+                            gate,
                         )
                 except Exception:
                     # Anything raised by the accept (a bug, or the host out of
@@ -802,6 +827,7 @@ async def run_server(
                 listener,
                 limiter,
                 slot,
+                gate,
             )
             dns_clash: DNSProxyPortInUseError | None = None
             try:
