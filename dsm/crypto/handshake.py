@@ -65,6 +65,7 @@ log = logging.getLogger(__name__)
 # One for the whole module, so the count spans attempts: a peer that keeps
 # resending the same message does so across retries too.
 _skip_log = RepeatLog(log, logging.DEBUG)
+_late_cookie_log = RepeatLog(log, logging.DEBUG)
 
 HANDSHAKE_TIMEOUT = 5.0
 MAX_RETRIES = 3
@@ -457,11 +458,11 @@ async def client_handshake(
 
     async def _late_cookie_reply(frame: bytes, addr: tuple[str, int] | None) -> bool:
         # A cookie reply held back in the network can land after msg2. It is
-        # not the bootstrap reply: skip it like a copy of msg2, with the same
-        # log line and count, and no new resend of msg1.
+        # not the bootstrap reply: skip it (no new resend of msg1) and go on
+        # waiting, with its own DEBUG line.
         if _cookie_in(frame, addr) is None:
             return False
-        _skip_log.log("handshake: skipped a copy of an earlier handshake message")
+        _late_cookie_log.log("handshake: skipped a late cookie reply to our msg1")
         return True
 
     bootstrap_resp_frame, bs_addr = await _recv_with_retry(
@@ -746,7 +747,8 @@ async def _recv_one_skipping(
 ) -> tuple[bytes, tuple[str, int] | None]:
     """Like ``_recv_one``, but drops frames for which ``skip`` returns True
     and shows the rest to ``handle`` first: a frame it returns True for was
-    dealt with (a cookie reply, answered with a resend) and the wait goes on.
+    dealt with (a cookie reply: answered with a resend, or, once msg2 is in,
+    dropped) and the wait goes on.
 
     Neither restarts the wait: it still ends ``timeout`` seconds after it
     began. Raises ``TimeoutError`` like ``_recv_one``.
