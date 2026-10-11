@@ -206,6 +206,11 @@ $ timedatectl status | grep -E 'synchronized|NTP'
 # expect: "NTP service: active" and "System clock synchronized: yes"
 ```
 
+Since wire v2 a clock more than 5 minutes off can also make the server stay
+silent: the client's first message carries a code tied to the time. The
+client then logs `handshake failed: no answer after 3 tries. ...` and keeps
+trying.
+
 ## 1. Build
 
 The dsm process runs under `sudo` (CAP_NET_ADMIN + CAP_NET_BIND_SERVICE),
@@ -947,6 +952,7 @@ $ sudo python3 -m dsm --mode client \
 Expected client log lines (log_level = "info"), in order, within ~5 s:
 
 ```
+... client starting (wire v2)
 ... handshake complete (client) — server_cn=dsm-XXXXXXXX-server
 ... TUN mtun0 configured: 10.8.0.2/24 mtu=1360
 ... tunnel established
@@ -958,6 +964,9 @@ Expected client log lines (log_level = "info"), in order, within ~5 s:
                                                  (typical on cellular)
 ```
 
+The server hands the client this address in the handshake (today always
+10.8.0.2/24, with the server at 10.8.0.1).
+
 If the server cannot be reached, the client does not exit. It keeps all
 traffic blocked, logs `no tunnel: all traffic is blocked until DSM connects
 again; ...` and keeps trying (§7i).
@@ -966,11 +975,14 @@ Expected server log lines:
 
 ```
 ... CN allowlist loaded (1 entries)
-... server listening on UDP port 51820
+... server listening on UDP port 51820 (wire v2)
 ... DNS blocklist loaded: 72,525 names to block, 0 allowed (files read: 1, lines skipped: 13)
 ... handshake complete (server) — client_cn=dsm-XXXXXXXX-client
 ... client connected (noise_static=<first 16 hex>)
 ```
+
+With `transport = "tcp"` the line reads `server listening on TCP port 51820
+(wire v2)`.
 
 ## 6. Verification
 
@@ -984,6 +996,9 @@ $ ip addr show mtun0          # client: 10.8.0.2/24 (server: 10.8.0.1/24)
 $ ip rule                     # expect "10: not from all fwmark 0x1 lookup 100"
 $ ip route show table 100     # expect "default dev mtun0"
 ```
+
+The server hands the client this address in the handshake (today always
+10.8.0.2/24, with the server at 10.8.0.1).
 
 nftables tables (2 on the server, 2 on the client):
 
@@ -1345,6 +1360,40 @@ leaves it up; run `sudo dsm cleanup`.
   also removes it (DSM exits 1), and a `systemctl stop` sent while DSM
   waits to restart (after a crash or a signal sent straight to it) leaves
   it up; run `sudo dsm cleanup`.
+
+### 7j. Upgrade to wire v2 (once, server and clients together)
+
+Wire v2 changes the packet format and the handshake. Old and new builds do
+not talk to each other, so this is one switch for every box.
+
+1. On a machine with enough memory (not a small laptop), build the new wheel
+   (§1) and copy it to every box (§1a.1).
+2. Upgrade the server and restart it: `sudo systemctl restart dsm`. Its log
+   must show `server listening on UDP port 51820 (wire v2)` (with your port;
+   `TCP` if you set `transport = "tcp"`).
+3. Upgrade each client and restart it: `sudo systemctl restart dsm-client`.
+   Its log must show `client starting (wire v2)`, then `handshake complete`.
+
+In between:
+
+- A client not yet upgraded gets no answer from the new server. It keeps its
+  kill switch up and tries again (1, 2, 4 ... up to 30 s between tries),
+  forever. It has no internet until it is upgraded, and nothing leaks.
+  A new client facing an old server does the same and logs
+  `handshake failed: could not read the server's reply ...`.
+- To get a client's internet back before its upgrade: `sudo systemctl stop
+  dsm-client`. If the kill switch is still up after that (for example after
+  a crash), `sudo dsm cleanup` removes it; it also sets `net.ipv4.ip_forward`
+  to 0, which can break Docker or other routing on that host.
+- A `systemctl restart`, a crash or a reboot does not lift the block (§7i);
+  only a real `systemctl stop dsm-client` does.
+- A client on a build older than the fail-closed work still exits after a few
+  failed handshakes and then drops its kill switch: stop it on purpose before
+  the server upgrade, or upgrade it to current main first.
+
+Upgrade the server, then each client, soon after: every client is blocked
+from the server's upgrade until its own. To go back, install the old wheel
+on both ends, in the same order (another switch).
 
 ## 8. Single-Host Loopback Smoke Test
 
@@ -1792,8 +1841,8 @@ costs.
 ### 10d. UDP-blocked networks (some cellular / captive Wi-Fi)
 
 A few networks block outbound UDP except on port 443. If the UDP handshake
-never completes (the client logs "handshake recv timed out" — see §11),
-switch BOTH ends to the TCP transport:
+never completes (the client logs "handshake failed: no answer after 3
+tries" — see §11), switch BOTH ends to the TCP transport:
 
 ```toml
 transport = "tcp"
@@ -1892,8 +1941,30 @@ $ sed -n '<N>p' /opt/mtun/config.toml | cat -An
 Re-run the tomllib check after every edit; proceed only when it
 prints "ok".
 
-### "handshake recv timed out after 3 attempts" / "handshake failed: ..."
+### "handshake failed: no answer after 3 tries" / "handshake recv timed out after 3 attempts"
 
+- The server stays silent to a first message without a valid code (wire v2).
+  Check on the client: the CA file is the one that signed the server's
+  certificate, `expected_server_cn` is exactly the server certificate's name,
+  and the clock is within 5 minutes of the server's (§0f). The server's log
+  then shows, at INFO, at most once a minute:
+
+  ```
+  dropped a handshake start with a bad mac1 (wrong CA or CN, a clock more than 5 minutes off, a DSM client older than wire v2, or not a DSM client)
+  ```
+
+  A later line adds `(N more in the last T s)`. It shows with
+  `log_level = "info"` (the default), not with the `"warning"` that
+  `config.example.toml` sets. While a session runs, the same line can also
+  come from the live client's own 1400-byte packets that do not open: network
+  duplicates, packets too late for their key set, or a replay by someone on
+  the path. In that case it does not mean a config problem.
+- The client runs a build older than wire v2 and the server a newer one
+  (same INFO line on the server): upgrade the client (§7j).
+- `handshake recv timed out after 3 attempts` is the same wait at a later
+  step: the server answered the first message, but the last reply never came
+  (the link broke, or the server refused this client after its second
+  message; see the bullet about another client below).
 - Server actually down, or port blocked. Test plain UDP reachability:
 
   ```sh
@@ -1918,6 +1989,13 @@ prints "ok".
   says `handshake refused: another client is connected (client_cn=...)`
   (INFO). This client connects once the other session ends. One server
   serves one client at a time.
+
+### "handshake failed: could not read the server's reply. The server may run a different DSM wire version ..."
+
+- The server runs a build older than wire v2: its log has no `(wire v2)` in
+  the `server listening` line. Upgrade it (§7j).
+- `server_ip` / `server_port` point at something that is not your DSM
+  server.
 
 ### Server log shows "handshake rejected (CNNotAllowedError): client CN '...' not in allowlist"
 
@@ -2111,20 +2189,22 @@ not with the `"warning"` that `config.example.toml` sets.
 A healthy client should not cause these lines, but a client with a config
 error may cause a few on its early retries. A few lines while someone scans
 or floods the port are normal. A refused UDP packet gets no answer; a
-refused TCP connection is closed at once. A UDP packet of the wrong size
-from a new address is dropped before these checks and logs nothing at INFO
-(DEBUG only). Devices behind one home router share one address: if several
-of them connect to this server at the same moment, some may need their next
-retry. These lines never show the address, and each reason is logged at
-most once every 10 s, with a count.
+refused TCP connection is closed at once. A UDP packet from a new address
+that is not 1400 bytes, or has no valid mac1 (wire v2), is dropped before
+these checks: the first logs nothing at INFO (DEBUG only), the second only
+the `bad mac1` line (§11). Devices behind one home router share one address:
+if several of them connect to this server at the same moment, some may need
+their next retry. These lines never show the address, and each reason is
+logged at most once every 10 s, with a count.
 
 If a client that works is refused for a long time with "already has 2
-running", someone may be targeting its address. Over UDP, a sender that
-fakes source addresses and knows the client's public IP can keep that
-address at 2 running with one full-size junk packet about every 6 s. The
-refusal ends at most 12 s after that stops. Four real addresses can also
-hold all 8 slots (UDP or TCP). Part 2 of the handshake hardening, with
-cookies that prove the address, closes the spoofed case.
+running", someone may be targeting its address. Since wire v2 a sender that
+fakes source addresses can no longer do this over UDP: its packets are
+dropped before these limits unless it has the CA certificate and the
+server's name, and once a handshake is running it also needs a cookie, which
+goes to the address it fakes. Four real addresses can still hold all 8 slots
+(UDP or TCP). Over TCP they need no key: a connection takes its slot before
+its first frame is checked, and keeps it until the 12 s cutoff.
 
 With `transport = "tcp"` the server keeps its one listening socket open for
 the whole run, also while a session runs, so a silent connection does not

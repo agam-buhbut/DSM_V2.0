@@ -8,6 +8,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Breaking: wire v2.** Old and new builds do not talk to each other:
+  upgrade the server, then every client (deploy/GUIDE.md §7j). What changes:
+  - The first 16 bytes of every data packet (the packet number, the key
+    number and the nonce counter) are encrypted with a header key, one per
+    direction, new at every key change. A watcher can no longer read packet
+    numbers, loss or key changes, or link flows by them. Packet sizes do not
+    change. Junk is now refused for the price of two AES blocks.
+  - The server answers a handshake only when its first message carries a
+    valid code made from the CA certificate and the server's name, within a
+    5-minute clock window; anything else gets silence. Under load the server
+    first sends a cookie reply, and the client proves its address with it
+    (over TCP there are no cookies). Spoofed addresses can no longer hold
+    handshake slots; the exception is the one slot an idle server gives
+    without a cookie to a sender that has the CA certificate and the
+    server's name (SECURITY.md). Server INFO line, once a minute: `dropped a
+    handshake start with a bad mac1 (...)`.
+  - The Noise prologue is version 2. A client facing an older server logs
+    `handshake failed: could not read the server's reply. The server may run
+    a different DSM wire version ...`; no answer at all gives
+    `handshake failed: no answer after 3 tries. Check ...`. Both ends say
+    `(wire v2)` when they start.
+  - The last handshake message tells the client its tunnel address and DNS
+    server; the client no longer assumes 10.8.0.2 and 10.8.0.1 (the server
+    still sends exactly those).
 - A client that crashes and starts again is back within seconds instead of
   about 65 s. That wait applied over UDP, or to a TCP connection left half
   open: over TCP a killed client's connection closes at once, and that
@@ -152,6 +176,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SO_REUSEADDR`. Before, another program on the same machine, even
   without special rights, could bind the same port and get the server's
   packets instead of DSM.
+- The AES round keys of the data keys (and the new header keys) are now
+  wiped from memory when dropped (the `aes` crate's `zeroize` feature was
+  off, so an older comment claimed more than was done). The GHASH key inside
+  the GCM state, which cannot decrypt, is still not wiped.
 
 ### Fixed
 - Packets sent into the tunnel at a steady beat of about 0.1 or 0.2 s

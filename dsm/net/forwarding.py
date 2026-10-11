@@ -10,7 +10,8 @@ The server's data path is:
 Both pieces are off by default on Linux:
   * ``net.ipv4.ip_forward`` defaults to 0 (no forwarding).
   * Without MASQUERADE, replies are addressed to the client's TUN IP
-    (10.8.0.2/24) which is not routable on the public internet.
+    (today always 10.8.0.2/24: one client) which is not routable on the
+    public internet.
 
 This module owns enabling those two for the duration of the server
 session, and reverting on teardown.

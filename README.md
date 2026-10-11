@@ -135,6 +135,11 @@ passes. Another client waits until the session ends. Over UDP the server
 locks onto the first peer address that passes authentication. A session
 ends cleanly with a SESSION_CLOSE packet.
 
+The server tells the client its address inside the tunnel, and its own
+(which is also the client's DNS server), in the last handshake message.
+Today that is always 10.8.0.2 for the client and 10.8.0.1 for the server,
+with a /24 prefix.
+
 ### Reliability
 
 - The handshake is retried with growing waits (exponential backoff):
@@ -207,9 +212,27 @@ The MTU is the largest packet a link can carry.
 
 - The handshake uses the Noise XX pattern (X25519 + AES-256-GCM + SHA-256).
 - Its prologue (a fixed tag that both sides mix into the handshake) is
-  `"DSM\x00\x01\x00\x01"`.
+  `"DSM\x00\x02\x00\x01"`: wire version 2. Builds of different wire
+  versions refuse each other at the handshake.
 - Every handshake message is padded to 1400 bytes, so they all have the
   same size.
+- Before it answers at all, the server checks a short code (mac1) in the
+  client's first message. Only a device that has the CA certificate and
+  knows the server's name can make it, so the server stays silent to
+  scanners and random probes. The code changes every 5 minutes, so the two
+  clocks must be within 5 minutes of each other, or the server stays
+  silent.
+- When the server is busy (a handshake is running, or one failed or was
+  turned away in the last 30 seconds), it first answers with a cookie: a
+  code tied to the client's address. The client sends its first message
+  again with a second code (mac2) made from the cookie. This proves the
+  client can receive at its address, so spoofed addresses cannot take
+  handshake slots. (One exception: when no handshake is running and none
+  failed lately, the first one needs no cookie, so one slot can be taken
+  without it.) Over TCP there are no cookies: TCP already proves the
+  address.
+- mac1 and the cookie are a filter, not a login: the certificates, the name
+  allowlist and the CRL still decide who gets in.
 - Each side sends a CA-signed device certificate inside the Noise XX
   msg2/msg3 payload. It is an X.509 certificate: an ECDSA P-256 leaf signed
   by an internal P-384 CA.
@@ -252,8 +275,11 @@ The MTU is the largest packet a link can carry.
 ### Encryption
 
 Packets are encrypted with AES-256-GCM, an AEAD (encryption that also detects
-tampering). The sequence number is the AAD: it is sent unencrypted, but any
-change to it is detected.
+tampering). The packet number (seq) is the AAD. Since wire v2 it is no longer
+sent in the clear: the first 16 bytes of every packet (the seq, the key number
+and the nonce counter) are one AES block under a separate header key, one per
+direction, new at every key change. A watcher sees random-looking bytes and
+cannot read packet numbers, loss or key changes from them.
 
 ### Nonce Strategy
 
@@ -265,13 +291,18 @@ A nonce is a number that must never repeat under the same key.
 - The epoch part keeps nonces from different key changes apart.
 - When the counter runs out, it is poisoned: it returns None from then on.
   So even a session that somehow ran past 2^32 packets cannot reuse a nonce.
+- On the wire the epoch and the counter are hidden inside the encrypted
+  header; only the 4 random bytes are sent as they are.
 
 ### Replay Protection
 
-A 128-bit sliding window (a bitmap of recently seen packet numbers) catches
-replayed packets. During the grace period, each epoch has its own window. The
-window is checked before decryption and updated only after the packet passes
-authentication.
+The receiver first decrypts the header block with its current and its
+previous header key and runs the AEAD only for the key set whose epoch
+matches, so junk costs two AES blocks and no AEAD. Each key set has a 128-bit
+sliding window (a bitmap of recently seen packet numbers), checked during the
+decrypt and updated only after the packet passes authentication. A second
+window over the whole session then drops a packet 128 or more behind the
+newest, also across key changes.
 
 ### Key Storage
 
@@ -454,8 +485,6 @@ server:
   their pauses only roughly match how fast real senders speed up, so a
   watcher who sees many climbs from you might still tell them apart by
   statistics;
-- the packet counter at the start of every packet. It is not encrypted, and
-  it links your traffic across port changes. (A fix is planned.)
 - anything from someone who watches both your link and your server's own
   internet traffic. Your real busy periods line up with what your server
   sends out, so they can filter out decoys and the wait before idle. With
@@ -766,6 +795,13 @@ the offline CA), `dsm.service` (the systemd unit), and
 `dsm-blocklist-update.sh` with its `.service` and `.timer` (the daily DNS
 block list download).
 
+### Upgrading to wire v2
+
+Wire v2 changes the packet format and the handshake. Old and new builds do
+not talk to each other. Upgrade the server first, then each client soon
+after: until a client is upgraded it keeps its kill switch up and has no
+internet. The steps are in `deploy/GUIDE.md` §7j.
+
 ## Logging
 
 The default is `log_level = "info"`. It shows the main lifecycle lines
@@ -831,9 +867,6 @@ Open items:
   and add remote attestation (TPM quotes). Then a peer can check that the
   key really lives in a TPM, not just that the signature is valid. Today's
   backend proves residency locally but produces no quote.
-- Header protection: encrypt the packet counter and key epoch at the start
-  of every packet, which are sent in the clear today. This changes the wire
-  format.
 - Phase 2B: a real-network demo on two physical Linux machines across two
   ISPs (a server on home Wi-Fi, a client on cellular). The steps are in
   `deploy/GUIDE.md` §9. Once the strace audit step there is done,

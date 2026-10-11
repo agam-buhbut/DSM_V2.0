@@ -76,12 +76,17 @@ closed as known:
 - **Traffic-analysis limits.** DSM's tier shaper sends packets at a steady
   rate that only changes in a few fixed steps, so a watcher sees which step
   you are on, not your real traffic. It does not hide everything: the step
-  itself shows roughly how much you send; the packet counter at the start of
-  every packet is not encrypted and links your traffic across port changes;
-  someone who watches both your connection and your server's internet side
-  can line up your real busy periods; and in TCP mode the TCP connection
-  itself stays visible. Perfect hiding from someone who can watch the whole
-  internet is not promised.
+  itself shows roughly how much you send; someone who watches both your
+  connection and your server's internet side can line up your real busy
+  periods; and in TCP mode the TCP connection itself stays visible. Perfect
+  hiding from someone who can watch the whole internet is not promised.
+- **The handshake gate is a filter, not a lock (wire v2).** Anyone with the
+  CA certificate and the server's name can make a valid mac1, and a captured
+  first message stays valid for up to 15 minutes. Such a sender gets the
+  server's answer (its certificate), can take the one handshake slot an idle
+  server gives without a cookie, or can use up the cookie-reply budget (20 a
+  second) so a real client waits for its cookie. Who gets in is unchanged:
+  the certificates, the name allowlist and the CRL decide.
 - **Slow-link auto cap.** Anyone who can congest the path for a few
   seconds, so that 5% or more of your packets are lost, can lower your top
   tier for minutes. They need no place on the path: flooding a link on the
