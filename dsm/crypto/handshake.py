@@ -418,16 +418,31 @@ async def client_handshake(
         return True
 
     msg2, recv_addr = await _recv_with_retry(
-        transport, retransmit=_retransmit_msg1, handle=_cookie_reply
+        transport,
+        retransmit=_retransmit_msg1,
+        handle=_cookie_reply,
+        gave_up=(
+            f"no answer after {MAX_RETRIES} tries. Check the server address "
+            "and port, expected_server_cn and the CA file, the clock (within "
+            f"5 minutes), and that the server runs DSM wire v{tuncore.WIRE_VERSION}."
+        ),
     )
     _pin_source(transport, recv_addr, server_addr, "msg2")
 
     # Snapshot the handshake hash that signs msg2's binding *before*
     # read_message_2 advances the Noise state past it.
     binding_hash_for_msg2 = bytes(initiator.get_handshake_hash())
-    server_static_raw, server_attest_payload = _translate_noise_errors(
-        "read msg2", lambda: initiator.read_message_2(msg2)
-    )
+    try:
+        server_static_raw, server_attest_payload = initiator.read_message_2(msg2)
+    except RuntimeError as e:
+        # Different prologues (another wire version) or not DSM at all both
+        # look like this: Noise cannot read the reply.
+        log.debug("read msg2 failed: %s", e)
+        raise HandshakeError(
+            "could not read the server's reply. The server may run a different "
+            f"DSM wire version (this build: wire v{tuncore.WIRE_VERSION}), or "
+            "this is not your DSM server."
+        ) from e
     server_static = bytes(server_static_raw)
 
     # Verify server attestation: cert chain → CA, binding → server_static,

@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 from dsm.core.config import Config
 from dsm.core.fsm import ProtocolError, SessionFSM, State
 from dsm.core.preflight import check_clock_sync
-from dsm.core.protocol import PacketType, ReassemblyBuffer
+from dsm.core.protocol import WIRE_VERSION, PacketType, ReassemblyBuffer
 from dsm.crypto.attest_store import AttestStore
 from dsm.crypto.auth_loader import (
     AuthMaterialsError,
@@ -697,7 +697,11 @@ async def run_server(
                 )
                 return 1
             stack.push_async_callback(transport_obj.aclose)
-            log.info("server listening on UDP port %d", config.listen_port)
+            log.info(
+                "server listening on UDP port %d (wire v%d)",
+                config.listen_port,
+                WIRE_VERSION,
+            )
         else:
             try:
                 listener = await _open_tcp_listener(config)
@@ -705,7 +709,11 @@ async def run_server(
                 log.error("%s; exiting", e)
                 return 1
             stack.callback(listener.close)
-            log.info("server listening on TCP port %d", config.listen_port)
+            log.info(
+                "server listening on TCP port %d (wire v%d)",
+                config.listen_port,
+                WIRE_VERSION,
+            )
 
         # Limits on starting handshake attempts, per source address and
         # overall. One for the whole run, so they hold across accept cycles.

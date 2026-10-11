@@ -25,7 +25,7 @@ from dsm.core.fsm import SessionFSM, State
 from dsm.core.log import RepeatLog
 from dsm.core.path_security import check_user_file_permissions
 from dsm.core.preflight import check_clock_sync
-from dsm.core.protocol import ReassemblyBuffer
+from dsm.core.protocol import WIRE_VERSION, ReassemblyBuffer
 from dsm.crypto.attest_store import AttestStore
 from dsm.crypto.auth_loader import (
     AuthMaterialsError,
@@ -352,6 +352,10 @@ async def run_client(
 
     if not harden_and_gate(config):
         return 1
+
+    # Old and new wire versions refuse each other (spec §8); the log says
+    # which one this build speaks.
+    log.info("client starting (wire v%d)", WIRE_VERSION)
 
     # Cert auth materials must load BEFORE we touch any host state, so a
     # missing cert file aborts cleanly with no rules / no TUN created.

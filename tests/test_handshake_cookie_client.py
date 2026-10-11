@@ -300,7 +300,7 @@ async def test_a_reply_sealed_for_another_mac1_is_read_as_msg2() -> None:
         reply = gate.cookie_reply(bytes(other), peer)
         assert reply is not None
         await server_t.send(reply, peer)
-        with pytest.raises(HandshakeError, match="read msg2"):
+        with pytest.raises(HandshakeError, match="could not read the server's reply"):
             await asyncio.wait_for(attempt, 10.0)
     finally:
         attempt.cancel()
