@@ -14,21 +14,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     number and the nonce counter) are encrypted with a header key, one per
     direction, new at every key change. A watcher can no longer read packet
     numbers, loss or key changes, or link flows by them. Packet sizes do not
-    change. Junk is now refused for the price of two AES blocks.
+    change. Junk is now refused for the price of two AES blocks (two quick
+    decryptions of 16 bytes each).
   - The server answers a handshake only when its first message carries a
-    valid code made from the CA certificate and the server's name, within a
-    5-minute clock window; anything else gets silence. Under load the server
-    first sends a cookie reply, and the client proves its address with it
-    (over TCP there are no cookies). Spoofed addresses can no longer hold
-    handshake slots; the exception is the one slot an idle server gives
+    valid code (mac1) made from the CA certificate and the server's name,
+    within a 5-minute clock window; anything else gets silence. Under load
+    the server first sends a cookie reply (a code tied to the client's
+    address), and the client sends its first message again with a second
+    code made from it, which proves its address (over TCP there are no
+    cookies). A sender that only fakes addresses can no longer hold
+    handshake slots. Two exceptions: the one slot an idle server gives
     without a cookie to a sender that has the CA certificate and the
-    server's name (SECURITY.md). Server INFO line, once a minute: `dropped a
-    handshake start with a bad mac1 (...)`.
-  - The Noise prologue is version 2. A client facing an older server logs
-    `handshake failed: could not read the server's reply. The server may run
-    a different DSM wire version ...`; no answer at all gives
-    `handshake failed: no answer after 3 tries. Check ...`. Both ends say
-    `(wire v2)` when they start.
+    server's name (SECURITY.md); and someone on the path can replay a
+    captured first message from the same address for 2 to 4 minutes (it
+    could also just drop packets). Server INFO line, once a minute: `dropped
+    a handshake start with a bad mac1 (...)`.
+  - The Noise prologue (a fixed tag both sides mix into the handshake, so
+    builds with different tags cannot finish one) is version 2. A client
+    facing an older server logs `handshake failed: could not read the
+    server's reply. The server may run a different DSM wire version ...`; no
+    answer at all gives `handshake failed: no answer after 3 tries. Check
+    ...`. Both ends say `(wire v2)` when they start.
   - The last handshake message tells the client its tunnel address and DNS
     server; the client no longer assumes 10.8.0.2 and 10.8.0.1 (the server
     still sends exactly those).

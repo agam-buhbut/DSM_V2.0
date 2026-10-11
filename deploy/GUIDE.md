@@ -2202,12 +2202,15 @@ running", someone may be targeting its address. Since wire v2 a sender that
 fakes source addresses can no longer do this over UDP: its packets are
 dropped before these limits unless it has the CA certificate and the
 server's name, and once a handshake is running it also needs a cookie, which
-goes to the address it fakes. Four real addresses can still hold all 8 slots
-(UDP or TCP). Over TCP they need no key: a connection takes its slot before
-its first frame is checked, and keeps it until the 12 s cutoff.
+goes to the address it fakes. Someone on the path can still replay a
+captured first message from the same address for 2 to 4 minutes (the cookie
+covers the address, not the message); that sender could also just drop
+packets. Four real addresses can still hold all 8 slots (UDP or TCP). Over
+TCP they need no key: a connection takes its slot before its first frame is
+checked, and keeps it until the 12 s cutoff.
 
 With `transport = "tcp"` the server keeps its one listening socket open for
-the whole run, also while a session runs, so a silent connection does not
+the whole run, also while a session runs, so one silent connection does not
 hold up other clients and a client that comes back can take its session
 over. It keeps at most 2 connections per address and closes each one that
 has not finished its handshake after 12 s.

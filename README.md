@@ -219,18 +219,21 @@ The MTU is the largest packet a link can carry.
 - Before it answers at all, the server checks a short code (mac1) in the
   client's first message. Only a device that has the CA certificate and
   knows the server's name can make it, so the server stays silent to
-  scanners and random probes. The code changes every 5 minutes, so the two
-  clocks must be within 5 minutes of each other, or the server stays
-  silent.
+  scanners and random probes. The code changes every 5 minutes, and the
+  server also accepts the one before and the one after. So the two clocks
+  must be within 5 minutes of each other; a little more may still pass, but
+  10 minutes or more never does.
 - When the server is busy (a handshake is running, or one failed or was
   turned away in the last 30 seconds), it first answers with a cookie: a
   code tied to the client's address. The client sends its first message
   again with a second code (mac2) made from the cookie. This proves the
-  client can receive at its address, so spoofed addresses cannot take
-  handshake slots. (One exception: when no handshake is running and none
-  failed lately, the first one needs no cookie, so one slot can be taken
-  without it.) Over TCP there are no cookies: TCP already proves the
-  address.
+  client can receive at its address, so a sender that only fakes addresses
+  cannot take handshake slots. (Two exceptions. When no handshake is running
+  and none failed lately, the first one needs no cookie, so one slot can be
+  taken without it. And someone on the path can replay a captured first
+  message, with its second code, from the same address for 2 to 4 minutes;
+  that sender could also just drop packets.) Over TCP there are no cookies:
+  TCP already proves the address.
 - mac1 and the cookie are a filter, not a login: the certificates, the name
   allowlist and the CRL still decide who gets in.
 - Each side sends a CA-signed device certificate inside the Noise XX
