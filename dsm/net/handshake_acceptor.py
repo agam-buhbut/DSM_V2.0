@@ -14,9 +14,10 @@ DNS proxy, one socket), and the acceptor runs in two places:
   and the others are cancelled.
 * While a session runs (:class:`SessionWatch`): over UDP the live
   session still reads every datagram first and hands over each one it
-  cannot use (did not open, or already seen); over TCP the run's one
-  listener stays open and the watch reads its queue. A client that passes
-  the full handshake and the run's
+  cannot use (did not open, which under wire v2 includes a replay and a
+  packet too late for its key set, or opened but too far behind the
+  newest); over TCP the run's one listener stays open and the watch reads
+  its queue. A client that passes the full handshake and the run's
   :class:`~dsm.net.session_slot.SessionSlot` (the live session's CN, so the
   same client coming back) ends the session and becomes the next one.
   Another client is refused before the last handshake frame.
@@ -30,6 +31,15 @@ DNS proxy, one socket), and the acceptor runs in two places:
   nothing but the socket, so no source can pause routing for the others.
   In a session it reads the live session's leftovers through an
   :class:`_IntakeView` instead.
+* With the run's :class:`~dsm.net.handshake_gate.HandshakeGate` (wire v2),
+  a new UDP source's 1400-byte frame must also carry a valid mac1, and,
+  under load, a mac2 from a cookie: the demux answers a missing cookie with
+  a cookie reply and keeps no state. A TCP connection's first frame must be
+  1400 bytes with a valid mac1 (no cookies: TCP already proves the
+  address). A bad mac1 is dropped silently and counted in one INFO line a
+  minute. A failed or refused attempt, and a start the pool or the limits
+  refuse, turn cookies on for 30 s. Without a gate (tests only) nothing of
+  this is checked.
 * Workers run under a semaphore of ``config.max_inflight_handshakes``, each
   with a hard per-attempt deadline. With the run's slot, a client that
   passed every check also needs the slot's yes before the last frame.
@@ -65,7 +75,7 @@ from typing import TYPE_CHECKING, Any
 
 from dsm.core.log import RepeatLog
 from dsm.crypto.handshake import HANDSHAKE_FRAME_SIZE
-from dsm.net.handshake_gate import SourceLimiter
+from dsm.net.handshake_gate import HandshakeGate, Msg1Verdict, SourceLimiter
 from dsm.net.transport.tcp import FramingError, TCPTransport
 from dsm.net.transport.udp import UDPTransport
 
@@ -105,6 +115,46 @@ def _emit_handshake_failure(err: Exception) -> None:
     )
 
 
+def _note_trouble(gate: HandshakeGate | None) -> None:
+    """An attempt failed or a start was refused: cookies on for 30 s."""
+    if gate is not None:
+        gate.load.note_trouble()
+
+
+async def _send_cookie_reply(
+    transport: UDPTransport, reply: bytes, addr: tuple[str, int]
+) -> None:
+    """Send a cookie reply. A send error drops it: the client resends msg1."""
+    try:
+        await transport.send(reply, addr)
+    except OSError as e:
+        log.debug("cookie reply not sent (%s)", type(e).__name__)
+
+
+class _FirstFrameTCP(TCPTransport):
+    """One TCP connection whose first frame was already read to check its
+    mac1. ``recv()`` gives that frame back once, then reads the connection.
+    ``__init__`` skips the base initializer: only ``recv`` and ``send`` are
+    ever called on a view.
+    """
+
+    def __init__(  # pylint: disable=super-init-not-called
+        self, real: TCPTransport, first: bytes
+    ) -> None:
+        self._real = real
+        self._first: bytes | None = first
+
+    async def recv(self, timeout: float | None = None) -> bytes:
+        first = self._first
+        if first is not None:
+            self._first = None
+            return first
+        return await self._real.recv(timeout)
+
+    async def send(self, data: bytes) -> None:
+        await self._real.send(data)
+
+
 # Per-attempt deadline (s): room for one lost-and-retransmitted message within
 # server_handshake's own retry budget, while capping how long one bogus msg1
 # can hold a worker slot.
@@ -128,9 +178,10 @@ _MAX_INBOXES = 4096
 # Shutdown/winner check cadence (s), matching the data loop's recv cadence.
 _ACCEPT_DEMUX_POLL = 0.1
 
-# Packets the live session cannot use (did not open, or already seen),
-# waiting for the in-session accept. Every handshake frame is 1400 bytes, so
-# about 90 KB. When it is full a packet is dropped, like loss on the link.
+# Packets the live session cannot use (did not open, or opened but too far
+# behind the newest), waiting for the in-session accept. Every handshake
+# frame is 1400 bytes, so about 90 KB. When it is full a packet is dropped,
+# like loss on the link.
 _INTAKE_FRAMES = 64
 
 
@@ -186,6 +237,7 @@ async def _run_handshake_worker(
     who: str,
     slot: SessionSlot | None = None,
     session_live: bool = False,
+    gate: HandshakeGate | None = None,
 ) -> None:
     """Run one handshake attempt under the per-attempt deadline.
 
@@ -200,6 +252,10 @@ async def _run_handshake_worker(
     handshake frame; ``session_live`` says whether a session runs now. The
     worker's own task is its mark in the slot, so the accept can tell which
     attempt passed and must not be cancelled.
+
+    With ``gate`` (wire v2), a TCP connection's first frame must be 1400
+    bytes with a valid mac1 before anything else happens (no cookies on
+    TCP), and every failure counts as trouble.
     """
     from cryptography.x509.oid import ExtendedKeyUsageOID
 
@@ -232,6 +288,15 @@ async def _run_handshake_worker(
             # while its signature still runs in a thread. Here the handshake
             # runs in this task, so its own wait for that thread holds.
             async with asyncio.timeout(_HANDSHAKE_ATTEMPT_DEADLINE):
+                if gate is not None and isinstance(transport, TCPTransport):
+                    # TCP gets no cookies (its own handshake proved the
+                    # address), but its first frame needs a valid mac1 before
+                    # anything is signed. Scanner noise, so not trouble.
+                    first = await transport.recv()
+                    if len(first) != HANDSHAKE_FRAME_SIZE or not gate.mac1_ok(first):
+                        log.debug("TCP handshake start dropped: wrong size or bad mac1")
+                        return
+                    transport = _FirstFrameTCP(transport, first)
                 session_keys, client_pub = await server_handshake(
                     transport,
                     keystore.identity,
@@ -246,6 +311,7 @@ async def _run_handshake_worker(
                     admit_client=admit_client,
                 )
         except TimeoutError:
+            _note_trouble(gate)
             log.info(
                 "handshake attempt from %s exceeded %.0fs deadline — slot reclaimed",
                 who,
@@ -253,6 +319,7 @@ async def _run_handshake_worker(
             )
             return
         except ClientRefusedError as e:
+            _note_trouble(gate)
             # The slot logged why, rate-limited and without an address; one
             # line per attempt here would repeat it.
             log.debug("handshake refused by the session rules: %s", e)
@@ -264,6 +331,7 @@ async def _run_handshake_worker(
             CertAuthError,
             HandshakeError,
         ) as e:
+            _note_trouble(gate)
             # Same opaque INFO/WARNING logging as before; detail at DEBUG.
             if isinstance(e, (CNNotAllowedError, CertRevokedError, CertAuthError)):
                 log.warning("handshake rejected (cert auth) from %s", who)
@@ -273,6 +341,7 @@ async def _run_handshake_worker(
             _emit_handshake_failure(e)
             return
         except (FramingError, OSError) as e:
+            _note_trouble(gate)
             # A bad length prefix, a reset or an early close on this connection.
             log.info("handshake transport error (%s)", type(e).__name__)
             # Never str(e): asyncio's OSError text can carry addresses. The class
@@ -350,6 +419,7 @@ async def _demux_loop(
     *,
     slot: SessionSlot | None = None,
     session_live: bool = False,
+    gate: HandshakeGate | None = None,
 ) -> None:
     """Route datagrams from the real socket to per-source inboxes.
 
@@ -361,7 +431,9 @@ async def _demux_loop(
     losers.
 
     ``slot`` and ``session_live`` go to each worker; ``session_live`` also
-    makes each new start need the limiter's in-session budget.
+    makes each new start need the limiter's in-session budget. ``gate``
+    (wire v2) checks mac1, and under load mac2, right after the size check,
+    before any slot.
     """
     # (inboxes stays the 11th positional parameter: a test wraps this
     # function and reads it by position.)
@@ -401,12 +473,29 @@ async def _demux_loop(
             size_drops.log("dropped a new-source datagram of the wrong size")
             continue
 
+        # Wire v2: mac1, and under load a cookie, before any slot or state.
+        # In a session this is also what drops the live client's own
+        # full-size packets that did not open (duplicates, replays): the
+        # intake hands them over like any new source's.
+        if gate is not None:
+            verdict = gate.check_msg1(
+                data, addr, under_load=gate.load.under_load(len(workers))
+            )
+            if verdict is Msg1Verdict.NEED_COOKIE:
+                reply = gate.cookie_reply(data, addr)
+                if reply is not None:
+                    await _send_cookie_reply(transport, reply, addr)
+                continue
+            if verdict is Msg1Verdict.DROP:
+                continue
+
         # New source without a free slot: drop it. A genuine client's msg1
         # retransmit gets in once a slot frees.
         if semaphore.locked():
             log.debug(
                 "handshake pool saturated — dropping new-source frame from %s", addr
             )
+            _note_trouble(gate)
             continue
         if len(inboxes) >= _MAX_INBOXES:
             log.warning(
@@ -415,6 +504,7 @@ async def _demux_loop(
                 _MAX_INBOXES,
                 addr,
             )
+            _note_trouble(gate)
             continue
         # Never waits: the pool has a free slot (checked above).
         await semaphore.acquire()
@@ -423,6 +513,7 @@ async def _demux_loop(
         # slot and the address are always given back.
         if not limiter.try_start(addr[0], in_session=session_live):
             semaphore.release()
+            _note_trouble(gate)
             continue
 
         new_inbox: asyncio.Queue[bytes] = asyncio.Queue(maxsize=_PER_PEER_INBOX_FRAMES)
@@ -457,6 +548,7 @@ async def _demux_loop(
                 who=str(addr),
                 slot=slot,
                 session_live=session_live,
+                gate=gate,
             )
         )
         task.add_done_callback(_end_attempt)
@@ -572,6 +664,7 @@ async def _accept_round(
     slot: SessionSlot | None = None,
     session_live: bool = False,
     on_winner: Callable[[tuple[str, int]], None] | None = None,
+    gate: HandshakeGate | None = None,
 ) -> tuple[
     tuple[tuncore.SessionKeyManager, bytes, tuple[str, int]] | None, list[bytes]
 ]:
@@ -611,6 +704,7 @@ async def _accept_round(
             limiter,
             slot=slot,
             session_live=session_live,
+            gate=gate,
         )
     )
     try:
@@ -655,6 +749,7 @@ async def _accept_until_winner(  # pyright: ignore[reportUnusedFunction]  # used
     process_shutdown: asyncio.Event,
     limiter: SourceLimiter | None = None,
     slot: SessionSlot | None = None,
+    gate: HandshakeGate | None = None,
 ) -> tuple[
     tuncore.SessionKeyManager | None,
     bytes | None,
@@ -668,7 +763,9 @@ async def _accept_until_winner(  # pyright: ignore[reportUnusedFunction]  # used
     shutdown arrives first. Production passes the run's one
     :class:`SourceLimiter` and :class:`SessionSlot`, so the limits and the
     session rules hold across accepts; without a limiter this call makes its
-    own, and without a slot every authenticated client may win.
+    own, and without a slot every authenticated client may win; production
+    also passes the run's one :class:`HandshakeGate` (without it, no mac1
+    check: tests only).
     """
     if limiter is None:
         limiter = SourceLimiter()
@@ -682,6 +779,7 @@ async def _accept_until_winner(  # pyright: ignore[reportUnusedFunction]  # used
         process_shutdown,
         limiter,
         slot=slot,
+        gate=gate,
     )
     if win is None:
         return None, None, transport_obj
@@ -705,6 +803,7 @@ async def _tcp_admit_loop(
     *,
     slot: SessionSlot | None = None,
     session_live: bool = False,
+    gate: HandshakeGate | None = None,
 ) -> None:
     """Admit queued TCP connections until a winner is set.
 
@@ -712,7 +811,8 @@ async def _tcp_admit_loop(
     the pool is full or ``limiter`` refuses its address; otherwise it takes a
     slot and a worker. ``open_conns`` and ``workers`` belong to the caller.
 
-    ``slot`` and ``session_live`` work as in :func:`_demux_loop`.
+    ``slot`` and ``session_live`` work as in :func:`_demux_loop`. ``gate``
+    goes to each worker, which checks the connection's first frame.
     """
     while not winner.done():
         conn, peer = await connections.get()
@@ -721,6 +821,7 @@ async def _tcp_admit_loop(
             return
         if semaphore.locked():
             _tcp_full_log.log("handshake pool saturated — closing a new TCP connection")
+            _note_trouble(gate)
             conn.close()
             continue
         # TCP gives each open connection its own peer address; this check
@@ -735,6 +836,7 @@ async def _tcp_admit_loop(
         # awaits, so the slot and the address are always given back.
         if not limiter.try_start(peer[0], in_session=session_live):
             semaphore.release()
+            _note_trouble(gate)
             conn.close()
             continue
         open_conns[peer] = conn
@@ -768,6 +870,7 @@ async def _tcp_admit_loop(
                 who="a TCP client",
                 slot=slot,
                 session_live=session_live,
+                gate=gate,
             )
         )
         task.add_done_callback(_end_attempt)
@@ -785,6 +888,7 @@ async def _accept_until_winner_tcp(  # pyright: ignore[reportUnusedFunction]  # 
     process_shutdown: asyncio.Event,
     limiter: SourceLimiter | None = None,
     slot: SessionSlot | None = None,
+    gate: HandshakeGate | None = None,
     *,
     session_live: bool = False,
     on_winner: Callable[[tuple[str, int]], None] | None = None,
@@ -803,8 +907,10 @@ async def _accept_until_winner_tcp(  # pyright: ignore[reportUnusedFunction]  # 
     connection, or ``(None, None, None)`` when ``process_shutdown`` is set
     first (the process shutdown for the idle accept, the session's end for
     the in-session one). Every other connection handed over, including any
-    still queued, is closed before return. ``slot``, ``session_live`` and
-    ``on_winner`` work as in :func:`_accept_round`.
+    still queued, is closed before return. ``slot``, ``session_live``,
+    ``on_winner`` and ``gate`` work as in :func:`_accept_round`. ``gate``
+    comes right after ``slot`` and may be passed by position: the server
+    does, and its test stand-ins take no keywords.
     """
     if limiter is None:
         limiter = SourceLimiter()
@@ -833,6 +939,7 @@ async def _accept_until_winner_tcp(  # pyright: ignore[reportUnusedFunction]  # 
             limiter,
             slot=slot,
             session_live=session_live,
+            gate=gate,
         )
     )
     try:
@@ -880,10 +987,11 @@ class _IntakeView(UDPTransport):
     """The live session's leftovers, seen by the demux as a UDP socket.
 
     ``recv()`` reads the intake that the live session fills with packets it
-    cannot use (did not open, or already seen). ``send()`` goes out on the
-    run's real socket, so msg2 and the bootstrap reply leave from the
-    server's one UDP port, as in the idle accept. ``__init__`` skips the base
-    initializer: only ``recv`` and ``send`` are ever called on a view.
+    cannot use (did not open, or opened but too far behind the newest).
+    ``send()`` goes out on the run's real socket, so msg2, the bootstrap
+    reply and a cookie reply leave from the server's one UDP port, as in the
+    idle accept. ``__init__`` skips the base initializer: only ``recv`` and
+    ``send`` are ever called on a view.
     """
 
     def __init__(  # pylint: disable=super-init-not-called
@@ -922,14 +1030,15 @@ class SessionWatch:
     The server makes one right before each session (it starts at once) and
     calls :meth:`stop` after the session ended. UDP (``udp=`` the run's
     socket): the live session hands over each packet it cannot use (did not
-    open, or already seen) through :attr:`offer`; the demux, workers, pool,
-    limits and deadline are the idle accept's. TCP (``tcp=`` the run's
-    listener queue): the idle accept's TCP machinery on the run's one
-    listener. A client that passes the full handshake and the slot's rules
-    sets :attr:`end_session`, so the live session stops, and :meth:`stop`
-    hands it over as the next session's peer. A crash here (a bug) is logged
-    once; the session runs on and just cannot be replaced until it ends
-    (TCP: each new connection is closed at once until :meth:`stop`).
+    open, or opened but too far behind the newest) through :attr:`offer`;
+    the demux, workers, pool, limits and deadline are the idle accept's.
+    TCP (``tcp=`` the run's listener queue): the idle accept's TCP machinery
+    on the run's one listener. A client that passes the full handshake and
+    the slot's rules sets :attr:`end_session`, so the live session stops,
+    and :meth:`stop` hands it over as the next session's peer. A crash here
+    (a bug) is logged once; the session runs on and just cannot be replaced
+    until it ends (TCP: each new connection is closed at once until
+    :meth:`stop`). ``gate`` is the run's :class:`HandshakeGate` (wire v2).
     """
 
     def __init__(
@@ -941,6 +1050,7 @@ class SessionWatch:
         cn_allowlist: CNAllowlist,
         limiter: SourceLimiter,
         slot: SessionSlot,
+        gate: HandshakeGate | None = None,
         *,
         udp: UDPTransport | None = None,
         tcp: asyncio.Queue[tuple[TCPTransport, tuple[str, int]]] | None = None,
@@ -971,6 +1081,7 @@ class SessionWatch:
                 udp,
                 limiter,
                 slot,
+                gate,
             )
         elif tcp is not None:
             work = self._accept_tcp(
@@ -982,12 +1093,13 @@ class SessionWatch:
                 tcp,
                 limiter,
                 slot,
+                gate,
             )
         else:
             raise ValueError("SessionWatch needs udp= or tcp=")
         # UDP: give the watch each packet the live session cannot use (did
-        # not open, or already seen; run_data_loops' ``unauthenticated``).
-        # None for TCP.
+        # not open, or opened but too far behind the newest; run_data_loops'
+        # ``unauthenticated``). None for TCP.
         self.offer: Callable[[bytes, tuple[str, int], bool], None] | None = (
             self._offer if udp is not None else None
         )
@@ -1005,6 +1117,7 @@ class SessionWatch:
         real: UDPTransport,
         limiter: SourceLimiter,
         slot: SessionSlot,
+        gate: HandshakeGate | None,
     ) -> Winner | None:
         win, held = await _accept_round(
             config,
@@ -1018,6 +1131,7 @@ class SessionWatch:
             slot=slot,
             session_live=True,
             on_winner=self._won,
+            gate=gate,
         )
         if win is None:
             return None
@@ -1035,6 +1149,7 @@ class SessionWatch:
         connections: asyncio.Queue[tuple[TCPTransport, tuple[str, int]]],
         limiter: SourceLimiter,
         slot: SessionSlot,
+        gate: HandshakeGate | None,
     ) -> Winner | None:
         session_keys, client_pub, conn = await _accept_until_winner_tcp(
             config,
@@ -1046,6 +1161,7 @@ class SessionWatch:
             self._stop,
             limiter,
             slot,
+            gate=gate,
             session_live=True,
             on_winner=self._won,
         )
@@ -1084,8 +1200,10 @@ class SessionWatch:
     def _offer(self, data: bytes, addr: tuple[str, int], seen: bool) -> None:
         """Take one packet the live session cannot use. Never raises.
 
-        ``seen`` is True when the session's replay window rejected the packet
-        as already seen or too old, and False when it did not open.
+        ``seen`` is True when the packet opened and the session-wide replay
+        window then refused it (128 or more behind the newest), and False
+        when it did not open. Under wire v2 a replay, and a packet too late
+        for its key set, do not open: they come with ``seen`` False.
         """
         intake = self._intake
         if intake is None:
@@ -1099,10 +1217,12 @@ class SessionWatch:
                 return
         elif seen or len(data) != HANDSHAKE_FRAME_SIZE or self._task.done():
             # Before a winner only a full handshake frame can start or feed an
-            # attempt. A seen packet is the live client's own (a handshake
-            # frame starts with 8 random bytes, never a seen sequence number),
-            # so it costs no signature and no budget. After a crash nothing
-            # reads the intake.
+            # attempt. A seen packet opened under the session's keys and was
+            # then refused by the session-wide replay window: the live
+            # client's own, so it costs no signature and no budget. A
+            # full-size packet that did not open (a duplicate, a replay)
+            # goes on and is dropped at mac1. After a crash nothing reads the
+            # intake.
             return
         try:
             intake.put_nowait((data, addr))
