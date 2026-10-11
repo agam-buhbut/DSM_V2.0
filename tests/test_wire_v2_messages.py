@@ -15,7 +15,6 @@ import pytest
 
 from dsm.crypto import handshake
 from dsm.crypto.handshake import HandshakeError, client_handshake
-from dsm.net.handshake_gate import GateKeys
 from dsm.net.transport.udp import UDPTransport
 from dsm.server import run_server
 from tests.cert_helpers import make_enrolled_device, make_test_ca
@@ -50,6 +49,17 @@ class _Answering(UDPTransport):
             self._recv_queue.put_nowait((self._reply, addr))
 
 
+class _Listener:
+    """A TCP listener that only needs to close."""
+
+    def close(self) -> None:
+        pass
+
+
+async def _never(*_a: Any, **_k: Any) -> tuple[Any, Any, Any]:
+    raise AssertionError("this accept must not run")
+
+
 async def _attempt(sock: UDPTransport) -> None:
     ca = make_test_ca()
     device = make_enrolled_device(ca, subject_cn="dsm-msg-client")
@@ -71,6 +81,7 @@ async def test_a_reply_the_client_cannot_read_names_the_wire_version() -> None:
     with pytest.raises(HandshakeError) as err:
         await _attempt(sock)
     assert str(err.value) == UNREADABLE
+    assert isinstance(err.value.__cause__, RuntimeError)
 
 
 async def test_no_answer_says_what_to_check() -> None:
@@ -93,17 +104,37 @@ async def test_the_server_says_wire_v2_when_it_starts(
         args[6].set()  # process_shutdown: stop right away
         return None, None, args[5]
 
-    with (
-        _base_patches(_accept, captured),
-        patch(
-            "dsm.server.server_gate_keys",
-            return_value=GateKeys(mac1_key=bytes(32), cookie_key=bytes(32)),
-        ),
-    ):
+    with _base_patches(_accept, captured):
         rc = await run_server(replace(_server_config(), dns_blocklist=False))
     assert rc == 0
     lines = [r.getMessage() for r in caplog.records]
     assert "server listening on UDP port 51820 (wire v2)" in lines
+
+
+async def test_the_server_says_wire_v2_when_it_starts_on_tcp(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="dsm")
+    captured: dict[str, Any] = {}
+
+    async def _listener(_config: Any) -> _Listener:
+        return _Listener()
+
+    async def _accept(*_a: Any) -> tuple[None, None, None]:
+        captured["event"].set()  # process_shutdown: stop right away
+        return None, None, None
+
+    with (
+        _base_patches(_never, captured),
+        patch("dsm.server._open_tcp_listener", _listener),
+        patch("dsm.server._accept_one_session", _accept),
+    ):
+        rc = await run_server(
+            replace(_server_config(), dns_blocklist=False, transport="tcp")
+        )
+    assert rc == 0
+    lines = [r.getMessage() for r in caplog.records]
+    assert "server listening on TCP port 51820 (wire v2)" in lines
 
 
 async def test_the_client_says_wire_v2_when_it_starts(

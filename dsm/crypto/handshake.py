@@ -437,7 +437,7 @@ async def client_handshake(
     except RuntimeError as e:
         # Different prologues (another wire version) or not DSM at all both
         # look like this: Noise cannot read the reply.
-        log.debug("read msg2 failed: %s", e)
+        log.debug("the server's reply did not open: %s", e)
         raise HandshakeError(
             "could not read the server's reply. The server may run a different "
             f"DSM wire version (this build: wire v{tuncore.WIRE_VERSION}), or "
