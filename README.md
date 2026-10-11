@@ -322,8 +322,10 @@ newest, also across key changes.
   enrolling again. On `dev-soft-attest` the key is sealed on disk with
   Argon2id under the same passphrase.
 - Argon2id settings: 512 MiB of memory, 4 iterations, parallelism 2.
-- Keys are locked in memory (mlock) while in use, so they are not swapped to
-  disk.
+- Key bytes are locked in memory (mlock) while in use, so they are not
+  swapped to disk. The AES round keys made from them are not: they sit in
+  normal memory, and the first two of them are the key itself. On a machine
+  with swap, use encrypted swap or none.
 - Keys are wiped in a single pass when they are dropped, using the Rust
   zeroize crate.
 - Core dumps are turned off at startup (setrlimit RLIMIT_CORE).
