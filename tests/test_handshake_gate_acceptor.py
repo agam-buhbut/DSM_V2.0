@@ -2,7 +2,10 @@
 §3.16 tests 9, 11-14 and 22). The Noise handshake is a scripted fake, as in
 test_handshake_acceptor_limits.py; the gate, the limiter and the slot are
 real; clocks are frozen. No sockets; nothing waits on the wall clock.
-Laptop: yes (old wheel; the shim's XChaCha).
+Laptop: partly (old wheel and shim). The shim has no XChaCha, so the tests
+that send or open a cookie reply (spoofed starts, the reply cap under a
+flood, one address with many ports, a replayed msg1) need tuncore's
+xchacha_seal and xchacha_open from the Task 5 wheel and run in CI.
 """
 
 from __future__ import annotations
@@ -240,6 +243,23 @@ async def test_a_replayed_msg1_takes_one_slot_and_the_client_still_gets_in() -> 
     assert script.started == [replayer, REAL]
 
 
+async def test_a_failed_attempt_turns_cookies_on_for_30_s() -> None:
+    # Spec §7.4, T10 §3.5: trouble puts the server under load for 30 s.
+    clock = _Frozen()
+    gate = _gate(clock)
+    failer: Addr = ("203.0.113.5", 5005)
+    script = _Script({failer: "fail"})
+    async with _Accept(script, gate) as run:
+        run.feed(_msg1(1), failer)
+        assert await _spin(lambda: script.ended == [failer])
+        await _yield()
+        assert gate.load.under_load(0)
+        clock.now = 29.9
+        assert gate.load.under_load(0)
+        clock.now = 30.0
+        assert not gate.load.under_load(0)
+
+
 class _TcpScript:
     """Fake server_handshake for TCP: reads the first frame, then wins."""
 
@@ -301,6 +321,51 @@ async def test_tcp_asks_no_cookie_even_under_load() -> None:
         _, pub, _ = await _tcp_accept(gate, [good])
     assert pub == b"pub-tcp"
     assert good.sent == []
+
+
+@pytest.mark.parametrize(
+    ("max_inflight", "peers"),
+    [
+        # The third connection from one address: 2 per address at most.
+        (8, [("203.0.113.8", 1), ("203.0.113.8", 2), ("203.0.113.8", 3)]),
+        # The second connection: the pool of 1 is full.
+        (1, [("203.0.113.8", 1), ("203.0.113.9", 2)]),
+    ],
+)
+async def test_a_refused_tcp_start_is_trouble(
+    max_inflight: int, peers: list[Addr]
+) -> None:
+    # Spec §7.4, T10 §3.5: a start the limits or the pool refuse is trouble.
+    gate = _gate()
+    conns = [_Conn(peer) for peer in peers]  # no frames: workers wait on recv
+    connections: asyncio.Queue[tuple[TCPTransport, Addr]] = asyncio.Queue()
+    shutdown = asyncio.Event()
+    with patch("dsm.crypto.handshake.server_handshake", new=_TcpScript()):
+        task = asyncio.ensure_future(
+            hsa._accept_until_winner_tcp(
+                _Config(max_inflight),
+                _Stub(),
+                _Stub(),
+                _Stub(),
+                _Stub(),
+                connections,
+                shutdown,
+                SourceLimiter(clock=_minutes()),
+                None,
+                gate,
+            )
+        )
+        for conn in conns[:-1]:
+            connections.put_nowait((conn, conn.peer))
+        await _yield()
+        assert not gate.load.under_load(0)
+        refused = conns[-1]
+        connections.put_nowait((refused, refused.peer))
+        assert await _spin(lambda: refused.closed)
+        assert gate.load.under_load(0)
+        shutdown.set()
+        assert await asyncio.wait_for(task, 5.0) == (None, None, None)
+    assert refused.sent == []
 
 
 async def test_full_size_packets_the_session_cannot_open_are_dropped_at_mac1(
