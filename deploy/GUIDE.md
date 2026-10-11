@@ -1996,6 +1996,10 @@ prints "ok".
   the `server listening` line. Upgrade it (§7j).
 - `server_ip` / `server_port` point at something that is not your DSM
   server.
+- The same text also shows for any reply that cannot be read as the
+  server's second message: a late reply from an earlier attempt, or
+  damaged or forged bytes. If it shows once and the next try works, it was
+  not a version mismatch.
 
 ### Server log shows "handshake rejected (CNNotAllowedError): client CN '...' not in allowlist"
 
@@ -2202,12 +2206,16 @@ running", someone may be targeting its address. Since wire v2 a sender that
 fakes source addresses can no longer do this over UDP: its packets are
 dropped before these limits unless it has the CA certificate and the
 server's name, and once a handshake is running it also needs a cookie, which
-goes to the address it fakes. Someone on the path can still replay a
-captured first message from the same address for 2 to 4 minutes (the cookie
-covers the address, not the message); that sender could also just drop
-packets. Four real addresses can still hold all 8 slots (UDP or TCP). Over
-TCP they need no key: a connection takes its slot before its first frame is
-checked, and keeps it until the 12 s cutoff.
+goes to the address it fakes. Anyone who captured one client first message
+can replay it from any address for up to 15 minutes. An idle server (no
+cookie asked) answers it and gives it the one handshake slot such a server
+gives, which costs the server a signature. When the server is busy, it asks
+for a cookie, and then only a replay from the same address and port works,
+for 2 to 4 minutes (the cookie covers the address and port, not the
+message); that sender could also just drop packets. Four real addresses can
+still hold all 8 slots (UDP or TCP). Over TCP they need no key: a
+connection takes its slot before its first frame is checked, and keeps it
+until the 12 s cutoff.
 
 With `transport = "tcp"` the server keeps its one listening socket open for
 the whole run, also while a session runs, so one silent connection does not

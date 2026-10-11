@@ -25,8 +25,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     cookies). A sender that only fakes addresses can no longer hold
     handshake slots. Two exceptions: the one slot an idle server gives
     without a cookie to a sender that has the CA certificate and the
-    server's name (SECURITY.md); and someone on the path can replay a
-    captured first message from the same address for 2 to 4 minutes (it
+    server's name (SECURITY.md); and anyone who captured one client first
+    message can replay it from any address for up to 15 minutes (an idle
+    server answers it and gives it that one slot, which costs the server a
+    signature; a busy server asks for a cookie, and then only a replay from
+    the same address and port works, for 2 to 4 minutes, and that sender
     could also just drop packets). Server INFO line, once a minute: `dropped
     a handshake start with a bad mac1 (...)`.
   - The Noise prologue (a fixed tag both sides mix into the handshake, so
@@ -184,8 +187,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   packets instead of DSM.
 - The AES round keys of the data keys (and the new header keys) are now
   wiped from memory when dropped (the `aes` crate's `zeroize` feature was
-  off, so an older comment claimed more than was done). The GHASH key inside
-  the GCM state, which cannot decrypt, is still not wiped.
+  off, so an older comment claimed more than was done). Copies left behind
+  when the key structs are moved are not wiped. The GHASH key inside the
+  GCM state, which cannot decrypt, is still not wiped.
 
 ### Fixed
 - Packets sent into the tunnel at a steady beat of about 0.1 or 0.2 s

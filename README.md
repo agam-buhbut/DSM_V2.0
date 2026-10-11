@@ -230,10 +230,13 @@ The MTU is the largest packet a link can carry.
   client can receive at its address, so a sender that only fakes addresses
   cannot take handshake slots. (Two exceptions. When no handshake is running
   and none failed lately, the first one needs no cookie, so one slot can be
-  taken without it. And someone on the path can replay a captured first
-  message, with its second code, from the same address for 2 to 4 minutes;
-  that sender could also just drop packets.) Over TCP there are no cookies:
-  TCP already proves the address.
+  taken without it. And anyone who captured one client first message can
+  replay it from any address for up to 15 minutes: an idle server answers
+  it and gives it that one slot, which costs the server a signature. When
+  the server is busy, it asks for a cookie, and then only a replay from the
+  same address and port works, for 2 to 4 minutes; that sender could also
+  just drop packets.) Over TCP there are no cookies: TCP already proves the
+  address.
 - mac1 and the cookie are a filter, not a login: the certificates, the name
   allowlist and the CRL still decide who gets in.
 - Each side sends a CA-signed device certificate inside the Noise XX
