@@ -1,9 +1,12 @@
 """The client's side of the handshake gate (wire v2, spec §7.5; T10 §3.16
-tests 17-18): it stamps msg1, answers a cookie reply with the same e and a
-valid mac2, keeps the latest mac2 for its timer resends, gives up after two
-cookie replies, and reads a frame that is not a cookie reply as msg2. Real
-client_handshake over loopback UDP, against the real acceptor or a scripted
-server. Laptop: yes (old wheel + shim).
+tests 17-18): it stamps msg1, answers a cookie reply at once with the same e
+and a valid mac2, keeps the latest mac2 for its timer resends, gives up after
+two cookie replies, and reads a frame that is not a cookie reply as msg2.
+Real client_handshake over loopback UDP, against the real acceptor or a
+scripted server. Laptop: no (old wheel and shim). Every test here sends or
+opens a cookie reply, and the client tries each frame as one, so all of them
+need tuncore's xchacha_seal and xchacha_open from the Task 5 wheel and run in
+CI.
 """
 
 from __future__ import annotations
@@ -54,6 +57,13 @@ def fast_retries() -> Iterator[None]:
         patch.object(handshake, "HANDSHAKE_TIMEOUT", 0.2),
         patch.object(handshake, "BACKOFF_BASE", 0.01),
     ):
+        yield
+
+
+@pytest.fixture
+def slow_retries() -> Iterator[None]:
+    """No timer resend for 60 s, so a resend sooner is the one sent at once."""
+    with patch.object(handshake, "HANDSHAKE_TIMEOUT", 60.0):
         yield
 
 
@@ -181,6 +191,35 @@ async def test_a_timer_resend_after_a_cookie_carries_the_latest_mac2(
     assert resend[:48] == first[:48]
     assert resend[48:64] == compute_mac2(first[:48], cookie)
     assert timer_resend[:64] == resend[:64]
+
+
+async def test_the_client_resends_at_once_after_a_cookie_reply(
+    slow_retries: None,
+) -> None:
+    # Spec §7.5: "resend at once", not at the next timer resend. The timer
+    # is 60 s away here, so the 5 s wait fails if the client waits for it.
+    ca = make_test_ca()
+    device = make_enrolled_device(ca, subject_cn=CLIENT_CN)
+    keys = GateKeys.derive(ca.certificate, SERVER_CN)
+    gate = HandshakeGate(keys)
+    server_t = UDPTransport()
+    client_t, addr = await _pair(server_t)
+    attempt = asyncio.ensure_future(_client(ca, device, client_t, addr))
+    try:
+        first, peer = await asyncio.wait_for(server_t.recv(), 5.0)
+        reply = gate.cookie_reply(first, peer)
+        assert reply is not None
+        await server_t.send(reply, peer)
+        resend, _ = await asyncio.wait_for(server_t.recv(), 5.0)
+    finally:
+        attempt.cancel()
+        await asyncio.gather(attempt, return_exceptions=True)
+        await client_t.aclose()
+        await server_t.aclose()
+    cookie = open_cookie_reply(reply, keys, first[32:48])
+    assert cookie is not None
+    assert resend[:48] == first[:48]
+    assert resend[48:64] == compute_mac2(first[:48], cookie)
 
 
 async def test_a_third_cookie_reply_ends_the_attempt() -> None:
