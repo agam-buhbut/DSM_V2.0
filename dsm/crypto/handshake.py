@@ -299,7 +299,9 @@ async def client_handshake(
         (SessionKeyManager, handshake_hash) on success.
 
     Raises:
-        HandshakeError on transport/protocol failure.
+        HandshakeError on transport/protocol failure, or when the gate
+            keys cannot be made (an empty or too long
+            ``expected_server_cn``).
         CertAuthError on cert validation / CN policy / CRL failure.
     """
     import tuncore
@@ -320,6 +322,7 @@ async def client_handshake(
     # we expect the server to have. Imported here, like tuncore: the gate
     # loads the Rust module at import.
     from dsm.net.handshake_gate import (
+        GateKeyError,
         GateKeys,
         compute_mac1,
         open_cookie_reply,
@@ -327,7 +330,10 @@ async def client_handshake(
         stamp_msg1,
     )
 
-    gate_keys = GateKeys.derive(ca_root, expected_server_cn)
+    try:
+        gate_keys = GateKeys.derive(ca_root, expected_server_cn)
+    except GateKeyError as e:
+        raise HandshakeError(f"handshake gate keys could not be made: {e}") from e
 
     # Message 1: -> e, stamped. mac1 once per attempt, from the time it
     # starts, so resends keep it; random bytes where mac2 goes.
@@ -341,16 +347,20 @@ async def client_handshake(
         # The latest stamp: after a cookie reply it carries mac2.
         await _send(transport, bytes(msg1), server_addr)
 
+    def _cookie_in(frame: bytes, addr: tuple[str, int] | None) -> bytes | None:
+        # Cookie replies come over UDP only, from the server's address. A
+        # frame from another address goes on to the source pin.
+        if not isinstance(transport, UDPTransport) or addr != server_addr:
+            return None
+        return open_cookie_reply(frame, gate_keys, mac1)
+
     cookie_replies = 0
 
     async def _cookie_reply(frame: bytes, addr: tuple[str, int] | None) -> bool:
-        # Under load the server answers msg1 with a cookie reply (UDP only).
-        # Tried before msg2: a failed Noise read could spoil the handshake
-        # state. A frame from another address goes on to the source pin.
+        # Under load the server answers msg1 with a cookie reply. Tried
+        # before msg2: a failed Noise read could spoil the handshake state.
         nonlocal cookie_replies
-        if not isinstance(transport, UDPTransport) or addr != server_addr:
-            return False
-        cookie = open_cookie_reply(frame, gate_keys, mac1)
+        cookie = _cookie_in(frame, addr)
         if cookie is None:
             return False
         cookie_replies += 1
@@ -445,8 +455,20 @@ async def client_handshake(
     def _resent_msg2(frame: bytes) -> bool:
         return frame == msg2
 
+    async def _late_cookie_reply(frame: bytes, addr: tuple[str, int] | None) -> bool:
+        # A cookie reply held back in the network can land after msg2. It is
+        # not the bootstrap reply: skip it like a copy of msg2, with the same
+        # log line and count, and no new resend of msg1.
+        if _cookie_in(frame, addr) is None:
+            return False
+        _skip_log.log("handshake: skipped a copy of an earlier handshake message")
+        return True
+
     bootstrap_resp_frame, bs_addr = await _recv_with_retry(
-        transport, retransmit=_retransmit_bootstrap, skip=_resent_msg2
+        transport,
+        retransmit=_retransmit_bootstrap,
+        skip=_resent_msg2,
+        handle=_late_cookie_reply,
     )
     # Pin source on the bootstrap response. AEAD already rejects forged
     # content, but a UDP-spoofed bootstrap frame from any source would
