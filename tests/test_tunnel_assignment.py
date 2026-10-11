@@ -2,7 +2,9 @@
 TunnelAssignment's checks, the field on the wire, admit_client choosing it,
 and the client setting its TUN and DNS from it. Real handshakes over
 loopback UDP (helpers of test_handshake_admit_hook.py); fakes for
-run_client. Laptop: yes (old wheel).
+run_client. The loopback handshake tests need tuncore.xchacha_open from the
+Task 5 wheel (every UDP client handshake tries it on the server's reply), so
+on the old wheel they are CI-only; the rest also run there.
 """
 
 from __future__ import annotations
@@ -14,6 +16,7 @@ from unittest.mock import patch
 
 import pytest
 
+import tuncore
 from dsm.crypto import handshake
 from dsm.crypto.handshake import HANDSHAKE_FRAME_SIZE, HandshakeError, VerifiedClient
 from dsm.net._addresses import SINGLE_CLIENT_TUNNEL, TunnelAssignment
@@ -52,7 +55,14 @@ def test_it_round_trips_in_9_bytes() -> None:
     other = TunnelAssignment(
         client=A("172.16.5.9"), server=A("172.16.5.1"), prefix_len=20
     )
-    for tunnel in (SINGLE_CLIENT_TUNNEL, other):
+    # The two ends of the prefix rule are allowed: /16 and /30.
+    widest = TunnelAssignment(
+        client=A("192.168.7.9"), server=A("192.168.0.1"), prefix_len=16
+    )
+    narrowest = TunnelAssignment(
+        client=A("10.8.0.2"), server=A("10.8.0.1"), prefix_len=30
+    )
+    for tunnel in (SINGLE_CLIENT_TUNNEL, other, widest, narrowest):
         data = tunnel.to_bytes()
         assert len(data) == TunnelAssignment.SIZE == 9
         assert TunnelAssignment.from_bytes(data) == tunnel
@@ -138,10 +148,21 @@ async def test_a_hook_that_refuses_means_no_reply(fast_retries: None) -> None:
 async def test_a_bad_field_from_the_server_fails_the_client(fast_retries: None) -> None:
     p = _Parties()
     bad = A("8.8.8.8").packed + A("10.8.0.1").packed + bytes([24])
-    with patch.object(handshake, "_tunnel_field", lambda _tunnel: bad):
+    real = tuncore.complete_bootstrap
+    key_makers: list[bool] = []  # is_initiator of each call
+
+    def _recording(*args: Any, **kwargs: Any) -> Any:
+        key_makers.append(bool(kwargs.get("is_initiator")))
+        return real(*args, **kwargs)
+
+    with (
+        patch.object(handshake, "_tunnel_field", lambda _tunnel: bad),
+        patch.object(tuncore, "complete_bootstrap", _recording),
+    ):
         client_res, _server_res, _s, _c = await _handshake(p)
     assert isinstance(client_res, HandshakeError)
     assert "server sent a bad tunnel address" in str(client_res)
+    assert key_makers == [False]  # the server's keys only: the client made none
 
 
 async def test_a_bad_hook_value_is_never_sent(fast_retries: None) -> None:

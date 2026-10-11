@@ -83,3 +83,5 @@ def test_vt1_tunnel_field() -> None:
     )
     assert home.to_bytes().hex() == "0a0800020a08000118"
     assert other.to_bytes().hex() == "ac100509ac10050114"
+    assert TunnelAssignment.from_bytes(bytes.fromhex("0a0800020a08000118")) == home
+    assert TunnelAssignment.from_bytes(bytes.fromhex("ac100509ac10050114")) == other
