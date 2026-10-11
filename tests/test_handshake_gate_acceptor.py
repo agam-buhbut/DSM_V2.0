@@ -33,6 +33,7 @@ from dsm.net.handshake_gate import (
     stamp_msg1,
 )
 from dsm.net.transport.tcp import TCPTransport
+from tests import test_handshake_acceptor_in_session as in_session
 from tests.test_handshake_acceptor_in_session import _Script as _SessionScript
 from tests.test_handshake_acceptor_in_session import _slot
 from tests.test_handshake_acceptor_limits import (
@@ -261,13 +262,19 @@ async def test_a_failed_attempt_turns_cookies_on_for_30_s() -> None:
 
 
 class _TcpScript:
-    """Fake server_handshake for TCP: reads the first frame, then wins."""
+    """Fake server_handshake for TCP: reads the first frame, asks the session
+    check when the accept gives one (as the real one does, with the session
+    holder's CN), then wins."""
 
     def __init__(self) -> None:
         self.frames: list[bytes] = []
 
-    async def __call__(self, conn: Any, *_a: Any, **_k: Any) -> tuple[object, bytes]:
+    async def __call__(
+        self, conn: Any, *_a: Any, admit_client: Any = None, **_k: Any
+    ) -> tuple[object, bytes]:
         self.frames.append(await conn.recv())
+        if admit_client is not None:
+            admit_client(in_session.HOLDER)
         return object(), b"pub-tcp"
 
 
@@ -410,3 +417,41 @@ async def test_full_size_packets_the_session_cannot_open_are_dropped_at_mac1(
         assert await _spin(lambda: script.admitted == [back])
         win = await watch.stop()
     assert win is not None
+
+
+async def test_the_in_session_tcp_accept_checks_the_first_frame_too() -> None:
+    # The TCP twin of the test above: the watch hands the gate to its TCP
+    # accept, so a bad first frame is closed before any handshake starts.
+    gate = _gate()
+    script = _TcpScript()
+    connections: asyncio.Queue[tuple[TCPTransport, Addr]] = asyncio.Queue()
+    other_ca = GateKeys.from_ca_der(b"another CA", "dsm-test-server")
+    bad = _Conn(("203.0.113.2", 2), [_msg1(1, other_ca)])
+    good_frame = _msg1(2)
+    back = _Conn(("198.51.100.7", 40001), [good_frame])
+    with patch("dsm.crypto.handshake.server_handshake", new=script):
+        watch = SessionWatch(
+            _Config(8),
+            _Stub(),
+            _Stub(),
+            _Stub(),
+            _Stub(),
+            SourceLimiter(clock=_minutes()),
+            _slot(),
+            gate,
+            tcp=connections,
+        )
+        connections.put_nowait((bad, bad.peer))
+        assert await _spin(lambda: bad.closed)
+        await _yield()
+        assert script.frames == []  # no handshake attempt
+        assert bad.sent == []
+        assert not watch.end_session.is_set()
+        assert not gate.load.under_load(0)
+        # The client that comes back still gets in.
+        connections.put_nowait((back, back.peer))
+        assert await _spin(watch.end_session.is_set)
+        win = await asyncio.wait_for(watch.stop(), 5.0)
+    assert win is not None
+    assert win.transport is back
+    assert script.frames == [good_frame]

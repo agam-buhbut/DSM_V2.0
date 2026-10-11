@@ -291,7 +291,12 @@ async def _run_handshake_worker(
                 if gate is not None and isinstance(transport, TCPTransport):
                     # TCP gets no cookies (its own handshake proved the
                     # address), but its first frame needs a valid mac1 before
-                    # anything is signed. Scanner noise, so not trouble.
+                    # anything is signed. A wrong size or a bad mac1 is
+                    # scanner noise, not trouble. A read that times out,
+                    # resets or breaks framing counts as trouble like any
+                    # failed attempt (the except branches below); today that
+                    # changes nothing, since TCP asks for no cookies and a
+                    # run serves one transport.
                     first = await transport.recv()
                     if len(first) != HANDSHAKE_FRAME_SIZE or not gate.mac1_ok(first):
                         log.debug("TCP handshake start dropped: wrong size or bad mac1")
