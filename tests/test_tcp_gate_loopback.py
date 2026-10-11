@@ -2,14 +2,15 @@
 
 Loopback sockets, the ``TCPListener``, ``_accept_until_winner_tcp`` with a
 ``HandshakeGate`` made from the test CA and the server's name,
-``server_handshake`` and ``client_handshake`` are all real; only the config,
-key store and certificate holders are small stand-ins. The other TCP gate
-tests script the handshake (test_handshake_gate_acceptor.py) or pass no gate
-(test_handshake_admit_hook.py).
+``server_handshake`` and ``client_handshake`` are real; only the config, key
+store and certificate holders are small stand-ins (the bad-mac1 test also
+wraps ``server_handshake`` and ``build_attest_payload`` as tripwires). The
+other TCP gate tests script the handshake (test_handshake_gate_acceptor.py)
+or bypass the acceptor (test_handshake_admit_hook.py).
 
-TCP asks for no cookies, so these tests need no XChaCha: they run on the old
-wheel with the shim as well as in CI. Nothing waits on the wall clock; the
-timeouts only turn a hang into a failure.
+TCP asks for no cookies, so these tests need no new tuncore calls (no
+XChaCha) and also run against an older tuncore build. Nothing waits on the
+wall clock; the timeouts only turn a hang into a failure.
 """
 
 from __future__ import annotations

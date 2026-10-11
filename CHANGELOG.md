@@ -23,13 +23,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     address), and the client sends its first message again with a second
     code made from it, which proves its address (over TCP there are no
     cookies). A sender that only fakes addresses can no longer hold
-    handshake slots. Two exceptions: the one slot an idle server gives
-    without a cookie to a sender that has the CA certificate and the
-    server's name (SECURITY.md); and anyone who captured one client first
-    message can replay it from any address for up to 15 minutes (an idle
+    handshake slots. Two exceptions. A sender that has the CA certificate
+    and the server's name can take the one slot an idle server gives
+    without a cookie (SECURITY.md). And anyone who captured one client first
+    message can replay it from any address for up to 15 minutes: an idle
     server answers it and gives it that one slot, which costs the server a
     signature; a busy server asks for a cookie, and then only a replay from
-    the same address and port works, for 2 to 4 minutes, and that sender
+    the same address and port works, for 2 to 4 minutes (such a sender
     could also just drop packets). Server INFO line, once a minute: `dropped
     a handshake start with a bad mac1 (...)`.
   - The Noise prologue (a fixed tag both sides mix into the handshake, so

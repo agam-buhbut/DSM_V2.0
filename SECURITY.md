@@ -90,7 +90,8 @@ closed as known:
   minutes. Such a sender gets the server's answer (its certificate), can
   take the one handshake slot an idle server gives without a cookie, or can
   use up the cookie-reply budget (20 a second) so a real client waits for
-  its cookie. Who gets in is unchanged: the certificates, the name allowlist
+  its cookie. When the server is busy, a captured first message works only
+  from its own address and port, for 2 to 4 minutes. Who gets in is unchanged: the certificates, the name allowlist
   and the CRL decide.
 - **Slow-link auto cap.** Anyone who can congest the path for a few
   seconds, so that 5% or more of your packets are lost, can lower your top
