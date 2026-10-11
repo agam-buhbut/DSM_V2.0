@@ -35,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, TypeVar
@@ -91,6 +92,11 @@ BOOTSTRAP_CIPHERTEXT_SIZE = 32 + 16
 # repeats those 32 bytes only by chance (2**-256). Only they are compared,
 # so a resend whose padding differs still matches.
 _MSG1_EPHEMERAL_SIZE = 32
+
+# Under load the server answers msg1 with a cookie reply (wire v2). A client
+# takes at most this many per attempt, then fails it; the next attempt starts
+# over. Two cover a cookie secret that changed between reply and resend.
+MAX_COOKIE_REPLIES = 2
 
 
 def _is_resent_msg1(frame: bytes, msg1: bytes) -> bool:
@@ -262,6 +268,11 @@ async def client_handshake(
 ) -> tuple[tuncore.SessionKeyManager, bytes, bytes]:
     """Perform Noise XX handshake as initiator (client).
 
+    msg1 carries the server gate's mac1 (wire v2), made from ``ca_root`` and
+    ``expected_server_cn``. Under load the server first sends a cookie reply;
+    the client resends the same msg1 with mac2 at once, at most
+    ``MAX_COOKIE_REPLIES`` times, within the same retry budget.
+
     Returns ``(session_keys, handshake_hash, server_static_pub)``.
     ``server_static_pub`` is the 32-byte X25519 Noise static recovered
     from msg2 and used by the caller for the M-BUG-1 mutual-rekey
@@ -304,15 +315,56 @@ async def client_handshake(
         expected_server_cn=expected_server_cn,
     )
 
-    # Message 1: -> e
-    msg1 = initiator.write_message_1()
-    await _send(transport, msg1, server_addr)
+    # The server's gate (wire v2) wants mac1 in msg1 and, under load, a mac2
+    # made from a cookie. Its keys come from the CA certificate and the name
+    # we expect the server to have. Imported here, like tuncore: the gate
+    # loads the Rust module at import.
+    from dsm.net.handshake_gate import (
+        GateKeys,
+        compute_mac1,
+        open_cookie_reply,
+        stamp_mac2,
+        stamp_msg1,
+    )
+
+    gate_keys = GateKeys.derive(ca_root, expected_server_cn)
+
+    # Message 1: -> e, stamped. mac1 once per attempt, from the time it
+    # starts, so resends keep it; random bytes where mac2 goes.
+    msg1 = bytearray(initiator.write_message_1())
+    mac1 = compute_mac1(bytes(msg1[:32]), gate_keys, time.time())
+    stamp_msg1(msg1, mac1)
+    await _send(transport, bytes(msg1), server_addr)
 
     # Message 2: <- e, ee, s, es [+ server attest payload]
     async def _retransmit_msg1() -> None:
-        await _send(transport, msg1, server_addr)
+        # The latest stamp: after a cookie reply it carries mac2.
+        await _send(transport, bytes(msg1), server_addr)
 
-    msg2, recv_addr = await _recv_with_retry(transport, retransmit=_retransmit_msg1)
+    cookie_replies = 0
+
+    async def _cookie_reply(frame: bytes, addr: tuple[str, int] | None) -> bool:
+        # Under load the server answers msg1 with a cookie reply (UDP only).
+        # Tried before msg2: a failed Noise read could spoil the handshake
+        # state. A frame from another address goes on to the source pin.
+        nonlocal cookie_replies
+        if not isinstance(transport, UDPTransport) or addr != server_addr:
+            return False
+        cookie = open_cookie_reply(frame, gate_keys, mac1)
+        if cookie is None:
+            return False
+        cookie_replies += 1
+        if cookie_replies > MAX_COOKIE_REPLIES:
+            raise HandshakeError(
+                f"the server sent more than {MAX_COOKIE_REPLIES} cookie replies"
+            )
+        stamp_mac2(msg1, cookie)
+        await _send(transport, bytes(msg1), server_addr)
+        return True
+
+    msg2, recv_addr = await _recv_with_retry(
+        transport, retransmit=_retransmit_msg1, handle=_cookie_reply
+    )
     _pin_source(transport, recv_addr, server_addr, "msg2")
 
     # Snapshot the handshake hash that signs msg2's binding *before*
@@ -668,13 +720,16 @@ async def _recv_one_skipping(
     transport: UDPTransport | TCPTransport,
     timeout: float,
     skip: Callable[[bytes], bool] | None,
+    handle: Callable[[bytes, tuple[str, int] | None], Awaitable[bool]] | None = None,
 ) -> tuple[bytes, tuple[str, int] | None]:
-    """Like ``_recv_one``, but drops frames for which ``skip`` returns True.
+    """Like ``_recv_one``, but drops frames for which ``skip`` returns True
+    and shows the rest to ``handle`` first: a frame it returns True for was
+    dealt with (a cookie reply, answered with a resend) and the wait goes on.
 
-    A dropped frame does not restart the wait: it still ends ``timeout``
-    seconds after it began. Raises ``TimeoutError`` like ``_recv_one``.
+    Neither restarts the wait: it still ends ``timeout`` seconds after it
+    began. Raises ``TimeoutError`` like ``_recv_one``.
     """
-    if skip is None:
+    if skip is None and handle is None:
         return await _recv_one(transport, timeout)
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
@@ -683,15 +738,20 @@ async def _recv_one_skipping(
         if remaining <= 0:
             raise TimeoutError
         frame, addr = await _recv_one(transport, remaining)
-        if not skip(frame):
-            return frame, addr
-        _skip_log.log("handshake: skipped a copy of an earlier handshake message")
+        if skip is not None and skip(frame):
+            _skip_log.log("handshake: skipped a copy of an earlier handshake message")
+            continue
+        if handle is not None and await handle(frame, addr):
+            continue
+        return frame, addr
 
 
 async def _recv_with_retry(
     transport: UDPTransport | TCPTransport,
     retransmit: Callable[[], Awaitable[None]] | None = None,
     skip: Callable[[bytes], bool] | None = None,
+    handle: Callable[[bytes, tuple[str, int] | None], Awaitable[bool]] | None = None,
+    gave_up: str | None = None,
 ) -> tuple[bytes, tuple[str, int] | None]:
     """Per-message handshake recv with bounded retries.
 
@@ -701,14 +761,16 @@ async def _recv_with_retry(
     of an earlier message; dropping one does not restart the wait. After
     ``MAX_RETRIES`` consecutive ``HANDSHAKE_TIMEOUT`` waits, raises
     ``HandshakeError`` so callers can surface a typed failure.
+    ``handle`` (optional) is passed on to :func:`_recv_one_skipping`.
+    ``gave_up`` (optional) is the error text after the last wait.
     """
     for attempt in range(MAX_RETRIES):
         try:
-            return await _recv_one_skipping(transport, HANDSHAKE_TIMEOUT, skip)
+            return await _recv_one_skipping(transport, HANDSHAKE_TIMEOUT, skip, handle)
         except TimeoutError:
             if attempt == MAX_RETRIES - 1:
                 raise HandshakeError(
-                    f"handshake recv timed out after {MAX_RETRIES} attempts"
+                    gave_up or f"handshake recv timed out after {MAX_RETRIES} attempts"
                 )
             delay = BACKOFF_BASE * (2**attempt)
             log.warning(
