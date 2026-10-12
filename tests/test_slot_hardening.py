@@ -65,7 +65,7 @@ def test_an_inherited_share_still_needs_the_address_rate() -> None:
     assert not limiter.try_start(ip, inherits_share=True)  # the rate is spent
 
 
-def test_an_inherited_tcp_start_pays_no_shared_token() -> None:
+def test_a_tcp_inherit_pays_only_its_address() -> None:
     limiter = SourceLimiter(clock=_Frozen())
     ip = "198.51.100.9"
     for _ in range(PER_SOURCE_INFLIGHT):
@@ -73,3 +73,51 @@ def test_an_inherited_tcp_start_pays_no_shared_token() -> None:
     for i in range(int(GLOBAL_START_BURST)):
         assert limiter.try_shared(f"203.0.113.{i}")  # spend the overall limit
     assert limiter.try_start(ip, shared=False, inherits_share=True)
+
+
+def test_an_inherit_still_pays_the_overall_limit() -> None:
+    limiter = SourceLimiter(clock=_Frozen())
+    ip = "198.51.100.9"
+    for _ in range(PER_SOURCE_INFLIGHT):
+        assert limiter.try_start(ip, shared=False)
+    for i in range(int(GLOBAL_START_BURST)):
+        assert limiter.try_shared(f"203.0.113.{i}")  # spend the overall limit
+    assert not limiter.try_start(ip, inherits_share=True)
+    # The refusal spent no address token: the one rate token left is still
+    # there for a start that needs only the address.
+    assert limiter.try_start(ip, shared=False, inherits_share=True)
+
+
+def test_an_inherit_takes_one_overall_token() -> None:
+    limiter = SourceLimiter(clock=_Frozen())
+    ip = "198.51.100.9"
+    for _ in range(PER_SOURCE_INFLIGHT):
+        assert limiter.try_start(ip, shared=False)
+    assert limiter.try_start(ip, inherits_share=True)
+    for i in range(int(GLOBAL_START_BURST) - 1):
+        assert limiter.try_shared(f"203.0.113.{i}")
+    assert not limiter.try_shared("203.0.113.200")
+
+
+def test_an_in_session_inherit_takes_the_newcomer_token_too() -> None:
+    limiter = SourceLimiter(clock=_Frozen())
+    ip = "198.51.100.9"
+    for _ in range(PER_SOURCE_INFLIGHT):
+        assert limiter.try_start(ip, shared=False)
+    assert limiter.try_start(ip, in_session=True, inherits_share=True)
+    assert not limiter.try_shared("203.0.113.1", in_session=True)
+    # The overall limit lost exactly one token to that inherit.
+    for i in range(int(GLOBAL_START_BURST) - 1):
+        assert limiter.try_shared(f"203.0.113.{10 + i}")
+    assert not limiter.try_shared("203.0.113.200")
+
+
+def test_a_per_address_only_start_ignores_in_session() -> None:
+    limiter = SourceLimiter(clock=_Frozen())
+    assert limiter.try_start("198.51.100.9", in_session=True, shared=False)
+    # Nothing shared was spent: the one newcomer token and every overall
+    # token are still there.
+    assert limiter.try_shared("203.0.113.1", in_session=True)
+    for i in range(int(GLOBAL_START_BURST) - 1):
+        assert limiter.try_shared(f"203.0.113.{10 + i}")
+    assert not limiter.try_shared("203.0.113.200")
