@@ -44,6 +44,14 @@ DNS proxy, one socket), and the acceptor runs in two places:
 * Workers run under a semaphore of ``config.max_inflight_handshakes``, each
   with a hard per-attempt deadline. With the run's slot, a client that
   passed every check also needs the slot's yes before the last frame.
+* Push-out (spec §4): with the run's gate, a new UDP source that finds no
+  room may take the place of a stalled attempt — one at least
+  ``_PUSH_OUT_AFTER_S`` old (from the msg1 that started it), whose msg2 has
+  left and that has not passed the slot's check. If its address already
+  runs ``PER_SOURCE_INFLIGHT`` attempts, only that address's own oldest such
+  attempt can go, and the new one takes over its share too; otherwise, when
+  every slot is full, the oldest such attempt of any address gives up its
+  slot. Without a gate (tests only) nothing is pushed out.
 * :func:`_accept_until_winner_tcp` does the same for TCP. The run's
   :class:`~dsm.net.transport.tcp.TCPListener` queues each accepted
   connection, and :func:`_tcp_admit_loop` gives it a slot and a worker under
@@ -68,9 +76,11 @@ already applies.
 from __future__ import annotations
 
 import asyncio
+import enum
 import logging
 import os
-from collections.abc import Callable, Coroutine
+import time
+from collections.abc import Callable, Coroutine, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -79,6 +89,7 @@ from dsm.crypto.handshake import HANDSHAKE_FRAME_SIZE
 from dsm.net._addresses import SINGLE_CLIENT_TUNNEL, TunnelAssignment
 from dsm.net.handshake_gate import (
     GLOBAL_START_RATE,
+    PER_SOURCE_INFLIGHT,
     HandshakeGate,
     Msg1Verdict,
     SourceLimiter,
@@ -104,6 +115,10 @@ _tcp_full_log = RepeatLog(log, logging.DEBUG)
 # A TCP connection that sent no first frame in time: one DEBUG line per 10 s
 # at most, with a count, never the address.
 _tcp_first_frame_log = RepeatLog(log, logging.DEBUG)
+
+# A stalled attempt was pushed out for a new one (spec §4.3): one INFO line
+# per 10 s at most, with a count, never an address.
+_push_out_log = RepeatLog(log, logging.INFO)
 
 
 def _emit_handshake_failure(err: Exception) -> None:
@@ -224,6 +239,114 @@ def _slot_rule_ok(max_inflight: int) -> bool:
     return max_inflight > GLOBAL_START_RATE * (_PUSH_OUT_AFTER_S + _SIGNING_ALLOWANCE_S)
 
 
+class _PassedOn(enum.Enum):
+    """How a pushed-out attempt's place went to a new attempt (spec §4.3),
+    so its done-callback gives back exactly what the new one did not take."""
+
+    SLOT_ONLY = enum.auto()  # case 2: it gives its address's share back
+    SLOT_AND_SHARE = enum.auto()  # case 1: the new same-address attempt holds both
+
+
+@dataclass(eq=False)
+class _Attempt:
+    """One running attempt, as push-out sees it (spec §4.3). Step S keeps no
+    ``proved`` bit: only the failed-start penalty (spec §3.7) reads one."""
+
+    ip: str
+    # Step S's clock at the attempt's start (UDP: its msg1; TCP: the accept).
+    # It never moves later.
+    started: float
+    # From entering the msg2 signing path, any wait in the TPM queue included,
+    # until msg2 has been sent: no push-out meanwhile.
+    signing: bool
+    passed_on: _PassedOn | None = None
+
+    def msg2_sent(self) -> None:
+        self.signing = False
+
+
+def _running_from(attempts: Mapping[asyncio.Task[None], _Attempt], ip: str) -> int:
+    """How many of ``ip``'s attempts still hold its address's share."""
+    return sum(
+        1
+        for task, rec in attempts.items()
+        if rec.ip == ip and rec.passed_on is None and not task.done()
+    )
+
+
+def _pick_victim(
+    attempts: Mapping[asyncio.Task[None], _Attempt],
+    now: float,
+    slot: SessionSlot | None,
+    *,
+    ip: str | None = None,
+) -> asyncio.Task[None] | None:
+    """The oldest attempt that can be pushed out (from ``ip`` only, when
+    given), or None (spec §4.3): at least ``_PUSH_OUT_AFTER_S`` old, its msg2
+    sent, not past the slot's ``admit``, not passed on already, not ended.
+    A clock that stepped back gives a negative age, which reads as too young.
+    A tie keeps the earlier record, and the dict holds records in start order.
+    """
+    victim: asyncio.Task[None] | None = None
+    oldest = 0.0
+    for task, rec in attempts.items():
+        if rec.passed_on is not None or task.done() or rec.signing:
+            continue
+        if ip is not None and rec.ip != ip:
+            continue
+        if now - rec.started < _PUSH_OUT_AFTER_S:
+            continue
+        if slot is not None and slot.admitted is task:
+            continue
+        if victim is None or rec.started < oldest:
+            victim, oldest = task, rec.started
+    return victim
+
+
+def _choose_push_out(
+    attempts: Mapping[asyncio.Task[None], _Attempt],
+    now: float,
+    slot: SessionSlot | None,
+    ip: str,
+    *,
+    pool_full: bool,
+) -> tuple[asyncio.Task[None], _PassedOn] | None:
+    """The attempt a new start from ``ip`` may push out, and how, or None.
+
+    Case 1 first, whether or not the pool is full: ``ip`` is at its in-flight
+    cap, so only its own oldest pushable attempt can help, and the new start
+    takes over that attempt's share and slot. If it has none, None: the
+    caller's usual path refuses it with the limiter's in-flight line. Case 2:
+    the pool is full, so the oldest pushable attempt of any address gives up
+    its slot.
+    """
+    if _running_from(attempts, ip) >= PER_SOURCE_INFLIGHT:
+        own = _pick_victim(attempts, now, slot, ip=ip)
+        return None if own is None else (own, _PassedOn.SLOT_AND_SHARE)
+    if pool_full:
+        other = _pick_victim(attempts, now, slot)
+        return None if other is None else (other, _PassedOn.SLOT_ONLY)
+    return None
+
+
+def _push_out(
+    attempts: dict[asyncio.Task[None], _Attempt],
+    victim: asyncio.Task[None],
+    how: _PassedOn,
+) -> None:
+    """Hand ``victim``'s place to a new attempt: mark how, then cancel it.
+
+    Marked first: a loop can take two new starts in one step, and the
+    victim's task ends only on a later one, so the mark is what keeps it from
+    being picked twice; its done-callback reads the mark too.
+    """
+    attempts[victim].passed_on = how
+    victim.cancel()
+    _push_out_log.log(
+        "pushed out a stalled handshake attempt to make room for a new one"
+    )
+
+
 class _PerPeerUDPView(UDPTransport):
     """One peer's slice of a real :class:`UDPTransport`.
 
@@ -242,10 +365,12 @@ class _PerPeerUDPView(UDPTransport):
         real: UDPTransport,
         peer_addr: tuple[str, int],
         inbox: asyncio.Queue[bytes],
+        on_msg2: Callable[[], None] | None = None,
     ) -> None:
         self._real = real
         self._peer_addr = peer_addr
         self._inbox = inbox
+        self._on_msg2 = on_msg2
 
     async def recv(  # type: ignore[override]
         self, timeout: float | None = None
@@ -261,6 +386,12 @@ class _PerPeerUDPView(UDPTransport):
     ) -> None:
         del addr  # pinned to peer_addr
         await self._real.send(data, self._peer_addr)
+        # The worker's first send is msg2 (cookie replies go out on the real
+        # socket): once it has left, the attempt is no longer signing. A
+        # resend does not call this again.
+        on_msg2, self._on_msg2 = self._on_msg2, None
+        if on_msg2 is not None:
+            on_msg2()
 
 
 async def _run_handshake_worker(
@@ -485,24 +616,82 @@ async def _demux_loop(
     slot: SessionSlot | None = None,
     session_live: bool = False,
     gate: HandshakeGate | None = None,
+    attempts: dict[asyncio.Task[None], _Attempt] | None = None,
+    clock: Callable[[], float] = time.monotonic,
 ) -> None:
     """Route datagrams from the real socket to per-source inboxes.
 
     Runs until a winner is set or shutdown is requested. A datagram from an
-    unknown source starts a worker only if it is a full handshake frame, a
-    slot is free and ``limiter`` admits its address. Nothing here awaits
-    anything but the socket. ``inboxes`` and ``workers`` belong to the
-    caller, which re-injects the winner's residual frames and cancels the
-    losers.
+    unknown source starts a worker only if it is a full handshake frame,
+    finds room (a free slot, its address below its in-flight cap) or, with
+    ``gate``, may push out a stalled attempt (spec §4.3), and ``limiter``
+    admits its address. Nothing here awaits but the socket and a cookie
+    reply's send. ``inboxes`` and ``workers`` belong to the caller, which
+    re-injects the winner's residual frames and cancels the losers.
 
     ``slot`` and ``session_live`` go to each worker; ``session_live`` also
     makes each new start need the limiter's in-session budget. ``gate``
     (wire v2) checks mac1, and under load mac2, right after the size check,
-    before any slot.
+    before any slot. ``attempts`` holds each running attempt's push-out
+    record (tests pass their own); ``clock`` is Step S's own, never the
+    limiter's, and dates each attempt's start.
     """
     # (inboxes stays the 11th positional parameter: a test wraps this
     # function and reads it by position.)
+    records: dict[asyncio.Task[None], _Attempt] = {} if attempts is None else attempts
     size_drops = RepeatLog(log, logging.DEBUG)
+
+    def _start(src: tuple[str, int], frame: bytes, started: float) -> None:
+        """Start one attempt in a slot the caller holds for it: a free one,
+        or a pushed-out attempt's. UDP: its msg1 is already here, so it is
+        signing from the start until its view has sent msg2."""
+        new_inbox: asyncio.Queue[bytes] = asyncio.Queue(maxsize=_PER_PEER_INBOX_FRAMES)
+        new_inbox.put_nowait(frame)
+        inboxes[src] = new_inbox
+        record = _Attempt(ip=src[0], started=started, signing=True)
+        view = _PerPeerUDPView(transport, src, new_inbox, on_msg2=record.msg2_sent)
+
+        # A done-callback, not a ``finally`` in the worker: a task cancelled
+        # before its first step never runs its body, but its done-callbacks
+        # still run, exactly once.
+        def _end_attempt(done: asyncio.Task[None], a: tuple[str, int] = src) -> None:
+            # The record first, so an error below cannot leave it behind.
+            passed_on = records.pop(done).passed_on
+            if passed_on is None:
+                # A pushed-out attempt's slot belongs to the one that took it.
+                semaphore.release()
+            # Evict so failing sources cannot grow ``inboxes``. The winner's
+            # inbox stays, widened, for the residual re-injection.
+            if not _is_winner_addr(winner, a):
+                inboxes.pop(a, None)
+            else:
+                _promote_winner_inbox(inboxes, a)
+            # Last, so an error in ``finish`` cannot leave a dead inbox. After
+            # a same-address push-out the new attempt holds this share.
+            if passed_on is not _PassedOn.SLOT_AND_SHARE:
+                limiter.finish(a[0])
+
+        task = asyncio.ensure_future(
+            _run_handshake_worker(
+                config,
+                keystore,
+                attest_store,
+                materials,
+                cn_allowlist,
+                view,
+                src,
+                winner,
+                who=str(src),
+                slot=slot,
+                session_live=session_live,
+                gate=gate,
+            )
+        )
+        records[task] = record
+        task.add_done_callback(_end_attempt)
+        workers.add(task)
+        task.add_done_callback(workers.discard)
+
     while not winner.done() and not process_shutdown.is_set():
         try:
             data, addr = await transport.recv(timeout=_ACCEPT_DEMUX_POLL)
@@ -554,9 +743,36 @@ async def _demux_loop(
             if verdict is Msg1Verdict.DROP:
                 continue
 
+        now = clock()
+        pool_full = semaphore.locked()
+        # No room: a full pool, or the address at its in-flight cap. With the
+        # run's gate a start that got this far proved its address (with any
+        # slot in use the server is under load, so it carried a valid mac2),
+        # and it may push out a stalled attempt (spec §4.3). Without a gate
+        # (tests only) nothing is pushed out.
+        push = (
+            _choose_push_out(records, now, slot, addr[0], pool_full=pool_full)
+            if gate is not None
+            else None
+        )
+        if push is not None:
+            victim, how = push
+            # Asked before anything changes, so a refusal leaves the old
+            # attempt alone. The new attempt takes the old one's slot.
+            if not limiter.try_start(
+                addr[0],
+                in_session=session_live,
+                inherits_share=how is _PassedOn.SLOT_AND_SHARE,
+            ):
+                _note_trouble(gate)
+                continue
+            _push_out(records, victim, how)
+            _start(addr, data, now)
+            continue
+
         # New source without a free slot: drop it. A genuine client's msg1
         # retransmit gets in once a slot frees.
-        if semaphore.locked():
+        if pool_full:
             log.debug(
                 "handshake pool saturated — dropping new-source frame from %s", addr
             )
@@ -574,51 +790,14 @@ async def _demux_loop(
         # Never waits: the pool has a free slot (checked above).
         await semaphore.acquire()
         # Asked last, so a packet dropped above spends none of its address's
-        # budget. From here to the done-callback below nothing awaits, so the
-        # slot and the address are always given back.
+        # budget. An address at its cap with nothing to push out is refused
+        # here, with the limiter's usual line. From here to the done-callback
+        # nothing awaits, so the slot and the address are always given back.
         if not limiter.try_start(addr[0], in_session=session_live):
             semaphore.release()
             _note_trouble(gate)
             continue
-
-        new_inbox: asyncio.Queue[bytes] = asyncio.Queue(maxsize=_PER_PEER_INBOX_FRAMES)
-        new_inbox.put_nowait(data)
-        inboxes[addr] = new_inbox
-        view = _PerPeerUDPView(transport, addr, new_inbox)
-
-        # A done-callback, not a ``finally`` in the worker: a task cancelled
-        # before its first step never runs its body, but its done-callbacks
-        # still run, exactly once.
-        def _end_attempt(_task: asyncio.Task[None], a: tuple[str, int] = addr) -> None:
-            semaphore.release()
-            # Evict so failing sources cannot grow ``inboxes``. The winner's
-            # inbox stays, widened, for the residual re-injection.
-            if not _is_winner_addr(winner, a):
-                inboxes.pop(a, None)
-            else:
-                _promote_winner_inbox(inboxes, a)
-            # Last, so an error in ``finish`` cannot leave a dead inbox.
-            limiter.finish(a[0])
-
-        task = asyncio.ensure_future(
-            _run_handshake_worker(
-                config,
-                keystore,
-                attest_store,
-                materials,
-                cn_allowlist,
-                view,
-                addr,
-                winner,
-                who=str(addr),
-                slot=slot,
-                session_live=session_live,
-                gate=gate,
-            )
-        )
-        task.add_done_callback(_end_attempt)
-        workers.add(task)
-        task.add_done_callback(workers.discard)
+        _start(addr, data, now)
 
 
 async def _cancel_and_drain(
@@ -730,6 +909,7 @@ async def _accept_round(
     session_live: bool = False,
     on_winner: Callable[[tuple[str, int]], None] | None = None,
     gate: HandshakeGate | None = None,
+    clock: Callable[[], float] = time.monotonic,
 ) -> tuple[
     tuple[tuncore.SessionKeyManager, bytes, tuple[str, int]] | None, list[bytes]
 ]:
@@ -770,6 +950,7 @@ async def _accept_round(
             slot=slot,
             session_live=session_live,
             gate=gate,
+            clock=clock,
         )
     )
     try:
@@ -815,6 +996,8 @@ async def _accept_until_winner(  # pyright: ignore[reportUnusedFunction]  # used
     limiter: SourceLimiter | None = None,
     slot: SessionSlot | None = None,
     gate: HandshakeGate | None = None,
+    *,
+    clock: Callable[[], float] = time.monotonic,
 ) -> tuple[
     tuncore.SessionKeyManager | None,
     bytes | None,
@@ -830,7 +1013,8 @@ async def _accept_until_winner(  # pyright: ignore[reportUnusedFunction]  # used
     session rules hold across accepts; without a limiter this call makes its
     own, and without a slot every authenticated client may win; production
     also passes the run's one :class:`HandshakeGate` (without it, no mac1
-    check: tests only).
+    check: tests only). ``clock`` is Step S's own; production uses the
+    default.
     """
     if limiter is None:
         limiter = SourceLimiter()
@@ -845,6 +1029,7 @@ async def _accept_until_winner(  # pyright: ignore[reportUnusedFunction]  # used
         limiter,
         slot=slot,
         gate=gate,
+        clock=clock,
     )
     if win is None:
         return None, None, transport_obj
@@ -1124,6 +1309,7 @@ class SessionWatch:
         *,
         udp: UDPTransport | None = None,
         tcp: asyncio.Queue[tuple[TCPTransport, tuple[str, int]]] | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.end_session = asyncio.Event()
         self._stop = asyncio.Event()
@@ -1152,6 +1338,7 @@ class SessionWatch:
                 limiter,
                 slot,
                 gate,
+                clock,
             )
         elif tcp is not None:
             work = self._accept_tcp(
@@ -1188,6 +1375,7 @@ class SessionWatch:
         limiter: SourceLimiter,
         slot: SessionSlot,
         gate: HandshakeGate | None,
+        clock: Callable[[], float],
     ) -> Winner | None:
         win, held = await _accept_round(
             config,
@@ -1202,6 +1390,7 @@ class SessionWatch:
             session_live=True,
             on_winner=self._won,
             gate=gate,
+            clock=clock,
         )
         if win is None:
             return None
