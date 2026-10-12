@@ -155,11 +155,12 @@ class SourceLimiter:
 
         ``shared=False`` charges only the per-address limits: a TCP connection
         at accept, which pays the shared ones with :meth:`try_shared` once its
-        first frame passed mac1. ``inherits_share=True`` is a start that takes
-        over a pushed-out attempt's place from the same address: it skips the
-        in-flight cap and adds nothing to the address's running count (the
-        pushed-out attempt never calls ``finish``); its rate limit and, when
-        ``shared``, the shared limits still apply.
+        first frame passed mac1; ``in_session`` is ignored then.
+        ``inherits_share=True`` is a start that takes over a pushed-out
+        attempt's place from the same address: it skips the in-flight cap and
+        adds nothing to the address's running count (the pushed-out attempt
+        never calls ``finish``); its rate limit and, when ``shared``, the
+        shared limits still apply.
         """
         now = self._clock()
         src = self._sources.get(ip)
