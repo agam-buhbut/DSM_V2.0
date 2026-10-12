@@ -76,7 +76,12 @@ from typing import TYPE_CHECKING, Any
 from dsm.core.log import RepeatLog
 from dsm.crypto.handshake import HANDSHAKE_FRAME_SIZE
 from dsm.net._addresses import SINGLE_CLIENT_TUNNEL, TunnelAssignment
-from dsm.net.handshake_gate import HandshakeGate, Msg1Verdict, SourceLimiter
+from dsm.net.handshake_gate import (
+    GLOBAL_START_RATE,
+    HandshakeGate,
+    Msg1Verdict,
+    SourceLimiter,
+)
 from dsm.net.transport.tcp import FramingError, TCPTransport
 from dsm.net.transport.udp import UDPTransport
 
@@ -184,6 +189,34 @@ _ACCEPT_DEMUX_POLL = 0.1
 # frame is 1400 bytes, so about 90 KB. When it is full a packet is dropped,
 # like loss on the link.
 _INTAKE_FRAMES = 64
+
+# Step S (spec §4): stalled attempts must not hold the handshake slots.
+
+# A TCP connection gets this long to send its first full frame (spec §4.2). A
+# real client sends msg1 right after connecting; 3 s covers a slow link and
+# one lost TCP segment.
+_TCP_FIRST_FRAME_DEADLINE = 3.0
+# The age, counted from its start, an attempt must reach before a new start
+# that finds no room can push it out (spec §4.3). A real client finishes
+# within the server's signature, one round trip and its own signature.
+_PUSH_OUT_AFTER_S = 1.5
+# How much longer than _PUSH_OUT_AFTER_S the slot rule lets an attempt stay
+# protected while its msg2 waits for the TPM (spec §4.4).
+_SIGNING_ALLOWANCE_S = 0.25
+# One msg2 signature on the box's TPM, as the slot rule assumes it (spec §4.4,
+# handshake_gate.py's GLOBAL_START_RATE note). Kept at the measured value even
+# where signing is faster: the larger value is the safe side.
+_SERVER_SIGNING_TIME_S = 0.21
+
+
+def _slot_rule_ok(max_inflight: int) -> bool:
+    """Whether ``max_inflight`` slots meet condition (1) of the slot rule
+    (spec §4.4): strangers starting at the overall limit keep fewer attempts
+    protected at once than there are slots. Conditions (2) and (3) use only
+    code constants, so a unit test pins them; ``run_server`` warns at start
+    when this is False.
+    """
+    return max_inflight > GLOBAL_START_RATE * (_PUSH_OUT_AFTER_S + _SIGNING_ALLOWANCE_S)
 
 
 class _PerPeerUDPView(UDPTransport):
