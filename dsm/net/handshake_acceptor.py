@@ -315,10 +315,10 @@ def _choose_push_out(
 
     Case 1 first, whether or not the pool is full: ``ip`` is at its in-flight
     cap, so only its own oldest pushable attempt can help, and the new start
-    takes over that attempt's share and slot. If it has none, None: the
-    caller's usual path refuses it with the limiter's in-flight line. Case 2:
-    the pool is full, so the oldest pushable attempt of any address gives up
-    its slot.
+    takes over that attempt's share and slot. If it has none, None: it is
+    refused as today: dropped as pool saturated when every slot is full,
+    else by the limiter's in-flight line. Case 2: the pool is full, so the
+    oldest pushable attempt of any address gives up its slot.
     """
     if _running_from(attempts, ip) >= PER_SOURCE_INFLIGHT:
         own = _pick_victim(attempts, now, slot, ip=ip)
@@ -791,8 +791,10 @@ async def _demux_loop(
         await semaphore.acquire()
         # Asked last, so a packet dropped above spends none of its address's
         # budget. An address at its cap with nothing to push out is refused
-        # here, with the limiter's usual line. From here to the done-callback
-        # nothing awaits, so the slot and the address are always given back.
+        # as today: dropped as pool saturated when every slot is full (above),
+        # else here by the limiter's in-flight line. From here to the
+        # done-callback nothing awaits, so the slot and the address are always
+        # given back.
         if not limiter.try_start(addr[0], in_session=session_live):
             semaphore.release()
             _note_trouble(gate)
