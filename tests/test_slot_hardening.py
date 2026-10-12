@@ -303,11 +303,12 @@ class _Hs:
 
 class _Tcp:
     """_tcp_admit_loop on an in-memory connection queue. The pool, the open
-    connections and the limiter stay here for the test; the patched
-    handshake stays in place for the whole run; the gate is the run's real
-    one (mac1 checked) or none. Leaving cancels the loop and every worker and
-    waits for them, so every done-callback has run; errors raised inside
-    callbacks land in ``loop_errors``."""
+    connections, the records and the limiter stay here for the test; the
+    patched handshake stays in place for the whole run; the gate is the
+    run's real one (mac1 checked) or none; ``clock`` is Step S's own.
+    Leaving cancels the loop and every worker and waits for them, so every
+    done-callback has run; errors raised inside callbacks land in
+    ``loop_errors``."""
 
     def __init__(
         self,
@@ -331,8 +332,7 @@ class _Tcp:
         self.slot = None if no_slot else SessionSlot()
         self.session_live = session_live
         self.clock: Callable[[], float] = clock if clock is not None else _Frozen()
-        # Loop keywords added by later tasks (Task 5: attempts and clock).
-        self.extra: dict[str, Any] = {}
+        self.extra: dict[str, Any] = {"attempts": self.attempts, "clock": self.clock}
         self.loop_errors: list[dict[str, Any]] = []
         self.task: asyncio.Future[None] | None = None
         self._patch = patch("dsm.crypto.handshake.server_handshake", new=hs)
@@ -1025,3 +1025,380 @@ async def test_the_msg2_hook_waits_until_msg2_really_left() -> None:
     with pytest.raises(OSError):
         await view.send(_MSG2, _A)
     assert fired == []  # still signing: msg2 did not go out
+
+
+async def _accepted(
+    run: _Tcp, peer: Addr, at: float, frames: list[bytes] | None = None
+) -> _Conn:
+    """Queue a connection at Step S time ``at`` and wait for its record."""
+    assert isinstance(run.clock, _Frozen)
+    run.clock.now = at
+    before = len(run.attempts)
+    conn = run.connect(peer, frames)
+    assert await _spin(lambda: len(run.attempts) == before + 1)
+    return conn
+
+
+async def test_a_silent_tcp_connection_is_pushed_out_when_the_pool_is_full() -> None:
+    hs = _Hs()
+    limiter = _Ledger(clock=_minutes())
+    async with _Tcp(hs, limiter=limiter) as run:
+        silent = await _accepted(run, _A, 0.0)  # no first frame: not signing
+        run.clock.now = 1.4  # too young yet
+        early = run.connect(_B, [_good(2)])
+        assert await _spin(lambda: early.closed)
+        assert not silent.closed
+        run.clock.now = 1.5
+        run.connect(_C, [_good(3)])
+        assert await _spin(lambda: silent.closed)
+        assert await _spin(lambda: _C in hs.sent_msg2)
+        await _yield()
+        # Case 2: the victim gave its share back, not its slot (_C holds it).
+        assert limiter.finished == [_A[0]]
+        assert await _slots_free(run.semaphore) == 0
+    assert sorted(limiter.finished) == sorted([_A[0], _C[0]])
+    assert await _slots_free(run.semaphore) == 1
+    assert run.attempts == {}
+    assert run.loop_errors == []
+
+
+async def test_a_tcp_attempts_age_counts_from_its_accept_not_its_first_frame() -> None:
+    hs = _Hs()
+    async with _Tcp(hs) as run:
+        first = await _accepted(run, _A, 0.0)
+        run.clock.now = 1.0
+        first._frames.put_nowait(_good(1))  # the first frame comes late
+        assert await _spin(lambda: _A in hs.sent_msg2)
+        run.clock.now = 1.5  # 1.5 s from the accept, 0.5 s from the frame
+        run.connect(_B, [_good(2)])
+        assert await _spin(lambda: first.closed)
+        assert await _spin(lambda: _B in hs.sent_msg2)
+
+
+async def test_a_tcp_attempt_is_never_pushed_out_while_its_msg2_waits() -> None:
+    hs = _Hs()
+    hs.tpm[_A] = asyncio.Event()
+    async with _Tcp(hs) as run:
+        held = await _accepted(run, _A, 0.0, [_good(1)])
+        assert await _spin(lambda: _A in hs.started)
+        run.clock.now = 10.0
+        refused = run.connect(_B, [_good(2)])
+        assert await _spin(lambda: refused.closed)
+        assert not held.closed
+        hs.tpm[_A].set()
+        assert await _spin(lambda: _A in hs.sent_msg2)
+        run.connect(_C, [_good(3)])
+        assert await _spin(lambda: held.closed)
+
+
+async def test_a_tcp_attempt_past_admit_is_never_pushed_out() -> None:
+    hs = _Hs({_A: "admit"})
+    async with _Tcp(hs) as run:
+        held = await _accepted(run, _A, 0.0, [_good(1)])
+        assert await _spin(
+            lambda: run.slot is not None and run.slot.admitted is not None
+        )
+        run.clock.now = 5.0
+        refused = run.connect(_B, [_good(2)])
+        assert await _spin(lambda: refused.closed)
+        assert not held.closed
+
+
+async def test_without_the_gate_no_tcp_connection_is_pushed_out() -> None:
+    hs = _Hs()
+    x1, x2, x3 = ("203.0.113.50", 1), ("203.0.113.50", 2), ("203.0.113.50", 3)
+    async with _Tcp(hs, max_inflight=2, gate=False) as run:
+        c1 = await _accepted(run, x1, 0.0, [_good(1)])
+        c2 = await _accepted(run, x2, 0.1, [_good(2)])
+        assert await _spin(lambda: x1 in hs.sent_msg2 and x2 in hs.sent_msg2)
+        run.clock.now = 60.0
+        other = run.connect(_B, [_good(3)])
+        same = run.connect(x3, [_good(4)])
+        assert await _spin(lambda: other.closed and same.closed)
+        assert not c1.closed and not c2.closed
+
+
+async def test_a_tcp_address_at_its_cap_pushes_out_its_own_oldest() -> None:
+    hs = _Hs()
+    limiter = _Ledger(clock=_minutes())
+    ip = "203.0.113.50"
+    async with _Tcp(hs, max_inflight=8, limiter=limiter) as run:
+        c1 = await _accepted(run, (ip, 1), 0.0)
+        c2 = await _accepted(run, (ip, 2), 0.2)
+        run.clock.now = 2.0
+        run.connect((ip, 3), [_good(3)])
+        assert await _spin(lambda: c1.closed)
+        assert await _spin(lambda: (ip, 3) in hs.sent_msg2)
+        await _yield()
+        assert not c2.closed
+        # Case 1: the victim gave back neither its slot nor its share.
+        assert limiter.finished == []
+        assert _inflight(limiter, ip) == 2
+        assert await _slots_free(run.semaphore) == 6
+    assert limiter.finished.count(ip) == 2
+    assert await _slots_free(run.semaphore) == 8
+    assert run.attempts == {}
+
+
+async def test_a_tcp_attempt_pushed_out_before_its_first_step_gives_back_once() -> None:
+    hs = _Hs()
+    limiter = _Ledger(clock=_minutes())
+    run = _Tcp(hs, limiter=limiter, clock=_Ticks(0.0, 2.0))
+    victim = run.connect(_A)  # both queued: one step of the loop takes both
+    run.connect(_B, [_good(2)])
+    async with run:
+        assert await _spin(lambda: victim.closed)
+        assert await _spin(lambda: _B in hs.sent_msg2)
+        await _yield()
+        assert limiter.finished == [_A[0]]  # its share, once; not its slot
+        assert await _slots_free(run.semaphore) == 0
+    assert hs.started == [_B]  # the victim's body never ran
+    assert sorted(limiter.finished) == sorted([_A[0], _B[0]])
+    assert await _slots_free(run.semaphore) == 1
+    assert run.attempts == {}
+    assert run.loop_errors == []
+
+
+async def test_two_tcp_connections_in_one_step_push_out_two_attempts() -> None:
+    hs = _Hs()
+    limiter = _Ledger(clock=_minutes())
+    async with _Tcp(hs, max_inflight=2, limiter=limiter) as run:
+        a = await _accepted(run, _A, 0.0)
+        b = await _accepted(run, _B, 0.1)
+        run.clock.now = 2.0
+        run.connect(_C, [_good(3)])
+        run.connect(_D, [_good(4)])  # Queue.get() does not yield: one step
+        assert await _spin(lambda: a.closed and b.closed)
+        assert await _spin(lambda: _C in hs.sent_msg2 and _D in hs.sent_msg2)
+    assert await _slots_free(run.semaphore) == 2
+    assert sorted(limiter.finished) == sorted(p[0] for p in (_A, _B, _C, _D))
+    assert run.attempts == {}
+    assert run.loop_errors == []
+
+
+async def test_the_first_frame_view_fires_its_msg2_hook_once() -> None:
+    fired: list[int] = []
+    conn = _Conn(_A)
+    view = hsa._FirstFrameTCP(conn, b"first", on_msg2=lambda: fired.append(1))
+    assert await view.recv() == b"first"
+    await view.send(_MSG2)
+    await view.send(_MSG2)  # a resend
+    assert fired == [1]
+    assert conn.sent == [_MSG2, _MSG2]
+
+
+class _SendFailsConn(_Conn):
+    """One accepted connection whose every send fails."""
+
+    async def send(self, data: bytes) -> None:
+        raise OSError("connection reset by peer")
+
+
+async def test_the_first_frame_views_hook_waits_until_msg2_really_left() -> None:
+    fired: list[int] = []
+    view = hsa._FirstFrameTCP(
+        _SendFailsConn(_A), b"first", on_msg2=lambda: fired.append(1)
+    )
+    with pytest.raises(OSError):
+        await view.send(_MSG2)
+    assert fired == []  # still signing: msg2 did not go out
+
+
+class _QueuesNext(_Conn):
+    """A connection that hands ``then`` to the admit loop as its worker first
+    reads (``at="read"``) or as its msg2 goes out (``at="msg2"``). A 0 s
+    deadline the worker entered earlier in that same step was queued first
+    (call_soon), so on the next loop pass the deadline asks to cancel this
+    attempt, then the admit loop takes ``then``, before this attempt runs
+    again."""
+
+    def __init__(
+        self,
+        peer: Addr,
+        connections: asyncio.Queue[tuple[TCPTransport, Addr]],
+        then: _Conn,
+        *,
+        at: str,
+        frames: list[bytes] | None = None,
+    ) -> None:
+        super().__init__(peer, frames)
+        self._connections = connections
+        self._then: _Conn | None = then
+        self._at = at
+
+    def _hand_over(self) -> None:
+        then, self._then = self._then, None
+        if then is not None:
+            self._connections.put_nowait((then, then.peer))
+
+    async def recv(self, timeout: float | None = None) -> bytes:
+        if self._at == "read":
+            self._hand_over()
+        return await super().recv(timeout)
+
+    async def send(self, data: bytes) -> None:
+        await super().send(data)
+        if self._at == "msg2":
+            self._hand_over()
+
+
+async def test_a_tcp_push_out_racing_the_first_frame_deadline_gives_back_once() -> None:
+    # _A sends nothing. Its first-frame deadline, patched to 0, fires on the
+    # loop pass after its worker began to read, and _B is taken in that same
+    # pass: the push-out comes after the deadline asked to cancel _A and
+    # before _A ran again.
+    hs = _Hs()
+    limiter = _Ledger(clock=_minutes())
+    asked: list[int] = []
+    run = _Tcp(hs, limiter=limiter, clock=_Ticks(0.0, 2.0))
+    new = _Conn(_B, [_good(2)])
+    victim = _QueuesNext(_A, run.connections, new, at="read")
+    run.connections.put_nowait((victim, _A))
+    with (
+        patch.object(hsa, "_TCP_FIRST_FRAME_DEADLINE", 0.0),
+        patch.object(hsa, "_push_out", _cancels_asked_at_push_out(asked)),
+    ):
+        async with run:
+            assert await _spin(lambda: victim.closed)
+            assert await _spin(lambda: _B in hs.sent_msg2)
+            await _yield()
+            # Case 2: its share given back once, not its slot (_B holds it).
+            assert limiter.finished == [_A[0]]
+            assert await _slots_free(run.semaphore) == 0
+            assert not new.closed
+    assert asked == [1]  # the deadline had already asked: a real race
+    assert hs.started == [_B]
+    assert sorted(limiter.finished) == sorted([_A[0], _B[0]])
+    assert _inflight(limiter, _A[0]) == 0 and _inflight(limiter, _B[0]) == 0
+    assert await _slots_free(run.semaphore) == 1
+    assert run.attempts == {}
+    assert run.loop_errors == []
+
+
+async def test_a_tcp_own_address_push_out_racing_the_first_frame_deadline() -> None:
+    # As above, in case 1: x1 passes its slot and its share to x3, so its
+    # done-callback gives back neither, even though its deadline fired too.
+    ip = "203.0.113.50"
+    x1, x2, x3 = (ip, 1), (ip, 2), (ip, 3)
+    hs = _Hs()
+    limiter = _Ledger(clock=_minutes())
+    asked: list[int] = []
+    # Step S times: x2 accepted at 1.0, x1 at 0.0 (the oldest), x3 at 2.0.
+    run = _Tcp(hs, max_inflight=4, limiter=limiter, clock=_Ticks(1.0, 0.0, 2.0))
+    new = _Conn(x3, [_good(3)])
+    victim = _QueuesNext(x1, run.connections, new, at="read")
+    with (
+        patch.object(hsa, "_TCP_FIRST_FRAME_DEADLINE", 0.0),
+        patch.object(hsa, "_push_out", _cancels_asked_at_push_out(asked)),
+    ):
+        async with run:
+            run.connect(x2, [_good(2)])  # its frame is there: the 0 s cannot cut it
+            assert await _spin(lambda: x2 in hs.sent_msg2)
+            run.connections.put_nowait((victim, x1))
+            assert await _spin(lambda: victim.closed)
+            assert await _spin(lambda: x3 in hs.sent_msg2)
+            await _yield()
+            assert limiter.finished == []
+            assert _inflight(limiter, ip) == 2  # x2's share and x3's (was x1's)
+            assert await _slots_free(run.semaphore) == 2
+    assert asked == [1]
+    assert hs.started == [x2, x3]
+    assert limiter.finished == [ip, ip]  # x2's and x3's, at the end
+    assert _inflight(limiter, ip) == 0
+    assert await _slots_free(run.semaphore) == 4
+    assert run.attempts == {}
+    assert run.loop_errors == []
+
+
+async def test_a_tcp_push_out_racing_the_attempt_deadline_gives_back_once() -> None:
+    # _A's attempt deadline, patched to 0, fires on the loop pass after its
+    # msg2 left, and _B is taken in that same pass.
+    hs = _Hs()
+    limiter = _Ledger(clock=_minutes())
+    asked: list[int] = []
+    run = _Tcp(hs, limiter=limiter, clock=_Ticks(0.0, 2.0))
+    new = _Conn(_B, [_good(2)])
+    victim = _QueuesNext(_A, run.connections, new, at="msg2", frames=[_good(1)])
+    run.connections.put_nowait((victim, _A))
+    with (
+        patch.object(hsa, "_HANDSHAKE_ATTEMPT_DEADLINE", 0.0),
+        patch.object(hsa, "_push_out", _cancels_asked_at_push_out(asked)),
+    ):
+        async with run:
+            # _B took _A's slot, then hit its own 0 s deadline.
+            assert await _spin(lambda: _B in hs.sent_msg2 and not run.workers)
+            assert await _slots_free(run.semaphore) == 1
+            assert victim.closed and new.closed
+    assert asked == [1]  # the deadline had already asked: a real race
+    assert hs.cancelled == [_A, _B]  # _B by its own deadline
+    assert limiter.finished == [_A[0], _B[0]]  # each share given back once
+    assert _inflight(limiter, _A[0]) == 0 and _inflight(limiter, _B[0]) == 0
+    assert await _slots_free(run.semaphore) == 1
+    assert run.attempts == {}
+    assert run.loop_errors == []
+
+
+async def test_a_tcp_own_address_push_out_racing_the_attempt_deadline() -> None:
+    # As above, in case 1: x1 passes its slot and its share to x3, so its
+    # done-callback gives back neither, even though its deadline fired too.
+    ip = "203.0.113.50"
+    x1, x2, x3 = (ip, 1), (ip, 2), (ip, 3)
+    hs = _Hs()
+    limiter = _Ledger(clock=_minutes())
+    asked: list[int] = []
+    # Step S times: x2 accepted at 1.0, x1 at 0.0 (the oldest), x3 at 2.0.
+    run = _Tcp(hs, max_inflight=2, limiter=limiter, clock=_Ticks(1.0, 0.0, 2.0))
+    new = _Conn(x3, [_good(3)])
+    victim = _QueuesNext(x1, run.connections, new, at="msg2", frames=[_good(1)])
+    async with run:
+        run.connect(x2, [_good(2)])  # the usual 12 s deadline: still running
+        assert await _spin(lambda: x2 in hs.sent_msg2)
+        with (
+            patch.object(hsa, "_HANDSHAKE_ATTEMPT_DEADLINE", 0.0),
+            patch.object(hsa, "_push_out", _cancels_asked_at_push_out(asked)),
+        ):
+            run.connections.put_nowait((victim, x1))
+            # x3 took x1's slot and share, then hit its own 0 s deadline.
+            assert await _spin(lambda: limiter.finished == [ip])
+        assert asked == [1]
+        assert hs.cancelled == [x1, x3]  # x3 by its own deadline
+        assert victim.closed and new.closed
+        assert _inflight(limiter, ip) == 1  # x2's share only
+        assert await _slots_free(run.semaphore) == 1  # x2 holds the other
+    assert limiter.finished == [ip, ip]  # x3's, then x2's at the end
+    assert _inflight(limiter, ip) == 0
+    assert await _slots_free(run.semaphore) == 2
+    assert run.attempts == {}
+    assert run.loop_errors == []
+
+
+async def test_a_shutdown_in_the_tcp_push_out_pass_gives_back_once() -> None:
+    # The run stops in the loop pass of a push-out: _A is marked and
+    # cancelled but has not run again, and _B has not run at all. Stopping
+    # cancels both once more; each done-callback still runs once.
+    hs = _Hs()
+    limiter = _Ledger(clock=_minutes())
+    asked: list[int] = []
+    async with _Tcp(hs, limiter=limiter) as run:
+        old = await _accepted(run, _A, 0.0, [_good(1)])
+        assert await _spin(lambda: _A in hs.sent_msg2)
+        victim = next(iter(run.attempts))
+        run.clock.now = 2.0
+        with patch.object(hsa, "_push_out", _cancels_asked_at_push_out(asked)):
+            new = run.connect(_B, [_good(2)])
+            assert await _spin(lambda: asked != [])
+        assert not victim.done() and _B not in hs.started  # both still pending
+        assert not old.closed
+        # Stop as the accept does: the admit loop first, then every worker,
+        # with no loop pass in between.
+        assert run.task is not None
+        run.task.cancel()
+        await hsa._cancel_and_drain(set(run.workers))
+    assert asked == [0]  # nothing but the push-out had asked before
+    assert hs.started == [_A] and hs.cancelled == [_A]  # _B never ran
+    assert old.closed and new.closed
+    assert sorted(limiter.finished) == sorted([_A[0], _B[0]])
+    assert _inflight(limiter, _A[0]) == 0 and _inflight(limiter, _B[0]) == 0
+    assert await _slots_free(run.semaphore) == 1
+    assert run.attempts == {}
+    assert run.loop_errors == []
