@@ -176,10 +176,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   go. Over TCP a connection must send its first handshake message within
   3 s, and it pays the shared start limits only after that message has the
   right size and a valid mac1, so a silent connection cannot use them up.
-  New log lines: `pushed out a stalled
-  handshake attempt to make room for a new one` (INFO, at most once per
-  10 s, with a count) and, at start, a WARNING when `max_inflight_handshakes`
-  is below 8.
+  New log lines: `pushed out a stalled handshake attempt to make room for a
+  new one` (INFO, at most once per 10 s, with a count) and, at start, a
+  WARNING when `max_inflight_handshakes` is below 8.
 - A malformed or truncated TCP frame from an unauthenticated peer (oversized
   length prefix, zero-length frame, or EOF mid-frame) no longer crashes the
   server: only that connection is closed and the server keeps serving.
