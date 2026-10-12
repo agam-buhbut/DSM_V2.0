@@ -1073,6 +1073,8 @@ async def test_a_tcp_attempts_age_counts_from_its_accept_not_its_first_frame() -
         run.connect(_B, [_good(2)])
         assert await _spin(lambda: first.closed)
         assert await _spin(lambda: _B in hs.sent_msg2)
+    assert run.attempts == {}
+    assert run.loop_errors == []
 
 
 async def test_a_tcp_attempt_is_never_pushed_out_while_its_msg2_waits() -> None:
@@ -1089,6 +1091,8 @@ async def test_a_tcp_attempt_is_never_pushed_out_while_its_msg2_waits() -> None:
         assert await _spin(lambda: _A in hs.sent_msg2)
         run.connect(_C, [_good(3)])
         assert await _spin(lambda: held.closed)
+    assert run.attempts == {}
+    assert run.loop_errors == []
 
 
 async def test_a_tcp_attempt_past_admit_is_never_pushed_out() -> None:
@@ -1102,6 +1106,8 @@ async def test_a_tcp_attempt_past_admit_is_never_pushed_out() -> None:
         refused = run.connect(_B, [_good(2)])
         assert await _spin(lambda: refused.closed)
         assert not held.closed
+    assert run.attempts == {}
+    assert run.loop_errors == []
 
 
 async def test_without_the_gate_no_tcp_connection_is_pushed_out() -> None:
@@ -1116,6 +1122,8 @@ async def test_without_the_gate_no_tcp_connection_is_pushed_out() -> None:
         same = run.connect(x3, [_good(4)])
         assert await _spin(lambda: other.closed and same.closed)
         assert not c1.closed and not c2.closed
+    assert run.attempts == {}
+    assert run.loop_errors == []
 
 
 async def test_a_tcp_address_at_its_cap_pushes_out_its_own_oldest() -> None:
@@ -1402,3 +1410,115 @@ async def test_a_shutdown_in_the_tcp_push_out_pass_gives_back_once() -> None:
     assert await _slots_free(run.semaphore) == 1
     assert run.attempts == {}
     assert run.loop_errors == []
+
+
+async def test_a_shutdown_in_an_own_address_tcp_push_out_pass_gives_back_once() -> None:
+    # As above, in case 1: x3 took x1's slot and share in the pass the run
+    # stops. x1 gives back neither; x2 and x3 each give back their own once.
+    ip = "203.0.113.50"
+    x1, x2, x3 = (ip, 1), (ip, 2), (ip, 3)
+    hs = _Hs()
+    limiter = _Ledger(clock=_minutes())
+    asked: list[int] = []
+    async with _Tcp(hs, max_inflight=4, limiter=limiter) as run:
+        old = await _accepted(run, x1, 0.0, [_good(1)])
+        young = await _accepted(run, x2, 1.0, [_good(2)])
+        assert await _spin(lambda: x1 in hs.sent_msg2 and x2 in hs.sent_msg2)
+        victim = next(iter(run.attempts))
+        run.clock.now = 2.0  # x1 is 2.0 s old, x2 only 1.0 s
+        with patch.object(hsa, "_push_out", _cancels_asked_at_push_out(asked)):
+            new = run.connect(x3, [_good(3)])
+            assert await _spin(lambda: asked != [])
+        assert not victim.done() and x3 not in hs.started  # both still pending
+        assert not old.closed
+        assert limiter.finished == [] and _inflight(limiter, ip) == 2
+        # Stop as the accept does: the admit loop first, then every worker,
+        # with no loop pass in between.
+        assert run.task is not None
+        run.task.cancel()
+        await hsa._cancel_and_drain(set(run.workers))
+    assert asked == [0]  # nothing but the push-out had asked before
+    assert hs.started == [x1, x2]  # x3 never ran
+    assert sorted(hs.cancelled) == sorted([x1, x2])
+    assert old.closed and young.closed and new.closed
+    assert limiter.finished == [ip, ip]  # x2's and x3's; none for x1
+    assert _inflight(limiter, ip) == 0
+    assert await _slots_free(run.semaphore) == 4
+    assert run.attempts == {}
+    assert run.loop_errors == []
+
+
+async def test_the_tcp_accept_hands_its_clock_to_push_out() -> None:
+    # With the default clock both connections would be about 0 s old and the
+    # second one would be closed as pool saturated.
+    hs = _Hs()
+    limiter = _Ledger(clock=_minutes())
+    connections: asyncio.Queue[tuple[TCPTransport, Addr]] = asyncio.Queue()
+    shutdown = asyncio.Event()
+    silent = _Conn(_A)
+    new = _Conn(_B, [_good(2)])
+    with patch("dsm.crypto.handshake.server_handshake", new=hs):
+        accept = asyncio.ensure_future(
+            hsa._accept_until_winner_tcp(
+                _Config(1),
+                _Stub(),
+                _Stub(),
+                _Stub(),
+                _Stub(),
+                connections,
+                shutdown,
+                limiter,
+                SessionSlot(),
+                _real_gate(),
+                clock=_Ticks(0.0, 2.0),
+            )
+        )
+        connections.put_nowait((silent, _A))
+        assert await _spin(lambda: bool(silent._frames._getters))  # it waits
+        connections.put_nowait((new, _B))
+        assert await _spin(lambda: silent.closed)
+        assert await _spin(lambda: _B in hs.sent_msg2)
+        assert not new.closed
+        assert limiter.finished == [_A[0]]
+        shutdown.set()
+        assert await accept == (None, None, None)
+    assert new.closed
+    assert hs.started == [_B]
+    assert sorted(limiter.finished) == sorted([_A[0], _B[0]])
+
+
+async def test_the_in_session_tcp_watch_hands_its_clock_to_push_out() -> None:
+    hs = _Hs()
+    limiter = _Ledger(clock=_minutes())
+    connections: asyncio.Queue[tuple[TCPTransport, Addr]] = asyncio.Queue()
+    slot = SessionSlot()
+    held_by = object()  # the live session's client, as after an idle accept
+    slot.admit(held_by, _HOLDER, session_live=False)
+    slot.confirm(held_by)
+    silent = _Conn(_A)
+    new = _Conn(_B, [_good(2)])
+    with patch("dsm.crypto.handshake.server_handshake", new=hs):
+        watch = hsa.SessionWatch(
+            _Config(1),
+            _Stub(),
+            _Stub(),
+            _Stub(),
+            _Stub(),
+            limiter,
+            slot,
+            _real_gate(),
+            tcp=connections,
+            clock=_Ticks(0.0, 2.0),
+        )
+        connections.put_nowait((silent, _A))
+        assert await _spin(lambda: bool(silent._frames._getters))  # it waits
+        connections.put_nowait((new, _B))
+        assert await _spin(lambda: silent.closed)
+        assert await _spin(lambda: _B in hs.sent_msg2)
+        assert not new.closed
+        assert limiter.finished == [_A[0]]
+        assert await watch.stop() is None
+    assert new.closed
+    assert not watch.end_session.is_set()
+    assert hs.started == [_B]
+    assert sorted(limiter.finished) == sorted([_A[0], _B[0]])
