@@ -162,6 +162,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     connections side by side, with the same limits and the same 12 s cutoff
     per attempt as UDP. Before, one silent connection held the port for up
     to 30-48 s and every other client was refused.
+- Handshake slots (server only, no wire change). A stalled handshake no
+  longer holds one of the `max_inflight_handshakes` slots for up to 12 s.
+  When a new handshake start finds no free slot, and its sender has proved
+  its address (over UDP with a cookie, over TCP by the connection), the
+  server ends the oldest attempt that is at least 1.5 s old, has sent its
+  answer (msg2) and has not passed the last check, and gives its slot to the
+  new one. When the new start's address already runs 2 handshakes, only that
+  address's own oldest such attempt can go. Over TCP a connection must send
+  its first handshake message within 3 s, and it pays the shared start
+  limits only after that message has the right size and a valid mac1, so a
+  silent connection cannot use them up. New log lines: `pushed out a stalled
+  handshake attempt to make room for a new one` (INFO, at most once per
+  10 s, with a count) and, at start, a WARNING when `max_inflight_handshakes`
+  is below 8.
 - A malformed or truncated TCP frame from an unauthenticated peer (oversized
   length prefix, zero-length frame, or EOF mid-frame) no longer crashes the
   server: only that connection is closed and the server keeps serving.

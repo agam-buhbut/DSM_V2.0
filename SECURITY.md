@@ -93,6 +93,10 @@ closed as known:
   its cookie. When the server is busy, a captured first message works only
   from its own address and port, for 2 to 4 minutes. Who gets in is unchanged: the certificates, the name allowlist
   and the CRL decide.
+  Someone with the CA certificate and the server's name can keep new
+  handshakes waiting, for as long as the attack runs, over UDP even from
+  faked source addresses. In TCP mode anyone with many addresses can too. A
+  stalled attempt cannot hold a handshake slot for long.
 - **Slow-link auto cap.** Anyone who can congest the path for a few
   seconds, so that 5% or more of your packets are lost, can lower your top
   tier for minutes. They need no place on the path: flooding a link on the

@@ -729,7 +729,9 @@ The config file is TOML, at `/opt/mtun/config.toml`.
   daemon's uid. Otherwise startup refuses to load it.
 - max_inflight_handshakes: server only; how many handshake attempts the
   server checks at the same time, over UDP or TCP (default: 8, allowed
-  1-4096, warns above 1024). One stalled attempt cannot block a real client.
+  1-4096, warns above 1024 and, at start, below 8). A stalled attempt cannot
+  hold a slot for long: once it is 1.5 s old and has sent its answer, a new
+  start can take its place.
   Each source address may also run at most 2 at once and start 1 every 4 s
   (3 at once). While a session runs, all addresses together may start only
   1 a second. These limits are fixed, not settings.
