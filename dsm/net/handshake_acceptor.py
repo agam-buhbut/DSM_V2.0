@@ -34,12 +34,13 @@ DNS proxy, one socket), and the acceptor runs in two places:
 * With the run's :class:`~dsm.net.handshake_gate.HandshakeGate` (wire v2),
   a new UDP source's 1400-byte frame must also carry a valid mac1, and,
   under load, a mac2 from a cookie: the demux answers a missing cookie with
-  a cookie reply and keeps no state. A TCP connection's first frame must be
-  1400 bytes with a valid mac1 (no cookies: TCP already proves the
-  address). A bad mac1 is dropped silently and counted in one INFO line a
-  minute. A failed or refused attempt, and a start the pool or the limits
-  refuse, turn cookies on for 30 s. Without a gate (tests only) nothing of
-  this is checked.
+  a cookie reply and keeps no state. A TCP connection's first frame must come
+  within ``_TCP_FIRST_FRAME_DEADLINE`` and be 1400 bytes with a valid mac1 (no
+  cookies: TCP already proves the address); only then is it charged the
+  shared start limits (the accept charges only its address's). A bad mac1 is
+  dropped silently and counted in one INFO line a minute. A failed or refused
+  attempt, and a start the pool or the limits refuse, turn cookies on for
+  30 s. Without a gate (tests only) nothing of this is checked.
 * Workers run under a semaphore of ``config.max_inflight_handshakes``, each
   with a hard per-attempt deadline. With the run's slot, a client that
   passed every check also needs the slot's yes before the last frame.
@@ -99,6 +100,10 @@ log = logging.getLogger(__name__)
 # One line per 10 s at most: a flood of connections would otherwise log one
 # line per connection.
 _tcp_full_log = RepeatLog(log, logging.DEBUG)
+
+# A TCP connection that sent no first frame in time: one DEBUG line per 10 s
+# at most, with a count, never the address.
+_tcp_first_frame_log = RepeatLog(log, logging.DEBUG)
 
 
 def _emit_handshake_failure(err: Exception) -> None:
@@ -272,6 +277,7 @@ async def _run_handshake_worker(
     slot: SessionSlot | None = None,
     session_live: bool = False,
     gate: HandshakeGate | None = None,
+    limiter: SourceLimiter | None = None,
 ) -> None:
     """Run one handshake attempt under the per-attempt deadline.
 
@@ -287,9 +293,11 @@ async def _run_handshake_worker(
     worker's own task is its mark in the slot, so the accept can tell which
     attempt passed and must not be cancelled.
 
-    With ``gate`` (wire v2), a TCP connection's first frame must be 1400
-    bytes with a valid mac1 before anything else happens (no cookies on
-    TCP), and every failure counts as trouble.
+    With ``gate`` (wire v2), a TCP connection's first frame must come within
+    ``_TCP_FIRST_FRAME_DEADLINE`` and be 1400 bytes with a valid mac1 before
+    anything else happens (no cookies on TCP), and every failure counts as
+    trouble. Only then does ``limiter`` (the run's) charge the shared start
+    limits; the accept charged only the address's own (spec §4.2).
     """
     from cryptography.x509.oid import ExtendedKeyUsageOID
 
@@ -328,15 +336,30 @@ async def _run_handshake_worker(
                 if gate is not None and isinstance(transport, TCPTransport):
                     # TCP gets no cookies (its own handshake proved the
                     # address), but its first frame needs a valid mac1 before
-                    # anything is signed. A wrong size or a bad mac1 is
-                    # scanner noise, not trouble. A read that times out,
-                    # resets or breaks framing counts as trouble like any
-                    # failed attempt (the except branches below); today that
-                    # changes nothing, since TCP asks for no cookies and a
-                    # run serves one transport.
-                    first = await transport.recv()
+                    # anything is signed, and it must come soon: a silent
+                    # connection no longer holds its slot for the whole
+                    # attempt deadline (spec §4.2). A wrong size or a bad mac1
+                    # is scanner noise, not trouble. No first frame in time, a
+                    # spent shared limit, or a read that resets or breaks
+                    # framing (the except branches below) is trouble.
+                    try:
+                        async with asyncio.timeout(_TCP_FIRST_FRAME_DEADLINE):
+                            first = await transport.recv()
+                    except TimeoutError:
+                        _note_trouble(gate)
+                        _tcp_first_frame_log.log(
+                            "TCP handshake start dropped: no first frame in time"
+                        )
+                        return
                     if len(first) != HANDSHAKE_FRAME_SIZE or not gate.mac1_ok(first):
                         log.debug("TCP handshake start dropped: wrong size or bad mac1")
+                        return
+                    # Only now the shared start limits: a silent connection or
+                    # a bad first frame spends none of them (spec §4.2).
+                    if limiter is not None and not limiter.try_shared(
+                        peer_addr[0], in_session=session_live
+                    ):
+                        _note_trouble(gate)
                         return
                     transport = _FirstFrameTCP(transport, first)
                 session_keys, client_pub = await server_handshake(
@@ -853,8 +876,9 @@ async def _tcp_admit_loop(
     the pool is full or ``limiter`` refuses its address; otherwise it takes a
     slot and a worker. ``open_conns`` and ``workers`` belong to the caller.
 
-    ``slot`` and ``session_live`` work as in :func:`_demux_loop`. ``gate``
-    goes to each worker, which checks the connection's first frame.
+    ``slot`` and ``session_live`` work as in :func:`_demux_loop`. With
+    ``gate``, a connection is charged only its address's limits here; its
+    worker checks the first frame, then charges the shared limits.
     """
     while not winner.done():
         conn, peer = await connections.get()
@@ -874,9 +898,12 @@ async def _tcp_admit_loop(
         # Never waits: the pool has a free slot (checked above).
         await semaphore.acquire()
         # Asked last, so a connection closed above spends none of its
-        # address's budget. From here to the done-callback below nothing
-        # awaits, so the slot and the address are always given back.
-        if not limiter.try_start(peer[0], in_session=session_live):
+        # address's budget. With the gate only the per-address limits are
+        # charged here; the worker charges the shared ones once the first
+        # frame passed mac1, so a silent connection spends none of them
+        # (spec §4.2). From here to the done-callback below nothing awaits, so
+        # the slot and the address are always given back.
+        if not limiter.try_start(peer[0], in_session=session_live, shared=gate is None):
             semaphore.release()
             _note_trouble(gate)
             conn.close()
@@ -913,6 +940,7 @@ async def _tcp_admit_loop(
                 slot=slot,
                 session_live=session_live,
                 gate=gate,
+                limiter=limiter,
             )
         )
         task.add_done_callback(_end_attempt)
