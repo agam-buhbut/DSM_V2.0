@@ -1370,9 +1370,9 @@ mod tests {
         // H-BUG-2/3: server defers its send-key swap during grace period.
         // So server.encrypt produces OLD-key ciphertext for the first
         // ~5s after responder apply. Client at this point has applied
-        // its own swap (current recv = NEW; prev_recv = OLD). Production
-        // Python `_decrypt_with_fallback` tries current first, then prev;
-        // mirror that pattern here.
+        // its own swap (current recv = NEW; prev_recv = OLD). `open`
+        // tries the current key set first, then the old one; mirror that
+        // here.
         let (nonce, ct, _) = server.encrypt(b"server after rotation", aad).unwrap();
         let pt = client
             .decrypt(&nonce, &ct, aad, 1, false)
@@ -1447,7 +1447,7 @@ mod tests {
     }
     /// Send one packet from `from` to `to` and report whether `to` could
     /// read it, trying the current recv key first and then the old one,
-    /// like `try_decrypt_with_fallback` in lib.rs.
+    /// like `open` does.
     fn delivers(
         from: &mut SessionKeyManager,
         to: &mut SessionKeyManager,

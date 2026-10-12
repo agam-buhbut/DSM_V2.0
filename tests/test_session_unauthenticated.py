@@ -1,5 +1,5 @@
-"""The live session hands each packet it cannot use (AEAD failed, or already
-seen by the replay window) to the server's in-session accept, and nothing
+"""The live session hands each packet it cannot use (it did not open, or the
+Python window refused it) to the server's in-session accept, and nothing
 else. Review Focus 2: a packet that opened, the live client's own traffic,
 never goes there.
 
@@ -8,7 +8,7 @@ before the packet opens. A replay is refused by the Rust window inside
 open_packet and so comes back as "did not open", and so does a reconnected
 client's first packet under its new keys. Both are handed over with seen
 False. Seen is True only for a packet that opened and that the Python
-window then refused (more than 128 behind; test_wire_v2.py covers it).
+window then refused (128 or more behind; test_wire_v2.py covers it).
 
 Real session keys from tuncore (as in test_link_stats.py); fakes elsewhere.
 No sockets; nothing sleeps.

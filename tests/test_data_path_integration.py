@@ -672,9 +672,8 @@ class TestDataPathRoundtrip(unittest.IsolatedAsyncioTestCase):
 class TestTCPFixedSizePadding(unittest.IsolatedAsyncioTestCase):
     """Regression: ``make_send_fn`` over TCP MUST pad the inner plaintext
     to ``tcp_fixed_size - OUTER_HEADER_SIZE - GCM_TAG_SIZE`` (1364), NOT
-    to ``tcp_fixed_size`` (1400). The latter caused
-    ``OuterPacket.serialize(target_size=1400)`` to fail with a wire-size
-    mismatch on every send below the max class — silently dropped by the
+    to ``tcp_fixed_size`` (1400). The latter made every send below the max
+    class fail with a wire-size mismatch — silently dropped by the
     scheduler's broad ``except Exception``.
     """
 

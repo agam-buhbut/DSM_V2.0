@@ -35,10 +35,10 @@ except ImportError:
 class TestBootstrapSessionDH(unittest.TestCase):
     """Exercise tuncore.complete_bootstrap directly."""
 
-    def test_bootstrap_roundtrip_encrypt_decrypt(self) -> None:
+    def test_bootstrap_roundtrip_seal_open(self) -> None:
         """The core property: when both sides call complete_bootstrap with
-        matching inputs (their own BootstrapEphemeral + peer's public) the
-        resulting SessionKeyManagers produce interoperable encrypt/decrypt."""
+        matching inputs (their own BootstrapEphemeral + peer's public) each
+        side opens what the other seals."""
         a_eph = tuncore.BootstrapEphemeral.generate()
         b_eph = tuncore.BootstrapEphemeral.generate()
         a_public = bytes(a_eph.public_key_bytes)
@@ -136,12 +136,11 @@ class TestBootstrapSessionDH(unittest.TestCase):
         with self.assertRaises(Exception):
             tuncore.complete_bootstrap(eph, peer_pub, is_initiator=True)
 
-    def test_session_key_manager_encrypt_decrypt_return_bytes(self) -> None:
+    def test_session_key_manager_seal_open_return_bytes(self) -> None:
         """H-PERF-3 contract, now on the wire v2 calls: ``seal_packet``
         returns the whole wire packet as ``bytes`` and ``open_packet`` returns
         ``(int, bytes, bool)``. The Rust side returns ``PyBytes`` directly so
-        Python callers need no ``bytes(...)`` copy on the hot path. (Named for
-        the calls it replaced.)
+        Python callers need no ``bytes(...)`` copy on the hot path.
         """
         a_eph = tuncore.BootstrapEphemeral.generate()
         b_eph = tuncore.BootstrapEphemeral.generate()
