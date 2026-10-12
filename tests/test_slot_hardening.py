@@ -331,12 +331,18 @@ class _Tcp:
         self.gate = _real_gate() if gate else None
         self.slot = None if no_slot else SessionSlot()
         self.session_live = session_live
-        self.clock: Callable[[], float] = clock if clock is not None else _Frozen()
+        self._frozen: _Frozen = clock if isinstance(clock, _Frozen) else _Frozen()
+        self.clock: Callable[[], float] = clock if clock is not None else self._frozen
         self.extra: dict[str, Any] = {"attempts": self.attempts, "clock": self.clock}
         self.loop_errors: list[dict[str, Any]] = []
         self.task: asyncio.Future[None] | None = None
         self._patch = patch("dsm.crypto.handshake.server_handshake", new=hs)
         self._old_handler: Any = None
+
+    def at(self, t: float) -> None:
+        """Set Step S's frozen clock to ``t``."""
+        assert self.clock is self._frozen, "this run has its own clock"
+        self._frozen.now = t
 
     def connect(self, peer: Addr, frames: list[bytes] | None = None) -> _Conn:
         conn = _Conn(peer, frames)
@@ -1134,8 +1140,7 @@ async def _accepted(
     run: _Tcp, peer: Addr, at: float, frames: list[bytes] | None = None
 ) -> _Conn:
     """Queue a connection at Step S time ``at`` and wait for its record."""
-    assert isinstance(run.clock, _Frozen)
-    run.clock.now = at
+    run.at(at)
     before = len(run.attempts)
     conn = run.connect(peer, frames)
     assert await _spin(lambda: len(run.attempts) == before + 1)
@@ -1147,11 +1152,11 @@ async def test_a_silent_tcp_connection_is_pushed_out_when_the_pool_is_full() -> 
     limiter = _Ledger(clock=_minutes())
     async with _Tcp(hs, limiter=limiter) as run:
         silent = await _accepted(run, _A, 0.0)  # no first frame: not signing
-        run.clock.now = 1.4  # too young yet
+        run.at(1.4)  # too young yet
         early = run.connect(_B, [_good(2)])
         assert await _spin(lambda: early.closed)
         assert not silent.closed
-        run.clock.now = 1.5
+        run.at(1.5)
         run.connect(_C, [_good(3)])
         assert await _spin(lambda: silent.closed)
         assert await _spin(lambda: _C in hs.sent_msg2)
@@ -1169,10 +1174,10 @@ async def test_a_tcp_attempts_age_counts_from_its_accept_not_its_first_frame() -
     hs = _Hs()
     async with _Tcp(hs) as run:
         first = await _accepted(run, _A, 0.0)
-        run.clock.now = 1.0
+        run.at(1.0)
         first._frames.put_nowait(_good(1))  # the first frame comes late
         assert await _spin(lambda: _A in hs.sent_msg2)
-        run.clock.now = 1.5  # 1.5 s from the accept, 0.5 s from the frame
+        run.at(1.5)  # 1.5 s from the accept, 0.5 s from the frame
         run.connect(_B, [_good(2)])
         assert await _spin(lambda: first.closed)
         assert await _spin(lambda: _B in hs.sent_msg2)
@@ -1186,7 +1191,7 @@ async def test_a_tcp_attempt_is_never_pushed_out_while_its_msg2_waits() -> None:
     async with _Tcp(hs) as run:
         held = await _accepted(run, _A, 0.0, [_good(1)])
         assert await _spin(lambda: _A in hs.started)
-        run.clock.now = 10.0
+        run.at(10.0)
         refused = run.connect(_B, [_good(2)])
         assert await _spin(lambda: refused.closed)
         assert not held.closed
@@ -1205,7 +1210,7 @@ async def test_a_tcp_attempt_past_admit_is_never_pushed_out() -> None:
         assert await _spin(
             lambda: run.slot is not None and run.slot.admitted is not None
         )
-        run.clock.now = 5.0
+        run.at(5.0)
         refused = run.connect(_B, [_good(2)])
         assert await _spin(lambda: refused.closed)
         assert not held.closed
@@ -1220,7 +1225,7 @@ async def test_without_the_gate_no_tcp_connection_is_pushed_out() -> None:
         c1 = await _accepted(run, x1, 0.0, [_good(1)])
         c2 = await _accepted(run, x2, 0.1, [_good(2)])
         assert await _spin(lambda: x1 in hs.sent_msg2 and x2 in hs.sent_msg2)
-        run.clock.now = 60.0
+        run.at(60.0)
         other = run.connect(_B, [_good(3)])
         same = run.connect(x3, [_good(4)])
         assert await _spin(lambda: other.closed and same.closed)
@@ -1236,7 +1241,7 @@ async def test_a_tcp_address_at_its_cap_pushes_out_its_own_oldest() -> None:
     async with _Tcp(hs, max_inflight=8, limiter=limiter) as run:
         c1 = await _accepted(run, (ip, 1), 0.0)
         c2 = await _accepted(run, (ip, 2), 0.2)
-        run.clock.now = 2.0
+        run.at(2.0)
         run.connect((ip, 3), [_good(3)])
         assert await _spin(lambda: c1.closed)
         assert await _spin(lambda: (ip, 3) in hs.sent_msg2)
@@ -1276,7 +1281,7 @@ async def test_two_tcp_connections_in_one_step_push_out_two_attempts() -> None:
     async with _Tcp(hs, max_inflight=2, limiter=limiter) as run:
         a = await _accepted(run, _A, 0.0)
         b = await _accepted(run, _B, 0.1)
-        run.clock.now = 2.0
+        run.at(2.0)
         run.connect(_C, [_good(3)])
         run.connect(_D, [_good(4)])  # Queue.get() does not yield: one step
         assert await _spin(lambda: a.closed and b.closed)
@@ -1494,7 +1499,7 @@ async def test_a_shutdown_in_the_tcp_push_out_pass_gives_back_once() -> None:
         old = await _accepted(run, _A, 0.0, [_good(1)])
         assert await _spin(lambda: _A in hs.sent_msg2)
         victim = next(iter(run.attempts))
-        run.clock.now = 2.0
+        run.at(2.0)
         with patch.object(hsa, "_push_out", _cancels_asked_at_push_out(asked)):
             new = run.connect(_B, [_good(2)])
             assert await _spin(lambda: asked != [])
@@ -1528,7 +1533,7 @@ async def test_a_shutdown_in_an_own_address_tcp_push_out_pass_gives_back_once() 
         young = await _accepted(run, x2, 1.0, [_good(2)])
         assert await _spin(lambda: x1 in hs.sent_msg2 and x2 in hs.sent_msg2)
         victim = next(iter(run.attempts))
-        run.clock.now = 2.0  # x1 is 2.0 s old, x2 only 1.0 s
+        run.at(2.0)  # x1 is 2.0 s old, x2 only 1.0 s
         with patch.object(hsa, "_push_out", _cancels_asked_at_push_out(asked)):
             new = run.connect(x3, [_good(3)])
             assert await _spin(lambda: asked != [])
