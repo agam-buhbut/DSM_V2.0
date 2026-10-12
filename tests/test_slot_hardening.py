@@ -440,11 +440,16 @@ async def test_half_a_first_frame_is_cut_at_the_deadline_too() -> None:
     writer = _Writer()
     conn = TCPTransport.from_streams(reader, writer)  # type: ignore[arg-type]
     hs = _Hs()
+    limiter = _Ledger(clock=_minutes())
     with patch.object(hsa, "_TCP_FIRST_FRAME_DEADLINE", 0.0):
-        async with _Tcp(hs) as run:
+        async with _Tcp(hs, limiter=limiter) as run:
             run.connections.put_nowait((conn, _A))
             assert await _spin(lambda: writer.closed)
     assert hs.started == []
+    assert limiter.finished == [_A[0]]
+    assert _inflight(limiter, _A[0]) == 0
+    assert run.gate is not None and run.gate.load.under_load(0)
+    assert run.loop_errors == []
 
 
 async def test_a_bad_first_frame_is_closed_and_spends_no_shared_token() -> None:
@@ -458,7 +463,9 @@ async def test_a_bad_first_frame_is_closed_and_spends_no_shared_token() -> None:
         assert await _spin(lambda: bad.closed)
         assert run.gate is not None and not run.gate.load.under_load(0)  # noise
     assert hs.started == []
+    assert limiter.finished == [_A[0], _B[0]]  # each gave its share back once
     assert _overall_left(limiter) == int(GLOBAL_START_BURST)
+    assert run.loop_errors == []
 
 
 async def test_a_good_first_frame_spends_exactly_one_shared_token() -> None:
@@ -486,6 +493,14 @@ async def test_a_good_first_frame_is_closed_as_trouble_when_limits_refuse() -> N
     assert hs.started == []
     assert limiter.finished == [_A[0]]
     assert run.loop_errors == []
+    # The refusal gave back the slot and the share but not the address's rate
+    # token: it has the rest of its burst left, not all of it.
+    assert _inflight(limiter, _A[0]) == 0
+    more = 0
+    while limiter.try_start(_A[0], shared=False):
+        limiter.finish(_A[0])
+        more += 1
+    assert more == int(PER_SOURCE_BURST) - 1
 
 
 async def test_in_a_session_the_first_frame_also_pays_the_newcomer_limit() -> None:
@@ -512,3 +527,44 @@ async def test_without_the_gate_a_tcp_connection_pays_everything_at_accept() -> 
         assert not conn._frames.empty()  # closed at accept, never read
     assert hs.started == []
     assert limiter.finished == []
+
+
+async def test_shutdown_while_waiting_for_the_first_frame_is_not_trouble() -> None:
+    hs = _Hs()
+    limiter = _Ledger(clock=_Frozen())
+    # The real 3 s deadline: the shutdown comes long before it.
+    async with _Tcp(hs, limiter=limiter) as run:
+        conn = run.connect(_A)
+        assert await _spin(lambda: bool(conn._frames._getters))  # worker is reading
+    # Leaving the block cancelled the admit loop and the worker.
+    assert conn.closed
+    assert hs.started == []
+    assert limiter.finished == [_A[0]]
+    assert _inflight(limiter, _A[0]) == 0
+    assert run.gate is not None and not run.gate.load.under_load(0)
+    assert _overall_left(limiter) == int(GLOBAL_START_BURST)
+    assert await _slots_free(run.semaphore) == 1
+    assert run.loop_errors == []
+
+
+async def test_a_frame_landing_as_the_deadline_fires_is_cut_as_a_timeout() -> None:
+    hs = _Hs()
+    limiter = _Ledger(clock=_Frozen())
+    with patch.object(hsa, "_TCP_FIRST_FRAME_DEADLINE", 0.0):
+        async with _Tcp(hs, limiter=limiter) as run:
+            conn = run.connect(_A)
+            assert await _spin(lambda: bool(conn._frames._getters))
+            # The deadline's timer fires on the next loop pass. The read is
+            # still waiting now, and the frame lands before the timer runs:
+            # the timer wins, the frame stays unread.
+            assert not conn._frames._getters[0].done()
+            conn._frames.put_nowait(_good(1))
+            assert await _spin(lambda: conn.closed)
+            assert await _slots_free(run.semaphore) == 1
+    assert not conn._frames.empty()
+    assert hs.started == []
+    assert limiter.finished == [_A[0]]
+    assert _inflight(limiter, _A[0]) == 0
+    assert run.gate is not None and run.gate.load.under_load(0)
+    assert _overall_left(limiter) == int(GLOBAL_START_BURST)  # no shared token
+    assert run.loop_errors == []
