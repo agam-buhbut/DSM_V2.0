@@ -155,8 +155,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - One address may run at most 2 handshakes at once and start 3 at once,
     then 1 every 4 s; all addresses together may start 8 at once, then 4 a
     second. Refused UDP packets get no answer; refused TCP connections are
-    closed at once. The log says why (an INFO line), without the address, at
-    most once per 10 s per reason. A wrong-size packet logs nothing at INFO
+    closed. The log says why (an INFO line), without the address, at most
+    once per 10 s per reason. A wrong-size packet logs nothing at INFO
     (DEBUG only).
   - TCP: the server keeps one listener open while handshakes run and checks
     connections side by side, with the same limits and the same 12 s cutoff
