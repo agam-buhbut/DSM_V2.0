@@ -19,7 +19,7 @@ import asyncio
 import contextlib
 import random
 import time
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncGenerator, Iterator
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
@@ -60,7 +60,9 @@ class _Server:
 
 
 @contextlib.asynccontextmanager
-async def _gated_tcp_server(p: _Parties, gate: HandshakeGate) -> AsyncIterator[_Server]:
+async def _gated_tcp_server(
+    p: _Parties, gate: HandshakeGate
+) -> AsyncGenerator[_Server, None]:
     """A loopback listener feeding the real gated TCP accept; the accept is
     stopped and the listener closed on the way out."""
     keystore: Any = SimpleNamespace(identity=p.server.identity)
