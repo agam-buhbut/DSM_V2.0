@@ -47,12 +47,13 @@ DNS proxy, one socket), and the acceptor runs in two places:
 * Push-out (spec §4): with the run's gate, a new UDP source or TCP
   connection that finds no room may take the place of a stalled attempt —
   one at least ``_PUSH_OUT_AFTER_S`` old (from the msg1 that started it, or
-  from the TCP accept), whose msg2 has left and that has not passed the
-  slot's check. If its address already runs ``PER_SOURCE_INFLIGHT``
-  attempts, only that address's own oldest such attempt can go, and the new
-  one takes over its share too; otherwise, when every slot is full, the
-  oldest such attempt of any address gives up its slot. Without a gate
-  (tests only) nothing is pushed out.
+  from the TCP accept), that is not busy making its msg2 (a wait for the TPM
+  counts; a TCP connection that has sent nothing yet is not busy) and that
+  has not passed the slot's check. If its address already runs
+  ``PER_SOURCE_INFLIGHT`` attempts, only that address's own oldest such
+  attempt can go, and the new one takes over its share too; otherwise, when
+  every slot is full, the oldest such attempt of any address gives up its
+  slot. Without a gate (tests only) nothing is pushed out.
 * :func:`_accept_until_winner_tcp` does the same for TCP. The run's
   :class:`~dsm.net.transport.tcp.TCPListener` queues each accepted
   connection, and :func:`_tcp_admit_loop` gives it a slot (a free one or,
@@ -293,8 +294,10 @@ def _pick_victim(
     ip: str | None = None,
 ) -> asyncio.Task[None] | None:
     """The oldest attempt that can be pushed out (from ``ip`` only, when
-    given), or None (spec §4.3): at least ``_PUSH_OUT_AFTER_S`` old, its msg2
-    sent, not past the slot's ``admit``, not passed on already, not ended.
+    given), or None (spec §4.3): at least ``_PUSH_OUT_AFTER_S`` old, not
+    signing (a wait for the TPM counts; a TCP connection that has sent
+    nothing yet is not signing), not past the slot's ``admit``, not passed on
+    already, not ended.
     A clock that stepped back gives a negative age, which reads as too young.
     A tie keeps the earlier record, and the dict holds records in start order.
     """

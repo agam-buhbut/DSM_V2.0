@@ -164,15 +164,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     to 30-48 s and every other client was refused.
 - Handshake slots (server only, no wire change). A stalled handshake no
   longer holds one of the `max_inflight_handshakes` slots for up to 12 s.
-  When a new handshake start finds no free slot, and its sender has proved
-  its address (over UDP with a cookie, over TCP by the connection), the
-  server ends the oldest attempt that is at least 1.5 s old, has sent its
-  answer (msg2) and has not passed the last check, and gives its slot to the
-  new one. When the new start's address already runs 2 handshakes, only that
-  address's own oldest such attempt can go. Over TCP a connection must send
-  its first handshake message within 3 s, and it pays the shared start
-  limits only after that message has the right size and a valid mac1, so a
-  silent connection cannot use them up. New log lines: `pushed out a stalled
+  When a new handshake start finds no room (no free slot, or its address
+  already runs 2 handshakes), and its sender has proved its address (over
+  UDP with a cookie, over TCP by the connection), the server ends the oldest
+  attempt that is at least 1.5 s old, is not busy making its answer (a wait
+  for the TPM counts) and has not passed the session check, and gives its
+  place to the new one. A TCP connection that has sent nothing yet counts
+  too. The 1.5 s counts from the first message (UDP) or the accept (TCP); a
+  resent first message does not restart it. If the new start's address
+  already runs 2 handshakes, only that address's own oldest such attempt can
+  go. Over TCP a connection must send its first handshake message within
+  3 s, and it pays the shared start limits only after that message has the
+  right size and a valid mac1, so a silent connection cannot use them up.
+  New log lines: `pushed out a stalled
   handshake attempt to make room for a new one` (INFO, at most once per
   10 s, with a count) and, at start, a WARNING when `max_inflight_handshakes`
   is below 8.

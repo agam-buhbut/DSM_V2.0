@@ -2213,14 +2213,16 @@ gives, which costs the server a signature. When the server is busy, it asks
 for a cookie, and then only a replay from the same address and port works,
 for 2 to 4 minutes (the cookie covers the address and port, not the
 message); that sender could also just drop packets. A stalled handshake
-cannot hold a slot for long: when a new start finds no free slot, the server
-ends the oldest attempt that is at least 1.5 s old and has sent its answer,
-and logs `pushed out a stalled handshake attempt to make room for a new one`
-(INFO, at most once per 10 s, with a count). Someone with many addresses can
-still make new devices wait while it lasts: over TCP with no key at all
-(about 22 addresses), over UDP with the CA certificate and the server's name
-(about 4 addresses while a session runs, about 16 otherwise, by using up the
-shared start limits).
+cannot hold a slot for long: when a new start finds no room (no free slot,
+or its address already runs 2), the server ends the oldest attempt that is
+at least 1.5 s old, is not busy making its answer (a wait for the TPM
+counts) and has not passed the session check. A TCP connection that has sent
+nothing yet counts too. The server logs `pushed out a stalled handshake
+attempt to make room for a new one` (INFO, at most once per 10 s, with a
+count). Someone with many addresses can still make new devices wait while
+it lasts: over TCP with no key at all (about 22 addresses), over UDP with
+the CA certificate and the server's name (about 4 addresses while a session
+runs, about 16 otherwise, by using up the shared start limits).
 
 With `transport = "tcp"` the server keeps its one listening socket open for
 the whole run, also while a session runs, so one silent connection does not
