@@ -44,18 +44,20 @@ DNS proxy, one socket), and the acceptor runs in two places:
 * Workers run under a semaphore of ``config.max_inflight_handshakes``, each
   with a hard per-attempt deadline. With the run's slot, a client that
   passed every check also needs the slot's yes before the last frame.
-* Push-out (spec §4): with the run's gate, a new UDP source that finds no
-  room may take the place of a stalled attempt — one at least
-  ``_PUSH_OUT_AFTER_S`` old (from the msg1 that started it), whose msg2 has
-  left and that has not passed the slot's check. If its address already
-  runs ``PER_SOURCE_INFLIGHT`` attempts, only that address's own oldest such
-  attempt can go, and the new one takes over its share too; otherwise, when
-  every slot is full, the oldest such attempt of any address gives up its
-  slot. Without a gate (tests only) nothing is pushed out.
+* Push-out (spec §4): with the run's gate, a new UDP source or TCP
+  connection that finds no room may take the place of a stalled attempt —
+  one at least ``_PUSH_OUT_AFTER_S`` old (from the msg1 that started it, or
+  from the TCP accept), whose msg2 has left and that has not passed the
+  slot's check. If its address already runs ``PER_SOURCE_INFLIGHT``
+  attempts, only that address's own oldest such attempt can go, and the new
+  one takes over its share too; otherwise, when every slot is full, the
+  oldest such attempt of any address gives up its slot. Without a gate
+  (tests only) nothing is pushed out.
 * :func:`_accept_until_winner_tcp` does the same for TCP. The run's
   :class:`~dsm.net.transport.tcp.TCPListener` queues each accepted
-  connection, and :func:`_tcp_admit_loop` gives it a slot and a worker under
-  the same pool, limits and deadline, or closes it at once.
+  connection, and :func:`_tcp_admit_loop` gives it a slot (a free one or,
+  with the gate, a stalled attempt's) and a worker under the same pool,
+  limits and deadline, or closes it at once.
 
 Handoff: once a winner is chosen the demux stops reading, so the client's
 first post-handshake datagrams stay queued for the data path. Any the demux
@@ -165,10 +167,14 @@ class _FirstFrameTCP(TCPTransport):
     """
 
     def __init__(  # pylint: disable=super-init-not-called
-        self, real: TCPTransport, first: bytes
+        self,
+        real: TCPTransport,
+        first: bytes,
+        on_msg2: Callable[[], None] | None = None,
     ) -> None:
         self._real = real
         self._first: bytes | None = first
+        self._on_msg2 = on_msg2
 
     async def recv(self, timeout: float | None = None) -> bytes:
         first = self._first
@@ -179,6 +185,11 @@ class _FirstFrameTCP(TCPTransport):
 
     async def send(self, data: bytes) -> None:
         await self._real.send(data)
+        # The first send is msg2: once it has left, the attempt is no longer
+        # signing. A resend does not call this again.
+        on_msg2, self._on_msg2 = self._on_msg2, None
+        if on_msg2 is not None:
+            on_msg2()
 
 
 # Per-attempt deadline (s): room for one lost-and-retransmitted message within
@@ -409,6 +420,7 @@ async def _run_handshake_worker(
     session_live: bool = False,
     gate: HandshakeGate | None = None,
     limiter: SourceLimiter | None = None,
+    record: _Attempt | None = None,
 ) -> None:
     """Run one handshake attempt under the per-attempt deadline.
 
@@ -429,6 +441,10 @@ async def _run_handshake_worker(
     anything else happens (no cookies on TCP), and every failure counts as
     trouble. Only then does ``limiter`` (the run's) charge the shared start
     limits; the accept charged only the address's own (spec §4.2).
+
+    ``record`` is the attempt's push-out record: over TCP it is marked as
+    signing once the first frame passed, until msg2 has left (UDP's view
+    does that for UDP).
     """
     from cryptography.x509.oid import ExtendedKeyUsageOID
 
@@ -492,7 +508,15 @@ async def _run_handshake_worker(
                     ):
                         _note_trouble(gate)
                         return
-                    transport = _FirstFrameTCP(transport, first)
+                    if record is not None:
+                        # Entering the msg2 signing path: no push-out until
+                        # msg2 has left, any wait for the TPM included.
+                        record.signing = True
+                    transport = _FirstFrameTCP(
+                        transport,
+                        first,
+                        on_msg2=None if record is None else record.msg2_sent,
+                    )
                 session_keys, client_pub = await server_handshake(
                     transport,
                     keystore.identity,
@@ -1056,23 +1080,37 @@ async def _tcp_admit_loop(
     slot: SessionSlot | None = None,
     session_live: bool = False,
     gate: HandshakeGate | None = None,
+    attempts: dict[asyncio.Task[None], _Attempt] | None = None,
+    clock: Callable[[], float] = time.monotonic,
 ) -> None:
     """Admit queued TCP connections until a winner is set.
 
-    The TCP twin of :func:`_demux_loop`. A connection is closed at once when
-    the pool is full or ``limiter`` refuses its address; otherwise it takes a
-    slot and a worker. ``open_conns`` and ``workers`` belong to the caller.
+    The TCP twin of :func:`_demux_loop`. A connection takes a free slot, or
+    with ``gate`` may push out a stalled attempt (spec §4.3; the connection
+    itself proves its address); otherwise it is closed at once, as when
+    ``limiter`` refuses its address. ``open_conns`` and ``workers`` belong to
+    the caller.
 
     ``slot`` and ``session_live`` work as in :func:`_demux_loop`. With
     ``gate``, a connection is charged only its address's limits here; its
     worker checks the first frame, then charges the shared limits.
+    ``attempts`` and ``clock`` work as in :func:`_demux_loop`; an attempt's
+    age counts from its accept.
     """
+    records: dict[asyncio.Task[None], _Attempt] = {} if attempts is None else attempts
     while not winner.done():
         conn, peer = await connections.get()
         if winner.done():
             conn.close()
             return
-        if semaphore.locked():
+        now = clock()
+        pool_full = semaphore.locked()
+        push = (
+            _choose_push_out(records, now, slot, peer[0], pool_full=pool_full)
+            if gate is not None
+            else None
+        )
+        if pool_full and push is None:
             _tcp_full_log.log("handshake pool saturated — closing a new TCP connection")
             _note_trouble(gate)
             conn.close()
@@ -1082,36 +1120,62 @@ async def _tcp_admit_loop(
         if peer in open_conns:
             conn.close()
             continue
-        # Never waits: the pool has a free slot (checked above).
-        await semaphore.acquire()
-        # Asked last, so a connection closed above spends none of its
-        # address's budget. With the gate only the per-address limits are
-        # charged here; the worker charges the shared ones once the first
-        # frame passed mac1, so a silent connection spends none of them
-        # (spec §4.2). From here to the done-callback below nothing awaits, so
-        # the slot and the address are always given back.
-        if not limiter.try_start(peer[0], in_session=session_live, shared=gate is None):
-            semaphore.release()
-            _note_trouble(gate)
-            conn.close()
-            continue
+        # With the gate only the per-address limits are charged here; the
+        # worker charges the shared ones once the first frame passed mac1,
+        # so a silent connection spends none of them (spec §4.2).
+        shared = gate is None
+        if push is not None:
+            victim, how = push
+            # Asked before anything changes, so a refusal leaves the old
+            # attempt alone. The new attempt takes the old one's slot.
+            if not limiter.try_start(
+                peer[0],
+                in_session=session_live,
+                shared=shared,
+                inherits_share=how is _PassedOn.SLOT_AND_SHARE,
+            ):
+                _note_trouble(gate)
+                conn.close()
+                continue
+            _push_out(records, victim, how)
+        else:
+            # Never waits: the pool has a free slot (checked above).
+            await semaphore.acquire()
+            # Asked last, so a connection closed above spends none of its
+            # address's budget. An address at its cap with nothing to push
+            # out is refused here, with the limiter's usual line. From here to
+            # the done-callback below nothing awaits, so the slot and the
+            # address are always given back.
+            if not limiter.try_start(peer[0], in_session=session_live, shared=shared):
+                semaphore.release()
+                _note_trouble(gate)
+                conn.close()
+                continue
         open_conns[peer] = conn
+        # Not signing yet: the worker sets that once the first frame passed.
+        record = _Attempt(ip=peer[0], started=now, signing=False)
 
         # A done-callback, not a ``finally`` in the worker: a task cancelled
         # before its first step never runs its body, but its done-callbacks
         # still run, exactly once. The close is the sync one; nothing here
         # may await.
         def _end_attempt(
-            _task: asyncio.Task[None],
+            done: asyncio.Task[None],
             c: TCPTransport = conn,
             p: tuple[str, int] = peer,
         ) -> None:
-            semaphore.release()
+            # The record first, so an error below cannot leave it behind.
+            passed_on = records.pop(done).passed_on
+            if passed_on is None:
+                # A pushed-out attempt's slot belongs to the one that took it.
+                semaphore.release()
             if not _is_winner_addr(winner, p):
                 open_conns.pop(p, None)
                 c.close()
             # Last, so an error in ``finish`` cannot leave a connection open.
-            limiter.finish(p[0])
+            # After a same-address push-out the new attempt holds this share.
+            if passed_on is not _PassedOn.SLOT_AND_SHARE:
+                limiter.finish(p[0])
 
         task = asyncio.ensure_future(
             _run_handshake_worker(
@@ -1128,8 +1192,10 @@ async def _tcp_admit_loop(
                 session_live=session_live,
                 gate=gate,
                 limiter=limiter,
+                record=record,
             )
         )
+        records[task] = record
         task.add_done_callback(_end_attempt)
         workers.add(task)
         task.add_done_callback(workers.discard)
@@ -1149,6 +1215,7 @@ async def _accept_until_winner_tcp(  # pyright: ignore[reportUnusedFunction]  # 
     *,
     session_live: bool = False,
     on_winner: Callable[[tuple[str, int]], None] | None = None,
+    clock: Callable[[], float] = time.monotonic,
 ) -> tuple[
     tuncore.SessionKeyManager | None,
     bytes | None,
@@ -1167,7 +1234,8 @@ async def _accept_until_winner_tcp(  # pyright: ignore[reportUnusedFunction]  # 
     still queued, is closed before return. ``slot``, ``session_live``,
     ``on_winner`` and ``gate`` work as in :func:`_accept_round`. ``gate``
     comes right after ``slot`` and may be passed by position: the server
-    does, and its test stand-ins take no keywords.
+    does, and its test stand-ins take no keywords. ``clock`` is Step S's own;
+    production uses the default.
     """
     if limiter is None:
         limiter = SourceLimiter()
@@ -1197,6 +1265,7 @@ async def _accept_until_winner_tcp(  # pyright: ignore[reportUnusedFunction]  # 
             slot=slot,
             session_live=session_live,
             gate=gate,
+            clock=clock,
         )
     )
     try:
@@ -1353,6 +1422,7 @@ class SessionWatch:
                 limiter,
                 slot,
                 gate,
+                clock,
             )
         else:
             raise ValueError("SessionWatch needs udp= or tcp=")
@@ -1411,6 +1481,7 @@ class SessionWatch:
         limiter: SourceLimiter,
         slot: SessionSlot,
         gate: HandshakeGate | None,
+        clock: Callable[[], float],
     ) -> Winner | None:
         session_keys, client_pub, conn = await _accept_until_winner_tcp(
             config,
@@ -1425,6 +1496,7 @@ class SessionWatch:
             gate=gate,
             session_live=True,
             on_winner=self._won,
+            clock=clock,
         )
         if session_keys is None or client_pub is None or conn is None:
             return None
