@@ -192,6 +192,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   GCM state, which cannot decrypt, is still not wiped.
 
 ### Fixed
+- The server's systemd unit (`deploy/dsm.service`) had `ProcSubset=pid`,
+  which hides `/proc/sys`. The server writes its network settings there
+  when a client connects, so under that unit every client session failed
+  ("TUN configure failed: sysctl -w net.ipv6.conf.all.disable_ipv6=1").
+  The line is gone; `ProtectProc=invisible` still hides other processes.
+  The client unit never had it.
 - Packets sent into the tunnel at a steady beat of about 0.1 or 0.2 s
   (for example `ping -i 0.2`, or a probe on a 100 ms timer) are no longer
   lost. One in four or more such packets went missing with no log line,

@@ -181,9 +181,10 @@ UMask=0077
 # is run by the operator directly and writes its CSR to the host /tmp.)
 PrivateTmp=true
 
-# Only see our own PIDs in /proc; hide other processes. dsm doesn't
-# scan /proc for siblings. /proc/sys (kernel tunables) is unaffected.
-ProcSubset=pid
+# Hide other processes in /proc. dsm doesn't scan /proc for siblings.
+# No ProcSubset=pid: it hides /proc/sys too, and the server writes
+# net.ipv4.ip_forward, net.ipv6.conf.*.disable_ipv6, net.ipv4.tcp_timestamps
+# and the redirect sysctls there (every client session failed with it).
 ProtectProc=invisible
 
 # Skipped because dsm legitimately writes to /proc/sys/net:
