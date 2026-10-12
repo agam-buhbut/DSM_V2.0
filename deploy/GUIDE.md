@@ -2212,16 +2212,29 @@ cookie asked) answers it and gives it the one handshake slot such a server
 gives, which costs the server a signature. When the server is busy, it asks
 for a cookie, and then only a replay from the same address and port works,
 for 2 to 4 minutes (the cookie covers the address and port, not the
-message); that sender could also just drop packets. Four real addresses can
-still hold all 8 slots (UDP or TCP). Over TCP they need no key: a
-connection takes its slot before its first frame is checked, and keeps it
-until the 12 s cutoff.
+message); that sender could also just drop packets. A stalled handshake
+cannot hold a slot for long: when a new start finds no free slot, the server
+ends the oldest attempt that is at least 1.5 s old and has sent its answer,
+and logs `pushed out a stalled handshake attempt to make room for a new one`
+(INFO, at most once per 10 s, with a count). Someone with many addresses can
+still make new devices wait while it lasts: over TCP with no key at all
+(about 22 addresses), over UDP with the CA certificate and the server's name
+(about 4 addresses while a session runs, about 16 otherwise, by using up the
+shared start limits).
 
 With `transport = "tcp"` the server keeps its one listening socket open for
 the whole run, also while a session runs, so one silent connection does not
 hold up other clients and a client that comes back can take its session
-over. It keeps at most 2 connections per address and closes each one that
-has not finished its handshake after 12 s.
+over. It keeps at most 2 connections per address, closes a connection that
+has not sent its first handshake message after 3 s, and one that has not
+finished its handshake after 12 s.
+
+### Server log: "max_inflight_handshakes=N is too low for the handshake slot rule"
+
+A WARNING at start. With fewer handshake slots than the line says, a steady
+stream of stalled handshakes can keep every slot busy, so new devices wait.
+Set `max_inflight_handshakes` to at least the number the line gives, or
+remove the setting to use the default (8, enough).
 
 ### Server log: "client reconnected (client_cn=...); ending its old session"
 
