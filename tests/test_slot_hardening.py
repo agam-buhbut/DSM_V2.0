@@ -1027,6 +1027,109 @@ async def test_the_msg2_hook_waits_until_msg2_really_left() -> None:
     assert fired == []  # still signing: msg2 did not go out
 
 
+_X = "203.0.113.50"  # one address, several ports
+
+
+async def test_an_address_at_its_cap_pushes_out_its_oldest_and_keeps_share() -> None:
+    hs = _Hs()
+    limiter = _Ledger(clock=_minutes())
+    async with _Udp(hs, max_inflight=8, limiter=limiter) as run:
+        await _started(run, hs, (_X, 1), 0.0)
+        await _started(run, hs, (_X, 2), 0.2)  # the address is at its cap
+        await _started(run, hs, (_X, 3), 2.0)
+        await _yield()
+        assert hs.cancelled == [(_X, 1)]  # its own oldest
+        # The victim gave back neither its slot nor its share.
+        assert limiter.finished == []
+        assert _inflight(limiter, _X) == 2  # exactly what it was
+        assert await _slots_free(run.semaphore) == 6
+    assert limiter.finished == [_X, _X]
+    assert await _slots_free(run.semaphore) == 8
+    assert run.loop_errors == []
+
+
+async def test_case_1_comes_before_case_2_even_with_every_slot_full() -> None:
+    hs = _Hs()
+    limiter = _Ledger(clock=_minutes())
+    async with _Udp(hs, max_inflight=3, limiter=limiter) as run:
+        await _started(run, hs, _A, 0.0)  # the oldest of all
+        await _started(run, hs, (_X, 1), 0.2)
+        await _started(run, hs, (_X, 2), 0.4)  # pool full, _X at its cap
+        await _started(run, hs, (_X, 3), 2.0)
+        await _yield()
+        assert hs.cancelled == [(_X, 1)]  # _X's own oldest, not _A
+        assert limiter.finished == []
+        assert await _slots_free(run.semaphore) == 0
+
+
+async def test_after_case_2_the_victim_gives_back_its_share_not_its_slot() -> None:
+    hs = _Hs()
+    limiter = _Ledger(clock=_minutes())
+    async with _Udp(hs, limiter=limiter) as run:
+        await _started(run, hs, _A, 0.0)
+        await _started(run, hs, _B, 2.0)
+        await _yield()
+        assert hs.cancelled == [_A]
+        assert limiter.finished == [_A[0]]
+        assert _inflight(limiter, _A[0]) == 0
+        assert await _slots_free(run.semaphore) == 0  # _B holds the slot
+
+
+async def test_a_spent_rate_refuses_an_own_address_push_out(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="dsm.net.handshake_gate")
+    hs = _Hs()
+    # The limiter's clock never moves, so _X's rate bucket (3) does not refill.
+    limiter = _Ledger(clock=_Frozen())
+    async with _Udp(hs, max_inflight=8, limiter=limiter) as run:
+        await _started(run, hs, (_X, 1), 0.0)  # token 1
+        await _started(run, hs, (_X, 2), 0.1)  # token 2
+        await _started(run, hs, (_X, 3), 2.0)  # token 3, pushes out (_X, 1)
+        run.clock.now = 4.0  # (_X, 2) is 3.9 s old: pushable
+        run.feed((_X, 4))
+        await _settle(run)
+        await _yield()
+        assert (_X, 4) not in hs.started  # no token left: refused
+        assert hs.cancelled == [(_X, 1)]  # (_X, 2) left alone
+        assert _inflight(limiter, _X) == 2
+    assert any("started too many lately" in r.getMessage() for r in caplog.records)
+
+
+async def test_a_refused_newcomer_leaves_the_old_attempt_alone() -> None:
+    hs = _Hs()
+    limiter = _Ledger(clock=_Frozen())
+    async with _Udp(hs, limiter=limiter) as run:
+        await _started(run, hs, _A, 0.0)  # 1 overall token
+        for i in range(int(GLOBAL_START_BURST) - 1):
+            assert limiter.try_shared(f"192.0.2.{i}")  # the rest
+        run.clock.now = 2.0
+        run.feed(_B)  # _A is pushable, but _B's start is refused
+        await _settle(run)
+        assert _B not in hs.started and hs.cancelled == []
+        assert await _slots_free(run.semaphore) == 0
+
+
+async def test_two_own_address_starts_in_one_step_push_out_two_own_attempts() -> None:
+    hs = _Hs()
+    limiter = _Ledger(clock=_minutes())
+    async with _Udp(hs, max_inflight=8, limiter=limiter) as run:
+        await _started(run, hs, (_X, 1), 0.0)
+        await _started(run, hs, (_X, 2), 0.1)
+        run.clock.now = 2.0
+        run.feed((_X, 3))
+        run.feed((_X, 4))  # both handled in one step of the demux
+        assert await _spin(lambda: (_X, 3) in hs.sent_msg2 and (_X, 4) in hs.sent_msg2)
+        await _yield()
+        assert sorted(hs.cancelled) == [(_X, 1), (_X, 2)]  # two, each once
+        assert _inflight(limiter, _X) == 2
+        assert limiter.finished == []
+        assert await _slots_free(run.semaphore) == 6
+    assert limiter.finished == [_X, _X]
+    assert await _slots_free(run.semaphore) == 8
+    assert run.loop_errors == []
+
+
 async def _accepted(
     run: _Tcp, peer: Addr, at: float, frames: list[bytes] | None = None
 ) -> _Conn:
