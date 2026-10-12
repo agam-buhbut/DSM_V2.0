@@ -357,7 +357,7 @@ class TunDevice:
 
     def configure(
         self,
-        local_ip: str = "10.8.0.2",
+        local_ip: str,
         netmask: int = TUN_PREFIX_LEN,
         mtu: int = 1400,
         *,
