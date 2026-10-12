@@ -31,6 +31,7 @@ from dsm.net.handshake_gate import (
     PER_SOURCE_INFLIGHT,
     GateKeys,
     HandshakeGate,
+    Msg1Verdict,
     SourceLimiter,
     compute_mac1,
     stamp_msg1,
@@ -44,6 +45,7 @@ from tests.test_handshake_acceptor_limits import (
     _minutes,
     _spin,
     _Stub,
+    _Transport,
     _yield,
 )
 from tests.test_tcp_accept_concurrency import _Conn
@@ -567,4 +569,410 @@ async def test_a_frame_landing_as_the_deadline_fires_is_cut_as_a_timeout() -> No
     assert _inflight(limiter, _A[0]) == 0
     assert run.gate is not None and run.gate.load.under_load(0)
     assert _overall_left(limiter) == int(GLOBAL_START_BURST)  # no shared token
+    assert run.loop_errors == []
+
+
+class _OneStepSock(_Transport):
+    """The run's UDP socket in memory. recv() returns at once, with no await,
+    while datagrams are queued, so the demux handles several new sources in
+    one step of its task on every Python version (3.11's wait_for would
+    yield between them)."""
+
+    async def recv(  # type: ignore[override]
+        self, timeout: float | None = None
+    ) -> tuple[bytes, Addr]:
+        if not self._recv_queue.empty():
+            return self._recv_queue.get_nowait()
+        return await super().recv(timeout)
+
+
+class _AdmitGate(HandshakeGate):
+    """The run's gate, admitting every 1400-byte msg1 as a good mac1 (and,
+    under load, a good mac2) would: push-out is under test here, not the
+    cookie round trip, which has its own tests. Notes the load it was asked
+    with."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            GateKeys(mac1_key=bytes(32), cookie_key=bytes(32)),
+            clock=_Frozen(),
+            wall_clock=lambda: _NOW,
+        )
+        self.under_load_seen: list[bool] = []
+
+    def check_msg1(self, frame: bytes, src: Addr, *, under_load: bool) -> Msg1Verdict:
+        del frame, src
+        self.under_load_seen.append(under_load)
+        return Msg1Verdict.ADMIT
+
+
+class _Udp:
+    """_demux_loop on an in-memory socket. Pool, inboxes, records and
+    limiter stay here for the test; the patched handshake stays in place for
+    the whole run; ``clock`` is Step S's own. Leaving cancels the demux and
+    every worker and waits for them, so every done-callback has run."""
+
+    def __init__(
+        self,
+        hs: _Hs,
+        *,
+        max_inflight: int = 1,
+        gate: bool = True,
+        limiter: SourceLimiter | None = None,
+        no_slot: bool = False,
+        clock: Callable[[], float] | None = None,
+    ) -> None:
+        self.max_inflight = max_inflight
+        self.sock = _OneStepSock()
+        self.semaphore = asyncio.Semaphore(max_inflight)
+        self.workers: set[asyncio.Task[None]] = set()
+        self.inboxes: dict[Addr, asyncio.Queue[bytes]] = {}
+        self.attempts: dict[asyncio.Task[None], Any] = {}
+        self.limiter = limiter if limiter is not None else _Ledger(clock=_minutes())
+        self.gate = _AdmitGate() if gate else None
+        self.slot = None if no_slot else SessionSlot()
+        self.clock: Any = clock if clock is not None else _Frozen()
+        self.loop_errors: list[dict[str, Any]] = []
+        self.task: asyncio.Future[None] | None = None
+        self._patch = patch("dsm.crypto.handshake.server_handshake", new=hs)
+        self._old_handler: Any = None
+
+    def feed(self, addr: Addr, n: int = 0) -> None:
+        self.sock.feed(addr, n)
+
+    async def __aenter__(self) -> _Udp:
+        loop = asyncio.get_running_loop()
+        self._old_handler = loop.get_exception_handler()
+        loop.set_exception_handler(lambda _l, ctx: self.loop_errors.append(ctx))
+        self._patch.start()
+        winner: asyncio.Future[Any] = loop.create_future()
+        self.task = asyncio.ensure_future(
+            hsa._demux_loop(
+                _Config(self.max_inflight),
+                _Stub(),
+                _Stub(),
+                _Stub(),
+                _Stub(),
+                self.sock,
+                winner,
+                asyncio.Event(),
+                self.workers,
+                self.semaphore,
+                self.inboxes,
+                self.limiter,
+                slot=self.slot,
+                gate=self.gate,
+                attempts=self.attempts,
+                clock=self.clock,
+            )
+        )
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        try:
+            assert self.task is not None
+            self.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self.task
+            await hsa._cancel_and_drain(set(self.workers))
+            await _yield()
+        finally:
+            self._patch.stop()
+            asyncio.get_running_loop().set_exception_handler(self._old_handler)
+
+
+async def _started(run: _Udp, hs: _Hs, addr: Addr, at: float) -> None:
+    """Start ``addr`` at Step S time ``at`` and wait until its msg2 left."""
+    run.clock.now = at
+    run.feed(addr)
+    assert await _spin(lambda: addr in hs.sent_msg2)
+
+
+async def _settle(run: _Udp) -> None:
+    """Let the demux take everything queued."""
+    assert await _spin(run.sock._recv_queue.empty)
+    await _yield()
+
+
+_PUSHED = "pushed out a stalled handshake attempt to make room for a new one"
+
+
+async def test_a_stalled_udp_attempt_is_pushed_out_only_once_old_enough(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="dsm.net.handshake_acceptor")
+    hs = _Hs()
+    run = _Udp(hs, max_inflight=2)
+    with patch.object(
+        hsa, "_push_out_log", RepeatLog(hsa.log, logging.INFO, clock=run.clock)
+    ):
+        async with run:
+            await _started(run, hs, _A, 0.0)
+            await _started(run, hs, _B, 0.5)
+            run.clock.now = 1.4  # _A is 1.4 s old: not yet
+            run.feed(_C)
+            await _settle(run)
+            assert _C not in hs.started and hs.cancelled == []
+            run.clock.now = 1.5  # _A is 1.5 s old, _B only 1.0 s
+            run.feed(_C, 1)  # _C's msg1 resend
+            assert await _spin(lambda: _C in hs.sent_msg2)
+            assert hs.cancelled == [_A]
+            assert run.gate is not None and run.gate.under_load_seen[-1]
+    lines = [r for r in caplog.records if r.getMessage().startswith(_PUSHED)]
+    assert [(r.levelno, r.getMessage()) for r in lines] == [(logging.INFO, _PUSHED)]
+
+
+async def test_nothing_is_pushed_out_while_a_slot_is_free() -> None:
+    hs = _Hs()
+    async with _Udp(hs, max_inflight=3) as run:
+        await _started(run, hs, _A, 0.0)
+        await _started(run, hs, _B, 0.1)
+        run.clock.now = 5.0
+        run.feed(_C)
+        assert await _spin(lambda: _C in hs.sent_msg2)
+        assert hs.cancelled == []
+
+
+async def test_a_msg2_resend_does_not_restart_the_age() -> None:
+    hs = _Hs()
+    hs.resend[_A] = asyncio.Event()
+    async with _Udp(hs) as run:
+        await _started(run, hs, _A, 0.0)
+        run.clock.now = 1.4
+        hs.resend[_A].set()
+        assert await _spin(lambda: hs.sent_msg2.count(_A) == 2)
+        run.clock.now = 1.5  # 1.5 s from its msg1, 0.1 s from the resend
+        run.feed(_B)
+        assert await _spin(lambda: _B in hs.sent_msg2)
+        assert hs.cancelled == [_A]
+
+
+async def test_an_attempt_waiting_for_its_signature_is_never_pushed_out() -> None:
+    hs = _Hs()
+    hs.tpm[_A] = asyncio.Event()  # msg2 waits in the TPM queue
+    async with _Udp(hs) as run:
+        run.feed(_A)
+        assert await _spin(lambda: _A in hs.started)
+        run.clock.now = 10.0  # far past every wait, but msg2 has not left
+        run.feed(_B)
+        await _settle(run)
+        assert _B not in hs.started and hs.cancelled == []
+        hs.tpm[_A].set()
+        assert await _spin(lambda: _A in hs.sent_msg2)
+        run.feed(_B, 1)
+        assert await _spin(lambda: _B in hs.sent_msg2)
+        assert hs.cancelled == [_A]
+
+
+async def test_the_age_counts_from_msg1_even_when_msg2_left_late() -> None:
+    hs = _Hs()
+    hs.tpm[_A] = asyncio.Event()
+    async with _Udp(hs) as run:
+        run.feed(_A)
+        assert await _spin(lambda: _A in hs.started)
+        run.clock.now = 1.4
+        hs.tpm[_A].set()
+        assert await _spin(lambda: _A in hs.sent_msg2)
+        run.clock.now = 1.5
+        run.feed(_B)
+        assert await _spin(lambda: _B in hs.sent_msg2)
+        assert hs.cancelled == [_A]
+
+
+async def test_an_attempt_past_admit_is_never_pushed_out() -> None:
+    hs = _Hs({_A: "admit"})
+    async with _Udp(hs) as run:
+        run.feed(_A)
+        assert run.slot is not None
+        assert await _spin(
+            lambda: run.slot is not None and run.slot.admitted is not None
+        )
+        run.clock.now = 5.0
+        run.feed(_B)
+        await _settle(run)
+        assert _B not in hs.started and hs.cancelled == []
+
+
+async def test_without_the_gate_nothing_is_pushed_out() -> None:
+    hs = _Hs()
+    x1, x2, x3 = ("203.0.113.50", 1), ("203.0.113.50", 2), ("203.0.113.50", 3)
+    async with _Udp(hs, max_inflight=2, gate=False) as run:
+        await _started(run, hs, x1, 0.0)
+        await _started(run, hs, x2, 0.1)  # pool full and the address at its cap
+        run.clock.now = 60.0
+        run.feed(_B)
+        run.feed(x3)
+        await _settle(run)
+        assert hs.started == [x1, x2] and hs.cancelled == []
+
+
+async def test_the_limiters_clock_never_dates_an_attempt() -> None:
+    # The limiter's clock moves a minute per reading; Step S's stays at 0.
+    hs = _Hs()
+    async with _Udp(hs, limiter=_Ledger(clock=_minutes())) as run:
+        await _started(run, hs, _A, 0.0)
+        run.feed(_B)
+        await _settle(run)
+        assert _B not in hs.started and hs.cancelled == []
+
+
+async def test_two_full_pool_starts_in_one_step_push_out_two_attempts() -> None:
+    hs = _Hs()
+    limiter = _Ledger(clock=_minutes())
+    async with _Udp(hs, max_inflight=2, limiter=limiter) as run:
+        await _started(run, hs, _A, 0.0)
+        await _started(run, hs, _B, 0.1)
+        run.clock.now = 2.0
+        run.feed(_C)
+        run.feed(_D)  # both handled in one step of the demux
+        assert await _spin(lambda: _C in hs.sent_msg2 and _D in hs.sent_msg2)
+        assert sorted(hs.cancelled) == sorted([_A, _B])  # never one twice
+        await _yield()
+        assert await _slots_free(run.semaphore) == 0
+    assert await _slots_free(run.semaphore) == 2  # exactly what it was
+    assert sorted(limiter.finished) == sorted(a[0] for a in (_A, _B, _C, _D))
+    assert all(_inflight(limiter, a[0]) == 0 for a in (_A, _B, _C, _D))
+    assert run.loop_errors == []
+
+
+async def test_push_out_also_works_without_a_slot() -> None:
+    hs = _Hs()
+    async with _Udp(hs, no_slot=True) as run:
+        await _started(run, hs, _A, 0.0)
+        run.clock.now = 2.0
+        run.feed(_B)
+        assert await _spin(lambda: _B in hs.sent_msg2)
+        assert hs.cancelled == [_A]
+
+
+async def test_a_clock_that_steps_back_pushes_nothing_out() -> None:
+    hs = _Hs()
+    async with _Udp(hs) as run:
+        await _started(run, hs, _A, 5.0)
+        run.clock.now = 1.0  # a negative age reads as too young
+        run.feed(_B)
+        await _settle(run)
+        assert _B not in hs.started and hs.cancelled == []
+
+
+async def test_the_msg2_hook_fires_once_over_two_sends() -> None:
+    fired: list[int] = []
+    real = _Transport()
+    view = hsa._PerPeerUDPView(
+        real, _A, asyncio.Queue(), on_msg2=lambda: fired.append(1)
+    )
+    await view.send(_MSG2, _B)
+    await view.send(_MSG2, _B)  # a resend
+    assert fired == [1]
+    assert real.sent == [(_MSG2, _A), (_MSG2, _A)]
+
+
+async def test_the_push_out_line_is_info_with_a_count_and_no_address(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="dsm.net.handshake_acceptor")
+    hs = _Hs()
+    run = _Udp(hs)
+    with patch.object(
+        hsa, "_push_out_log", RepeatLog(hsa.log, logging.INFO, clock=run.clock)
+    ):
+        async with run:
+            await _started(run, hs, _A, 0.0)
+            await _started(run, hs, _B, 2.0)  # pushes _A out
+            await _started(run, hs, _C, 4.0)  # pushes _B out: counted, no line
+            await _started(run, hs, _D, 13.0)  # pushes _C out: line with count
+            assert hs.cancelled == [_A, _B, _C]
+    lines = [
+        r.getMessage() for r in caplog.records if r.getMessage().startswith(_PUSHED)
+    ]
+    assert lines == [_PUSHED, f"{_PUSHED} (1 more in the last 11 s)"]
+    assert not any("203.0.113" in line for line in lines)
+
+
+class _FeedOnMsg2Sock(_OneStepSock):
+    """Queues ``then``'s msg1 the moment msg2 goes out to ``to``, and waits
+    on its queue with no poll timer, so the demux takes ``then`` on the very
+    next loop pass on every Python version."""
+
+    def __init__(self, to: Addr, then: Addr) -> None:
+        super().__init__()
+        self._to = to
+        self._then = then
+
+    async def recv(  # type: ignore[override]
+        self, timeout: float | None = None
+    ) -> tuple[bytes, Addr]:
+        del timeout  # leaving the run cancels the demux
+        return await self._recv_queue.get()
+
+    async def send(self, data: bytes, addr: Addr) -> None:  # type: ignore[override]
+        await super().send(data, addr)
+        if addr == self._to:
+            self.feed(self._then)
+
+
+def _cancels_asked_at_push_out(asked: list[int]) -> Callable[..., None]:
+    """``hsa._push_out``, noting how many cancels its victim already had."""
+    push_out = hsa._push_out
+
+    def _spy(attempts: Any, victim: asyncio.Task[None], how: Any) -> None:
+        asked.append(victim.cancelling())
+        push_out(attempts, victim, how)
+
+    return _spy
+
+
+async def test_a_push_out_racing_the_attempts_own_deadline_gives_back_once() -> None:
+    # _A's attempt deadline, patched to 0, fires on the loop pass after its
+    # msg2 left, and _B's msg1 is taken in that same pass: the push-out comes
+    # after the deadline asked to cancel _A and before _A ran again.
+    hs = _Hs()
+    limiter = _Ledger(clock=_minutes())
+    asked: list[int] = []
+    run = _Udp(hs, limiter=limiter, clock=_Ticks(0.0, 2.0))
+    run.sock = _FeedOnMsg2Sock(_A, _B)
+    with (
+        patch.object(hsa, "_HANDSHAKE_ATTEMPT_DEADLINE", 0.0),
+        patch.object(hsa, "_push_out", _cancels_asked_at_push_out(asked)),
+    ):
+        async with run:
+            run.feed(_A)
+            # _B took _A's slot, then hit its own 0 s deadline.
+            assert await _spin(lambda: _B in hs.started and not run.workers)
+            assert await _slots_free(run.semaphore) == 1
+    assert asked == [1]  # the deadline had already asked: a real race
+    assert hs.cancelled == [_A, _B]  # _B by its own deadline
+    assert limiter.finished == [_A[0], _B[0]]  # each share given back once
+    assert _inflight(limiter, _A[0]) == 0 and _inflight(limiter, _B[0]) == 0
+    assert await _slots_free(run.semaphore) == 1
+    assert run.loop_errors == []
+
+
+async def test_an_own_address_push_out_racing_its_deadline_gives_back_nothing() -> None:
+    # As above, in case 1: x1 passes its slot and its share to x3, so its
+    # done-callback gives back neither, even when its own deadline fired too.
+    x1, x2, x3 = ("203.0.113.50", 1), ("203.0.113.50", 2), ("203.0.113.50", 3)
+    hs = _Hs()
+    limiter = _Ledger(clock=_minutes())
+    asked: list[int] = []
+    # Step S times: x2 starts at 1.0, x1 at 0.0 (the oldest), x3 at 2.0.
+    run = _Udp(hs, max_inflight=2, limiter=limiter, clock=_Ticks(1.0, 0.0, 2.0))
+    run.sock = _FeedOnMsg2Sock(x1, x3)
+    async with run:
+        run.feed(x2)  # the usual 12 s deadline: still running at the end
+        assert await _spin(lambda: x2 in hs.sent_msg2)
+        with (
+            patch.object(hsa, "_HANDSHAKE_ATTEMPT_DEADLINE", 0.0),
+            patch.object(hsa, "_push_out", _cancels_asked_at_push_out(asked)),
+        ):
+            run.feed(x1)
+            # x3 took x1's slot and share, then hit its own 0 s deadline.
+            assert await _spin(lambda: limiter.finished == [x3[0]])
+        assert asked == [1]
+        assert hs.cancelled == [x1, x3]  # x3 by its own deadline
+        assert _inflight(limiter, x3[0]) == 1  # x2's share only
+        assert await _slots_free(run.semaphore) == 1  # x2 holds the other
+    assert limiter.finished == [x3[0], x3[0]]  # x3's, then x2's at the end
+    assert _inflight(limiter, x3[0]) == 0
+    assert await _slots_free(run.semaphore) == 2
     assert run.loop_errors == []
