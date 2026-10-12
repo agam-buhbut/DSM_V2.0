@@ -830,6 +830,7 @@ async def test_two_full_pool_starts_in_one_step_push_out_two_attempts() -> None:
         await _yield()
         assert await _slots_free(run.semaphore) == 0
     assert await _slots_free(run.semaphore) == 2  # exactly what it was
+    assert run.attempts == {}  # every record left with its attempt
     assert sorted(limiter.finished) == sorted(a[0] for a in (_A, _B, _C, _D))
     assert all(_inflight(limiter, a[0]) == 0 for a in (_A, _B, _C, _D))
     assert run.loop_errors == []
@@ -945,6 +946,7 @@ async def test_a_push_out_racing_the_attempts_own_deadline_gives_back_once() -> 
     assert limiter.finished == [_A[0], _B[0]]  # each share given back once
     assert _inflight(limiter, _A[0]) == 0 and _inflight(limiter, _B[0]) == 0
     assert await _slots_free(run.semaphore) == 1
+    assert run.attempts == {}
     assert run.loop_errors == []
 
 
@@ -975,4 +977,51 @@ async def test_an_own_address_push_out_racing_its_deadline_gives_back_nothing() 
     assert limiter.finished == [x3[0], x3[0]]  # x3's, then x2's at the end
     assert _inflight(limiter, x3[0]) == 0
     assert await _slots_free(run.semaphore) == 2
+    assert run.attempts == {}
     assert run.loop_errors == []
+
+
+async def test_a_shutdown_in_the_push_out_pass_gives_back_once() -> None:
+    # The run stops in the loop pass of a push-out: _A is marked and
+    # cancelled but has not run again, and _B has not run at all. Stopping
+    # cancels both once more; each done-callback still runs once.
+    hs = _Hs()
+    limiter = _Ledger(clock=_minutes())
+    asked: list[int] = []
+    async with _Udp(hs, limiter=limiter) as run:
+        await _started(run, hs, _A, 0.0)
+        victim = next(iter(run.attempts))
+        run.clock.now = 2.0
+        with patch.object(hsa, "_push_out", _cancels_asked_at_push_out(asked)):
+            run.feed(_B)
+            assert await _spin(lambda: asked != [])
+        assert not victim.done() and _B not in hs.started  # both still pending
+        # Stop as the accept does: the demux first, then every worker, with
+        # no loop pass in between.
+        assert run.task is not None
+        run.task.cancel()
+        await hsa._cancel_and_drain(set(run.workers))
+    assert asked == [0]  # nothing but the push-out had asked before
+    assert hs.started == [_A] and hs.cancelled == [_A]  # _B never ran
+    assert sorted(limiter.finished) == sorted([_A[0], _B[0]])
+    assert _inflight(limiter, _A[0]) == 0 and _inflight(limiter, _B[0]) == 0
+    assert await _slots_free(run.semaphore) == 1
+    assert run.attempts == {}
+    assert run.loop_errors == []
+
+
+class _SendFails(_Transport):
+    """The run's UDP socket, whose every send fails."""
+
+    async def send(self, data: bytes, addr: Addr) -> None:  # type: ignore[override]
+        raise OSError("network is unreachable")
+
+
+async def test_the_msg2_hook_waits_until_msg2_really_left() -> None:
+    fired: list[int] = []
+    view = hsa._PerPeerUDPView(
+        _SendFails(), _A, asyncio.Queue(), on_msg2=lambda: fired.append(1)
+    )
+    with pytest.raises(OSError):
+        await view.send(_MSG2, _A)
+    assert fired == []  # still signing: msg2 did not go out
