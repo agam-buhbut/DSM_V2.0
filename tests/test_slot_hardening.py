@@ -10,8 +10,11 @@ from __future__ import annotations
 
 import pytest
 
+from dsm.core.config import MAX_INFLIGHT_HANDSHAKES
+from dsm.net import handshake_acceptor as hsa
 from dsm.net.handshake_gate import (
     GLOBAL_START_BURST,
+    GLOBAL_START_RATE,
     IN_SESSION_START_BURST,
     PER_SOURCE_BURST,
     PER_SOURCE_INFLIGHT,
@@ -121,3 +124,27 @@ def test_a_per_address_only_start_ignores_in_session() -> None:
     for i in range(int(GLOBAL_START_BURST) - 1):
         assert limiter.try_shared(f"203.0.113.{10 + i}")
     assert not limiter.try_shared("203.0.113.200")
+
+
+def test_the_step_s_numbers() -> None:
+    assert hsa._TCP_FIRST_FRAME_DEADLINE == 3.0
+    assert hsa._PUSH_OUT_AFTER_S == 1.5
+    assert hsa._SIGNING_ALLOWANCE_S == 0.25
+    assert hsa._SERVER_SIGNING_TIME_S == 0.21
+
+
+def test_slot_rule_conditions_2_and_3_hold_for_the_code_constants() -> None:
+    w = hsa._PUSH_OUT_AFTER_S + hsa._SIGNING_ALLOWANCE_S
+    # (3) The TPM signs faster than the overall limit lets strangers start.
+    assert GLOBAL_START_RATE * hsa._SERVER_SIGNING_TIME_S < 1
+    # (2) The deepest queue strangers can build drains inside W, for every
+    # slot count the config allows (more slots never deepen it).
+    for slots in range(1, MAX_INFLIGHT_HANDSHAKES + 1):
+        assert min(slots, GLOBAL_START_BURST) * hsa._SERVER_SIGNING_TIME_S < w
+
+
+def test_slot_rule_ok_checks_condition_1() -> None:
+    assert hsa._slot_rule_ok(8)  # the default meets it: 8 > 4 x 1.75
+    assert not hsa._slot_rule_ok(7)  # 7 is not more than 7
+    assert not hsa._slot_rule_ok(1)
+    assert hsa._slot_rule_ok(16)
