@@ -1,9 +1,7 @@
 """Step S, slot hardening (spec §4): the gate plumbing, the slot rule, the TCP
-first-frame deadline and shared charge, push-out over UDP and TCP, and the
-start WARNING. Handshakes are scripted fakes; ages come from Step S's own
-injected clock, never the limiter's (re-review I5); nothing waits on the wall
-clock. Laptop: run with --noconftest (tests/conftest.py imports dsm.server,
-which needs the new tuncore); the run_server tests are box-only.
+first-frame deadline and shared charge, and push-out over UDP and TCP.
+Handshakes are scripted fakes; ages come from Step S's own injected clock,
+never the limiter's (re-review I5); nothing waits on the wall clock.
 """
 
 from __future__ import annotations
@@ -301,11 +299,17 @@ class _Hs:
         self.sent_msg2.append(peer)
 
 
+_REAL_FIRST_FRAME_DEADLINE = hsa._TCP_FIRST_FRAME_DEADLINE
+_FAR_FIRST_FRAME_DEADLINE = 3600.0
+
+
 class _Tcp:
     """_tcp_admit_loop on an in-memory connection queue. The pool, the open
     connections, the records and the limiter stay here for the test; the
     patched handshake stays in place for the whole run; the gate is the
     run's real one (mac1 checked) or none; ``clock`` is Step S's own.
+    The first-frame deadline is put far off for the run, so no assert races
+    real time, unless the test patched it already (the deadline tests use 0).
     Leaving cancels the loop and every worker and waits for them, so every
     done-callback has run; errors raised inside callbacks land in
     ``loop_errors``."""
@@ -337,6 +341,7 @@ class _Tcp:
         self.loop_errors: list[dict[str, Any]] = []
         self.task: asyncio.Future[None] | None = None
         self._patch = patch("dsm.crypto.handshake.server_handshake", new=hs)
+        self._deadline_patch: Any = None
         self._old_handler: Any = None
 
     def at(self, t: float) -> None:
@@ -354,6 +359,11 @@ class _Tcp:
         self._old_handler = loop.get_exception_handler()
         loop.set_exception_handler(lambda _l, ctx: self.loop_errors.append(ctx))
         self._patch.start()
+        if hsa._TCP_FIRST_FRAME_DEADLINE == _REAL_FIRST_FRAME_DEADLINE:
+            self._deadline_patch = patch.object(
+                hsa, "_TCP_FIRST_FRAME_DEADLINE", _FAR_FIRST_FRAME_DEADLINE
+            )
+            self._deadline_patch.start()
         winner: asyncio.Future[Any] = loop.create_future()
         self.task = asyncio.ensure_future(
             hsa._tcp_admit_loop(
@@ -385,6 +395,8 @@ class _Tcp:
             await hsa._cancel_and_drain(set(self.workers))
             await _yield()
         finally:
+            if self._deadline_patch is not None:
+                self._deadline_patch.stop()
             self._patch.stop()
             asyncio.get_running_loop().set_exception_handler(self._old_handler)
 
@@ -392,6 +404,15 @@ class _Tcp:
 def _spend_overall(limiter: SourceLimiter) -> None:
     for i in range(int(GLOBAL_START_BURST)):
         assert limiter.try_shared(f"192.0.2.{i}")
+
+
+def _spend_rate(limiter: _Ledger, ip: str) -> None:
+    """Use up ``ip``'s start tokens (a frozen limiter clock never refills
+    them) and leave it with no running attempt. The base ``finish`` is used,
+    so the ledger notes nothing."""
+    for _ in range(int(PER_SOURCE_BURST)):
+        assert limiter.try_start(ip, shared=False)
+        SourceLimiter.finish(limiter, ip)
 
 
 def _overall_left(limiter: SourceLimiter) -> int:
@@ -540,7 +561,7 @@ async def test_without_the_gate_a_tcp_connection_pays_everything_at_accept() -> 
 async def test_shutdown_while_waiting_for_the_first_frame_is_not_trouble() -> None:
     hs = _Hs()
     limiter = _Ledger(clock=_Frozen())
-    # The real 3 s deadline: the shutdown comes long before it.
+    # The deadline is far off: only the shutdown can end the wait.
     async with _Tcp(hs, limiter=limiter) as run:
         conn = run.connect(_A)
         assert await _spin(lambda: bool(conn._frames._getters))  # worker is reading
@@ -615,8 +636,9 @@ class _AdmitGate(HandshakeGate):
 class _Udp:
     """_demux_loop on an in-memory socket. Pool, inboxes, records and
     limiter stay here for the test; the patched handshake stays in place for
-    the whole run; ``clock`` is Step S's own. Leaving cancels the demux and
-    every worker and waits for them, so every done-callback has run."""
+    the whole run; ``clock`` is Step S's own; ``session_live`` is the in-session
+    accept. Leaving cancels the demux and every worker and waits for them, so
+    every done-callback has run."""
 
     def __init__(
         self,
@@ -626,6 +648,7 @@ class _Udp:
         gate: bool = True,
         limiter: SourceLimiter | None = None,
         no_slot: bool = False,
+        session_live: bool = False,
         clock: Callable[[], float] | None = None,
     ) -> None:
         self.max_inflight = max_inflight
@@ -637,6 +660,7 @@ class _Udp:
         self.limiter = limiter if limiter is not None else _Ledger(clock=_minutes())
         self.gate = _AdmitGate() if gate else None
         self.slot = None if no_slot else SessionSlot()
+        self.session_live = session_live
         self.clock: Any = clock if clock is not None else _Frozen()
         self.loop_errors: list[dict[str, Any]] = []
         self.task: asyncio.Future[None] | None = None
@@ -667,6 +691,7 @@ class _Udp:
                 self.inboxes,
                 self.limiter,
                 slot=self.slot,
+                session_live=self.session_live,
                 gate=self.gate,
                 attempts=self.attempts,
                 clock=self.clock,
@@ -919,7 +944,14 @@ class _FeedOnMsg2Sock(_OneStepSock):
 
 
 def _cancels_asked_at_push_out(asked: list[int]) -> Callable[..., None]:
-    """``hsa._push_out``, noting how many cancels its victim already had."""
+    """``hsa._push_out``, noting how many cancels its victim already had.
+
+    The race tests assert ``asked == [1]`` first: that is their precondition
+    (the victim's own deadline had already asked to cancel it when the
+    push-out came). A failure there means the race was not set up, because
+    the order in which the loop runs callbacks within one pass changed; it is
+    not a give-back bug, and the asserts after it are not reached.
+    """
     push_out = hsa._push_out
 
     def _spy(attempts: Any, victim: asyncio.Task[None], how: Any) -> None:
@@ -1051,6 +1083,7 @@ async def test_an_address_at_its_cap_pushes_out_its_oldest_and_keeps_share() -> 
         assert await _slots_free(run.semaphore) == 6
     assert limiter.finished == [_X, _X]
     assert await _slots_free(run.semaphore) == 8
+    assert run.attempts == {}
     assert run.loop_errors == []
 
 
@@ -1066,6 +1099,7 @@ async def test_case_1_comes_before_case_2_even_with_every_slot_full() -> None:
         assert hs.cancelled == [(_X, 1)]  # _X's own oldest, not _A
         assert limiter.finished == []
         assert await _slots_free(run.semaphore) == 0
+    assert run.loop_errors == []
 
 
 async def test_after_case_2_the_victim_gives_back_its_share_not_its_slot() -> None:
@@ -1079,6 +1113,10 @@ async def test_after_case_2_the_victim_gives_back_its_share_not_its_slot() -> No
         assert limiter.finished == [_A[0]]
         assert _inflight(limiter, _A[0]) == 0
         assert await _slots_free(run.semaphore) == 0  # _B holds the slot
+    assert sorted(limiter.finished) == sorted([_A[0], _B[0]])
+    assert await _slots_free(run.semaphore) == 1
+    assert run.attempts == {}
+    assert run.loop_errors == []
 
 
 async def test_a_spent_rate_refuses_an_own_address_push_out(
@@ -1100,6 +1138,7 @@ async def test_a_spent_rate_refuses_an_own_address_push_out(
         assert hs.cancelled == [(_X, 1)]  # (_X, 2) left alone
         assert _inflight(limiter, _X) == 2
     assert any("started too many lately" in r.getMessage() for r in caplog.records)
+    assert run.loop_errors == []
 
 
 async def test_a_refused_newcomer_leaves_the_old_attempt_alone() -> None:
@@ -1114,6 +1153,38 @@ async def test_a_refused_newcomer_leaves_the_old_attempt_alone() -> None:
         await _settle(run)
         assert _B not in hs.started and hs.cancelled == []
         assert await _slots_free(run.semaphore) == 0
+    assert run.loop_errors == []
+
+
+async def test_an_in_session_push_out_needs_the_newcomer_token_too(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="dsm.net.handshake_gate")
+    hs = _Hs()
+    clock = _Frozen()  # the limiter's: the newcomer token does not refill
+    limiter = _Ledger(clock=clock)
+    async with _Udp(hs, limiter=limiter, session_live=True) as run:
+        await _started(run, hs, _A, 0.0)  # its start took the one newcomer token
+        victim = next(iter(run.attempts))
+        run.clock.now = 2.0  # _A is pushable
+        run.feed(_B)
+        await _settle(run)
+        await _yield()
+        assert _B not in hs.started and hs.cancelled == []
+        assert not victim.done() and victim.cancelling() == 0
+        assert list(run.attempts) == [victim]
+        assert limiter.finished == []
+        assert await _slots_free(run.semaphore) == 0  # _A still holds it
+        assert any("while a session runs" in r.getMessage() for r in caplog.records)
+        # The refusal spent nothing: with the token back, _B pushes _A out.
+        clock.now = 1.0
+        run.feed(_B, 1)
+        assert await _spin(lambda: _B in hs.sent_msg2)
+        assert hs.cancelled == [_A]
+    assert sorted(limiter.finished) == sorted([_A[0], _B[0]])
+    assert await _slots_free(run.semaphore) == 1
+    assert run.attempts == {}
+    assert run.loop_errors == []
 
 
 async def test_two_own_address_starts_in_one_step_push_out_two_own_attempts() -> None:
@@ -1133,6 +1204,7 @@ async def test_two_own_address_starts_in_one_step_push_out_two_own_attempts() ->
         assert await _slots_free(run.semaphore) == 6
     assert limiter.finished == [_X, _X]
     assert await _slots_free(run.semaphore) == 8
+    assert run.attempts == {}
     assert run.loop_errors == []
 
 
@@ -1166,6 +1238,91 @@ async def test_a_silent_tcp_connection_is_pushed_out_when_the_pool_is_full() -> 
         assert await _slots_free(run.semaphore) == 0
     assert sorted(limiter.finished) == sorted([_A[0], _C[0]])
     assert await _slots_free(run.semaphore) == 1
+    assert run.attempts == {}
+    assert run.loop_errors == []
+
+
+async def test_a_silent_tcp_push_out_spends_no_shared_token() -> None:
+    hs = _Hs()
+    limiter = _Ledger(clock=_Frozen())
+    async with _Tcp(hs, limiter=limiter) as run:
+        silent = await _accepted(run, _A, 0.0)
+        run.at(2.0)  # _A is pushable
+        newcomer = run.connect(_B)  # silent too: no first frame
+        assert await _spin(lambda: silent.closed)
+        await _yield()
+        assert not newcomer.closed
+        assert limiter.finished == [_A[0]]  # case 2: its share, not its slot
+        assert await _slots_free(run.semaphore) == 0  # _B holds the slot
+    # Neither start, nor the push-out, took a token from the shared limits.
+    assert _overall_left(limiter) == int(GLOBAL_START_BURST)
+    assert await _slots_free(run.semaphore) == 1
+    assert run.attempts == {}
+    assert run.loop_errors == []
+
+
+async def test_a_refused_tcp_newcomer_leaves_the_old_attempt_alone() -> None:
+    hs = _Hs()
+    clock = _Frozen()  # the limiter's: the tokens do not refill by themselves
+    limiter = _Ledger(clock=clock)
+    _spend_rate(limiter, _B[0])  # _B may not start again for now
+    async with _Tcp(hs, limiter=limiter) as run:
+        silent = await _accepted(run, _A, 0.0)
+        victim = next(iter(run.attempts))
+        run.at(2.0)  # _A is pushable
+        refused = run.connect(_B, [_good(2)])
+        assert await _spin(lambda: refused.closed)
+        await _yield()
+        assert not silent.closed
+        assert not victim.done() and victim.cancelling() == 0
+        assert list(run.attempts) == [victim]
+        assert run.attempts[victim].passed_on is None
+        assert limiter.finished == []
+        assert await _slots_free(run.semaphore) == 0  # _A still holds it
+        # The refusal spent nothing: with _B's tokens back, it pushes _A out.
+        clock.now = 5.0
+        run.connect(_B, [_good(3)])
+        assert await _spin(lambda: silent.closed)
+        assert await _spin(lambda: _B in hs.sent_msg2)
+    assert sorted(limiter.finished) == sorted([_A[0], _B[0]])
+    assert await _slots_free(run.semaphore) == 1
+    assert run.attempts == {}
+    assert run.loop_errors == []
+
+
+async def test_a_refused_tcp_own_address_start_leaves_its_oldest_alone() -> None:
+    hs = _Hs()
+    ip = "203.0.113.50"
+    clock = _Frozen()  # the limiter's: the tokens do not refill by themselves
+    limiter = _Ledger(clock=clock)
+    async with _Tcp(hs, max_inflight=8, limiter=limiter) as run:
+        c1 = await _accepted(run, (ip, 1), 0.0)
+        c2 = await _accepted(run, (ip, 2), 0.2)  # the address is at its cap
+        # Its third and last start token, taken without a running attempt.
+        assert limiter.try_start(ip, shared=False, inherits_share=True)
+        run.at(2.0)  # both are pushable
+        refused = run.connect((ip, 3), [_good(3)])
+        assert await _spin(lambda: refused.closed)
+        await _yield()
+        assert not c1.closed and not c2.closed
+        assert len(run.attempts) == 2
+        assert all(rec.passed_on is None for rec in run.attempts.values())
+        # Case 1: neither the share nor the slot of the oldest went anywhere.
+        assert limiter.finished == []
+        assert _inflight(limiter, ip) == 2
+        assert await _slots_free(run.semaphore) == 6
+        # The refusal spent nothing: with the tokens back, it pushes c1 out.
+        clock.now = 5.0
+        run.connect((ip, 4), [_good(4)])
+        assert await _spin(lambda: c1.closed)
+        assert await _spin(lambda: (ip, 4) in hs.sent_msg2)
+        await _yield()
+        assert not c2.closed
+        assert limiter.finished == []
+        assert _inflight(limiter, ip) == 2
+        assert await _slots_free(run.semaphore) == 6
+    assert limiter.finished == [ip, ip]
+    assert await _slots_free(run.semaphore) == 8
     assert run.attempts == {}
     assert run.loop_errors == []
 
@@ -1589,7 +1746,7 @@ async def test_the_tcp_accept_hands_its_clock_to_push_out() -> None:
         assert not new.closed
         assert limiter.finished == [_A[0]]
         shutdown.set()
-        assert await accept == (None, None, None)
+        assert await asyncio.wait_for(accept, 5.0) == (None, None, None)
     assert new.closed
     assert hs.started == [_B]
     assert sorted(limiter.finished) == sorted([_A[0], _B[0]])
@@ -1625,8 +1782,79 @@ async def test_the_in_session_tcp_watch_hands_its_clock_to_push_out() -> None:
         assert await _spin(lambda: _B in hs.sent_msg2)
         assert not new.closed
         assert limiter.finished == [_A[0]]
-        assert await watch.stop() is None
+        assert await asyncio.wait_for(watch.stop(), 5.0) is None
     assert new.closed
     assert not watch.end_session.is_set()
     assert hs.started == [_B]
+    assert sorted(limiter.finished) == sorted([_A[0], _B[0]])
+
+
+async def test_the_udp_accept_hands_its_clock_to_push_out() -> None:
+    # With the default clock both starts would be about 0 s old and the
+    # second one would be dropped as pool saturated.
+    hs = _Hs()
+    limiter = _Ledger(clock=_minutes())
+    sock = _Transport()
+    shutdown = asyncio.Event()
+    with patch("dsm.crypto.handshake.server_handshake", new=hs):
+        accept = asyncio.ensure_future(
+            hsa._accept_until_winner(
+                _Config(1),
+                _Stub(),
+                _Stub(),
+                _Stub(),
+                _Stub(),
+                sock,
+                shutdown,
+                limiter,
+                SessionSlot(),
+                _AdmitGate(),
+                clock=_Ticks(0.0, 2.0),
+            )
+        )
+        sock.feed(_A)
+        assert await _spin(lambda: _A in hs.sent_msg2)
+        sock.feed(_B)
+        assert await _spin(lambda: _B in hs.sent_msg2)
+        assert hs.cancelled == [_A]
+        await _yield()
+        assert limiter.finished == [_A[0]]
+        shutdown.set()
+        assert await asyncio.wait_for(accept, 5.0) == (None, None, sock)
+    assert hs.started == [_A, _B]
+    assert sorted(limiter.finished) == sorted([_A[0], _B[0]])
+
+
+async def test_the_in_session_udp_watch_hands_its_clock_to_push_out() -> None:
+    hs = _Hs()
+    limiter = _Ledger(clock=_minutes())
+    sock = _Transport()
+    slot = SessionSlot()
+    held_by = object()  # the live session's client, as after an idle accept
+    slot.admit(held_by, _HOLDER, session_live=False)
+    slot.confirm(held_by)
+    with patch("dsm.crypto.handshake.server_handshake", new=hs):
+        watch = hsa.SessionWatch(
+            _Config(1),
+            _Stub(),
+            _Stub(),
+            _Stub(),
+            _Stub(),
+            limiter,
+            slot,
+            _AdmitGate(),
+            udp=sock,
+            clock=_Ticks(0.0, 2.0),
+        )
+        assert watch.offer is not None
+        watch.offer(_good(1), _A, False)
+        assert await _spin(lambda: _A in hs.sent_msg2)
+        watch.offer(_good(2), _B, False)
+        assert await _spin(lambda: _B in hs.sent_msg2)
+        assert hs.cancelled == [_A]
+        await _yield()
+        assert limiter.finished == [_A[0]]
+        assert await asyncio.wait_for(watch.stop(), 5.0) is None
+    assert not watch.end_session.is_set()
+    assert hs.started == [_A, _B]
     assert sorted(limiter.finished) == sorted([_A[0], _B[0]])
