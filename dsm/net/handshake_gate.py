@@ -16,7 +16,8 @@ Two parts, both used by the acceptor (``dsm.net.handshake_acceptor``):
 
 Each admitted msg1 costs the server an attest-key signature (a TPM call on
 TPM builds) and holds one of ``max_inflight_handshakes`` slots for up to
-12 s.
+12 s, or less once it stalls and a new start pushes it out
+(``dsm.net.handshake_acceptor``, spec §4).
 
 Limits and cookies are keyed by source IPv4 address (cookies also by port):
 a client gets a new port each time it restarts. The server binds IPv4 only;
@@ -137,17 +138,36 @@ class SourceLimiter:
         """How many addresses are remembered now."""
         return len(self._sources)
 
-    def try_start(self, ip: str, *, in_session: bool = False) -> bool:
+    def try_start(
+        self,
+        ip: str,
+        *,
+        in_session: bool = False,
+        shared: bool = True,
+        inherits_share: bool = False,
+    ) -> bool:
         """Admit a new attempt from ``ip`` if every limit allows it.
 
         All or nothing: a refusal spends no token and remembers nothing.
         Pair every True with exactly one ``finish(ip)``. ``in_session`` is
         True for the accept that runs while a session is live: such a start
         also needs the in-session budget (one a second).
+
+        ``shared=False`` charges only the per-address limits: a TCP connection
+        at accept, which pays the shared ones with :meth:`try_shared` once its
+        first frame passed mac1. ``inherits_share=True`` is a start that takes
+        over a pushed-out attempt's place from the same address: it skips the
+        in-flight cap and adds nothing to the address's running count (the
+        pushed-out attempt never calls ``finish``); its rate limit and, when
+        ``shared``, the shared limits still apply.
         """
         now = self._clock()
         src = self._sources.get(ip)
-        if src is not None and src.inflight >= PER_SOURCE_INFLIGHT:
+        if (
+            not inherits_share
+            and src is not None
+            and src.inflight >= PER_SOURCE_INFLIGHT
+        ):
             self._busy_log.log(
                 "new handshake refused: that address already has %d running",
                 PER_SOURCE_INFLIGHT,
@@ -158,15 +178,7 @@ class SourceLimiter:
                 "new handshake refused: that address started too many lately"
             )
             return False
-        if not self._overall.ready(now):
-            self._overall_log.log(
-                "new handshake refused: too many new handshakes overall"
-            )
-            return False
-        if in_session and not self._in_session.ready(now):
-            self._in_session_log.log(
-                "new handshake refused: too many new handshakes while a session runs"
-            )
+        if shared and not self._shared_ready(now, in_session=in_session):
             return False
         if src is None:
             if len(self._sources) >= self._max_sources and not self._forget_one_idle():
@@ -181,10 +193,10 @@ class SourceLimiter:
         else:
             del self._sources[ip]  # added back below, as the newest
         src.bucket.take()
-        self._overall.take()
-        if in_session:
-            self._in_session.take()
-        src.inflight += 1
+        if shared:
+            self._take_shared(in_session=in_session)
+        if not inherits_share:
+            src.inflight += 1
         self._sources[ip] = src
         return True
 
@@ -203,6 +215,43 @@ class SourceLimiter:
         if src is None or src.inflight <= 0:
             raise RuntimeError("finish without a matching try_start")
         src.inflight -= 1
+
+    def try_shared(self, ip: str, *, in_session: bool = False) -> bool:
+        """Charge the shared limits (overall, and in a session the in-session
+        budget) for an attempt from ``ip`` that ``try_start(ip, shared=False)``
+        admitted: a TCP connection whose first frame passed mac1.
+
+        All or nothing, like ``try_start``. Nothing to pair with ``finish``:
+        the caller still ends the attempt, which calls ``finish(ip)`` once.
+        """
+        # The known-address lane (spec §3.7) will let a known ip skip these;
+        # Step S charges every address.
+        del ip
+        now = self._clock()
+        if not self._shared_ready(now, in_session=in_session):
+            return False
+        self._take_shared(in_session=in_session)
+        return True
+
+    def _shared_ready(self, now: float, *, in_session: bool) -> bool:
+        """True if the overall budget, and in a session the in-session one,
+        each hold a token. Logs the refusal."""
+        if not self._overall.ready(now):
+            self._overall_log.log(
+                "new handshake refused: too many new handshakes overall"
+            )
+            return False
+        if in_session and not self._in_session.ready(now):
+            self._in_session_log.log(
+                "new handshake refused: too many new handshakes while a session runs"
+            )
+            return False
+        return True
+
+    def _take_shared(self, *, in_session: bool) -> None:
+        self._overall.take()
+        if in_session:
+            self._in_session.take()
 
     def _forget_one_idle(self) -> bool:
         """Forget the idle address that started longest ago, if there is one."""
