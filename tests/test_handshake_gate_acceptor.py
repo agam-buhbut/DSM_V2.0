@@ -360,6 +360,7 @@ async def test_a_refused_tcp_start_is_trouble(
                 SourceLimiter(clock=_minutes()),
                 None,
                 gate,
+                clock=lambda: 0.0,
             )
         )
         for conn in conns[:-1]:

@@ -99,7 +99,8 @@ expected_server_cn = "dsm-1234abcd-server"
 # allowed_cns_file = "/opt/mtun/allowed_cns.txt"
 
 # Server only: peak number of handshake attempts the server validates
-# CONCURRENTLY, over UDP or TCP (default 8, must be >= 1). Only one session is
+# CONCURRENTLY, over UDP or TCP (default 8, must be 1 to 4096; below 8 logs a
+# WARNING at start, because the handshake slot rule needs 8). Only one session is
 # admitted, but attempts are checked side by side under a 12 s deadline each,
 # so one stalled bogus attempt cannot starve a legitimate client. The default
 # is ample for the single-client model; raise it only on a busy public

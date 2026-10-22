@@ -12,6 +12,7 @@ import logging
 import random
 import struct
 from collections.abc import Callable
+from dataclasses import replace
 from typing import Any
 from unittest.mock import patch
 
@@ -1858,3 +1859,40 @@ async def test_the_in_session_udp_watch_hands_its_clock_to_push_out() -> None:
     assert not watch.end_session.is_set()
     assert hs.started == [_A, _B]
     assert sorted(limiter.finished) == sorted([_A[0], _B[0]])
+
+
+@pytest.mark.parametrize(
+    ("slots", "warned"), [(1, True), (4, True), (7, True), (8, False), (16, False)]
+)
+async def test_run_server_warns_at_start_when_too_few_slots(
+    slots: int, warned: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    # [BOX-ONLY] dsm.server needs the new tuncore; imported here so the rest
+    # of this file still runs on the laptop.
+    from dsm.server import run_server
+    from tests.test_server_dns_fatal import _base_patches, _server_config
+
+    caplog.set_level(logging.WARNING, logger="dsm")
+
+    async def _accept(*args: Any, **_k: Any) -> tuple[Any, Any, Any]:
+        return None, None, args[5]  # no client: the accept loop ends
+
+    config = replace(
+        _server_config(), max_inflight_handshakes=slots, dns_blocklist=False
+    )
+    with _base_patches(_accept, {}):
+        assert await run_server(config) == 0
+    lines = [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.WARNING and "slot rule" in r.getMessage()
+    ]
+    if warned:
+        # "Use 8" from every low value, not just slots + 1.
+        assert lines == [
+            f"max_inflight_handshakes={slots} is too low for the handshake slot "
+            "rule: a steady stream of stalled handshakes could keep every slot "
+            "busy, so new devices wait. Use 8 or more."
+        ]
+    else:
+        assert lines == []

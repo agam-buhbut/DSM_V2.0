@@ -31,6 +31,7 @@ def _udp_config(port: int) -> MagicMock:
     config.allowed_cns_file = "/fake/cns"
     config.key_file = "/fake/key"
     config.attest_key_file = "/fake/attest"
+    config.max_inflight_handshakes = 8
     return config
 
 

@@ -103,6 +103,7 @@ class TestRunServerLoopSurvivesFramingError(unittest.IsolatedAsyncioTestCase):
         mock_config.allowed_cns_file = "/fake/cns"
         mock_config.key_file = "/fake/key"
         mock_config.attest_key_file = "/fake/attest"
+        mock_config.max_inflight_handshakes = 8
 
         mock_materials = MagicMock()
         mock_cn_allowlist = MagicMock()

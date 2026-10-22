@@ -241,7 +241,9 @@ _SIGNING_ALLOWANCE_S = 0.25
 _SERVER_SIGNING_TIME_S = 0.21
 
 
-def _slot_rule_ok(max_inflight: int) -> bool:
+def _slot_rule_ok(  # pyright: ignore[reportUnusedFunction]  # used by dsm.server
+    max_inflight: int,
+) -> bool:
     """Whether ``max_inflight`` slots meet condition (1) of the slot rule
     (spec §4.4): strangers starting at the overall limit keep fewer attempts
     protected at once than there are slots. Conditions (2) and (3) use only

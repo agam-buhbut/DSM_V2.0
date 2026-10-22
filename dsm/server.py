@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
 import os
 from collections.abc import Awaitable, Callable
@@ -36,6 +37,12 @@ from dsm.net.handshake_acceptor import (
 # names each carry a pyright pragma.
 from dsm.net.handshake_acceptor import (
     _accept_until_winner_tcp,  # pyright: ignore[reportPrivateUsage]
+)
+
+# isort: split
+# Its own statement too, for the same reason.
+from dsm.net.handshake_acceptor import (
+    _slot_rule_ok,  # pyright: ignore[reportPrivateUsage]
 )
 
 # isort: split
@@ -724,6 +731,19 @@ async def run_server(
         # The gate in front of new handshakes: mac1, cookies, the load rule.
         # One for the whole run, handed to every accept, idle or in session.
         gate = HandshakeGate(gate_keys)
+        # Push-out keeps a steady stream of stalled handshakes from holding
+        # every slot only when there are enough slots (spec §4.4, condition
+        # 1). More slots never break the rule, so only too few warn.
+        slots = config.max_inflight_handshakes
+        if not _slot_rule_ok(slots):
+            enough = next(n for n in itertools.count(slots + 1) if _slot_rule_ok(n))
+            log.warning(
+                "max_inflight_handshakes=%d is too low for the handshake slot "
+                "rule: a steady stream of stalled handshakes could keep every "
+                "slot busy, so new devices wait. Use %d or more.",
+                slots,
+                enough,
+            )
 
         fsm.transition(State.CONNECTING)
 
