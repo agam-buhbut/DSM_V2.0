@@ -1,8 +1,9 @@
 """DSM-008 — byte/target-exact capture & restore of ResolvConfManager.
 
 The only thing mocked is the I/O boundary: the module-level ``RESOLV_CONF``
-constant is redirected into a tmp dir. The real ``ResolvConfManager`` (and
-the real ``atomic_write`` it calls) operate on actual files we control.
+and ``RESOLV_BACKUP`` constants are redirected into a tmp dir. The real
+``ResolvConfManager`` (and the real ``atomic_write`` it calls) operate on
+actual files we control.
 
 Locks exact restore for all three prior states plus idempotency:
   (1) prior regular file -> bytes restored exactly,
@@ -39,6 +40,11 @@ class ResolvConfManagerTest(unittest.TestCase):
         patcher = patch.object(resolv_conf, "RESOLV_CONF", self.resolv)
         patcher.start()
         self.addCleanup(patcher.stop)
+        # The backup too: the real one is /var/lib/dsm, which a host with
+        # DSM installed may hold (and a root run would overwrite).
+        backup = patch.object(resolv_conf, "RESOLV_BACKUP", self.root / "resolv.orig")
+        backup.start()
+        self.addCleanup(backup.stop)
 
     def _managed(self) -> ResolvConfManager:
         return ResolvConfManager(NAMESERVER)
