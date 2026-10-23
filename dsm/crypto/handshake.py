@@ -143,6 +143,12 @@ class ClientRefusedError(HandshakeError):
     """
 
 
+class BadMsg3Error(HandshakeError):
+    """The client's msg3 did not open. A spoofed datagram in a real client's
+    attempt looks the same, so the acceptor does not bar the address for it
+    (multi-client spec §3.7 E2)."""
+
+
 @dataclass(frozen=True, slots=True)
 class VerifiedClient:
     """A client that passed every handshake check: certificate chain, attest
@@ -229,7 +235,12 @@ def _read_bootstrap_reply(plaintext: bytes) -> tuple[bytes, TunnelAssignment]:
 _NoiseT = TypeVar("_NoiseT")
 
 
-def _translate_noise_errors(what: str, call: Callable[[], _NoiseT]) -> _NoiseT:
+def _translate_noise_errors(
+    what: str,
+    call: Callable[[], _NoiseT],
+    *,
+    error: type[HandshakeError] = HandshakeError,
+) -> _NoiseT:
     """Run a tuncore Noise/transport call that parses peer-controlled
     bytes, translating the PyO3 ``RuntimeError`` it raises on malformed
     input into a typed :class:`HandshakeError`.
@@ -241,11 +252,14 @@ def _translate_noise_errors(what: str, call: Callable[[], _NoiseT]) -> _NoiseT:
     catch only ``HandshakeError`` / ``CertAuthError``, so an
     unauthenticated malformed ``msg1`` would otherwise escape the retry
     loop and terminate ``asyncio.run``.
+
+    ``error`` is the class raised, for a read whose failure the caller must
+    tell apart (msg3).
     """
     try:
         return call()
     except RuntimeError as e:
-        raise HandshakeError(f"{what}: {e}") from e
+        raise error(f"{what}: {e}") from e
 
 
 async def _attest_payload_in_thread(
@@ -607,6 +621,7 @@ async def server_handshake(
 
     Raises:
         HandshakeError on transport/protocol failure.
+        BadMsg3Error (a HandshakeError) when msg3 does not open.
         CertAuthError / CNNotAllowedError / CertRevokedError on cert
             policy failure.
         ClientRefusedError when ``admit_client`` refuses the client.
@@ -667,7 +682,7 @@ async def server_handshake(
 
     binding_hash_for_msg3 = bytes(responder.get_handshake_hash())
     client_static_raw, client_attest_payload = _translate_noise_errors(
-        "read msg3", lambda: responder.read_message_3(msg3)
+        "read msg3", lambda: responder.read_message_3(msg3), error=BadMsg3Error
     )
     client_static = bytes(client_static_raw)
 

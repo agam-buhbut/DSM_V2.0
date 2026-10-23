@@ -237,6 +237,11 @@ _SIGNING_ALLOWANCE_S = 0.25
 # handshake_gate.py's GLOBAL_START_RATE note). Kept at the measured value even
 # where signing is faster: the larger value is the safe side.
 _SERVER_SIGNING_TIME_S = 0.21
+# The time a real client gets from msg2 leaving to its msg3: what
+# _PUSH_OUT_AFTER_S leaves after the server's own signature. A push-out
+# victim whose msg2 left more recently was held up by the server's TPM
+# queue, so it did not stall (owner decision 2026-10-23).
+_REPLY_ALLOWANCE_S = _PUSH_OUT_AFTER_S - _SERVER_SIGNING_TIME_S
 
 
 def _slot_rule_ok(  # pyright: ignore[reportUnusedFunction]  # used by dsm.server
@@ -276,9 +281,14 @@ class _Attempt:
     # server was under load); over TCP the connection itself, with the gate.
     # Only a proved start that ends without a session costs the penalty.
     proved: bool = False
+    # Step S's clock, for msg2_at.
+    clock: Callable[[], float] = field(default=time.monotonic, repr=False)
+    # Step S's clock when msg2 first left; None before.
+    msg2_at: float | None = None
 
     def msg2_sent(self) -> None:
         self.signing = False
+        self.msg2_at = self.clock()
 
 
 def _running_from(attempts: Mapping[asyncio.Task[None], _Attempt], ip: str) -> int:
@@ -1693,14 +1703,16 @@ async def _run_attempt(
     does ``limiter`` charge the shared start limits; once any CN has
     connected in this run they include the newcomer limit (spec §3.7 E1).
 
-    ``record`` is the attempt's record: over TCP it is marked as signing
+    ``record`` is the attempt's record. Over TCP it is marked as signing
     once the first frame passed, until msg2 has left (UDP's view does that
     for UDP), and it loses its ``proved`` bit when the shared limits refuse
-    the first frame, which is not the address's doing (spec §3.7 E2).
+    the first frame, which is not the address's doing. Over both it loses
+    that bit when msg3 does not open (spec §3.7 E2).
     """
     from cryptography.x509.oid import ExtendedKeyUsageOID
 
     from dsm.crypto.handshake import (
+        BadMsg3Error,
         CertAuthError,
         CertRevokedError,
         ClientRefusedError,
@@ -1795,6 +1807,10 @@ async def _run_attempt(
             HandshakeError,
         ) as e:
             _note_trouble(gate)
+            if isinstance(e, BadMsg3Error) and record is not None:
+                # Over UDP a spoofed datagram in this attempt looks the same:
+                # no penalty, so it cannot bar a real client (spec §3.7 E2).
+                record.proved = False
             # Same opaque INFO/WARNING logging as before; detail at DEBUG.
             if isinstance(e, (CNNotAllowedError, CertRevokedError, CertAuthError)):
                 log.warning("handshake rejected (cert auth) from %s", who)
@@ -1844,6 +1860,17 @@ def _penalized(done: asyncio.Task[None], rec: _Attempt) -> bool:
     (a push-out is not a stop). A success says True too: its address is
     known by then, and the limiter never bars a known address."""
     return rec.proved and not (done.cancelled() and rec.passed_on is None)
+
+
+def _stalled(rec: _Attempt, now: float) -> bool:
+    """Whether a push-out victim stalled, so its address pays the penalty
+    (spec §3.7 E2): at least ``_PUSH_OUT_AFTER_S`` old (a younger one went
+    by E3), and its msg2, if one left, left at least ``_REPLY_ALLOWANCE_S``
+    ago (a later one waited in the server's TPM queue, not the client's
+    doing)."""
+    if now - rec.started < _PUSH_OUT_AFTER_S:
+        return False
+    return rec.msg2_at is None or now - rec.msg2_at >= _REPLY_ALLOWANCE_S
 
 
 async def _demux(
@@ -1897,7 +1924,9 @@ async def _demux(
         new_inbox: asyncio.Queue[bytes] = asyncio.Queue(maxsize=_PER_PEER_INBOX_FRAMES)
         new_inbox.put_nowait(frame)
         inboxes[src] = new_inbox
-        record = _Attempt(ip=src[0], started=started, signing=True, proved=proved)
+        record = _Attempt(
+            ip=src[0], started=started, signing=True, proved=proved, clock=clock
+        )
         view = _PerPeerUDPView(transport, src, new_inbox, on_msg2=record.msg2_sent)
 
         # A done-callback, not a ``finally`` in the worker: a task cancelled
@@ -1931,6 +1960,7 @@ async def _demux(
                 table=table,
                 gate=gate,
                 limiter=limiter,
+                record=record,
             )
         )
         records[task] = record
@@ -2012,9 +2042,8 @@ async def _demux(
             ):
                 _note_trouble(gate)
                 continue
-            if now - records[victim].started < _PUSH_OUT_AFTER_S:
-                # Pushed out young (E3): it did not stall, so it costs its
-                # address nothing (spec §3.7 E2).
+            if not _stalled(records[victim], now):
+                # It did not stall: it costs its address nothing (spec §3.7 E2).
                 records[victim].proved = False
             _push_out(records, victim, how)
             _start(addr, data, now, under_load)
@@ -2124,9 +2153,8 @@ async def _admit_tcp(
                 _note_trouble(gate)
                 conn.close()
                 continue
-            if now - records[victim].started < _PUSH_OUT_AFTER_S:
-                # Pushed out young (E3): it did not stall, so it costs its
-                # address nothing (spec §3.7 E2).
+            if not _stalled(records[victim], now):
+                # It did not stall: it costs its address nothing (spec §3.7 E2).
                 records[victim].proved = False
             _push_out(records, victim, how)
         else:
@@ -2146,7 +2174,7 @@ async def _admit_tcp(
         # Not signing yet: the worker sets that once the first frame passed.
         # With the gate the connection itself proved its address (E2).
         record = _Attempt(
-            ip=peer[0], started=now, signing=False, proved=gate is not None
+            ip=peer[0], started=now, signing=False, proved=gate is not None, clock=clock
         )
 
         def _hand_on(accepted: AcceptedClient, p: tuple[str, int] = peer) -> None:

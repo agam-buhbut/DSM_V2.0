@@ -988,8 +988,9 @@ async def test_an_own_address_push_out_racing_its_deadline_gives_back_nothing() 
     hs = _Hs()
     limiter = _Ledger(clock=_minutes())
     asked: list[int] = []
-    # Step S times: x2 starts at 1.0, x1 at 0.0 (the oldest), x3 at 2.0.
-    run = _Udp(hs, max_inflight=2, limiter=limiter, clock=_Ticks(1.0, 0.0, 2.0))
+    # Step S times: x2 starts at 1.0, its msg2 is stamped 1.0, x1 at 0.0 (the
+    # oldest), x3 at 2.0.
+    run = _Udp(hs, max_inflight=2, limiter=limiter, clock=_Ticks(1.0, 1.0, 0.0, 2.0))
     run.sock = _FeedOnMsg2Sock(x1, x3)
     async with run:
         run.feed(x2)  # the usual 12 s deadline: still running at the end
@@ -1547,8 +1548,9 @@ async def test_a_tcp_own_address_push_out_racing_the_first_frame_deadline() -> N
     hs = _Hs()
     limiter = _Ledger(clock=_minutes())
     asked: list[int] = []
-    # Step S times: x2 accepted at 1.0, x1 at 0.0 (the oldest), x3 at 2.0.
-    run = _Tcp(hs, max_inflight=4, limiter=limiter, clock=_Ticks(1.0, 0.0, 2.0))
+    # Step S times: x2 accepted at 1.0, its msg2 stamped 1.0, x1 at 0.0 (the
+    # oldest), x3 at 2.0.
+    run = _Tcp(hs, max_inflight=4, limiter=limiter, clock=_Ticks(1.0, 1.0, 0.0, 2.0))
     new = _Conn(x3, [_good(3)])
     victim = _QueuesNext(x1, run.connections, new, at="read")
     with (
@@ -1610,8 +1612,9 @@ async def test_a_tcp_own_address_push_out_racing_the_attempt_deadline() -> None:
     hs = _Hs()
     limiter = _Ledger(clock=_minutes())
     asked: list[int] = []
-    # Step S times: x2 accepted at 1.0, x1 at 0.0 (the oldest), x3 at 2.0.
-    run = _Tcp(hs, max_inflight=2, limiter=limiter, clock=_Ticks(1.0, 0.0, 2.0))
+    # Step S times: x2 accepted at 1.0, its msg2 stamped 1.0, x1 at 0.0 (the
+    # oldest), x3 at 2.0.
+    run = _Tcp(hs, max_inflight=2, limiter=limiter, clock=_Ticks(1.0, 1.0, 0.0, 2.0))
     new = _Conn(x3, [_good(3)])
     victim = _QueuesNext(x1, run.connections, new, at="msg2", frames=[_good(1)])
     async with run:
