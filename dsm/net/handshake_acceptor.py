@@ -1864,7 +1864,7 @@ def _log_unexpected(done: asyncio.Task[None]) -> None:
     if error is not None:
         log.error(
             "a handshake attempt failed with an unexpected error",
-            exc_info=(type(error), error, error.__traceback__),
+            exc_info=error,
         )
 
 
@@ -1949,7 +1949,6 @@ async def _demux(
         def _end_attempt(done: asyncio.Task[None], a: tuple[str, int] = src) -> None:
             # The record first, so an error below cannot leave it behind.
             rec = records.pop(done)
-            _log_unexpected(done)
             if rec.passed_on is None:
                 # A pushed-out attempt's slot belongs to the one that took it.
                 semaphore.release()
@@ -1960,6 +1959,7 @@ async def _demux(
             # a same-address push-out the new attempt holds this share.
             if rec.passed_on is not _PassedOn.SLOT_AND_SHARE:
                 limiter.finish(a[0], failed=_penalized(done, rec))
+            _log_unexpected(done)
 
         task = asyncio.ensure_future(
             _run_attempt(
@@ -2209,7 +2209,6 @@ async def _admit_tcp(
         ) -> None:
             # The record first, so an error below cannot leave it behind.
             rec = records.pop(done)
-            _log_unexpected(done)
             if rec.passed_on is None:
                 # A pushed-out attempt's slot belongs to the one that took it.
                 semaphore.release()
@@ -2219,6 +2218,7 @@ async def _admit_tcp(
             # After a same-address push-out the new attempt holds this share.
             if rec.passed_on is not _PassedOn.SLOT_AND_SHARE:
                 limiter.finish(p[0], failed=_penalized(done, rec))
+            _log_unexpected(done)
 
         task = asyncio.ensure_future(
             _run_attempt(

@@ -188,3 +188,18 @@ async def test_a_worker_bug_outside_the_caught_set_is_logged_once(
     assert record.exc_info is not None
     assert record.exc_info[0] is RuntimeError
     assert A[0] not in record.getMessage()
+
+
+async def test_an_attempt_cut_by_a_stop_logs_no_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.ERROR, logger="dsm")
+    hs = _Hs()
+    hs.stall.add(A)
+    async with _Demux(hs, SessionTable([A_CN])) as run:
+        run.feed(_frame(A), A)
+        assert await _spin(lambda: hs.started == [A])
+        assert await _spin(lambda: len(run.sent_to(A)) == 1)  # stalled after msg2
+    # Leaving the harness cancelled the worker: a stop is not a bug.
+    assert not run.workers
+    assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
