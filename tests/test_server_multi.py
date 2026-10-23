@@ -939,8 +939,10 @@ class _AlwaysValid:
     """PathValidationState stand-in: every PATH_RESPONSE validates; no
     challenge is ever queued."""
 
+    valid = True
+
     def validate(self, _addr: Any, _payload: bytes) -> bool:
-        return True
+        return self.valid
 
     def clear(self) -> None:
         pass
@@ -949,7 +951,18 @@ class _AlwaysValid:
         return None
 
 
-async def test_egress_starts_at_the_peer_and_only_a_validated_roam_moves_it() -> None:
+class _NeverValid(_AlwaysValid):
+    """Every PATH_RESPONSE fails validation."""
+
+    valid = False
+
+
+@pytest.mark.parametrize(
+    ("validator", "moves"), [(_AlwaysValid, True), (_NeverValid, False)]
+)
+async def test_egress_starts_at_the_peer_and_only_a_validated_roam_moves_it(
+    validator: type[_AlwaysValid], moves: bool
+) -> None:
     table = SessionTable([A])
     attempt = object()
     client = VerifiedClient(cn=A, noise_static=b"\x01" * 32)
@@ -990,7 +1003,7 @@ async def test_egress_starts_at_the_peer_and_only_a_validated_roam_moves_it() ->
     with (
         patch("dsm.server.make_send_fn", _send_fn),
         patch("dsm.server.SendScheduler", _FakeScheduler),
-        patch("dsm.server.PathValidationState", _AlwaysValid),
+        patch("dsm.server.PathValidationState", validator),
         patch("dsm.session.run_data_loops", _loops),
     ):
         await server._run_one_session(
@@ -1003,5 +1016,9 @@ async def test_egress_starts_at_the_peer_and_only_a_validated_roam_moves_it() ->
         )
     assert seen["first"] == PEER_A
     assert seen["after_data"] == (PEER_A, session)
-    assert seen["dest"]() == NEW_PEER
-    assert table.by_peer(NEW_PEER) is session and table.by_peer(PEER_A) is None
+    if moves:
+        assert seen["dest"]() == NEW_PEER
+        assert table.by_peer(NEW_PEER) is session and table.by_peer(PEER_A) is None
+    else:
+        assert seen["dest"]() == PEER_A
+        assert table.by_peer(PEER_A) is session and table.by_peer(NEW_PEER) is None
