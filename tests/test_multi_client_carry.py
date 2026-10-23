@@ -6,6 +6,7 @@ files; nothing here edits them."""
 from __future__ import annotations
 
 import asyncio
+import logging
 from unittest.mock import patch
 
 import pytest
@@ -28,6 +29,7 @@ from tests.test_client_acceptor import (
     _with_cookie,
 )
 from tests.test_handshake_acceptor_limits import _Frozen, _spin, _Transport, _yield
+from tests.test_udp_dispatcher import A_PEER, _Keys, _Run, _Socket
 
 
 async def test_a_second_run_without_stop_raises() -> None:
@@ -143,3 +145,17 @@ async def test_a_udp_stranger_cut_by_a_stop_costs_nothing() -> None:
     # Leaving the harness cancelled its worker with passed_on None: a stop,
     # not a stall. The twin of the TCP test in test_client_acceptor.py.
     assert limiter.try_start(B[0])
+
+
+def test_a_session_with_no_udp_view_drops_with_one_error_line(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.ERROR, logger="dsm")
+    run = _Run()
+    session = run.connect("dsm-a-client", A_PEER, 1, _Keys(b"one", b"two"))
+    session.transport = _Socket([])  # not a _SessionUDPView
+    run.dispatcher.route(b"one", A_PEER)
+    run.dispatcher.route(b"two", A_PEER)
+    assert run.offered == []  # dropped, not offered to the acceptor
+    (record,) = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert record.getMessage() == "dropped a UDP packet: session 1 has no UDP view"

@@ -248,6 +248,7 @@ class UDPDispatcher:
         self._offer = offer
         self._unmatched = 0
         self._full_log = RepeatLog(log, logging.DEBUG)
+        self._no_view_log = RepeatLog(log, logging.ERROR)
 
     @property
     def unmatched(self) -> int:
@@ -279,5 +280,9 @@ class UDPDispatcher:
         view = session.transport
         # Every session of a UDP run reads through its view, so anything else
         # is dropped (fail closed). A full view counts the drop itself.
-        if isinstance(view, _SessionUDPView) and not view.deliver(data, addr):
+        if not isinstance(view, _SessionUDPView):
+            self._no_view_log.log(
+                "dropped a UDP packet: session %d has no UDP view", session.number
+            )
+        elif not view.deliver(data, addr):
             self._full_log.log("dropped a UDP packet: its session's queue is full")
