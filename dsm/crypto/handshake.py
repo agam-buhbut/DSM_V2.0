@@ -139,7 +139,8 @@ class ClientRefusedError(HandshakeError):
     """The server's rules refused a client that passed every check.
 
     Raised by an ``admit_client`` hook (see :func:`server_handshake`), for
-    example while another client holds the server's one session.
+    example when the session table's rules refuse it (it took its session
+    over too often).
     """
 
 

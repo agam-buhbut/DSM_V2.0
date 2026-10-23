@@ -2,8 +2,8 @@
 
 DSM is an open-source VPN for Linux that puts security and anonymity first.
 One server serves several clients at once, each in its own tunnel. It also
-resists traffic analysis: working out what you do from the size and timing of your
-packets.
+resists traffic analysis: working out what you do from the size and timing of
+your packets.
 
 ## Quickstart
 

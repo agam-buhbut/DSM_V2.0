@@ -948,14 +948,17 @@ IPv4 forwarding is on, whether or not a client is connected. A process that
 holds 10.8.0.1:53 stops the server at start (§11).
 
 Each client's NAT flows carry a tag of its own (a conntrack mark), and a
-reply whose flow lacks the tag of the address's holder is dropped. So: do
-not run another tool that sets conntrack marks on mtun0 traffic (multi-WAN
-or policy-routing setups); port forwards (DNAT) from the internet to a
-client's tunnel address no longer work, nor does traffic a LAN host routes
-into 10.8.0.0/24; and the first start after this upgrade cuts each older
-client flow once. A packet with a tunnel source (10.8.0.x) that reaches the
-server on any interface but mtun0 is dropped, and so is a packet into mtun0
-that belongs to no flow.
+reply whose flow lacks the tag of the address's holder is dropped. This has
+four effects:
+
+- Do not run another tool that sets conntrack marks on mtun0 traffic
+  (multi-WAN or policy-routing setups).
+- Port forwards (DNAT) from the internet to a client's tunnel address no
+  longer work, nor does traffic a LAN host routes into 10.8.0.0/24.
+- The first start after this upgrade cuts each older client flow once.
+- A packet with a tunnel source (10.8.0.x) that reaches the server on any
+  interface but mtun0 is dropped, and so is a packet into mtun0 that
+  belongs to no flow.
 
 ## 5. Run Both Sides
 
@@ -1008,7 +1011,7 @@ Expected server log lines:
 ... DNS blocklist loaded: 72,525 names to block, 0 allowed (files read: 1, lines skipped: 13)
 ... handshake complete (server) — client_cn=dsm-XXXXXXXX-client
 ... session 1: client_cn=dsm-XXXXXXXX-client, tunnel address 10.8.0.2
-... client connected (noise_static=<first 16 hex>)
+... client connected (noise_static_sha256=<first 16 hex of the key's SHA-256>)
 ```
 
 With `transport = "tcp"` the line reads `server listening on TCP port 51820
@@ -2219,7 +2222,9 @@ every handshake slot. The limits are the same for UDP and TCP:
   the overall one. Each start costs a TPM signature.
 - "that address's last handshake failed": an unknown address whose last
   handshake proved the address (a cookie over UDP, the connection over TCP)
-  and then failed or stalled may not start another for 30 s.
+  and then failed or stalled may not start another for 30 s. Two starts cost
+  nothing: one whose final handshake message does not open, and one pushed
+  out less than 1.29 s after the server's reply left.
 
 Over TCP, the overall limit and the limit for unknown addresses are checked
 when the connection's first handshake message arrives (after its mac1
@@ -2260,18 +2265,22 @@ busy making its answer (a wait for the TPM counts) and has not passed the
 session check. A TCP connection that has sent nothing yet counts too. The
 server logs `pushed out a stalled handshake attempt to make room for a new
 one` (INFO, at most once per 10 s, with a count). Someone with many
-addresses can still make new devices wait while it lasts: over TCP with no
-key at all (about 170 addresses, since a failed start bars its address for
-30 s), over UDP with the CA certificate and the server's name (about 31
-addresses once a client has connected, about 125 right after a restart). A
-device coming back from an address it connected from in this run is not
-held back.
+addresses can still make new devices wait while it lasts. Over TCP with no
+key at all it takes about 170 addresses, since a failed start bars its
+address for 30 s. Over UDP with the CA certificate and the server's name, it
+takes about 4 addresses once a client has connected, and about 16 right
+after a restart, if each start ends with a bad final message (that costs its
+address nothing, as said above). An attacker who stalls instead needs about
+31 (once a client has connected) or about 125 (right after a restart). A
+device coming back from an address it connected from in this run is not held
+back.
 
 With `transport = "tcp"` the server keeps its one listening socket open for
 the whole run, so one silent connection does not hold up other clients and
-a client that comes back can take its session over. It keeps at most 2 connections per address, closes a connection that
-has not sent its first handshake message after 3 s, and one that has not
-finished its handshake after 12 s.
+a client that comes back can take its session over. It keeps at most 2
+connections per address, closes a connection that has not sent its first
+handshake message after 3 s, and one that has not finished its handshake
+after 12 s.
 
 ### Many devices are slow to reconnect after an outage
 
@@ -2415,6 +2424,19 @@ server's socket than DSM asked for (the daemon lacks CAP_NET_ADMIN, or
 (`nstat -az UdpRcvbufErrors` counts them; `netstat -su` calls them
 `RcvbufErrors`). Run the daemon under its systemd unit, or raise
 `net.core.rmem_max`.
+
+### Server log: "a handshake attempt failed with an unexpected error"
+
+An ERROR with a traceback: a bug (a TPM error is one possible cause) ended
+one handshake attempt. That attempt ends; other attempts and live sessions
+go on, and the client tries again by itself. Report it with the traceback.
+(This line carries no client address.)
+
+### Server log: "dropped a UDP packet: session N has no UDP view"
+
+An ERROR, at most once per 10 s: the server found a session whose UDP
+wiring is missing, so it dropped the packet. This is a bug in the server,
+not a network problem. Report it.
 
 ### Server log: "DNS queries dropped: one client already has 256 waiting"
 

@@ -46,20 +46,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   open: over TCP a killed client's connection closes at once, and that
   ends the old session anyway. The server now accepts handshakes while a
   session runs. A client with the same name (the CN in its certificate)
-  that passes the full handshake replaces its old session at once; another
-  client is refused before the last handshake frame and gets in once the
-  session ends. Each name may replace its session 3 times at once, then
-  once a minute, so two devices that share a name swap at most once a
-  minute. New log lines: `client reconnected`, `reconnected with a
-  different device key`, `reconnected too often`, `handshake refused:
-  another client is connected`. Over UDP, a client with a fixed
-  `listen_port` gets nothing from this: it still waits for the old session
-  to time out.
+  that passes the full handshake replaces its old session at once. Each
+  name may replace its session 3 times at once, then once a minute, so two
+  devices that share a name swap at most once a minute. New log lines:
+  `client reconnected`, `reconnected with a different device key`,
+  `reconnected too often`. Over UDP, a client with a fixed `listen_port`
+  gets nothing from this: it still waits for the old session to time out.
 - With `transport = "tcp"` the server opens its TCP port once at start and
   keeps it open for the whole run, also during a session. In UDP mode it
   still opens no TCP port.
-- While a session runs, new handshakes may start at most once a second, on
-  top of the existing limits.
 - The server's attest signature no longer blocks its event loop: it runs in
   a worker thread, without the Python lock. On `/dev/tpmrm*` and with
   tpm2-abrmd the attest key keeps one TPM connection with its parent key

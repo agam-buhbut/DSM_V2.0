@@ -494,9 +494,9 @@ def decrypt_packet(
     dropped later still crossed the link. A packet dropped before that (too
     short, did not open, a replay) counts as junk.
 
-    ``on_auth_fail`` and ``on_replay`` (server, while a session runs) are
-    called for a packet the session cannot use, so the server's in-session
-    accept can look at it. ``on_auth_fail``: the packet does not open (no
+    ``on_auth_fail`` and ``on_replay`` are called for a packet the session
+    cannot use. They are set only from the ``unauthenticated`` hook, which
+    the server no longer uses. ``on_auth_fail``: the packet does not open (no
     header key matched, the AEAD failed, or this key set's window refused
     it: already seen, or 128 or more behind that key set's newest); it may
     be a reconnecting client's handshake frame or its first packets under
@@ -1050,8 +1050,8 @@ async def run_data_loops(
     * ``extra_loops``: client passes ``auto_mtu_loop(...)`` here; server
       passes nothing.
     * ``shutdown_log``: caller-supplied label so the log line still
-      distinguishes "shutting down" (client) vs "server shutting
-      down".
+      distinguishes "shutting down" (client) vs "session
+      closing" (server).
 
     The caller owns scheduler.start() / .stop registration on the
     AsyncExitStack — this helper deliberately does NOT pull the stack
