@@ -18,8 +18,10 @@ from unittest.mock import patch
 
 import pytest
 
+from dsm import server
 from dsm.core.config import Config
 from dsm.core.fsm import SessionFSM, State
+from dsm.core.protocol import InnerPacket, PacketType
 from dsm.crypto.cert_allowlist import CNAllowlist
 from dsm.crypto.handshake import VerifiedClient
 from dsm.net.dns import DNSResolver
@@ -35,7 +37,15 @@ from dsm.server import (
     run_server,
 )
 from tests.test_handshake_acceptor_limits import _spin
-from tests.test_server_dns_fatal import _base_patches, _FakeUDPTransport, _server_config
+from tests.test_server_dns_fatal import (
+    _base_patches,
+    _FakeScheduler,
+    _FakeStore,
+    _FakeTun,
+    _FakeUDPTransport,
+    _noop_send,
+    _server_config,
+)
 
 A = "dsm-a-client"
 B = "dsm-b-client"
@@ -430,6 +440,7 @@ class _Sessions:
         _keystore: Any,
         session: ServerSession,
         tun: Any,
+        _on_peer: Any,
     ) -> None:
         fsm.transition(State.ESTABLISHED)
         self.started.append(session)
@@ -915,3 +926,82 @@ async def test_a_session_crash_ends_only_that_session(
         f"session 1 failed (client_cn={A}); other clients are not affected"
     )
     assert error.exc_info is not None
+
+
+NEW_PEER = ("203.0.113.77", 41000)
+
+
+class _Sock(_FakeUDPTransport):
+    """The run's socket under one session's view."""
+
+
+class _AlwaysValid:
+    """PathValidationState stand-in: every PATH_RESPONSE validates; no
+    challenge is ever queued."""
+
+    def validate(self, _addr: Any, _payload: bytes) -> bool:
+        return True
+
+    def clear(self) -> None:
+        pass
+
+    def should_challenge(self, _addr: Any) -> None:
+        return None
+
+
+async def test_egress_starts_at_the_peer_and_only_a_validated_roam_moves_it() -> None:
+    table = SessionTable([A])
+    attempt = object()
+    client = VerifiedClient(cn=A, noise_static=b"\x01" * 32)
+    table.admit(attempt, client)
+    _, tunnel = table.confirm(attempt)
+    table.release(attempt)
+    session = ServerSession(
+        number=1,
+        client=client,
+        tunnel=tunnel,
+        session_keys=_Keys(),  # type: ignore[arg-type]
+        transport=_SessionUDPView(_Sock(), lambda: 0),
+        shutdown=asyncio.Event(),
+        tun_queue=asyncio.Queue(),
+        peer=PEER_A,
+    )
+    table.add(session)
+    seen: dict[str, Any] = {}
+
+    def _send_fn(
+        _keys: Any, _transport: Any, dest_addr: Any, *_a: Any, **_k: Any
+    ) -> Any:
+        seen["dest"] = dest_addr
+        return _noop_send
+
+    async def _loops(*_a: Any, post_authenticate: Any, **_k: Any) -> None:
+        seen["first"] = seen["dest"]()  # before any packet arrived
+        # A packet that merely opens, from another address, moves nothing.
+        await post_authenticate(NEW_PEER, InnerPacket(PacketType.DATA, 0, b""))
+        seen["after_data"] = (seen["dest"](), table.by_peer(PEER_A))
+        await post_authenticate(
+            NEW_PEER, InnerPacket(PacketType.PATH_RESPONSE, 0, bytes(16))
+        )
+
+    fsm = SessionFSM()
+    fsm.transition(State.CONNECTING)
+    fsm.transition(State.HANDSHAKING)
+    with (
+        patch("dsm.server.make_send_fn", _send_fn),
+        patch("dsm.server.SendScheduler", _FakeScheduler),
+        patch("dsm.server.PathValidationState", _AlwaysValid),
+        patch("dsm.session.run_data_loops", _loops),
+    ):
+        await server._run_one_session(
+            _server_config(),
+            fsm,
+            _FakeStore(),  # type: ignore[arg-type]
+            session,
+            ClientTun(_FakeTun(), session, server._TUNNEL.network),  # type: ignore[arg-type]
+            lambda addr: table.note_peer(session, addr),
+        )
+    assert seen["first"] == PEER_A
+    assert seen["after_data"] == (PEER_A, session)
+    assert seen["dest"]() == NEW_PEER
+    assert table.by_peer(NEW_PEER) is session and table.by_peer(PEER_A) is None

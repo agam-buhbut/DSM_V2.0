@@ -303,6 +303,7 @@ async def _run_one_session(
     keystore: KeyStore,
     session: ServerSession,
     tun: TunDevice,
+    on_peer: Callable[[tuple[str, int]], None],
 ) -> None:
     """Run one client's session until it ends, then unwind its own state.
 
@@ -312,6 +313,8 @@ async def _run_one_session(
     reassembly, shaper, replay window, egress address) is new here, so each
     session starts from a clean epoch and an empty replay window: carrying
     state across sessions would be a nonce-reuse / replay-bypass bug.
+    ``on_peer`` gets each new egress address a PATH_RESPONSE validated, so
+    the dispatcher checks this session first for that address's packets.
     """
     import tuncore
 
@@ -348,10 +351,12 @@ async def _run_one_session(
         liveness = LivenessState()
         reassembly = ReassemblyBuffer()
 
-        # One-element cell holding the committed egress addr. None until the
-        # first authenticated packet; post_authenticate may later overwrite it
-        # with the SAME addr, or a new src port after a validated roam.
-        client_addr: list[tuple[str, int] | None] = [None]
+        # The committed egress address. It starts at the handshake address:
+        # the handshake proved the client receives there (spec §2.10), so a
+        # takeover's new session can send at once, and a spoofed source on a
+        # first data packet cannot point the stream elsewhere. Only a
+        # validated PATH_RESPONSE moves it.
+        client_addr: list[tuple[str, int] | None] = [session.peer]
 
         send_packet = make_send_fn(
             session_keys,
@@ -364,9 +369,8 @@ async def _run_one_session(
 
         # Shaper-driven (mirrors the client): the tier shaper decides when
         # packets leave. should_chaff is only a GATE that keeps free slots
-        # empty until client_addr is known — otherwise each chaff packet would
-        # burn a sequence number only to be dropped by make_send_fn's
-        # "destination addr not yet known" path.
+        # empty while the egress cell is empty; the server's starts at the
+        # handshake address, so here it is open from the start.
         def _chaff_allowed() -> bool:
             return client_addr[0] is not None
 
@@ -405,9 +409,9 @@ async def _run_one_session(
             autocap=autocap,
         )
 
-        # Return-routability state for egress roaming. The first authenticated
-        # addr commits normally; a later authenticated packet from a DIFFERENT
-        # source is treated as an unvalidated candidate and probed with a
+        # Return-routability state for egress roaming. Egress starts at the
+        # handshake address; an authenticated packet from a DIFFERENT source
+        # is treated as an unvalidated candidate and probed with a
         # PATH_CHALLENGE — egress does NOT roam there until the candidate echoes
         # the token in a PATH_RESPONSE. This blocks the on-path attack where a
         # genuine client packet is suppressed and reinjected with a SPOOFED
@@ -424,7 +428,8 @@ async def _run_one_session(
             assert isinstance(inner, InnerPacket)
             committed = client_addr[0]
 
-            # First authenticated addr: commit (no challenge for the first one).
+            # An empty cell would commit its first address; the server's starts
+            # at the handshake address (see above), so it never is.
             if committed is None:
                 client_addr[0] = addr
                 return
@@ -437,6 +442,7 @@ async def _run_one_session(
                 if path_validation.validate(addr, inner.payload):
                     client_addr[0] = addr
                     path_validation.clear()
+                    on_peer(addr)  # the dispatcher's hint follows
                     log.info("egress roam validated, committed to new peer addr")
                 return
 
@@ -484,6 +490,7 @@ async def _serve_client(
             keystore,
             session,
             ClientTun(host.tun, session, _TUNNEL.network),
+            lambda addr: table.note_peer(session, addr),
         )
     except Exception:
         # A bug in the session's setup or teardown (the data loops contain
