@@ -6,74 +6,67 @@ well-formed msg1 followed by silence parked the responder across its retries
 nftables rate-limiting bounds the packet rate but cannot tell a slow genuine
 handshake from a slow bogus one.
 
-Here a bounded pool of workers validates handshakes concurrently. The server
-serves one session at a time (one TUN, one forwarding/MASQUERADE setup, one
-DNS proxy, one socket), and the acceptor runs in two places:
+Here a bounded pool of workers validates handshakes concurrently.
+:class:`ClientAcceptor` runs for the whole run (spec §2.7). Each attempt
+that passes the full handshake and the run's
+:class:`~dsm.net.session_slot.SessionTable` (one tunnel address and one
+session per CN, and each CN's takeover allowance) is handed to
+``on_client`` and becomes a session; the other attempts go on.
 
-* Between sessions (the idle accept): the first worker to authenticate wins
-  and the others are cancelled.
-* While a session runs (:class:`SessionWatch`): over UDP the live
-  session still reads every datagram first and hands over each one it
-  cannot use (did not open, which under wire v2 includes a replay and a
-  packet too late for its key set, or opened but too far behind the
-  newest); over TCP the run's one listener stays open and the watch reads
-  its queue. A client that passes the full handshake and the run's
-  :class:`~dsm.net.session_slot.SessionSlot` (the live session's CN, so the
-  same client coming back) ends the session and becomes the next one.
-  Another client is refused before the last handshake frame.
-
-* :func:`_demux_loop` is the only caller of the real ``transport.recv()``. It
-  routes each datagram to a bounded per-source inbox. A new source must open
-  with a full handshake frame, find a free slot and pass the run's
-  :class:`~dsm.net.handshake_gate.SourceLimiter`; then it gets a worker on a
-  :class:`_PerPeerUDPView`, which gives ``server_handshake`` the transport
-  surface it expects with the source address pinned. The demux awaits
-  nothing but the socket, so no source can pause routing for the others.
-  In a session it reads the live session's leftovers through an
-  :class:`_IntakeView` instead.
+* :func:`_demux` reads the frames no session fits (UDP; the dispatcher
+  hands them over through :meth:`ClientAcceptor.offer`, which keeps only
+  1400-byte frames) and routes each to a bounded per-source inbox. A new
+  source must open with a full handshake frame, find a free slot and pass
+  the run's :class:`~dsm.net.handshake_gate.SourceLimiter`; then it gets a
+  worker on a :class:`_PerPeerUDPView`, which gives ``server_handshake`` the
+  transport surface it expects with the source address pinned. The demux
+  awaits nothing but its read and a cookie reply's send, so no source can
+  pause routing for the others. :func:`_admit_tcp` does the same for the
+  connections the run's listener queues.
 * With the run's :class:`~dsm.net.handshake_gate.HandshakeGate` (wire v2),
   a new UDP source's 1400-byte frame must also carry a valid mac1, and,
   under load, a mac2 from a cookie: the demux answers a missing cookie with
-  a cookie reply and keeps no state. A TCP connection's first frame must come
-  within ``_TCP_FIRST_FRAME_DEADLINE`` and be 1400 bytes with a valid mac1 (no
-  cookies: TCP already proves the address); only then is it charged the
-  shared start limits (the accept charges only its address's). A bad mac1 is
-  dropped silently and counted in one INFO line a minute. A failed or refused
-  attempt, and a start the pool or the limits refuse, turn cookies on for
-  30 s. Without a gate (tests only) nothing of this is checked.
+  a cookie reply and keeps no state; a known address's reply comes from its
+  own small budget (spec §3.7). A TCP connection's first frame must come
+  within ``_TCP_FIRST_FRAME_DEADLINE`` and be 1400 bytes with a valid mac1
+  (no cookies: TCP already proves the address); only then is it charged the
+  shared start limits (the accept charges only its address's). A bad mac1
+  is dropped silently and counted in one INFO line a minute. A failed or
+  refused attempt, and a start the pool or the limits refuse, turn cookies
+  on for 30 s. Without a gate (tests only) nothing of this is checked.
 * Workers run under a semaphore of ``config.max_inflight_handshakes``, each
-  with a hard per-attempt deadline. With the run's slot, a client that
-  passed every check also needs the slot's yes before the last frame.
+  with a hard per-attempt deadline. A client that passed every check also
+  needs the table's yes before the last frame.
 * Push-out (spec §4): with the run's gate, a new UDP source or TCP
   connection that finds no room may take the place of a stalled attempt —
   one at least ``_PUSH_OUT_AFTER_S`` old (from the msg1 that started it, or
   from the TCP accept), that is not busy making its msg2 (a wait for the TPM
   counts; a TCP connection that has sent nothing yet is not busy) and that
-  has not passed the slot's check. If its address already runs
+  has not passed the table's check. If its address already runs
   ``PER_SOURCE_INFLIGHT`` attempts, only that address's own oldest such
   attempt can go, and the new one takes over its share too; otherwise, when
   every slot is full, the oldest such attempt of any address gives up its
-  slot. Without a gate (tests only) nothing is pushed out.
-* :func:`_accept_until_winner_tcp` does the same for TCP. The run's
-  :class:`~dsm.net.transport.tcp.TCPListener` queues each accepted
-  connection, and :func:`_tcp_admit_loop` gives it a slot (a free one or,
-  with the gate, a stalled attempt's) and a worker under the same pool,
-  limits and deadline, or closes it at once.
+  slot, and a known address may take a stranger's attempt of any age (spec
+  §3.7 E3). Without a gate (tests only) nothing is pushed out.
+* A stranger's start that proved its address (a valid mac2, or a TCP
+  connection) and then ended without a session bars that address for 30 s
+  (spec §3.7 E2).
 
-Handoff: once a winner is chosen the demux stops reading, so the client's
-first post-handshake datagrams stay queued for the data path. Any the demux
-had already routed into the winner's inbox (and, in a session, any the live
-session handed over since) are re-injected ahead of the real queue once
-nothing else reads the socket. The handoff is loss-free up to the smaller of
-the winner's inbox (``_WINNER_INBOX_FRAMES``) and the real recv queue
-(``RECV_QUEUE_SIZE`` in ``udp.py``), both 256 frames, and in a session the
-intake (``_INTAKE_FRAMES``, 64) — the same backpressure the live data path
-already applies.
+Handoff: the frames still in a passing client's inbox go with it
+(``AcceptedClient.held``). Nothing awaits between its bootstrap reply and
+``on_client``, so its session is in the table before its first data packet
+can arrive; later packets reach the session through the dispatcher.
+
+Until dsm.server moves to :class:`ClientAcceptor` (multi-client step 9), the
+one-client accept stays as it was: ``_accept_until_winner``,
+``_accept_until_winner_tcp`` and :class:`SessionWatch`, on
+``_run_handshake_worker``, ``_demux_loop`` and ``_tcp_admit_loop``. That
+step deletes them.
 """
 
-# The idle accept and the in-session accept share the demux, the
-# workers and the TCP machinery, so this module is over pylint's 1000-line
-# ceiling by design.
+# The always-on acceptor and, until multi-client step 9, the one-client
+# accept share the views, the push-out rules and the TCP machinery, so this
+# module is over pylint's 1000-line ceiling by design.
 # pylint: disable=too-many-lines
 
 from __future__ import annotations
@@ -123,6 +116,10 @@ _tcp_first_frame_log = RepeatLog(log, logging.DEBUG)
 # A stalled attempt was pushed out for a new one (spec §4.3): one INFO line
 # per 10 s at most, with a count, never an address.
 _push_out_log = RepeatLog(log, logging.INFO)
+
+# A full intake (spec §2.7): one DEBUG line per 10 s at most, with a count,
+# never an address.
+_intake_full_log = RepeatLog(log, logging.DEBUG)
 
 
 def _emit_handshake_failure(err: Exception) -> None:
@@ -1849,7 +1846,7 @@ def _penalized(done: asyncio.Task[None], rec: _Attempt) -> bool:
     return rec.proved and not (done.cancelled() and rec.passed_on is None)
 
 
-async def _demux(  # pyright: ignore[reportUnusedFunction]  # ClientAcceptor uses it next
+async def _demux(
     config: Config,
     keystore: KeyStore,
     attest_store: AttestStore,
@@ -2052,7 +2049,7 @@ async def _demux(  # pyright: ignore[reportUnusedFunction]  # ClientAcceptor use
         _start(addr, data, now, under_load)
 
 
-async def _admit_tcp(  # pyright: ignore[reportUnusedFunction]  # ClientAcceptor uses it next
+async def _admit_tcp(
     config: Config,
     keystore: KeyStore,
     attest_store: AttestStore,
@@ -2200,3 +2197,148 @@ async def _admit_tcp(  # pyright: ignore[reportUnusedFunction]  # ClientAcceptor
         task.add_done_callback(_end_attempt)
         workers.add(task)
         task.add_done_callback(workers.discard)
+
+
+class ClientAcceptor:
+    """The run's handshake acceptor (spec §2.7). It runs for the whole run
+    and turns each checked client into a session through ``on_client``.
+
+    UDP (``udp=`` the run's socket): the dispatcher hands over each packet
+    no session fits through :meth:`offer`, and replies leave on the socket.
+    TCP (``tcp=`` the run's listener queue): each queued connection gets an
+    attempt. Both share one pool of ``config.max_inflight_handshakes``
+    slots, the run's ``limiter``, ``table`` and ``gate``, the attempt
+    deadline, and Step S's ``clock`` (never the limiter's). ``gate`` is None
+    only in tests.
+
+    :meth:`run` serves until :meth:`stop`. A bug in its loop raises from
+    :meth:`run`; the server then logs it, calls :meth:`stop`, backs off and
+    calls :meth:`run` again, with empty inboxes. ``on_client`` must be sync
+    and must never raise: it runs inside an attempt, after the client got
+    its bootstrap reply.
+    """
+
+    def __init__(
+        self,
+        config: Config,
+        keystore: KeyStore,
+        attest_store: AttestStore,
+        materials: CertAuthMaterials,
+        cn_allowlist: CNAllowlist,
+        limiter: SourceLimiter,
+        table: SessionTable,
+        gate: HandshakeGate,
+        on_client: Callable[[AcceptedClient], None],
+        *,
+        udp: UDPTransport | None = None,
+        tcp: asyncio.Queue[tuple[TCPTransport, tuple[str, int]]] | None = None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if (udp is None) == (tcp is None):
+            raise ValueError("ClientAcceptor needs exactly one of udp= or tcp=")
+        self._config = config
+        self._keystore = keystore
+        self._attest_store = attest_store
+        self._materials = materials
+        self._cn_allowlist = cn_allowlist
+        self._limiter = limiter
+        self._table = table
+        self._gate: HandshakeGate | None = gate
+        self._on_client = on_client
+        self._udp = udp
+        self._tcp = tcp
+        self._clock = clock
+        # UDP frames no session fits, waiting for the demux. They survive a
+        # restart of run(): frames offered during the server's backoff wait.
+        self._intake: asyncio.Queue[tuple[bytes, tuple[str, int]]] = asyncio.Queue(
+            maxsize=_INTAKE_FRAMES
+        )
+        self._workers: set[asyncio.Task[None]] = set()
+        self._serving: asyncio.Task[None] | None = None
+
+    def offer(self, data: bytes, addr: tuple[str, int]) -> None:
+        """Take one UDP packet that no session fits. Only 1400-byte frames
+        are kept: every handshake frame is that size, so small junk cannot
+        push a real msg1 out of the intake (spec §2.7). Never raises."""
+        if len(data) != HANDSHAKE_FRAME_SIZE:
+            return
+        try:
+            self._intake.put_nowait((data, addr))
+        except asyncio.QueueFull:
+            _intake_full_log.log("handshake intake full, dropping a frame")
+
+    async def run(self) -> None:
+        """Serve handshakes until :meth:`stop`. Raises only a bug in the
+        demux or the admit loop. Call :meth:`stop` after it ends or is
+        cancelled: a cancel of this task alone leaves the loop running."""
+        semaphore = asyncio.Semaphore(self._config.max_inflight_handshakes)
+        if self._udp is not None:
+            work = _demux(
+                self._config,
+                self._keystore,
+                self._attest_store,
+                self._materials,
+                self._cn_allowlist,
+                self._udp,
+                self._on_client,
+                self._table,
+                self._workers,
+                semaphore,
+                {},
+                self._limiter,
+                gate=self._gate,
+                clock=self._clock,
+                intake=self._intake,
+            )
+        else:
+            assert self._tcp is not None  # __init__ checked: exactly one
+            work = _admit_tcp(
+                self._config,
+                self._keystore,
+                self._attest_store,
+                self._materials,
+                self._cn_allowlist,
+                self._tcp,
+                self._on_client,
+                self._table,
+                self._workers,
+                semaphore,
+                {},
+                self._limiter,
+                gate=self._gate,
+                clock=self._clock,
+            )
+        serving = asyncio.ensure_future(work)
+        self._serving = serving
+        # wait(), not await: stop() cancels the loop, and that is no cancel
+        # of this task.
+        await asyncio.wait({serving})
+        if not serving.cancelled():
+            error = serving.exception()
+            if error is not None:
+                raise error
+
+    async def stop(self) -> None:
+        """Cancel the loop and every attempt, and wait for each: a cancelled
+        worker still waits for its signing thread. Then close the queued TCP
+        connections. It returns only once every attempt's done-callbacks have
+        run (its slot, share, inbox and connection are back). A client that
+        already had its bootstrap reply is not served: the server is
+        stopping. Raises the first error an attempt raised while it was being
+        stopped (a bug), once all are done."""
+        tasks = set(self._workers)
+        if self._serving is not None:
+            tasks.add(self._serving)
+            self._serving = None
+        try:
+            await _cancel_and_drain(tasks)
+        finally:
+            while self._tcp is not None and not self._tcp.empty():
+                conn, _ = self._tcp.get_nowait()
+                conn.close()
+            # A worker that ended in the same loop pass as one the drain
+            # awaited may still have its done-callbacks queued: let them run
+            # first. Each worker leaves the set in its last callback, and
+            # every one left here is done, so this takes one loop pass.
+            if self._workers:
+                await asyncio.wait(set(self._workers))

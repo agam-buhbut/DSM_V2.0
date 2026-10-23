@@ -17,6 +17,7 @@ from unittest.mock import patch
 
 import pytest
 
+from dsm.core.log import RepeatLog
 from dsm.crypto.handshake import HANDSHAKE_FRAME_SIZE, HandshakeError, VerifiedClient
 from dsm.net import handshake_acceptor as hsa
 from dsm.net.handshake_gate import (
@@ -1049,3 +1050,234 @@ async def test_a_bad_tcp_first_frame_costs_a_stranger_the_penalty(
         bad = run.connect(B, [first])
         assert await _spin(lambda: bad.closed)
     assert not limiter.try_start(B[0], shared=False)
+
+
+def _acceptor(
+    table: SessionTable,
+    on_client: Any,
+    *,
+    limiter: SourceLimiter | None = None,
+    max_inflight: int = 8,
+    **kwargs: Any,
+) -> hsa.ClientAcceptor:
+    """A ClientAcceptor with stub stores and no gate (tests only)."""
+    return hsa.ClientAcceptor(
+        _Config(max_inflight),
+        _Stub(),
+        _Stub(),
+        _Stub(),
+        _Stub(),
+        limiter if limiter is not None else SourceLimiter(clock=_minutes()),
+        table,
+        None,
+        on_client,
+        **kwargs,
+    )
+
+
+def test_the_acceptor_needs_exactly_one_transport() -> None:
+    with pytest.raises(ValueError, match="exactly one"):
+        _acceptor(SessionTable([A_CN]), None)
+    with pytest.raises(ValueError, match="exactly one"):
+        _acceptor(SessionTable([A_CN]), None, udp=_Transport(), tcp=asyncio.Queue())
+
+
+async def test_offer_keeps_only_full_size_frames() -> None:
+    hs = _Hs()
+    hs.stall.add(B)
+    acceptor = _acceptor(SessionTable([A_CN]), None, udp=_Transport())
+    with patch("dsm.crypto.handshake.server_handshake", new=hs):
+        # Not running yet, so what offer() keeps waits in the intake. Kept
+        # small frames would fill it, and B's frame would then be dropped.
+        for size in (0, 64, 1399, 1401) * hsa._INTAKE_FRAMES:
+            acceptor.offer(b"\x00" * size, B)
+        acceptor.offer(_frame(B), B)
+        run = asyncio.ensure_future(acceptor.run())
+        assert await _spin(lambda: hs.started == [B])
+        await asyncio.wait_for(acceptor.stop(), 5.0)
+        await run
+
+
+def test_a_full_intake_drops_with_one_debug_line(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG, logger="dsm.net.handshake_acceptor")
+    acceptor = _acceptor(SessionTable([A_CN]), None, udp=_Transport())
+    quiet_log = RepeatLog(hsa.log, logging.DEBUG, clock=_Frozen())
+    with patch.object(hsa, "_intake_full_log", quiet_log):
+        for n in range(hsa._INTAKE_FRAMES + 5):  # not running: nobody reads it
+            acceptor.offer(_frame(B, n), B)
+    full = [
+        r
+        for r in caplog.records
+        if r.getMessage() == "handshake intake full, dropping a frame"
+    ]
+    assert [r.levelno for r in full] == [logging.DEBUG]
+
+
+async def test_a_loop_bug_raises_and_the_next_run_serves_waiting_frames() -> None:
+    async def _broken(*_a: Any, **_k: Any) -> None:
+        raise RuntimeError("demux bug")
+
+    clients: list[hsa.AcceptedClient] = []
+    acceptor = _acceptor(SessionTable([A_CN]), clients.append, udp=_Transport())
+    with patch("dsm.crypto.handshake.server_handshake", new=_Hs()):
+        with patch.object(hsa, "_demux", new=_broken):
+            with pytest.raises(RuntimeError, match="demux bug"):
+                await asyncio.wait_for(acceptor.run(), 5.0)
+        await acceptor.stop()
+        acceptor.offer(_frame(A), A)  # during the server's backoff: it waits
+        run = asyncio.ensure_future(acceptor.run())  # empty inboxes, same intake
+        assert await _spin(lambda: len(clients) == 1)
+        await asyncio.wait_for(acceptor.stop(), 5.0)
+        await run
+    assert clients[0].peer == A
+
+
+async def test_stop_cancels_every_attempt_and_gives_everything_back() -> None:
+    limiter = SourceLimiter(clock=_Frozen())
+    first: Addr = ("203.0.113.1", 1)
+    second: Addr = ("203.0.113.2", 2)
+    hs = _Hs()
+    hs.stall.update({first, second})
+    before = asyncio.all_tasks()
+    acceptor = _acceptor(SessionTable([A_CN]), None, limiter=limiter, udp=_Transport())
+    with patch("dsm.crypto.handshake.server_handshake", new=hs):
+        run = asyncio.ensure_future(acceptor.run())
+        acceptor.offer(_frame(first), first)
+        acceptor.offer(_frame(second), second)
+        assert await _spin(lambda: hs.started == [first, second])
+        await asyncio.wait_for(acceptor.stop(), 5.0)
+        await run
+    assert asyncio.all_tasks() - before == set()
+    for ip, _port in (first, second):  # each address may run its two again
+        assert limiter.try_start(ip)
+        assert limiter.try_start(ip)
+
+
+async def test_stop_closes_running_and_queued_tcp_connections() -> None:
+    hs = _Hs()
+    hs.stall.add(B)
+    connections: asyncio.Queue[tuple[TCPTransport, Addr]] = asyncio.Queue()
+    acceptor = _acceptor(SessionTable([A_CN]), None, tcp=connections)
+    with patch("dsm.crypto.handshake.server_handshake", new=hs):
+        run = asyncio.ensure_future(acceptor.run())
+        running = _Conn(B, [b"msg1"])
+        connections.put_nowait((running, B))
+        assert await _spin(lambda: B in hs.started)
+        queued = _Conn(("203.0.113.3", 3))
+        connections.put_nowait((queued, queued.peer))  # the loop has not taken it
+        await acceptor.stop()
+        # No await between the return and this check.
+        still_open = [c.peer for c in (running, queued) if not c.closed]
+        await run
+    assert still_open == []
+
+
+async def test_stop_waits_for_an_attempt_that_waits_for_its_signing_thread() -> None:
+    release = asyncio.Event()
+    started: list[Addr] = []
+    finished: list[str] = []
+
+    async def _signing(view: Any, *_a: Any, **_k: Any) -> tuple[object, bytes]:
+        started.append(_peer_of(view))
+        await view.recv()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await release.wait()  # as a cancelled worker waits for its thread
+            finished.append("signed")
+            raise
+        raise AssertionError("unreachable")
+
+    acceptor = _acceptor(SessionTable([A_CN]), None, udp=_Transport())
+    with patch("dsm.crypto.handshake.server_handshake", new=_signing):
+        run = asyncio.ensure_future(acceptor.run())
+        acceptor.offer(_frame(A), A)
+        assert await _spin(lambda: started == [A])
+        stopping = asyncio.ensure_future(acceptor.stop())
+        await _yield()
+        assert not stopping.done(), "stop must wait for the signing thread"
+        release.set()
+        await asyncio.wait_for(stopping, 5.0)
+        await run
+    assert finished == ["signed"]
+
+
+def test_reprs_show_no_key_material() -> None:
+    keys = object()
+    client = _client(A_CN)
+    accepted = hsa.AcceptedClient(
+        keys,
+        client,
+        SessionTable([A_CN]).assignment_for(A_CN),
+        _Transport(),
+        A,
+    )
+    assert repr(keys) not in repr(accepted)
+    assert repr(client.noise_static) not in repr(accepted)
+    assert A_CN in repr(accepted)
+
+
+async def test_stop_raises_a_worker_bug_once_every_attempt_ended() -> None:
+    release = asyncio.Event()
+    started: list[Addr] = []
+    other: Addr = ("203.0.113.2", 2)
+
+    async def _buggy(conn: Any, *_a: Any, **_k: Any) -> tuple[object, bytes]:
+        peer = _peer_of(conn)
+        started.append(peer)
+        await conn.recv()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            if peer == B:
+                raise RuntimeError("worker bug") from None
+            await release.wait()  # as a cancelled worker waits for its thread
+            raise
+        raise AssertionError("unreachable")
+
+    connections: asyncio.Queue[tuple[TCPTransport, Addr]] = asyncio.Queue()
+    acceptor = _acceptor(SessionTable([A_CN]), None, tcp=connections)
+    with patch("dsm.crypto.handshake.server_handshake", new=_buggy):
+        run = asyncio.ensure_future(acceptor.run())
+        buggy, slow = _Conn(B, [b"msg1"]), _Conn(other, [b"msg1"])
+        connections.put_nowait((buggy, B))
+        connections.put_nowait((slow, other))
+        assert await _spin(lambda: started == [B, other])
+        stopping = asyncio.ensure_future(acceptor.stop())
+        await _yield()
+        assert not stopping.done(), "stop must wait for every attempt"
+        queued = _Conn(("203.0.113.3", 3))
+        connections.put_nowait((queued, queued.peer))  # the loop has ended
+        release.set()
+        with pytest.raises(RuntimeError, match="worker bug"):
+            await asyncio.wait_for(stopping, 5.0)
+        # No await between the raise and this check.
+        still_open = [c.peer for c in (buggy, slow, queued) if not c.closed]
+        await run
+        await acceptor.stop()  # a second stop is harmless
+    assert still_open == []
+
+
+async def test_a_cancelled_run_leaves_the_loop_for_stop_to_end() -> None:
+    # Part C's stop order: cancel the task running run(), then call stop().
+    limiter = SourceLimiter(clock=_Frozen())
+    hs = _Hs()
+    hs.stall.update({A, B})
+    before = asyncio.all_tasks()
+    acceptor = _acceptor(SessionTable([A_CN]), None, limiter=limiter, udp=_Transport())
+    with patch("dsm.crypto.handshake.server_handshake", new=hs):
+        run = asyncio.ensure_future(acceptor.run())
+        acceptor.offer(_frame(A), A)
+        assert await _spin(lambda: hs.started == [A])
+        run.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await run
+        acceptor.offer(_frame(B), B)  # the loop outlived the cancel
+        assert await _spin(lambda: hs.started == [A, B])
+        await asyncio.wait_for(acceptor.stop(), 5.0)
+    assert asyncio.all_tasks() - before == set()
+    for ip, _port in (A, B):  # each address may run its two again
+        assert limiter.try_start(ip)
+        assert limiter.try_start(ip)
