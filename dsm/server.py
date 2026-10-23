@@ -309,11 +309,11 @@ async def _run_one_session(
     """Run one client's session until it ends, then unwind its own state.
 
     ``tun`` is the session's :class:`ClientTun`. ``session.shutdown`` ends
-    it: the run sets it on a signal, the table on a takeover. All protocol
-    state (sequence counter, rekey, liveness, reassembly, shaper, replay
-    window, egress address) is new here, so each session starts from a
-    clean epoch and an empty replay window: carrying state across sessions
-    would be a nonce-reuse / replay-bypass bug.
+    it: the run sets it on a signal, and run_server's ``on_client`` on a
+    takeover. All protocol state (sequence counter, rekey, liveness,
+    reassembly, shaper, replay window, egress address) is new here, so each
+    session starts from a clean epoch and an empty replay window: carrying
+    state across sessions would be a nonce-reuse / replay-bypass bug.
     """
     import tuncore
 
@@ -628,10 +628,9 @@ async def run_server(
 
         # Transport. UDP mode: one UDP socket for the whole run, and no TCP
         # port is opened at all. TCP mode: one TCP listener, open for the
-        # whole run; each session's connection lives on its
-        # session stack. Either way a port that cannot be opened is one ERROR
-        # line and exit 1: retrying cannot fix it, and systemd restarts us
-        # after its delay.
+        # whole run; each session's connection lives on its session stack.
+        # Either way a port that cannot be opened is one ERROR line and exit 1:
+        # retrying cannot fix it, and systemd restarts us after its delay.
         udp: UDPTransport | None = None
         listener: TCPListener | None = None
         if config.transport == "udp":
@@ -794,6 +793,8 @@ async def run_server(
         accepting = asyncio.create_task(_run_acceptor(acceptor, process_shutdown))
         signalled = asyncio.create_task(process_shutdown.wait())
         rc = 0
+        # Routing failures already logged, so the stop does not log them again.
+        reported: set[asyncio.Task[None]] = set()
         try:
             # Until a signal, or until the TUN or packet routing fails. A
             # routing bug fails closed: its state may be wrong.
@@ -804,6 +805,7 @@ async def run_server(
                 if not task.done():
                     continue
                 rc = 1
+                reported.add(task)
                 err = task.exception()
                 if task is router and isinstance(err, OSError):
                     log.error("the tunnel device failed (%s); stopping", err)
@@ -837,5 +839,13 @@ async def run_server(
                 for task in routing:
                     task.cancel()
                 await asyncio.gather(signalled, *routing, return_exceptions=True)
+                # A failure after the wait above (for example the TUN went away
+                # while the sessions closed) is logged here, not dropped.
+                for task in routing:
+                    if task in reported or task.cancelled():
+                        continue
+                    err = task.exception()
+                    if err is not None:
+                        log.error("packet routing failed while stopping", exc_info=err)
 
     return rc

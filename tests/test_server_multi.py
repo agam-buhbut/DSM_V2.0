@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import logging
+import os
 from collections.abc import Callable, Generator
 from contextlib import AsyncExitStack, ExitStack, contextmanager
 from dataclasses import replace
@@ -23,7 +25,7 @@ from dsm.crypto.handshake import VerifiedClient
 from dsm.net.dns import DNSResolver
 from dsm.net.dns_proxy import DNSProxyPortInUseError
 from dsm.net.handshake_acceptor import AcceptedClient
-from dsm.net.session_router import _SessionUDPView
+from dsm.net.session_router import ClientTun, _SessionUDPView
 from dsm.net.session_slot import ServerSession, SessionTable
 from dsm.server import (
     SERVER_RECV_QUEUE_PACKETS,
@@ -415,6 +417,8 @@ class _Sessions:
     def __init__(self, events: list[str] | None = None) -> None:
         self.events: list[str] = events if events is not None else []
         self.started: list[ServerSession] = []
+        # The tun each session got, in the order of ``started``.
+        self.tuns: list[Any] = []
         self.end_at_once: set[str] = set()
 
     async def __call__(
@@ -423,10 +427,11 @@ class _Sessions:
         fsm: SessionFSM,
         _keystore: Any,
         session: ServerSession,
-        *_rest: Any,
+        tun: Any,
     ) -> None:
         fsm.transition(State.ESTABLISHED)
         self.started.append(session)
+        self.tuns.append(tun)
         cn = session.client.cn
         self.events.append(f"{cn} started")
         try:
@@ -489,6 +494,25 @@ async def test_two_clients_are_served_at_once(caplog: pytest.LogCaptureFixture) 
         assert (str(a.tunnel.client), str(b.tunnel.client)) == ("10.8.0.2", "10.8.0.3")
         assert isinstance(a.transport, _SessionUDPView)
         assert isinstance(b.transport, _SessionUDPView)
+        assert a.transport is not b.transport
+        sent: list[bytes] = []
+        for session, tun in zip(sessions.started, sessions.tuns, strict=True):
+            # Its own side of the host TUN: it reads its own session's queue,
+            # and what it may send goes to the host TUN.
+            assert isinstance(tun, ClientTun)
+            session.tun_queue.put_nowait(b"to " + session.client.cn.encode())
+            got = await asyncio.wait_for(tun.read(), 1.0)
+            assert got == b"to " + session.client.cn.encode()
+            # An IPv4 header from its tunnel address to the server.
+            out = (
+                bytes([0x45])
+                + bytes(11)
+                + session.tunnel.client.packed
+                + session.tunnel.server.packed
+            )
+            assert await tun.awrite(out) == len(out)
+            sent.append(out)
+        assert captured["host"].tun.written == sent
         assert captured["table"].sessions() == [a, b]
         assert not a.shutdown.is_set() and not b.shutdown.is_set()
         rc = await _stop(run, captured)
@@ -556,6 +580,27 @@ async def test_a_takeover_ends_only_that_cns_old_session(
     ]
 
 
+async def test_a_session_that_ends_by_itself_leaves_the_table(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="dsm.server")
+    captured: dict[str, Any] = {}
+    sessions = _Sessions()
+    sessions.end_at_once.add(A)  # as a dead peer would end it
+    with _multi(captured, sessions):
+        run = await _start()
+        _Acceptor.made[0].admit(A, PEER_A)
+        assert await _spin(
+            lambda: len(sessions.started) == 1 and not captured["table"].sessions()
+        )
+        assert not run.done()  # the server serves on
+        rc = await _stop(run, captured)
+    assert rc == 0
+    assert f"session 1 ended (client_cn={A})" in [
+        r.getMessage() for r in caplog.records
+    ]
+
+
 async def test_a_signal_stops_the_acceptor_then_every_session_then_the_host() -> None:
     captured: dict[str, Any] = {}
     events: list[str] = captured.setdefault("events", [])
@@ -613,6 +658,7 @@ async def test_a_cancel_still_ends_every_session_before_the_host() -> None:
             await asyncio.wait_for(run, 5.0)
     assert run.cancelled()
     assert acceptor.stops == 1
+    assert acceptor.live_at_stop == [False, False]
     assert sorted(events[-4:-2]) == sorted([f"{A} ended", f"{B} ended"])
     assert events[-2:] == ["routing stopped", "host down"]
 
@@ -687,9 +733,51 @@ async def test_a_tun_read_error_stops_the_run_with_exit_1(
         captured["host"].tun.fail.set()
         rc = await asyncio.wait_for(run, 5.0)
     assert rc == 1
-    assert [r.getMessage() for r in _errors(caplog)] == [
+    (error,) = _errors(caplog)
+    assert error.getMessage() == (
         "the tunnel device failed ([Errno 5] Input/output error); stopping"
-    ]
+    )
+    assert error.exc_info is None
+    assert events[-2:] == [f"{A} ended", "host down"]
+
+
+async def test_a_routing_failure_during_the_stop_is_logged(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.ERROR, logger="dsm")
+    captured: dict[str, Any] = {}
+    events: list[str] = captured.setdefault("events", [])
+    sessions = _Sessions(events)
+    fail = asyncio.Event()
+    raised: list[OSError] = []
+
+    class _Router:
+        """Routes nothing until ``fail``; then fails as a TUN read would."""
+
+        def __init__(self, *_a: Any) -> None:
+            pass
+
+        async def run(self) -> None:
+            await fail.wait()
+            raised.append(OSError(errno.EIO, os.strerror(errno.EIO)))
+            raise raised[0]
+
+    with _multi(captured, sessions), patch("dsm.server.TunRouter", _Router):
+        run = await _start()
+        acceptor = _Acceptor.made[0]
+        acceptor.stop_wait = asyncio.Event()
+        acceptor.admit(A, PEER_A)
+        assert await _spin(lambda: len(sessions.started) == 1)
+        captured["event"].set()  # as SIGTERM would
+        assert await _spin(lambda: acceptor.stops == 1)
+        fail.set()  # the TUN goes away while the run stops
+        assert await _spin(lambda: bool(raised))
+        acceptor.stop_wait.set()
+        rc = await asyncio.wait_for(run, 5.0)
+    assert rc == 0  # the signal came first
+    (error,) = _errors(caplog)
+    assert error.getMessage() == "packet routing failed while stopping"
+    assert error.exc_info is not None and error.exc_info[1] is raised[0]
     assert events[-2:] == [f"{A} ended", "host down"]
 
 
@@ -732,10 +820,12 @@ async def test_a_host_setup_failure_at_start_exits_1_before_any_client(
             run_server(replace(_server_config(), dns_blocklist=False)), 5.0
         )
     assert rc == 1
-    assert [r.getMessage() for r in _errors(caplog)] == [
+    (error,) = _errors(caplog)
+    assert error.getMessage() == (
         "could not set up the tunnel at start: "
         "TUN configure failed: ip link set mtun0 up; exiting"
-    ]
+    )
+    assert error.exc_info is None
     assert _Acceptor.made == []
 
 
@@ -780,10 +870,12 @@ async def test_a_nat_table_that_does_not_load_exits_1_before_any_client(
             run_server(replace(_server_config(), dns_blocklist=False)), 5.0
         )
     assert rc == 1
-    assert [r.getMessage() for r in _errors(caplog)] == [
+    (error,) = _errors(caplog)
+    assert error.getMessage() == (
         "could not set up the tunnel at start: the NAT table (MASQUERADE, "
         "client isolation, flow tags) did not load; exiting"
-    ]
+    )
+    assert error.exc_info is None
     assert _Acceptor.made == []
     assert parts.proxy_args == {}
     assert parts.events[-2:] == ["forwarding off", "tun close"]

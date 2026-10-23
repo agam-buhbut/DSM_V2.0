@@ -228,7 +228,7 @@ async def _run_until(  # pyright: ignore[reportUnusedFunction]  # other test fil
     """Under ``_base_patches(captured)``: run run_server until its host is
     up and ``until()`` holds, then stop it as a signal would; its exit code."""
     run = asyncio.ensure_future(run_server(config))
-    await _spin(lambda: run.done() or ("host" in captured and until()))
+    assert await _spin(lambda: run.done() or ("host" in captured and until()))
     if not run.done():
         captured["event"].set()
     return await asyncio.wait_for(run, 5.0)
