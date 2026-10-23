@@ -1,7 +1,7 @@
 """The handshake gate in the acceptor (wire v2, spec §7.4 and §7.6; T10
 §3.16 tests 9, 11-14 and 22). The Noise handshake is a scripted fake, as in
-test_handshake_acceptor_limits.py; the gate, the limiter and the slot are
-real; clocks are frozen. No sockets; nothing waits on the wall clock.
+test_handshake_acceptor_limits.py; the gate, the limiter and the session
+table are real; clocks are frozen. No sockets; nothing waits on the wall clock.
 Laptop: partly (old wheel and shim). The shim has no XChaCha, so the tests
 that send or open a cookie reply (spoofed starts, the reply cap under a
 flood, one address with many ports, a replayed msg1) need tuncore's
@@ -19,7 +19,7 @@ from unittest.mock import patch
 import pytest
 
 from dsm.crypto.handshake import HANDSHAKE_FRAME_SIZE, VerifiedClient
-from dsm.net.handshake_acceptor import SessionWatch
+from dsm.net.handshake_acceptor import ClientAcceptor
 from dsm.net.handshake_gate import (
     BAD_MAC1_LINE,
     COOKIE_REPLY_BURST,
@@ -31,10 +31,9 @@ from dsm.net.handshake_gate import (
     stamp_mac2,
     stamp_msg1,
 )
+from dsm.net.session_slot import SessionTable
 from dsm.net.transport.tcp import TCPTransport
 from tests.acceptor_harness import HARNESS_CN, accept_first
-from tests.test_handshake_acceptor_in_session import _Script as _SessionScript
-from tests.test_handshake_acceptor_in_session import _slot
 from tests.test_handshake_acceptor_limits import (
     _Config,
     _Frozen,
@@ -282,6 +281,25 @@ class _TcpScript:
         return object(), b"pub-tcp"
 
 
+_UDP_CLIENT = VerifiedClient(cn=HARNESS_CN, noise_static=b"pub-udp")
+
+
+class _UdpScript:
+    """Fake server_handshake for UDP: reads msg1, asks the session table as
+    the real one does, then wins."""
+
+    def __init__(self) -> None:
+        self.started: list[Addr] = []
+
+    async def __call__(
+        self, view: Any, *_a: Any, admit_client: Any = None, **_k: Any
+    ) -> tuple[object, bytes]:
+        self.started.append(view._peer_addr)
+        await view.recv()
+        admit_client(_UDP_CLIENT)
+        return object(), b"pub-udp"
+
+
 async def _tcp_accept(gate: HandshakeGate, conns: list[_Conn]) -> tuple[Any, Any, Any]:
     connections: asyncio.Queue[tuple[TCPTransport, Addr]] = asyncio.Queue()
     for conn in conns:
@@ -380,34 +398,36 @@ async def test_a_refused_tcp_start_is_trouble(
     assert refused.sent == []
 
 
-async def test_full_size_packets_the_session_cannot_open_are_dropped_at_mac1(
+async def test_full_size_packets_no_session_fits_are_dropped_at_mac1(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    # Review Focus 1: duplicates, replays and late old-key packets of the
-    # live client reach the in-session accept as new sources.
+    # Duplicates, replays and late old-key packets of a live client reach the
+    # acceptor as packets no session fits.
     caplog.set_level(logging.INFO, logger="dsm")
     gate = _gate()
-    script = _SessionScript()
+    script = _UdpScript()
     real = _Transport()
     limiter = SourceLimiter(clock=_minutes())
+    clients: list[Any] = []
     live: Addr = ("198.51.100.7", 40000)
     back: Addr = ("198.51.100.7", 40001)
     with patch("dsm.crypto.handshake.server_handshake", new=script):
-        watch = SessionWatch(
+        acceptor = ClientAcceptor(
             _Config(8),
             _Stub(),
             _Stub(),
             _Stub(),
             _Stub(),
             limiter,
-            _slot(),
+            SessionTable([HARNESS_CN]),
             gate,
+            clients.append,
             udp=real,
         )
-        assert watch.offer is not None
+        run = asyncio.ensure_future(acceptor.run())
         rng = random.Random(5)
         for _ in range(60):
-            watch.offer(rng.randbytes(HANDSHAKE_FRAME_SIZE), live, False)
+            acceptor.offer(rng.randbytes(HANDSHAKE_FRAME_SIZE), live)
             await asyncio.sleep(0)
         await _yield(200)
         assert script.started == []
@@ -418,45 +438,48 @@ async def test_full_size_packets_the_session_cannot_open_are_dropped_at_mac1(
         assert len(lines) == 1
         assert lines[0].levelno == logging.INFO
         # The client that comes back still gets in, without a cookie.
-        watch.offer(_msg1(9), back, False)
-        assert await _spin(lambda: script.admitted == [back])
-        win = await watch.stop()
-    assert win is not None
+        acceptor.offer(_msg1(9), back)
+        assert await _spin(lambda: len(clients) == 1)
+        await asyncio.wait_for(acceptor.stop(), 5.0)
+        await run
+    assert clients[0].peer == back
 
 
-async def test_the_in_session_tcp_accept_checks_the_first_frame_too() -> None:
-    # The TCP twin of the test above: the watch hands the gate to its TCP
-    # accept, so a bad first frame is closed before any handshake starts.
+async def test_the_tcp_acceptor_checks_the_first_frame() -> None:
+    # The TCP twin of the test above: a bad first frame is closed before any
+    # handshake starts.
     gate = _gate()
     script = _TcpScript()
     connections: asyncio.Queue[tuple[TCPTransport, Addr]] = asyncio.Queue()
+    clients: list[Any] = []
     other_ca = GateKeys.from_ca_der(b"another CA", "dsm-test-server")
     bad = _Conn(("203.0.113.2", 2), [_msg1(1, other_ca)])
     good_frame = _msg1(2)
     back = _Conn(("198.51.100.7", 40001), [good_frame])
     with patch("dsm.crypto.handshake.server_handshake", new=script):
-        watch = SessionWatch(
+        acceptor = ClientAcceptor(
             _Config(8),
             _Stub(),
             _Stub(),
             _Stub(),
             _Stub(),
             SourceLimiter(clock=_minutes()),
-            _slot(),
+            SessionTable([HARNESS_CN]),
             gate,
+            clients.append,
             tcp=connections,
         )
+        run = asyncio.ensure_future(acceptor.run())
         connections.put_nowait((bad, bad.peer))
         assert await _spin(lambda: bad.closed)
         await _yield()
         assert script.frames == []  # no handshake attempt
         assert bad.sent == []
-        assert not watch.end_session.is_set()
         assert not gate.load.under_load(0)
         # The client that comes back still gets in.
         connections.put_nowait((back, back.peer))
-        assert await _spin(watch.end_session.is_set)
-        win = await asyncio.wait_for(watch.stop(), 5.0)
-    assert win is not None
-    assert win.transport is back
+        assert await _spin(lambda: len(clients) == 1)
+        await asyncio.wait_for(acceptor.stop(), 5.0)
+        await run
+    assert clients[0].transport is back
     assert script.frames == [good_frame]
