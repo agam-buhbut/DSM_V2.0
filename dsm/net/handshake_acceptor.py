@@ -2050,3 +2050,153 @@ async def _demux(  # pyright: ignore[reportUnusedFunction]  # ClientAcceptor use
             _note_trouble(gate)
             continue
         _start(addr, data, now, under_load)
+
+
+async def _admit_tcp(  # pyright: ignore[reportUnusedFunction]  # ClientAcceptor uses it next
+    config: Config,
+    keystore: KeyStore,
+    attest_store: AttestStore,
+    materials: CertAuthMaterials,
+    cn_allowlist: CNAllowlist,
+    connections: asyncio.Queue[tuple[TCPTransport, tuple[str, int]]],
+    on_client: Callable[[AcceptedClient], None],
+    table: SessionTable,
+    workers: set[asyncio.Task[None]],
+    semaphore: asyncio.Semaphore,
+    open_conns: dict[tuple[str, int], TCPTransport],
+    limiter: SourceLimiter,
+    *,
+    gate: HandshakeGate | None = None,
+    attempts: dict[asyncio.Task[None], _Attempt] | None = None,
+    clock: Callable[[], float] = time.monotonic,
+) -> None:
+    """Admit queued TCP connections, until cancelled.
+
+    The TCP twin of :func:`_demux`. A connection takes a free slot, or with
+    ``gate`` may push out a stalled attempt (spec §4.3; the connection
+    itself proves its address); otherwise it is closed at once, as when
+    ``limiter`` refuses its address. With ``gate``, a connection is charged
+    only its address's limits here; its worker checks the first frame, then
+    charges the shared ones. A connection that becomes a session is handed
+    to ``on_client`` and stays open; every other one is closed when its
+    attempt ends. ``open_conns`` and ``workers`` belong to the caller;
+    ``attempts`` and ``clock`` work as in :func:`_demux`, and an attempt's
+    age counts from its accept.
+    """
+    records: dict[asyncio.Task[None], _Attempt] = {} if attempts is None else attempts
+    while True:
+        conn, peer = await connections.get()
+        now = clock()
+        pool_full = semaphore.locked()
+        push = (
+            _choose_push_out(
+                records,
+                now,
+                peer[0],
+                pool_full=pool_full,
+                past_admit=table.is_admitted,
+                is_known=limiter.is_known,
+            )
+            if gate is not None
+            else None
+        )
+        if pool_full and push is None:
+            _tcp_full_log.log("handshake pool saturated — closing a new TCP connection")
+            _note_trouble(gate)
+            conn.close()
+            continue
+        # TCP gives each open connection its own peer address; this check
+        # only keeps open_conns one-to-one.
+        if peer in open_conns:
+            conn.close()
+            continue
+        # With the gate only the per-address limits are charged here; the
+        # worker charges the shared ones once the first frame passed mac1,
+        # so a silent connection spends none of them (spec §4.2).
+        shared = gate is None
+        if push is not None:
+            victim, how = push
+            # Asked before anything changes, so a refusal leaves the old
+            # attempt alone. The new attempt takes the old one's slot.
+            if not limiter.try_start(
+                peer[0],
+                in_session=table.ever_confirmed,
+                shared=shared,
+                inherits_share=how is _PassedOn.SLOT_AND_SHARE,
+            ):
+                _note_trouble(gate)
+                conn.close()
+                continue
+            if now - records[victim].started < _PUSH_OUT_AFTER_S:
+                # Pushed out young (E3): it did not stall, so it costs its
+                # address nothing (spec §3.7 E2).
+                records[victim].proved = False
+            _push_out(records, victim, how)
+        else:
+            # Never waits: the pool has a free slot (checked above).
+            await semaphore.acquire()
+            # Asked last, so a connection closed above spends none of its
+            # address's budget. From here to the done-callback below nothing
+            # awaits, so the slot and the address are always given back.
+            if not limiter.try_start(
+                peer[0], in_session=table.ever_confirmed, shared=shared
+            ):
+                semaphore.release()
+                _note_trouble(gate)
+                conn.close()
+                continue
+        open_conns[peer] = conn
+        # Not signing yet: the worker sets that once the first frame passed.
+        # With the gate the connection itself proved its address (E2).
+        record = _Attempt(
+            ip=peer[0], started=now, signing=False, proved=gate is not None
+        )
+
+        def _hand_on(accepted: AcceptedClient, p: tuple[str, int] = peer) -> None:
+            # The session owns the connection now: the attempt's end must
+            # not close it.
+            open_conns.pop(p, None)
+            on_client(accepted)
+
+        # A done-callback, not a ``finally`` in the worker: a task cancelled
+        # before its first step never runs its body, but its done-callbacks
+        # still run, exactly once. The close is the sync one; nothing here
+        # may await.
+        def _end_attempt(
+            done: asyncio.Task[None],
+            c: TCPTransport = conn,
+            p: tuple[str, int] = peer,
+        ) -> None:
+            # The record first, so an error below cannot leave it behind.
+            rec = records.pop(done)
+            if rec.passed_on is None:
+                # A pushed-out attempt's slot belongs to the one that took it.
+                semaphore.release()
+            if open_conns.pop(p, None) is not None:
+                c.close()
+            # Last, so an error in ``finish`` cannot leave a connection open.
+            # After a same-address push-out the new attempt holds this share.
+            if rec.passed_on is not _PassedOn.SLOT_AND_SHARE:
+                limiter.finish(p[0], failed=_penalized(done, rec))
+
+        task = asyncio.ensure_future(
+            _run_attempt(
+                config,
+                keystore,
+                attest_store,
+                materials,
+                cn_allowlist,
+                conn,
+                peer,
+                _hand_on,
+                who="a TCP client",
+                table=table,
+                gate=gate,
+                limiter=limiter,
+                record=record,
+            )
+        )
+        records[task] = record
+        task.add_done_callback(_end_attempt)
+        workers.add(task)
+        task.add_done_callback(workers.discard)

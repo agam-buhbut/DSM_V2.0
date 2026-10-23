@@ -865,3 +865,187 @@ async def test_a_proved_start_the_table_refuses_is_barred() -> None:
         assert await _spin(lambda: B in hs.started and not run.workers)
     assert run.clients == []
     assert not limiter.try_start(B[0])  # refused by the table: barred
+
+
+class _Admit:
+    """The TCP admit loop on an in-memory connection queue, with the run's
+    table, limiter and gate and Step S's clock. Leaving cancels it and every
+    worker and waits for them, so every done-callback has run."""
+
+    def __init__(
+        self,
+        hs: Any,
+        table: SessionTable,
+        *,
+        limiter: SourceLimiter | None = None,
+        gate: HandshakeGate | None = None,
+        max_inflight: int = 8,
+        clock: _Frozen | None = None,
+    ) -> None:
+        self.connections: asyncio.Queue[tuple[TCPTransport, Addr]] = asyncio.Queue()
+        self.clock = clock if clock is not None else _Frozen()
+        self.table = table
+        self.limiter = (
+            limiter if limiter is not None else SourceLimiter(clock=_minutes())
+        )
+        self.gate = gate
+        self.max_inflight = max_inflight
+        self.clients: list[hsa.AcceptedClient] = []
+        self.workers: set[asyncio.Task[None]] = set()
+        self.semaphore = asyncio.Semaphore(max_inflight)
+        self.open_conns: dict[Addr, TCPTransport] = {}
+        self._patch = patch("dsm.crypto.handshake.server_handshake", new=hs)
+        self.task: asyncio.Future[None] | None = None
+
+    def connect(self, peer: Addr, frames: list[bytes] | None = None) -> _Conn:
+        conn = _Conn(peer, frames)
+        self.connections.put_nowait((conn, peer))
+        return conn
+
+    async def __aenter__(self) -> _Admit:
+        self._patch.start()
+        self.task = asyncio.ensure_future(
+            hsa._admit_tcp(
+                _Config(self.max_inflight),
+                _Stub(),
+                _Stub(),
+                _Stub(),
+                _Stub(),
+                self.connections,
+                self.clients.append,
+                self.table,
+                self.workers,
+                self.semaphore,
+                self.open_conns,
+                self.limiter,
+                gate=self.gate,
+                clock=self.clock,
+            )
+        )
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        try:
+            assert self.task is not None
+            self.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self.task
+            await hsa._cancel_and_drain(set(self.workers))
+            await _yield()
+        finally:
+            self._patch.stop()
+
+
+async def test_two_tcp_connections_both_become_sessions_and_stay_open() -> None:
+    async with _Admit(_Hs({A: A_CN, B: B_CN}), SessionTable([A_CN, B_CN])) as run:
+        ca = run.connect(A, [b"msg1"])
+        cb = run.connect(B, [b"msg1"])
+        assert await _spin(lambda: len(run.clients) == 2)
+        await _yield()
+        assert run.open_conns == {}  # handed on: no longer the acceptor's
+    assert [c.transport for c in run.clients] == [ca, cb]
+    assert [c.client.cn for c in run.clients] == [A_CN, B_CN]
+    assert not ca.closed and not cb.closed
+    assert ca.sent == [MSG2, REPLY]
+
+
+async def test_a_failed_tcp_attempt_is_closed_and_gives_its_address_back() -> None:
+    limiter = SourceLimiter(clock=_minutes())
+    hs = _Hs()
+    hs.fail.add(B)
+    async with _Admit(hs, SessionTable([A_CN]), limiter=limiter) as run:
+        failed = run.connect(B, [b"msg1"])
+        assert await _spin(lambda: failed.closed)
+        assert run.open_conns == {}
+    assert run.clients == []
+    assert limiter.try_start(B[0])  # its two at once again
+    assert limiter.try_start(B[0])
+
+
+async def test_tcp_a_reconnecting_client_takes_over_on_the_runs_listener(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="dsm.net.session_slot")
+    async with _Admit(_Hs(), SessionTable([A_CN])) as run:
+        first = run.connect(A, [b"msg1"])
+        assert await _spin(lambda: len(run.clients) == 1)
+        back = run.connect(A2, [b"msg1"])  # the same device, a new connection
+        assert await _spin(lambda: len(run.clients) == 2)
+    assert [c.transport for c in run.clients] == [first, back]
+    assert not back.closed  # the acceptor never closes a connection it handed on
+    assert [
+        r.getMessage() for r in caplog.records if r.name == "dsm.net.session_slot"
+    ] == ["client reconnected (client_cn=dsm-a-client); ending its old session"]
+
+
+async def test_a_silent_tcp_connection_costs_its_address_the_penalty() -> None:
+    limiter = SourceLimiter(clock=_Frozen())
+    with patch.object(hsa, "_TCP_FIRST_FRAME_DEADLINE", 0.0):  # fires next pass
+        async with _Admit(
+            _Hs(), SessionTable([A_CN]), limiter=limiter, gate=_gate()
+        ) as run:
+            silent = run.connect(B)
+            assert await _spin(lambda: silent.closed)
+    # The connection proved its address, and it sent no first frame in time:
+    # a failed proven start (spec §3.7 E2).
+    assert not limiter.try_start(B[0], shared=False)
+
+
+async def test_a_tcp_attempt_cut_by_a_stop_costs_nothing() -> None:
+    limiter = SourceLimiter(clock=_Frozen())
+    with patch.object(hsa, "_TCP_FIRST_FRAME_DEADLINE", 3600.0):
+        async with _Admit(
+            _Hs(), SessionTable([A_CN]), limiter=limiter, gate=_gate()
+        ) as run:
+            waiting = run.connect(B)  # no first frame yet
+            assert await _spin(lambda: bool(waiting._frames._getters))
+    assert waiting.closed  # leaving stopped the loop and cancelled the worker
+    assert limiter.try_start(B[0], shared=False)
+
+
+async def test_a_known_tcp_connection_pushes_out_a_young_silent_stranger() -> None:
+    # E3 in TCP mode: what keeps silent connections from holding every slot
+    # against a known device (spec §3.7, §4.4).
+    limiter = SourceLimiter(clock=_Frozen())
+    limiter.note_known(A[0], A_CN)
+    with patch.object(hsa, "_TCP_FIRST_FRAME_DEADLINE", 3600.0):
+        async with _Admit(
+            _Hs(), SessionTable([A_CN]), limiter=limiter, gate=_gate(), max_inflight=1
+        ) as run:
+            silent = run.connect(B)  # takes the one slot and sends nothing
+            assert await _spin(lambda: bool(silent._frames._getters))
+            known = run.connect(A, [_msg1(1)])  # Step S's clock: B is 0 s old
+            assert await _spin(lambda: silent.closed and len(run.clients) == 1)
+    assert run.clients[0].transport is known
+    # Pushed out young, it did not stall: no penalty (spec §3.7 E2, E3).
+    assert limiter.try_start(B[0], shared=False)
+
+
+async def test_a_silent_tcp_stranger_pushed_out_after_it_stalled_is_barred() -> None:
+    limiter = SourceLimiter(clock=_Frozen())
+    other: Addr = ("203.0.113.10", 40010)
+    with patch.object(hsa, "_TCP_FIRST_FRAME_DEADLINE", 3600.0):
+        async with _Admit(
+            _Hs(), SessionTable([A_CN]), limiter=limiter, gate=_gate(), max_inflight=1
+        ) as run:
+            silent = run.connect(B)  # takes the one slot and sends nothing
+            assert await _spin(lambda: bool(silent._frames._getters))
+            run.clock.now = 2.0  # Step S's clock: B is past _PUSH_OUT_AFTER_S
+            run.connect(other, [_msg1(1)])  # a stranger
+            assert await _spin(lambda: silent.closed and len(run.clients) == 1)
+    # It was silent for 2 s and then pushed out: a stall (spec §3.7 E2).
+    assert not limiter.try_start(B[0], shared=False)
+
+
+@pytest.mark.parametrize("first", [b"short", bytes(HANDSHAKE_FRAME_SIZE)])
+async def test_a_bad_tcp_first_frame_costs_a_stranger_the_penalty(
+    first: bytes,
+) -> None:
+    # A wrong size or a bad mac1 is no good first frame: a stall (spec §3.7 E2).
+    limiter = SourceLimiter(clock=_Frozen())
+    async with _Admit(
+        _Hs(), SessionTable([A_CN]), limiter=limiter, gate=_gate()
+    ) as run:
+        bad = run.connect(B, [first])
+        assert await _spin(lambda: bad.closed)
+    assert not limiter.try_start(B[0], shared=False)
