@@ -33,6 +33,15 @@ class CNAllowlistError(Exception):
 @dataclass(frozen=True)
 class CNAllowlist:
     cns: frozenset[str]
+    # The file's order, each CN once at its first line: the n-th CN gets the
+    # n-th tunnel address (multi-client spec §2.3). Built directly (tests):
+    # the names sorted.
+    order: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.order:
+            # The dataclass is frozen; this is how a field is set after init.
+            object.__setattr__(self, "order", tuple(sorted(self.cns)))
 
     @classmethod
     def from_file(cls, path: Path) -> CNAllowlist:
@@ -46,7 +55,7 @@ class CNAllowlist:
             text = path.read_text(encoding="utf-8")
         except OSError as e:
             raise CNAllowlistError(f"failed to read CN allowlist {path}: {e}") from e
-        cns: set[str] = set()
+        names: list[str] = []
         for lineno, raw in enumerate(text.splitlines(), start=1):
             line = raw.strip()
             if not line or line.startswith("#"):
@@ -55,8 +64,10 @@ class CNAllowlist:
                 raise CNAllowlistError(
                     f"{path}:{lineno}: CN must not contain whitespace"
                 )
-            cns.add(line)
-        return cls(cns=frozenset(cns))
+            names.append(line)
+        # A dict keeps each repeated CN once, at its first line.
+        order = tuple(dict.fromkeys(names))
+        return cls(cns=frozenset(order), order=order)
 
     def is_allowed(self, cn: str) -> bool:
         return cn in self.cns
