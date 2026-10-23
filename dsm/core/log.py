@@ -3,6 +3,7 @@ packet."""
 
 from __future__ import annotations
 
+import contextvars
 import logging
 import sys
 import time
@@ -17,6 +18,24 @@ _configured = (
 # tier, so one line per packet would flood the log; one line per 10 s still
 # shows within seconds that a problem started, and every 10 s that it goes on.
 REPEAT_LOG_INTERVAL_S = 10.0
+
+# The running server session's number, as text ("7"); "" outside a session.
+# Each session's task sets it at its start, and asyncio copies it into every
+# task that session starts (multi-client spec §2.13).
+SESSION_LABEL: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "dsm_session_label", default=""
+)
+
+
+class _SessionLabel(logging.Filter):
+    """Puts ``"[s7] "`` in ``record.session`` inside session 7, ``""``
+    elsewhere, for the human log format."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        label = SESSION_LABEL.get()
+        # LogRecord has no such field; the formatter reads it from __dict__.
+        record.__dict__["session"] = f"[s{label}] " if label else ""
+        return True
 
 
 class RepeatLog:
@@ -77,9 +96,10 @@ def configure(level: str = "warning") -> None:
 
     numeric = getattr(logging, level.upper(), logging.WARNING)
     handler = logging.StreamHandler(sys.stderr)
+    handler.addFilter(_SessionLabel())
     handler.setFormatter(
         logging.Formatter(
-            fmt="%(asctime)s %(levelname)s %(name)s: %(message)s",
+            fmt="%(asctime)s %(levelname)s %(name)s: %(session)s%(message)s",
             datefmt="%Y-%m-%d %H:%M:%S",
         )
     )

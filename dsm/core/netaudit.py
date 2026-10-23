@@ -35,6 +35,8 @@ import logging
 import sys
 from typing import Any
 
+from dsm.core.log import SESSION_LABEL
+
 LOGGER_NAME = "dsm.netaudit"
 
 _log = logging.getLogger(LOGGER_NAME)
@@ -78,6 +80,7 @@ def emit(event: str, **fields: Any) -> None:
 
     ``ts`` (ISO-8601 UTC with microseconds) and ``event`` are always
     set; caller-provided keys must not collide with them.
+    Inside a server session, ``session`` is set to its number.
     """
     if not _enabled:
         return
@@ -86,6 +89,9 @@ def emit(event: str, **fields: Any) -> None:
         "event": event,
         **fields,
     }
+    label = SESSION_LABEL.get()
+    if label:
+        payload["session"] = int(label)
     try:
         # repr() fallback: emit() must never crash a session over a logging detail.
         line = json.dumps(payload, default=repr)
