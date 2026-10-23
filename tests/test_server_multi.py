@@ -1062,6 +1062,7 @@ async def test_a_failed_session_start_is_logged_and_the_cn_is_not_taken_over(
         run = await _start()
         acceptor = _Acceptor.made[0]
         acceptor.admit(A, PEER_A)  # must not raise into the worker
+        assert captured["table"].sessions() == []
         assert sessions.started == []
         acceptor.admit(A, PEER_A2)  # the client comes back
         assert await _spin(lambda: len(sessions.started) == 1)

@@ -380,7 +380,9 @@ class SessionTable:
         is not a takeover of a session that does not exist. A failed takeover
         leaves the old session running, and that session stays a takeover
         target. The slot then names the client that got no session, so step
-        R's lines at the CN's next takeover compare against that client."""
+        R's lines at the CN's next takeover compare against that client.
+        A CN with no slot is a no-op: ``on_client`` calls this from an error
+        handler and relies on it never raising."""
         slot = self._slots.get(cn)
         if slot is not None and cn not in self._by_cn:
             slot.clear()

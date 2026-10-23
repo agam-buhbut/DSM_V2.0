@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 import pytest
 
+from dsm.crypto.handshake import VerifiedClient
 from dsm.net import handshake_acceptor as hsa
 from dsm.net.handshake_gate import SourceLimiter
 from dsm.net.session_slot import SessionTable
@@ -205,7 +206,18 @@ async def test_an_attempt_cut_by_a_stop_logs_no_error(
     assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
 
 
-def test_abandon_of_a_cn_with_no_slot_does_nothing() -> None:
+def test_abandon_of_a_cn_with_no_slot_does_nothing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="dsm")
     table = SessionTable([A_CN])
     table.abandon(A_CN)  # a CN with a slot but no client
     table.abandon("dsm-unknown")  # a CN with no slot at all
+    assert table.sessions() == []
+    assert not table.any_live
+    # The next attempt of A is a plain first session, not a takeover.
+    attempt = object()
+    table.admit(attempt, VerifiedClient(cn=A_CN, noise_static=b"\x01" * 32))
+    table.confirm(attempt)
+    table.release(attempt)
+    assert caplog.records == []
