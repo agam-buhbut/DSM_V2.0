@@ -4,20 +4,25 @@ and hint. A fake clock; no event loop and no sockets."""
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import ipaddress
 import logging
 from collections.abc import Sequence
 
 import pytest
 
 from dsm.crypto.handshake import ClientRefusedError, VerifiedClient
-from dsm.net.session_slot import SessionTable
+from dsm.net.session_slot import SESSION_QUEUE_PACKETS, ServerSession, SessionTable
 
 A = VerifiedClient(cn="dsm-a-client", noise_static=b"\x01" * 32)
 A_NEW_KEY = VerifiedClient(cn="dsm-a-client", noise_static=b"\x02" * 32)
 B = VerifiedClient(cn="dsm-b-client", noise_static=b"\x03" * 32)
 CNS = ("dsm-a-client", "dsm-b-client")
 A_TAKEOVER = "client reconnected (client_cn=dsm-a-client); ending its old session"
+PEER_A = ("198.51.100.7", 40000)
+PEER_A2 = ("198.51.100.7", 40001)
+PEER_B = ("203.0.113.9", 51000)
 
 
 class _Clock:
@@ -45,6 +50,48 @@ def _lines(caplog: pytest.LogCaptureFixture) -> list[tuple[int, str]]:
         for r in caplog.records
         if r.name == "dsm.net.session_slot"
     ]
+
+
+class _Secret:
+    def __repr__(self) -> str:
+        return "SECRET-KEYS"
+
+
+def _session(
+    table: SessionTable,
+    client: VerifiedClient,
+    number: int = 1,
+    peer: tuple[str, int] = PEER_A,
+) -> ServerSession:
+    tunnel = table.assignment_for(client.cn)
+    assert tunnel is not None
+    return ServerSession(
+        number=number,
+        client=client,
+        tunnel=tunnel,
+        session_keys=_Secret(),  # the table never touches keys
+        transport=object(),
+        shutdown=asyncio.Event(),
+        tun_queue=asyncio.Queue(maxsize=SESSION_QUEUE_PACKETS),
+        peer=peer,
+    )
+
+
+def _connect(
+    table: SessionTable,
+    client: VerifiedClient,
+    number: int = 1,
+    peer: tuple[str, int] = PEER_A,
+) -> ServerSession:
+    """``client`` finishes a handshake from ``peer`` and becomes a session."""
+    _confirm(table, client)
+    session = _session(table, client, number, peer)
+    table.add(session)
+    return session
+
+
+def _packed(address: str) -> bytes:
+    return ipaddress.IPv4Address(address).packed
 
 
 def test_the_nth_name_gets_the_nth_address() -> None:
@@ -217,3 +264,181 @@ def test_ever_confirmed_turns_on_at_the_first_confirm() -> None:
     assert not table.ever_confirmed
     table.confirm(attempt)
     assert table.ever_confirmed
+
+
+def test_each_session_queue_holds_one_client_share() -> None:
+    assert SESSION_QUEUE_PACKETS == 256
+
+
+def test_a_session_repr_shows_no_keys_and_no_packets() -> None:
+    session = _session(_table(), A)
+    session.tun_queue.put_nowait(b"inner-packet")
+    assert "SECRET-KEYS" not in repr(session)
+    assert "inner-packet" not in repr(session)
+
+
+def test_add_makes_the_session_findable() -> None:
+    table = _table()
+    assert not table.any_live
+    a = _connect(table, A, peer=PEER_A)
+    assert table.any_live
+    assert table.sessions() == [a]
+    assert table.by_tunnel(_packed("10.8.0.2")) is a
+    assert table.by_tunnel(_packed("10.8.0.3")) is None
+    assert table.by_peer(PEER_A) is a
+    assert table.by_peer(PEER_B) is None
+
+
+def test_a_takeover_keeps_the_address_and_returns_the_old_session(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="dsm.net.session_slot")
+    table = _table()
+    old = _connect(table, A, number=1, peer=PEER_A)
+    _confirm(table, A)
+    new = _session(table, A, number=2, peer=PEER_A2)
+    assert table.add(new) is old
+    assert new.tunnel == old.tunnel
+    assert table.by_tunnel(_packed("10.8.0.2")) is new
+    assert table.by_peer(PEER_A) is None  # the old session's hint is gone
+    assert table.by_peer(PEER_A2) is new
+    assert table.sessions() == [new]
+    assert not table.remove(old)  # replaced: it is not the current one
+    assert table.sessions() == [new]
+    assert table.by_tunnel(_packed("10.8.0.2")) is new
+    assert table.by_peer(PEER_A2) is new
+    caplog.clear()
+    _confirm(table, A)  # the slot still holds A: this is a takeover
+    assert [m for _, m in _lines(caplog) if m.startswith("client reconnected")] == [
+        A_TAKEOVER
+    ]
+
+
+def test_remove_is_true_only_for_the_current_session_and_clears_its_slot(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="dsm.net.session_slot")
+    table = _table()
+    a = _connect(table, A)
+    assert table.remove(a)
+    assert not table.any_live
+    assert table.by_tunnel(_packed("10.8.0.2")) is None
+    assert table.by_peer(PEER_A) is None
+    assert not table.remove(a)  # nothing left to take out
+    caplog.clear()
+    again = _connect(table, A, number=2)  # cleared: not a takeover
+    assert not [m for _, m in _lines(caplog) if m.startswith("client reconnected")]
+    assert again.tunnel == a.tunnel  # the same address after its session ended
+
+
+def test_the_takeover_allowance_outlives_the_session() -> None:
+    """The slot is kept for the run (spec §2.4): a session that ends does not
+    refill its CN's takeover allowance."""
+    table = _table()
+    first = _connect(table, A)
+    for _ in range(3):
+        _confirm(table, A)  # three takeovers spend the allowance
+    assert table.remove(first)  # still the current one: the slot is cleared
+    _connect(table, A, number=2)  # no session ran: not a takeover, no token
+    with pytest.raises(ClientRefusedError):
+        table.admit(object(), A)  # the frozen clock refilled nothing
+
+
+def test_a_bad_assignment_stops_the_table_at_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Checked at start, so no takeover token is spent on it (spec §2.3)."""
+    monkeypatch.setattr(
+        "dsm.net.session_slot._POOL", (ipaddress.IPv4Address("10.8.0.1"),)
+    )
+    with pytest.raises(ValueError, match="both have"):
+        SessionTable(["dsm-a-client"])
+
+
+def test_an_attempt_admitted_while_its_cns_session_ends_can_still_win() -> None:
+    table = _table()
+    old = _connect(table, A)
+    back = object()
+    table.admit(back, A)  # a takeover: A's session is live
+    assert table.remove(old)  # the old session ends by itself first
+    assert table.is_admitted(back)
+    assert table.confirm(back) == (A, old.tunnel)
+    new = _session(table, A, number=2)
+    assert table.add(new) is None
+    assert table.sessions() == [new]
+
+
+def test_two_cns_run_at_once() -> None:
+    table = _table()
+    a = _connect(table, A, number=1, peer=PEER_A)
+    b = _connect(table, B, number=2, peer=PEER_B)
+    assert table.sessions() == [a, b]
+    assert table.by_tunnel(_packed("10.8.0.3")) is b
+    assert table.remove(a)
+    assert table.sessions() == [b]
+    assert table.by_peer(PEER_B) is b
+
+
+def test_note_peer_moves_a_hint_and_takes_it_from_another_session() -> None:
+    table = _table()
+    a = _connect(table, A, number=1, peer=PEER_A)
+    b = _connect(table, B, number=2, peer=PEER_B)
+    table.note_peer(a, PEER_A2)  # a validated PATH_RESPONSE
+    assert table.by_peer(PEER_A2) is a
+    assert table.by_peer(PEER_A) is None
+    table.note_peer(b, PEER_A2)  # that address now belongs to b
+    assert table.by_peer(PEER_A2) is b
+    assert table.by_peer(PEER_B) is None
+    table.note_peer(a, PEER_A)
+    assert table.by_peer(PEER_A) is a
+    assert table.by_peer(PEER_A2) is b
+
+
+def test_add_takes_the_hint_from_another_session() -> None:
+    """A finished handshake proves its address at least as well as a
+    PATH_RESPONSE (spec §2.5)."""
+    table = _table()
+    a = _connect(table, A, number=1, peer=PEER_A)
+    b = _connect(table, B, number=2, peer=PEER_A)  # from a's address
+    assert table.by_peer(PEER_A) is b
+    assert table.remove(a)
+    assert table.by_peer(PEER_A) is b  # a had no hint left to drop
+
+
+def test_note_peer_does_nothing_for_a_replaced_session() -> None:
+    table = _table()
+    old = _connect(table, A, number=1, peer=PEER_A)
+    _confirm(table, A)
+    table.add(_session(table, A, number=2, peer=PEER_A2))
+    table.note_peer(old, PEER_B)  # its last PATH_RESPONSE, after the takeover
+    assert table.by_peer(PEER_B) is None
+
+
+def test_abandon_clears_the_slot_so_the_next_attempt_is_no_takeover(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="dsm.net.session_slot")
+    table = _table()
+    _confirm(table, A)  # confirmed, but on_client failed: no session
+    table.abandon("dsm-a-client")
+    caplog.clear()
+    _confirm(table, A)
+    assert not [m for _, m in _lines(caplog) if m.startswith("client reconnected")]
+
+
+def test_abandon_after_a_failed_takeover_keeps_the_old_session_a_takeover_target(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """OWNER-APPROVAL ITEM A-OA-1: the old session still runs, so the CN's next
+    attempt is still a takeover and spends a token."""
+    caplog.set_level(logging.INFO, logger="dsm.net.session_slot")
+    table = _table()
+    old = _connect(table, A)
+    _confirm(table, A)  # a takeover passed; then on_client failed
+    table.abandon("dsm-a-client")
+    assert table.sessions() == [old]
+    caplog.clear()
+    _confirm(table, A)
+    assert [m for _, m in _lines(caplog) if m.startswith("client reconnected")] == [
+        A_TAKEOVER
+    ]

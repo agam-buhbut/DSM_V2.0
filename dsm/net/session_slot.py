@@ -26,16 +26,24 @@ Nothing here touches the wire.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import ipaddress
 import logging
 import time
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from dsm.core.log import RepeatLog
 from dsm.crypto.handshake import ClientRefusedError, VerifiedClient
 from dsm.net._addresses import SERVER_TUN_IP, TUN_PREFIX_LEN, TunnelAssignment
 from dsm.net.handshake_gate import TokenBucket
+
+if TYPE_CHECKING:
+    import tuncore
+    from dsm.net.transport.tcp import TCPTransport
+    from dsm.net.transport.udp import UDPTransport
 
 log = logging.getLogger(__name__)
 
@@ -44,6 +52,11 @@ log = logging.getLogger(__name__)
 # session's dead-peer timer, as it did before a session could be taken over.
 REPLACE_BURST = 3.0
 REPLACE_RATE = 1.0 / 60.0  # tokens per second
+
+# Each session's view queue and TUN queue (multi-client spec, Numbers):
+# today's one-client RECV_QUEUE_SIZE, so each session keeps the share one
+# client has today.
+SESSION_QUEUE_PACKETS = 256
 
 # The pool (multi-client spec, Numbers): every host address of the tunnel
 # network but the server's own, 10.8.0.2 to 10.8.0.254.
@@ -173,6 +186,29 @@ class SessionSlot:
         self._holder = None
 
 
+@dataclass(eq=False)
+class ServerSession:
+    """One live session of a server with several clients (spec §2.4).
+
+    ``eq=False``: two sessions are never equal, and each hashes by identity,
+    so the table can key its maps by session.
+    """
+
+    number: int
+    client: VerifiedClient
+    tunnel: TunnelAssignment
+    session_keys: tuncore.SessionKeyManager = field(repr=False)
+    # UDP: its _SessionUDPView, filled by the dispatcher; TCP: its connection.
+    transport: UDPTransport | TCPTransport
+    shutdown: asyncio.Event
+    # Out of the repr: a queue's repr lists the client's packets in it.
+    tun_queue: asyncio.Queue[bytes] = field(repr=False)
+    # The handshake address: where the session starts sending, and its first
+    # hint. Later hints live in the table.
+    peer: tuple[str, int]
+    tun_drops: int = 0
+
+
 class SessionTable:
     """The server's sessions when it serves several clients at once (spec §2.4).
 
@@ -209,6 +245,11 @@ class SessionTable:
         self._slots: dict[str, SessionSlot] = {}
         # Each attempt past admit, until confirm or release: its client.
         self._admitted: dict[object, VerifiedClient] = {}
+        self._by_cn: dict[str, ServerSession] = {}
+        self._by_tunnel: dict[bytes, ServerSession] = {}
+        # The hints, both ways: an address belongs to at most one session.
+        self._by_peer: dict[tuple[str, int], ServerSession] = {}
+        self._hints: dict[ServerSession, tuple[str, int]] = {}
         self._ever_confirmed = False
         self._no_address_log = RepeatLog(log, logging.WARNING, clock=clock)
 
@@ -281,3 +322,78 @@ class SessionTable:
     def ever_confirmed(self) -> bool:
         """Whether any CN has connected in this run (spec §3.7, E1)."""
         return self._ever_confirmed
+
+    def add(self, session: ServerSession) -> ServerSession | None:
+        """Make ``session`` its CN's session, the owner of its tunnel address
+        and the holder of its hint (its handshake address). Returns the CN's
+        old session, or None. The caller ends the returned session (sets its
+        ``shutdown``); ``add`` only reroutes."""
+        cn = session.client.cn
+        old = self._by_cn.get(cn)
+        if old is not None:
+            self._drop_hint(old)
+        self._by_cn[cn] = session
+        self._by_tunnel[session.tunnel.client.packed] = session
+        self.note_peer(session, session.peer)
+        return old
+
+    def remove(self, session: ServerSession) -> bool:
+        """Take ``session`` out where it is still the current one.
+
+        True when it was its CN's current session: its tunnel address is free
+        and the CN's slot is cleared, so the CN's next attempt is no takeover.
+        False when a takeover replaced it.
+        """
+        self._drop_hint(session)
+        cn = session.client.cn
+        if self._by_cn.get(cn) is not session:
+            return False
+        del self._by_cn[cn]
+        del self._by_tunnel[session.tunnel.client.packed]
+        self._slots[cn].clear()
+        return True
+
+    def by_tunnel(self, address: bytes) -> ServerSession | None:
+        """The session that owns ``address`` (4 raw bytes), or None."""
+        return self._by_tunnel.get(address)
+
+    def by_peer(self, addr: tuple[str, int]) -> ServerSession | None:
+        """The session whose hint is ``addr``, or None."""
+        return self._by_peer.get(addr)
+
+    def note_peer(self, session: ServerSession, addr: tuple[str, int]) -> None:
+        """Make ``addr`` the hint of ``session`` (its packets are checked
+        against it first), taking it from any other session. Does nothing for
+        a session that is no longer its CN's current one."""
+        if self._by_cn.get(session.client.cn) is not session:
+            return
+        self._drop_hint(session)
+        other = self._by_peer.get(addr)
+        if other is not None:
+            del self._hints[other]
+        self._by_peer[addr] = session
+        self._hints[session] = addr
+
+    def abandon(self, cn: str) -> None:
+        """A client of ``cn`` passed :meth:`confirm` but got no session (a bug
+        in starting it, spec §2.2). Clears the CN's slot, so its next attempt
+        is not a takeover of a session that does not exist. A failed takeover
+        leaves the old session running, and that session stays a takeover
+        target. The slot then names the client that got no session, so step
+        R's lines at the CN's next takeover compare against that client."""
+        if cn not in self._by_cn:
+            self._slots[cn].clear()
+
+    def sessions(self) -> list[ServerSession]:
+        """Every live session, one per CN."""
+        return list(self._by_cn.values())
+
+    @property
+    def any_live(self) -> bool:
+        """Whether a session runs."""
+        return bool(self._by_cn)
+
+    def _drop_hint(self, session: ServerSession) -> None:
+        addr = self._hints.pop(session, None)
+        if addr is not None:
+            del self._by_peer[addr]
