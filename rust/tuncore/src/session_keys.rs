@@ -104,6 +104,9 @@ pub struct Opened {
 thread_local! {
     /// AEAD runs on this thread, for the tests that check junk runs none.
     static AEAD_RUNS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Header decryptions on this thread, for the tests that check both
+    /// header keys always run (audit M1).
+    static HEADER_RUNS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 // Manual .min().max() instead of .clamp(1, ROTATION_BASE_MAX): the
@@ -504,32 +507,61 @@ impl SessionKeyManager {
         if wire.len() < MIN_WIRE_LEN {
             return None;
         }
+        let (current, previous) = self.match_header(wire);
+        // A genuine packet matches exactly one key set (but once in 2^32,
+        // and then the second try still finds it).
+        if let Some(opened) = current.and_then(|block| self.open_with(&block, wire, false)) {
+            return Some(opened);
+        }
+        previous.and_then(|block| self.open_with(&block, wire, true))
+    }
+
+    /// Whether `wire`'s header decrypts, under the current or the previous
+    /// header key, to that key set's epoch: the test `open` makes before any
+    /// AEAD (multi-client spec §6.1). Changes nothing: no tick, no replay
+    /// window, no grace state, no parked send swap. Runs no AEAD, allocates
+    /// nothing, and always runs both header keys, as `open` does (audit M1).
+    /// False for a packet shorter than `MIN_WIRE_LEN`.
+    ///
+    /// It does not tick, so a previous key set whose grace ran out but that
+    /// no tick has dropped yet still matches; `open` then drops it and fails,
+    /// and that packet is lost, as it would be anyway.
+    pub fn header_matches(&self, wire: &[u8]) -> bool {
+        if wire.len() < MIN_WIRE_LEN {
+            return false;
+        }
+        let (current, previous) = self.match_header(wire);
+        current.is_some() || previous.is_some()
+    }
+
+    /// The header step `open` and `header_matches` share, so the two cannot
+    /// drift: both header decryptions, then the epoch match. Returns each key
+    /// set's decrypted block when its epoch matches. `wire` holds at least
+    /// `MIN_WIRE_LEN` bytes.
+    fn match_header(&self, wire: &[u8]) -> (Option<[u8; 16]>, Option<[u8; 16]>) {
         let mut block = [0u8; 16];
         block.copy_from_slice(&wire[..16]);
-        let current = self.recv.hp.unprotect(&block);
+        let current = unprotect_header(&self.recv.hp, &block);
         let (previous, previous_epoch) = match &self.prev_recv {
-            Some(prev) => (prev.hp.unprotect(&block), Some(prev.epoch())),
+            Some(prev) => (unprotect_header(&prev.hp, &block), Some(prev.epoch())),
             // M1: this AES block must really run. black_box on the input
             // hides that it is the same key and block as `current`, so the
             // optimizer cannot merge the two; black_box on the output keeps
             // the result, which nothing reads.
             None => (
-                std::hint::black_box(self.recv.hp.unprotect(&std::hint::black_box(block))),
+                std::hint::black_box(unprotect_header(
+                    &self.recv.hp,
+                    &std::hint::black_box(block),
+                )),
                 None,
             ),
         };
-        // A genuine packet matches exactly one key set (but once in 2^32,
-        // and then the second try still finds it); junk matches by chance
-        // once in 2^32 per key set.
-        if epoch_matches(&current, self.recv.epoch()) {
-            if let Some(opened) = self.open_with(&current, wire, false) {
-                return Some(opened);
-            }
-        }
-        if previous_epoch.is_some_and(|epoch| epoch_matches(&previous, epoch)) {
-            return self.open_with(&previous, wire, true);
-        }
-        None
+        // Junk matches by chance once in 2^32 per key set.
+        let current = epoch_matches(&current, self.recv.epoch()).then_some(current);
+        let previous = previous_epoch
+            .is_some_and(|epoch| epoch_matches(&previous, epoch))
+            .then_some(previous);
+        (current, previous)
     }
 
     /// The per-key-set step of `open`: today's `decrypt` (replay check, the
@@ -921,6 +953,14 @@ fn try_decrypt_dir(
 /// Whether a decrypted header block names `epoch` (its bytes 8-11).
 fn epoch_matches(block: &[u8; 16], epoch: u32) -> bool {
     bool::from(block[8..12].ct_eq(&epoch.to_be_bytes()))
+}
+
+/// One header decryption. Every one goes through here so the tests can count
+/// them: `open` and `header_matches` always run two (audit M1).
+fn unprotect_header(key: &HeaderKey, block: &[u8; 16]) -> [u8; 16] {
+    #[cfg(test)]
+    HEADER_RUNS.with(|runs| runs.set(runs.get() + 1));
+    key.unprotect(block)
 }
 
 /// Derive both directions' `DirSecrets` from a rotation DH: (send, recv)
@@ -1644,6 +1684,14 @@ mod tests {
         AEAD_RUNS.with(|runs| runs.set(0));
     }
 
+    fn header_runs() -> u64 {
+        HEADER_RUNS.with(std::cell::Cell::get)
+    }
+
+    fn reset_header_runs() {
+        HEADER_RUNS.with(|runs| runs.set(0));
+    }
+
     fn unhex(s: &str) -> Vec<u8> {
         (0..s.len())
             .step_by(2)
@@ -2017,5 +2065,124 @@ mod tests {
         forged[last] ^= 0x01;
         assert!(server.open(&forged).is_none());
         assert!(server.has_pending_send_swap());
+    }
+
+    /// Multi-client spec §6.1: the header check is true for a packet under
+    /// the current key set and under the previous one, and false for a short
+    /// packet and for another session's packet. It runs no AEAD.
+    #[test]
+    fn header_matches_its_own_key_sets_only() {
+        let (mut client, mut server) = fixed_pair();
+        let old = client.seal(1, b"old key set").unwrap();
+        assert!(server.header_matches(&old));
+        fixed_rotation(&mut client, &mut server);
+        let new = client.seal(2, b"new key set").unwrap();
+        let mut other = SessionKeyManager::new(
+            fixed_dir(9, 10),
+            fixed_dir(11, 12),
+            client.epoch(),
+            None,
+            None,
+        )
+        .unwrap();
+        let stranger = other.seal(3, b"another session").unwrap();
+        reset_aead_runs();
+        assert!(server.header_matches(&new));
+        assert!(server.header_matches(&old));
+        assert!(!server.header_matches(&new[..MIN_WIRE_LEN - 1]));
+        assert!(!server.header_matches(&stranger));
+        assert_eq!(aead_runs(), 0);
+    }
+
+    /// Junk never matches, with or without a grace period: the same fixed
+    /// bytes that `junk_runs_no_aead_with_or_without_grace` shows reach no
+    /// AEAD.
+    #[test]
+    fn header_matches_no_junk_with_or_without_grace() {
+        let (mut client, mut server) = fixed_pair();
+        for grace in [false, true] {
+            if grace {
+                fixed_rotation(&mut client, &mut server);
+            }
+            for &size in &crate::shaper::SIZE_CLASSES {
+                for packet in junk(u64::from(size) + u64::from(grace), usize::from(size), 1000) {
+                    assert!(
+                        !server.header_matches(&packet),
+                        "size {size}, grace {grace}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The header check changes nothing: no AEAD runs, the grace period stays
+    /// on, and each packet still opens exactly once.
+    #[test]
+    fn header_matches_changes_nothing() {
+        let (mut client, mut server) = fixed_pair();
+        let old = client.seal(1, b"old key set").unwrap();
+        fixed_rotation(&mut client, &mut server);
+        let new = client.seal(2, b"new key set").unwrap();
+        reset_aead_runs();
+        for _ in 0..3 {
+            assert!(server.header_matches(&new));
+            assert!(server.header_matches(&old));
+        }
+        assert_eq!(aead_runs(), 0);
+        assert!(server.has_grace_period());
+        assert!(!server.open(&new).unwrap().used_prev);
+        assert!(server.open(&new).is_none(), "opened once: now a replay");
+        assert!(server.open(&old).unwrap().used_prev);
+    }
+
+    /// The header check of the first new-key packet does not confirm the
+    /// peer: the responder's new send key stays parked until `open`.
+    #[test]
+    fn header_matches_leaves_a_parked_send_swap_parked() {
+        let (mut client, mut server) = make_paired_managers();
+        let (init, server_pub) = responder_applies(&client, &mut server);
+        client
+            .complete_rotation_initiator(init, &server_pub)
+            .unwrap();
+        let first = client.seal(1, b"first new-key packet").unwrap();
+        assert!(server.header_matches(&first));
+        assert!(server.has_pending_send_swap());
+        assert!(!server.open(&first).unwrap().used_prev);
+        assert!(!server.has_pending_send_swap());
+    }
+
+    /// The header check does not tick (spec §6.1, re-review M10): a previous
+    /// key set whose grace ran out still matches until `open` ticks, drops it
+    /// and fails, so the check ends no grace period.
+    #[test]
+    fn header_matches_does_not_tick() {
+        let (mut client, mut server) = fixed_pair();
+        let old = client.seal(1, b"old key set").unwrap();
+        fixed_rotation(&mut client, &mut server);
+        server.age_for_test(Duration::from_secs(GRACE_PERIOD_SECS));
+        assert!(server.header_matches(&old));
+        assert!(server.has_grace_period());
+        assert!(server.open(&old).is_none());
+        assert!(!server.has_grace_period());
+    }
+
+    /// Audit M1: both header decryptions run on every call of `open` and of
+    /// `header_matches`, with and without a previous key set.
+    #[test]
+    fn two_header_decryptions_per_call_with_or_without_grace() {
+        let (mut client, mut server) = fixed_pair();
+        for (seq, grace) in [(1u64, false), (2, true)] {
+            if grace {
+                fixed_rotation(&mut client, &mut server);
+                assert!(server.has_grace_period());
+            }
+            let wire = client.seal(seq, b"x").unwrap();
+            reset_header_runs();
+            assert!(server.header_matches(&wire));
+            assert_eq!(header_runs(), 2, "header_matches, grace {grace}");
+            reset_header_runs();
+            assert!(server.open(&wire).is_some());
+            assert_eq!(header_runs(), 2, "open, grace {grace}");
+        }
     }
 }

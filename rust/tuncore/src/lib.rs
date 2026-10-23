@@ -361,6 +361,15 @@ impl PySessionKeyManager {
         ))
     }
 
+    /// Whether `wire`'s header fits these keys, under the current or the
+    /// previous key set: the check `open_packet` makes before any AEAD. Two
+    /// AES blocks; changes nothing; never raises on peer bytes. Keeps the
+    /// GIL: the work is shorter than a release, and a release would make each
+    /// check wait for the GIL behind a busy thread (multi-client spec §6.1).
+    fn header_matches(&self, wire: &[u8]) -> bool {
+        self.inner.header_matches(wire)
+    }
+
     /// Check if key rotation is needed (packet count or time threshold).
     fn needs_rotation(&self) -> bool {
         self.inner.needs_rotation()
