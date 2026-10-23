@@ -265,9 +265,10 @@ class SourceLimiter:
             src.barred_until = self._clock() + FAILED_START_PENALTY_S
 
     def try_shared(self, ip: str, *, in_session: bool = False) -> bool:
-        """Charge the shared limits (overall, and in a session the in-session
-        budget) for an attempt from ``ip`` that ``try_start(ip, shared=False)``
-        admitted: a TCP connection whose first frame passed mac1.
+        """Charge the shared limits (overall, and once any client has
+        connected in this run the newcomer budget) for an attempt from ``ip``
+        that ``try_start(ip, shared=False)`` admitted: a TCP connection whose
+        first frame passed mac1.
 
         All or nothing, like ``try_start``. Nothing to pair with ``finish``:
         the caller still ends the attempt, which calls ``finish(ip)`` once.
@@ -322,8 +323,8 @@ class SourceLimiter:
             del self._known_cookies[ip]
 
     def _shared_ready(self, now: float, *, in_session: bool) -> bool:
-        """True if the overall budget, and in a session the in-session one,
-        each hold a token. Logs the refusal."""
+        """True if the overall budget, and once any client has connected in
+        this run the newcomer one, each hold a token. Logs the refusal."""
         if not self._overall.ready(now):
             self._overall_log.log(
                 "new handshake refused: too many new handshakes overall"

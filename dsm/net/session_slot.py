@@ -11,7 +11,8 @@ may have the session:
   next session.
 * While a session runs, only a client with the same CN (the name in its
   certificate) may take it over: that is the same client coming back.
-  Another client is refused; it gets in once the session ends.
+  A slot refuses any other CN, but the server's :class:`SessionTable`
+  gives each CN its own slot, so another client never meets this rule.
 * Each CN may take its session over 3 times at once, then once a minute.
   Two devices that share one CN would otherwise push each other off
   forever. When the budget is spent, the old session stays.
@@ -73,9 +74,9 @@ def _key_hash(noise_static: bytes) -> str:
 class SessionSlot:
     """One session's slot: who holds it, and who may take it over.
 
-    Today's ``run_server`` makes one per run and hands it to every accept; a
-    :class:`SessionTable` makes one per CN. Nothing here awaits, so a check
-    and the mark it sets happen in one step on the event loop.
+    A :class:`SessionTable` makes one per CN and keeps it for the run.
+    Nothing here awaits, so a check and the mark it sets happen in one step
+    on the event loop.
     """
 
     def __init__(self, *, clock: Callable[[], float] = time.monotonic) -> None:

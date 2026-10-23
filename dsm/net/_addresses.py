@@ -3,9 +3,9 @@
 Wire v2 (spec §7.7): the last handshake frame, the bootstrap reply, tells
 the client its tunnel address, the server's tunnel address (also the
 client's DNS server) and the prefix length. The client takes them from
-there and assumes none of them. Today's server always sends
-``SINGLE_CLIENT_TUNNEL``; it binds its own TUN to ``SERVER_TUN_IP`` and its
-DNS proxy listens on ``SERVER_TUN_IP:53``.
+there and assumes none of them. The server gives each allowlisted CN the
+address of its line (``dsm.net.session_slot.SessionTable``); it binds its own
+TUN to ``SERVER_TUN_IP`` and its DNS proxy listens on ``SERVER_TUN_IP:53``.
 
 Stdlib only: ``dsm cleanup`` imports this module through ``dsm.net.tunnel``
 and must not need the Rust extension. Changing these values affects the
@@ -100,7 +100,8 @@ class TunnelAssignment:
         )
 
 
-# One client at a time: today's server gives every client this.
+# server_handshake's tunnel when no admit_client hook gives one (tests);
+# the first allowlist line's address.
 SINGLE_CLIENT_TUNNEL: TunnelAssignment = TunnelAssignment(
     client=ipaddress.IPv4Address("10.8.0.2"),
     server=ipaddress.IPv4Address(SERVER_TUN_IP),

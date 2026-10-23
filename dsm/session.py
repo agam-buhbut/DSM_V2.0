@@ -1037,13 +1037,14 @@ async def run_data_loops(
       decrypted ``inner`` too so it can act on a PATH_RESPONSE; called BEFORE
       ``dispatch_inner`` so the egress decision is made before the payload is
       delivered.
-    * ``unauthenticated`` (server, while a session runs): gets each UDP
-      packet the session cannot use, with its source address and ``seen``,
-      for the in-session accept. ``seen`` is False when the packet did not
-      open (no header key matched, the AEAD failed, or it was a replay or
-      too late for its key set) and True when it opened but the session-wide
-      replay window refused it as too far behind the newest packet (a
-      straggler from the previous key set). It runs inside the receive
+    * ``unauthenticated`` (a hook the server no longer uses; only
+      ``tests/test_session_unauthenticated.py`` passes it): gets each UDP
+      packet the session cannot use, with its source address and ``seen``.
+      ``seen`` is False when the packet did not open (no header key matched,
+      the AEAD failed, or it was a replay or too late for its key set) and
+      True when it opened but the session-wide replay window refused it as
+      too far behind the newest packet (a straggler from the previous key
+      set). It runs inside the receive
       loop, so it must not block or raise: an exception ends the session.
       The client passes nothing; TCP never calls it.
     * ``extra_loops``: client passes ``auto_mtu_loop(...)`` here; server

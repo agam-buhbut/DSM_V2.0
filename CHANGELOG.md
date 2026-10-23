@@ -297,6 +297,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with the usual one-line config error naming the key, not a traceback.
 
 ### Added
+- Several clients at once (server only; wire v2 clients need nothing). One
+  server now serves every allowlisted device at the same time, each in its
+  own session with its own tunnel address, shaper, chaff and DNS cache. The
+  n-th name in the allowlist file gets the n-th address (10.8.0.2,
+  10.8.0.3, ... up to 10.8.0.254), so a device keeps its address across
+  restarts while the file is unchanged. A device that comes back replaces
+  only its own old session. Clients cannot reach each other through the
+  tunnel or send with another client's address. The TUN, forwarding, NAT
+  and the DNS proxy are set up once, at start: a busy :53 now stops the
+  server at start, and the host's IPv6 stays off and IPv4 forwarding on for
+  the whole run. Each client's NAT flows carry a tag of its own (a
+  conntrack mark), so late replies for an address's former holder are
+  dropped; port forwards to a client's tunnel address no longer work, and
+  the first start after the upgrade cuts each older client flow once.
+  Start limits: once a client has connected, new addresses share 4 starts
+  at once, then 1 a second; an address a client connected from skips the
+  shared limits and has its own small cookie budget; an unknown address
+  whose proven start failed waits 30 s. The server's socket asks the kernel
+  for a bigger receive buffer. Log lines from a session carry its label
+  (`[s3]`); new lines are listed in deploy/GUIDE.md §11.
 - `deploy/dsm-client.service`, a systemd unit for clients (`--mode client`,
   `Restart=always`). It removes the kill switch only for `systemctl stop`;
   `systemctl restart dsm-client`, a signal sent straight to DSM and a

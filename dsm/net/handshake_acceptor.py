@@ -427,7 +427,7 @@ class _PerPeerUDPView(UDPTransport):
 
 
 async def _cancel_and_drain(tasks: set[asyncio.Task[None]]) -> None:
-    """Cancel and await ``tasks`` so no loser outlives the accept.
+    """Cancel and await ``tasks`` so no attempt outlives the acceptor's stop.
 
     Every task is awaited, even after one failed: a cancelled worker may
     still wait for its signing thread, and the server zeroizes the attest key
