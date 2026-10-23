@@ -235,7 +235,9 @@ async def _run_acceptor(  # pyright: ignore[reportUnusedFunction]  # not called 
     acceptor (every attempt ends and gives back what it held), wait the
     jittered backoff, and run it again with empty inboxes. ``stop()`` raises
     a bug a worker hit while being stopped, once every attempt has ended; it
-    is logged the same way. Live sessions are not touched.
+    is logged the same way. Live sessions are not touched. It sees shutdown
+    only during a backoff: the caller cancels it, then calls
+    ``acceptor.stop()``.
     """
     failures = 0
     while True:

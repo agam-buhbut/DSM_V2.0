@@ -27,7 +27,7 @@ from tests.test_client_acceptor import (
     _msg1,
     _with_cookie,
 )
-from tests.test_handshake_acceptor_limits import _Frozen, _spin, _Transport
+from tests.test_handshake_acceptor_limits import _Frozen, _spin, _Transport, _yield
 
 
 async def test_a_second_run_without_stop_raises() -> None:
@@ -46,6 +46,7 @@ async def test_a_second_run_without_stop_raises() -> None:
             acceptor.offer(_frame(A), A)
             runs.append(asyncio.ensure_future(acceptor.run()))
             assert await _spin(lambda: len(clients) == 1)
+            assert not runs[1].done()  # no late crash
         finally:
             # Cancel rather than await: a run that wrongly served twice
             # leaves a loop that stop() can no longer reach.
@@ -55,6 +56,48 @@ async def test_a_second_run_without_stop_raises() -> None:
             await asyncio.wait_for(acceptor.stop(), 5.0)
 
 
+async def test_a_run_called_while_stop_is_draining_raises() -> None:
+    hs = _Hs()
+    hs.hold[A] = asyncio.Event()
+    acceptor = _acceptor(SessionTable([A_CN]), None, udp=_Transport())
+    draining = asyncio.Event()
+    drain = hsa._cancel_and_drain
+
+    async def _slow_drain(tasks: set[asyncio.Task[None]]) -> None:
+        await draining.wait()
+        await drain(tasks)
+
+    with patch("dsm.crypto.handshake.server_handshake", new=hs):
+        with patch.object(hsa, "_cancel_and_drain", new=_slow_drain):
+            first = asyncio.ensure_future(acceptor.run())
+            acceptor.offer(_frame(A), A)
+            assert await _spin(lambda: hs.admitted == [A])
+            stopping = asyncio.ensure_future(acceptor.stop())
+            await _yield()  # stop() is now inside its drain
+            try:
+                with pytest.raises(RuntimeError, match="stop"):
+                    await asyncio.wait_for(acceptor.run(), 1.0)
+            finally:
+                draining.set()
+                await asyncio.wait_for(stopping, 5.0)
+                first.cancel()
+                await asyncio.gather(first, return_exceptions=True)
+
+
+async def test_a_run_scheduled_before_a_stop_serves_until_the_next_stop() -> None:
+    clients: list[hsa.AcceptedClient] = []
+    acceptor = _acceptor(SessionTable([A_CN]), clients.append, udp=_Transport())
+    with patch("dsm.crypto.handshake.server_handshake", new=_Hs()):
+        scheduled = asyncio.ensure_future(acceptor.run())  # has not started
+        await acceptor.stop()
+        acceptor.offer(_frame(A), A)
+        try:
+            assert await _spin(lambda: len(clients) == 1)
+        finally:
+            await acceptor.stop()
+            await scheduled
+
+
 async def test_an_attempt_held_past_admit_gives_its_cn_back_on_a_restart() -> None:
     hs = _Hs()
     hs.hold[A] = asyncio.Event()  # never set: A waits after the table's yes
@@ -62,11 +105,15 @@ async def test_an_attempt_held_past_admit_gives_its_cn_back_on_a_restart() -> No
     acceptor = _acceptor(SessionTable([A_CN]), clients.append, udp=_Transport())
     with patch("dsm.crypto.handshake.server_handshake", new=hs):
         first = asyncio.ensure_future(acceptor.run())
-        acceptor.offer(_frame(A), A)
-        assert await _spin(lambda: hs.admitted == [A])
-        # What _run_acceptor does after a crash: stop, then run again.
-        await acceptor.stop()
-        await first
+        try:
+            acceptor.offer(_frame(A), A)
+            assert await _spin(lambda: hs.admitted == [A])
+            # What _run_acceptor does after a crash: stop, then run again.
+            await acceptor.stop()
+        finally:
+            first.cancel()
+            await asyncio.gather(first, return_exceptions=True)
+            await acceptor.stop()
         # The same CN from a new address: refused if A's attempt still held
         # the CN ("another handshake is finishing").
         acceptor.offer(_frame(A2), A2)

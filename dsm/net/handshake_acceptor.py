@@ -2302,7 +2302,8 @@ class ClientAcceptor:
         """Serve handshakes until :meth:`stop`. Raises only a bug in the
         demux or the admit loop. The order is: ``run()``, then :meth:`stop`
         once it ended or was cancelled (a cancel of this task alone leaves
-        the loop running), then the next ``run()``.
+        the loop running), then the next ``run()``. A ``run()`` scheduled
+        before a :meth:`stop` still serves, until the next ``stop()``.
 
         Raises:
             RuntimeError: called again before :meth:`stop`.
@@ -2366,7 +2367,6 @@ class ClientAcceptor:
         stopping. Raises the first error an attempt raised while it was being
         stopped (a bug), once all are done. A cancel of the task that awaits
         it still goes through, once every attempt has ended."""
-        self._started = False
         current = asyncio.current_task()
         cancels = current.cancelling() if current is not None else 0
         tasks = set(self._workers)
@@ -2376,6 +2376,8 @@ class ClientAcceptor:
         try:
             await _cancel_and_drain(tasks)
         finally:
+            # Only now, so a run() that starts mid-drain is still refused.
+            self._started = False
             while self._tcp is not None and not self._tcp.empty():
                 conn, _ = self._tcp.get_nowait()
                 conn.close()
