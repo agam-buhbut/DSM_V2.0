@@ -738,21 +738,41 @@ async def run_server(
 
         def on_client(accepted: AcceptedClient) -> None:
             # Runs inside a handshake worker, after the client got its
-            # bootstrap reply (spec §2.2).
+            # bootstrap reply (spec §2.2). It never raises.
             routing_now = dispatcher
-            transport: UDPTransport | TCPTransport = accepted.transport
-            if routing_now is not None and isinstance(transport, UDPTransport):
-                transport = _SessionUDPView(transport, lambda: routing_now.unmatched)
-            session = ServerSession(
-                number=next(session_numbers),
-                client=accepted.client,
-                tunnel=accepted.tunnel,
-                session_keys=accepted.session_keys,
-                transport=transport,
-                shutdown=asyncio.Event(),
-                tun_queue=asyncio.Queue(SESSION_QUEUE_PACKETS),
-                peer=accepted.peer,
-            )
+            try:
+                transport: UDPTransport | TCPTransport = accepted.transport
+                if routing_now is not None and isinstance(transport, UDPTransport):
+                    transport = _SessionUDPView(
+                        transport, lambda: routing_now.unmatched
+                    )
+                session = ServerSession(
+                    number=next(session_numbers),
+                    client=accepted.client,
+                    tunnel=accepted.tunnel,
+                    session_keys=accepted.session_keys,
+                    transport=transport,
+                    shutdown=asyncio.Event(),
+                    tun_queue=asyncio.Queue(SESSION_QUEUE_PACKETS),
+                    peer=accepted.peer,
+                )
+                if session.tunnel != table.assignment_for(session.client.cn):
+                    # A wiring bug: add() routes by session.tunnel, so this
+                    # client would get another CN's downloads.
+                    raise RuntimeError("the session's tunnel is not its CN's")
+            except Exception:
+                # Never raise into the worker: the client already has its
+                # bootstrap reply. It gets no session; its dead-peer timer
+                # brings it back, and its next attempt must not count as a
+                # takeover of a session that does not exist.
+                log.exception(
+                    "could not start a session for client_cn=%s", accepted.client.cn
+                )
+                table.abandon(accepted.client.cn)
+                if isinstance(accepted.transport, TCPTransport):
+                    accepted.transport.close()  # no session owns it
+                return
+            # Nothing below can raise.
             old = table.add(session)
             if old is not None:
                 old.shutdown.set()  # a takeover: the new one is routed already

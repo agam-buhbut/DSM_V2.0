@@ -381,8 +381,9 @@ class SessionTable:
         leaves the old session running, and that session stays a takeover
         target. The slot then names the client that got no session, so step
         R's lines at the CN's next takeover compare against that client."""
-        if cn not in self._by_cn:
-            self._slots[cn].clear()
+        slot = self._slots.get(cn)
+        if slot is not None and cn not in self._by_cn:
+            slot.clear()
 
     def sessions(self) -> list[ServerSession]:
         """Every live session, one per CN."""

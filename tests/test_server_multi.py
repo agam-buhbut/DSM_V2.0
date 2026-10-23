@@ -46,6 +46,7 @@ from tests.test_server_dns_fatal import (
     _noop_send,
     _server_config,
 )
+from tests.test_tcp_accept_concurrency import _Conn
 
 A = "dsm-a-client"
 B = "dsm-b-client"
@@ -1041,3 +1042,139 @@ async def test_egress_starts_at_the_peer_and_only_a_validated_roam_moves_it(
     else:
         assert seen["dest"]() == PEER_A
         assert table.by_peer(PEER_A) is session and table.by_peer(NEW_PEER) is None
+
+
+async def test_a_failed_session_start_is_logged_and_the_cn_is_not_taken_over(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="dsm")
+    captured: dict[str, Any] = {}
+    sessions = _Sessions()
+    calls = {"n": 0}
+
+    def _flaky(**kwargs: Any) -> ServerSession:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("session bug")
+        return ServerSession(**kwargs)
+
+    with _multi(captured, sessions), patch("dsm.server.ServerSession", _flaky):
+        run = await _start()
+        acceptor = _Acceptor.made[0]
+        acceptor.admit(A, PEER_A)  # must not raise into the worker
+        assert sessions.started == []
+        acceptor.admit(A, PEER_A2)  # the client comes back
+        assert await _spin(lambda: len(sessions.started) == 1)
+        rc = await _stop(run, captured)
+    assert rc == 0
+    errors = _errors(caplog)
+    assert [r.getMessage() for r in errors] == [
+        f"could not start a session for client_cn={A}"
+    ]
+    assert errors[0].exc_info is not None
+    # The second attempt was no takeover: no session existed to replace.
+    assert not any("client reconnected" in r.getMessage() for r in caplog.records)
+
+
+async def test_a_failed_tcp_session_start_closes_its_connection() -> None:
+    captured: dict[str, Any] = {}
+    listener = _Listener()
+    conn = _Conn(PEER_A)
+
+    async def _open(_config: Any) -> _Listener:
+        return listener
+
+    def _broken(**_kwargs: Any) -> ServerSession:
+        raise RuntimeError("session bug")
+
+    with (
+        _multi(captured, _Sessions()),
+        patch("dsm.server._open_tcp_listener", _open),
+        patch("dsm.server.ServerSession", _broken),
+    ):
+        run = await _start(
+            replace(_server_config(), dns_blocklist=False, transport="tcp")
+        )
+        _Acceptor.made[0].admit(A, PEER_A, transport=conn)
+        assert conn.closed  # no session owns it
+        rc = await _stop(run, captured)
+    assert rc == 0
+
+
+async def test_a_session_whose_tunnel_is_not_its_cns_is_not_started(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="dsm")
+    captured: dict[str, Any] = {}
+    sessions = _Sessions()
+    with _multi(captured, sessions):
+        run = await _start()
+        acceptor = _Acceptor.made[0]
+        table = captured["table"]
+        client = VerifiedClient(cn=A, noise_static=A.encode().ljust(32, b"\x00")[:32])
+        attempt = object()
+        table.admit(attempt, client)
+        table.confirm(attempt)
+        acceptor.on_client(
+            AcceptedClient(
+                session_keys=_Keys(),  # type: ignore[arg-type]
+                client=client,
+                tunnel=table.assignment_for(B),  # a wiring bug: B's address
+                transport=acceptor.udp,
+                peer=PEER_A,
+            )
+        )
+        table.release(attempt)
+        assert table.sessions() == []  # nothing routed to B's address
+        acceptor.admit(A, PEER_A2)  # the client comes back
+        assert await _spin(lambda: len(sessions.started) == 1)
+        assert sessions.started[0].tunnel == table.assignment_for(A)
+        rc = await _stop(run, captured)
+    assert rc == 0
+    errors = _errors(caplog)
+    assert [r.getMessage() for r in errors] == [
+        f"could not start a session for client_cn={A}"
+    ]
+    assert not any("client reconnected" in r.getMessage() for r in caplog.records)
+
+
+async def test_a_tcp_session_closes_its_connection_when_it_ends() -> None:
+    table = SessionTable([A])
+    attempt = object()
+    client = VerifiedClient(cn=A, noise_static=b"\x01" * 32)
+    table.admit(attempt, client)
+    _, tunnel = table.confirm(attempt)
+    table.release(attempt)
+    conn = _Conn(PEER_A)
+    session = ServerSession(
+        number=1,
+        client=client,
+        tunnel=tunnel,
+        session_keys=_Keys(),  # type: ignore[arg-type]
+        transport=conn,
+        shutdown=asyncio.Event(),
+        tun_queue=asyncio.Queue(),
+        peer=PEER_A,
+    )
+    table.add(session)
+
+    async def _loops(*_a: Any, **_k: Any) -> None:
+        assert not conn.closed  # open while the session runs
+
+    fsm = SessionFSM()
+    fsm.transition(State.CONNECTING)
+    fsm.transition(State.HANDSHAKING)
+    with (
+        patch("dsm.server.make_send_fn", lambda *_a, **_k: _noop_send),
+        patch("dsm.server.SendScheduler", _FakeScheduler),
+        patch("dsm.session.run_data_loops", _loops),
+    ):
+        await server._run_one_session(
+            replace(_server_config(), transport="tcp"),
+            fsm,
+            _FakeStore(),  # type: ignore[arg-type]
+            session,
+            ClientTun(_FakeTun(), session, server._TUNNEL.network),  # type: ignore[arg-type]
+            lambda addr: table.note_peer(session, addr),
+        )
+    assert conn.closed  # the session's stack closed it

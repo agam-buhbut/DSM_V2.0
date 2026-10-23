@@ -203,3 +203,9 @@ async def test_an_attempt_cut_by_a_stop_logs_no_error(
     # Leaving the harness cancelled the worker: a stop is not a bug.
     assert not run.workers
     assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
+
+
+def test_abandon_of_a_cn_with_no_slot_does_nothing() -> None:
+    table = SessionTable([A_CN])
+    table.abandon(A_CN)  # a CN with a slot but no client
+    table.abandon("dsm-unknown")  # a CN with no slot at all
