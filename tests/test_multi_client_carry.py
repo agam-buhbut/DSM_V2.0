@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -159,3 +160,31 @@ def test_a_session_with_no_udp_view_drops_with_one_error_line(
     assert run.offered == []  # dropped, not offered to the acceptor
     (record,) = [r for r in caplog.records if r.levelno == logging.ERROR]
     assert record.getMessage() == "dropped a UDP packet: session 1 has no UDP view"
+
+
+class _BuggyHs(_Hs):
+    """A handshake whose sign step fails with a RuntimeError, as tuncore's
+    does for a TPM error: no handler of the attempt catches it."""
+
+    async def __call__(self, transport: Any, *_a: Any, **_k: Any) -> Any:
+        self.started.append(("", 0))
+        await transport.recv()
+        raise RuntimeError("tpm sign failed")
+
+
+async def test_a_worker_bug_outside_the_caught_set_is_logged_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.ERROR, logger="dsm")
+    hs = _BuggyHs()
+    async with _Demux(hs, SessionTable([A_CN])) as run:
+        run.feed(_frame(A), A)
+        assert await _spin(lambda: bool(hs.started))
+        assert await _spin(lambda: not run.workers)
+        await _yield()
+        assert run.semaphore._value == run.max_inflight  # the slot came back
+        assert run.limiter.try_start(A[0])  # and the address's share
+    (record,) = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert record.exc_info is not None
+    assert record.exc_info[0] is RuntimeError
+    assert A[0] not in record.getMessage()

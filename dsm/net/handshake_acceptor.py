@@ -1854,6 +1854,20 @@ async def _run_attempt(
         table.release(attempt)
 
 
+def _log_unexpected(done: asyncio.Task[None]) -> None:
+    """Log an attempt's error that none of its handlers caught (a bug, or a
+    TPM error from tuncore), once, with its traceback and no address. Without
+    this the task's exception would never be read."""
+    if done.cancelled():
+        return
+    error = done.exception()
+    if error is not None:
+        log.error(
+            "a handshake attempt failed with an unexpected error",
+            exc_info=(type(error), error, error.__traceback__),
+        )
+
+
 def _penalized(done: asyncio.Task[None], rec: _Attempt) -> bool:
     """Whether an ended attempt costs its address the failed-start penalty
     (spec §3.7 E2): its start proved the address, and no stop cancelled it
@@ -1935,6 +1949,7 @@ async def _demux(
         def _end_attempt(done: asyncio.Task[None], a: tuple[str, int] = src) -> None:
             # The record first, so an error below cannot leave it behind.
             rec = records.pop(done)
+            _log_unexpected(done)
             if rec.passed_on is None:
                 # A pushed-out attempt's slot belongs to the one that took it.
                 semaphore.release()
@@ -2194,6 +2209,7 @@ async def _admit_tcp(
         ) -> None:
             # The record first, so an error below cannot leave it behind.
             rec = records.pop(done)
+            _log_unexpected(done)
             if rec.passed_on is None:
                 # A pushed-out attempt's slot belongs to the one that took it.
                 semaphore.release()
