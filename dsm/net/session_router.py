@@ -13,7 +13,7 @@ import logging
 from collections.abc import Callable
 
 from dsm.core.log import RepeatLog
-from dsm.net.session_slot import SESSION_QUEUE_PACKETS, ServerSession
+from dsm.net.session_slot import SESSION_QUEUE_PACKETS, ServerSession, SessionTable
 from dsm.net.transport.udp import UDPTransport
 from dsm.net.tunnel import TunDevice
 
@@ -171,3 +171,56 @@ class ClientTun(TunDevice):
         """The server's TUN MTU is set once, at start; only the client runs
         the auto-MTU loop."""
         raise NotImplementedError("the server's TUN MTU is set once, at start")
+
+
+class TunRouter:
+    """The one reader of the shared TUN (spec §2.9): each packet goes to the
+    session that owns its inner destination.
+
+    It never waits for a session: a full queue drops the packet, like loss on
+    the link, so one slow client cannot hold up another.
+    """
+
+    def __init__(
+        self,
+        tun: TunDevice,
+        table: SessionTable,
+        network: ipaddress.IPv4Network,
+        server: ipaddress.IPv4Address,
+    ) -> None:
+        self._tun = tun
+        self._table = table
+        self._network = network
+        self._server = server.packed
+        self._not_ipv4_log = RepeatLog(log, logging.DEBUG)
+        self._from_client_log = RepeatLog(log, logging.DEBUG)
+        self._no_client_log = RepeatLog(log, logging.DEBUG)
+        self._full_log = RepeatLog(log, logging.DEBUG)
+
+    async def run(self) -> None:
+        """Route packets until cancelled. An ``OSError`` from the TUN goes up:
+        the server stops."""
+        while True:
+            self._route(await self._tun.read())
+
+    def _route(self, packet: bytes) -> None:
+        if len(packet) < _IPV4_HEADER_LEN or packet[0] >> 4 != 4:
+            self._not_ipv4_log.log("dropped a TUN packet that is not IPv4")
+            return
+        source = packet[12:16]
+        if source != self._server and ipaddress.IPv4Address(source) in self._network:
+            # Only another client could be that source; each session's check
+            # and the nft rule already stop it (spec §3.2). A third layer.
+            self._from_client_log.log(
+                "dropped a TUN packet from a client's tunnel address"
+            )
+            return
+        session = self._table.by_tunnel(packet[16:20])
+        if session is None:
+            self._no_client_log.log("dropped a TUN packet for no client")
+            return
+        try:
+            session.tun_queue.put_nowait(packet)
+        except asyncio.QueueFull:
+            session.tun_drops += 1
+            self._full_log.log("dropped a TUN packet: its session's queue is full")

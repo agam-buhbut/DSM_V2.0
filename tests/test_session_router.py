@@ -13,6 +13,7 @@ import pytest
 from dsm.crypto.handshake import VerifiedClient
 from dsm.net.session_router import (
     ClientTun,
+    TunRouter,
     Verdict,
     _SessionUDPView,
     check_from_client,
@@ -243,3 +244,102 @@ def test_client_tun_cannot_change_the_mtu() -> None:
     session = _live(SessionTable(CNS), "dsm-a-client", 1)
     with pytest.raises(NotImplementedError):
         ClientTun(_SharedTun(), session, NETWORK).set_mtu(1280)
+
+
+class _Tun:
+    """The shared TUN: read() gives the listed packets, then raises OSError,
+    so run() ends without waiting."""
+
+    def __init__(self, packets: list[bytes]) -> None:
+        self._packets = list(packets)
+
+    async def read(self) -> bytes:
+        if not self._packets:
+            raise OSError("no more packets")
+        return self._packets.pop(0)
+
+
+def _drain(queue: asyncio.Queue[bytes]) -> list[bytes]:
+    packets: list[bytes] = []
+    while not queue.empty():
+        packets.append(queue.get_nowait())
+    return packets
+
+
+async def _route_all(table: SessionTable, packets: list[bytes]) -> None:
+    with pytest.raises(OSError, match="no more packets"):
+        await TunRouter(_Tun(packets), table, NETWORK, SERVER).run()
+
+
+async def test_the_router_gives_each_packet_to_its_session() -> None:
+    table = SessionTable(CNS)
+    a = _live(table, "dsm-a-client", 1)
+    b = _live(table, "dsm-b-client", 2)
+    to_a = _ipv4("93.184.216.34", "10.8.0.2")
+    to_b = _ipv4("10.8.0.1", "10.8.0.3")  # from the server itself: DNS
+    await _route_all(table, [to_a, to_b, to_a])
+    assert _drain(a.tun_queue) == [to_a, to_a]
+    assert _drain(b.tun_queue) == [to_b]
+
+
+async def test_the_router_drops_what_no_client_should_get() -> None:
+    table = SessionTable(CNS)
+    a = _live(table, "dsm-a-client", 1)
+    ended = _live(table, "dsm-b-client", 2)
+    assert table.remove(ended)
+    await _route_all(
+        table,
+        [
+            IPV6,
+            b"\x45" * 19,
+            _ipv4("93.184.216.34", "10.8.0.9"),  # an address with no session
+            _ipv4("93.184.216.34", "10.8.0.255"),  # the broadcast address
+            _ipv4("93.184.216.34", "10.8.0.3"),  # its session ended
+            _ipv4("10.8.0.3", "10.8.0.2"),  # from a client's address
+        ],
+    )
+    assert a.tun_queue.empty()
+    assert ended.tun_queue.empty()
+
+
+async def test_each_router_drop_logs_one_debug_line_per_kind(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG, logger="dsm.net.session_router")
+    table = SessionTable(CNS)
+    a = _live(table, "dsm-a-client", 1)
+    to_a = _ipv4("93.184.216.34", "10.8.0.2")
+    for _ in range(SESSION_QUEUE_PACKETS):
+        a.tun_queue.put_nowait(to_a)
+    kinds = [
+        IPV6,
+        _ipv4("10.8.0.3", "10.8.0.2"),  # from a client's address
+        _ipv4("93.184.216.34", "10.8.0.9"),  # no session
+        to_a,  # a's queue is full
+    ]
+    await _route_all(table, [p for p in kinds for _ in range(2)])
+    assert _lines(caplog) == [
+        (logging.DEBUG, "dropped a TUN packet that is not IPv4"),
+        (logging.DEBUG, "dropped a TUN packet from a client's tunnel address"),
+        (logging.DEBUG, "dropped a TUN packet for no client"),
+        (logging.DEBUG, "dropped a TUN packet: its session's queue is full"),
+    ]
+    assert a.tun_drops == 2
+
+
+async def test_a_full_session_queue_drops_counts_and_delays_no_one() -> None:
+    table = SessionTable(CNS)
+    slow = _live(table, "dsm-a-client", 1)
+    other = _live(table, "dsm-b-client", 2)
+    to_slow = _ipv4("93.184.216.34", "10.8.0.2")
+    to_other = _ipv4("93.184.216.34", "10.8.0.3")
+    for _ in range(SESSION_QUEUE_PACKETS):
+        slow.tun_queue.put_nowait(to_slow)
+    await _route_all(table, [to_slow, to_other])
+    assert slow.tun_drops == 1
+    assert slow.tun_queue.qsize() == SESSION_QUEUE_PACKETS
+    assert _drain(other.tun_queue) == [to_other]
+
+
+async def test_a_tun_read_error_goes_up() -> None:
+    await _route_all(SessionTable(CNS), [])
