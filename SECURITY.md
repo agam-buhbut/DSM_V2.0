@@ -122,9 +122,10 @@ closed as known:
   When all slots are busy, a stalled handshake attempt can lose its slot
   to a new one; this is called being pushed out.
 
-  The 30 s penalty has two exceptions, by design. A start whose
-  final handshake message (msg3) does not open costs its address nothing, because a faked packet slipped into a real device's handshake
-  looks the same. And a start pushed out less than 1.29 s after the
+  The 30 s penalty has two exceptions, by design. A start whose final
+  handshake message (msg3) does not open costs its address nothing,
+  because a faked packet slipped into a real device's handshake looks
+  the same. And a start pushed out less than 1.29 s after the
   server's reply left costs nothing, because it was waiting on the
   server's TPM, not stalling. So someone who can send a valid first
   message (the CA certificate and the server's name) and ends every start
@@ -161,7 +162,7 @@ closed as known:
     - open many NAT flows and fill the kernel's connection table, which
       stops new flows for every client;
     - flood the shared socket, which can cost other clients packets there.
-    - It **cannot**:
+  - It **cannot**:
     - hold a second session, or one for another CN;
     - reach another client through the tunnel, or send with another
       client's tunnel address;
