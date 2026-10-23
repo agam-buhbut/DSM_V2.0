@@ -18,8 +18,7 @@ from unittest.mock import patch
 
 import pytest
 
-from dsm.crypto.handshake import HANDSHAKE_FRAME_SIZE
-from dsm.net import handshake_acceptor as hsa
+from dsm.crypto.handshake import HANDSHAKE_FRAME_SIZE, VerifiedClient
 from dsm.net.handshake_acceptor import SessionWatch
 from dsm.net.handshake_gate import (
     BAD_MAC1_LINE,
@@ -33,7 +32,7 @@ from dsm.net.handshake_gate import (
     stamp_msg1,
 )
 from dsm.net.transport.tcp import TCPTransport
-from tests import test_handshake_acceptor_in_session as in_session
+from tests.acceptor_harness import HARNESS_CN, accept_first
 from tests.test_handshake_acceptor_in_session import _Script as _SessionScript
 from tests.test_handshake_acceptor_in_session import _slot
 from tests.test_handshake_acceptor_limits import (
@@ -86,7 +85,8 @@ def _pub(addr: Addr) -> bytes:
 
 
 class _Accept:
-    """_accept_until_winner with a gate, on an in-memory socket."""
+    """The always-on acceptor with a gate, until its first client, on an
+    in-memory socket."""
 
     def __init__(self, script: Any, gate: HandshakeGate) -> None:
         self.transport = _Transport()
@@ -102,7 +102,7 @@ class _Accept:
     async def __aenter__(self) -> _Accept:
         self._patch.start()
         self.task = asyncio.ensure_future(
-            hsa._accept_until_winner(
+            accept_first(
                 _Config(8),
                 _Stub(),
                 _Stub(),
@@ -261,10 +261,14 @@ async def test_a_failed_attempt_turns_cookies_on_for_30_s() -> None:
         assert not gate.load.under_load(0)
 
 
+# A real client's device key is the client_pub server_handshake returns, so
+# this fake's client has the bytes it returns as its key.
+_TCP_CLIENT = VerifiedClient(cn=HARNESS_CN, noise_static=b"pub-tcp")
+
+
 class _TcpScript:
     """Fake server_handshake for TCP: reads the first frame, asks the session
-    check when the accept gives one (as the real one does, with the session
-    holder's CN), then wins."""
+    check as the real one does, then wins."""
 
     def __init__(self) -> None:
         self.frames: list[bytes] = []
@@ -274,7 +278,7 @@ class _TcpScript:
     ) -> tuple[object, bytes]:
         self.frames.append(await conn.recv())
         if admit_client is not None:
-            admit_client(in_session.HOLDER)
+            admit_client(_TCP_CLIENT)
         return object(), b"pub-tcp"
 
 
@@ -283,7 +287,7 @@ async def _tcp_accept(gate: HandshakeGate, conns: list[_Conn]) -> tuple[Any, Any
     for conn in conns:
         connections.put_nowait((conn, conn.peer))
     return await asyncio.wait_for(
-        hsa._accept_until_winner_tcp(
+        accept_first(
             _Config(8),
             _Stub(),
             _Stub(),
@@ -349,7 +353,7 @@ async def test_a_refused_tcp_start_is_trouble(
     shutdown = asyncio.Event()
     with patch("dsm.crypto.handshake.server_handshake", new=_TcpScript()):
         task = asyncio.ensure_future(
-            hsa._accept_until_winner_tcp(
+            accept_first(
                 _Config(max_inflight),
                 _Stub(),
                 _Stub(),

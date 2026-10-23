@@ -1,6 +1,7 @@
-"""Concurrent TCP accept (_accept_until_winner_tcp): connections are checked
-side by side under the UDP acceptor's pool, per-address limits and attempt
-deadline, and every connection but the winner is closed.
+"""The always-on acceptor over TCP: connections are checked side by side
+under the UDP acceptor's pool, per-address limits and attempt deadline;
+every connection that passes becomes a session and every failed one is
+closed.
 
 Connections are in-memory TCPTransport stand-ins fed straight into the
 acceptor's queue (no sockets). The handshake is a scripted fake, except in
@@ -23,7 +24,9 @@ import pytest
 from dsm.crypto.handshake import HandshakeError
 from dsm.net import handshake_acceptor as hsa
 from dsm.net.handshake_gate import SourceLimiter
+from dsm.net.session_slot import SessionTable
 from dsm.net.transport.tcp import FramingError, TCPTransport
+from tests.acceptor_harness import HARNESS_CN, accept_first, fakes_admitted
 
 Addr = tuple[str, int]
 _WINNER: Addr = ("198.51.100.7", 40000)
@@ -113,7 +116,8 @@ def _minutes() -> Callable[[], float]:
 
 
 class _Run:
-    """Run _accept_until_winner_tcp on an in-memory connection queue."""
+    """Run the always-on acceptor until its first client, on an in-memory
+    connection queue."""
 
     def __init__(
         self,
@@ -141,7 +145,7 @@ class _Run:
         return conn
 
     async def __aenter__(self) -> _Run:
-        accept = hsa._accept_until_winner_tcp  # AttributeError until this task lands
+        accept = accept_first
         if self._patch is not None:
             self._patch.start()
         self.task = asyncio.ensure_future(
@@ -274,65 +278,65 @@ async def test_shutdown_closes_every_connection_and_leaves_no_task() -> None:
     assert asyncio.all_tasks() - before == set()
 
 
-async def test_losers_are_closed_and_give_their_address_back() -> None:
-    """Review Focus 2: cancelled losers give their address back to the
-    run's limiter, which the next accept cycle shares."""
-    ip = "203.0.113.60"
+async def test_every_connection_that_passes_becomes_a_session() -> None:
+    """Two connections both pass (the same CN, so the second takes over):
+    each is handed on and stays open (spec §2.7: no winner, no losers). After
+    the stop the addresses' shares are back for the run's limiter."""
+    a: Addr = ("203.0.113.60", 1)
+    b: Addr = ("203.0.113.61", 1)
     limiter = SourceLimiter(clock=_minutes())
-    script = _Script({(ip, 1): "stall", (ip, 2): "stall"})
+    connections: asyncio.Queue[tuple[TCPTransport, Addr]] = asyncio.Queue()
+    clients: list[hsa.AcceptedClient] = []
+    ca, cb = _Conn(a), _Conn(b)
+    with (
+        patch("dsm.crypto.handshake.server_handshake", new=_Script({})),
+        fakes_admitted(),
+    ):
+        acceptor = hsa.ClientAcceptor(
+            _Config(),
+            _Stub(),
+            _Stub(),
+            _Stub(),
+            _Stub(),
+            limiter,
+            SessionTable([HARNESS_CN]),
+            None,
+            clients.append,
+            tcp=connections,
+        )
+        run = asyncio.ensure_future(acceptor.run())
+        connections.put_nowait((ca, a))
+        connections.put_nowait((cb, b))
+        assert await _spin(lambda: len(clients) == 2)
+        await acceptor.stop()
+        await run
+    assert [c.transport for c in clients] == [ca, cb]
+    assert not ca.closed and not cb.closed
+    for ip, _port in (a, b):  # each address may run its two again
+        assert limiter.try_start(ip)
+        assert limiter.try_start(ip)
+
+
+async def test_a_failed_connection_is_closed_and_gives_its_address_back() -> None:
+    """A connection whose attempt fails is closed as the attempt ends, and
+    its address's share comes back; the attempts beside it go on."""
+    ip = "203.0.113.65"
+    limiter = SourceLimiter(clock=_minutes())
+    script = _Script({(ip, 1): "fail", (ip, 2): "stall"})
     async with _Run(script, limiter=limiter) as run:
-        l1, l2 = run.connect((ip, 1)), run.connect((ip, 2))
-        assert await _spin(lambda: len(script.started) == 2)
+        failed, stalled = run.connect((ip, 1)), run.connect((ip, 2))
+        assert await _spin(lambda: failed.closed)
+        assert not stalled.closed
+        assert limiter.try_start(ip)  # the failed one's share came back
+        limiter.finish(ip)
         w = run.connect(_WINNER)
         _, _, transport = await run.result()
     assert transport is w and not w.closed
-    assert l1.closed and l2.closed
-    later = _Script({(ip, 3): "stall", (ip, 4): "stall"})
-    async with _Run(later, limiter=limiter) as run2:
-        run2.connect((ip, 3))
-        run2.connect((ip, 4))
-        assert await _spin(lambda: len(later.started) == 2)
-
-
-async def test_every_loser_is_closed_when_the_accept_returns() -> None:
-    """The accept is awaited inline (as _accept_one_session does), so the
-    losers must be closed by the time it returns, not a loop pass later."""
-    losers: list[Addr] = [("203.0.113.65", 1), ("203.0.113.66", 1)]
-    script = _Script({p: "stall" for p in losers})
-    connections: asyncio.Queue[tuple[TCPTransport, Addr]] = asyncio.Queue()
-    conns = [_Conn(p) for p in losers]
-    for conn in conns:
-        connections.put_nowait((conn, conn.peer))
-
-    async def _then_the_winner() -> None:
-        assert await _spin(lambda: len(script.started) == 2)
-        connections.put_nowait((_Conn(_WINNER), _WINNER))
-
-    feeder = asyncio.ensure_future(_then_the_winner())
-    # asyncio.timeout, not wait_for: on 3.11 wait_for runs the accept in a
-    # task of its own, so it would no longer be awaited inline.
-    async with asyncio.timeout(5.0):
-        with patch("dsm.crypto.handshake.server_handshake", new=script):
-            _, _, transport = await hsa._accept_until_winner_tcp(
-                _Config(),
-                _Stub(),
-                _Stub(),
-                _Stub(),
-                _Stub(),
-                connections,
-                asyncio.Event(),
-                SourceLimiter(),
-            )
-            # No await between the return and this check.
-            still_open = [c.peer for c in conns if not c.closed]
-        await feeder
-    assert isinstance(transport, _Conn) and transport.peer == _WINNER
-    assert still_open == []
 
 
 async def test_a_worker_cancelled_before_it_runs_gives_everything_back() -> None:
-    """Review Focus 2: a worker whose body never ran (a loser can be
-    cancelled right after it was made) still frees its slot and its address,
+    """Review Focus 2: a worker whose body never ran (an attempt can be
+    stopped or pushed out right after it was made) still frees its slot and its address,
     and its connection is closed. The limiter lives for the whole run, so a
     leak here would lock the address out until restart."""
     ip = "203.0.113.90"
@@ -342,20 +346,20 @@ async def test_a_worker_cancelled_before_it_runs_gives_everything_back() -> None
     workers: set[asyncio.Task[None]] = set()
     open_conns: dict[Addr, TCPTransport] = {}
     connections: asyncio.Queue[tuple[TCPTransport, Addr]] = asyncio.Queue()
-    winner: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
     script = _Script({peer: "stall"})
     conn = _Conn(peer)
     connections.put_nowait((conn, peer))
     with patch("dsm.crypto.handshake.server_handshake", new=script):
         admit = asyncio.ensure_future(
-            hsa._tcp_admit_loop(
+            hsa._admit_tcp(
                 _Config(1),
                 _Stub(),
                 _Stub(),
                 _Stub(),
                 _Stub(),
                 connections,
-                winner,
+                lambda _accepted: None,
+                SessionTable([HARNESS_CN]),
                 workers,
                 semaphore,
                 open_conns,

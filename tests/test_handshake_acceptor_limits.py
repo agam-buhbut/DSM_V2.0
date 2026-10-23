@@ -19,7 +19,9 @@ from unittest.mock import patch
 from dsm.crypto.handshake import HANDSHAKE_FRAME_SIZE, HandshakeError
 from dsm.net import handshake_acceptor as hsa
 from dsm.net.handshake_gate import SourceLimiter
+from dsm.net.session_slot import SessionTable
 from dsm.net.transport.udp import UDPTransport
+from tests.acceptor_harness import HARNESS_CN, accept_first
 
 Addr = tuple[str, int]
 _WINNER: Addr = ("198.51.100.7", 51820)
@@ -120,7 +122,8 @@ class _Frozen:
 
 
 class _Run:
-    """Run _accept_until_winner on a _Transport with a scripted handshake."""
+    """Run the always-on acceptor until its first client, on a _Transport with a
+    scripted handshake."""
 
     def __init__(
         self,
@@ -140,7 +143,7 @@ class _Run:
         extra: dict[str, Any] = (
             {} if self._limiter is None else {"limiter": self._limiter}
         )
-        coro = hsa._accept_until_winner(
+        coro = accept_first(
             _Config(self._max_inflight),
             _Stub(),
             _Stub(),
@@ -255,8 +258,8 @@ async def test_every_way_an_attempt_ends_gives_its_address_back() -> None:
         run.transport.feed(loser_2)
         assert await _spin(lambda: len(script.started) == 4)
         run.transport.feed(_WINNER)
-        await run.result()  # the two stalls are cancelled as losers
-    # The next accept cycle shares the limiter, as in run_server.
+        await run.result()  # the two stalls are cancelled when it stops
+    # A restarted acceptor shares the limiter, as in run_server.
     later = _Script({(ip, 5): "stall", (ip, 6): "stall"})
     async with _Run(later, limiter=limiter) as run2:
         run2.transport.feed((ip, 5))
@@ -285,8 +288,8 @@ async def test_the_overall_budget_limits_new_attempts() -> None:
 class _CancelsNewWorkers(_Transport):
     """Each time the demux reads, cancel every worker it has made since the
     last read. This runs inside the demux's own step, so each worker is
-    cancelled before its first step, as a loser can be when the losers are
-    cancelled right after it was made."""
+    cancelled before its first step, as an attempt can be when it is stopped or
+    pushed out right after it was made."""
 
     def __init__(self, workers: set[asyncio.Task[None]]) -> None:
         super().__init__()
@@ -313,20 +316,19 @@ async def test_a_worker_cancelled_before_it_runs_gives_its_address_back() -> Non
     workers: set[asyncio.Task[None]] = set()
     inboxes: dict[Addr, asyncio.Queue[bytes]] = {}
     transport = _CancelsNewWorkers(workers)
-    winner: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
     script = _Script({})
     transport.feed((ip, 1))
     with patch("dsm.crypto.handshake.server_handshake", new=script):
         demux = asyncio.ensure_future(
-            hsa._demux_loop(
+            hsa._demux(
                 _Config(1),
                 _Stub(),
                 _Stub(),
                 _Stub(),
                 _Stub(),
                 transport,
-                winner,
-                asyncio.Event(),
+                lambda _accepted: None,
+                SessionTable([HARNESS_CN]),
                 workers,
                 semaphore,
                 inboxes,

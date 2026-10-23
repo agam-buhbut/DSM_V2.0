@@ -27,7 +27,6 @@ from dsm.crypto.handshake import (
     client_handshake,
     server_handshake,
 )
-from dsm.net import handshake_acceptor as hsa
 from dsm.net.handshake_gate import (
     GateKeys,
     HandshakeGate,
@@ -36,6 +35,7 @@ from dsm.net.handshake_gate import (
     open_cookie_reply,
 )
 from dsm.net.transport.udp import UDPTransport
+from tests.acceptor_harness import accept_first
 from tests.cert_helpers import (
     SERVER_AUTH_OID,
     EnrolledDevice,
@@ -165,7 +165,7 @@ async def test_the_client_answers_a_cookie_reply_and_connects() -> None:
     client_t, addr = await _pair(server_t)
     shutdown = asyncio.Event()
     accept = asyncio.ensure_future(
-        hsa._accept_until_winner(
+        accept_first(
             _Config(8),
             server,
             server,

@@ -1,12 +1,13 @@
 """The real client over TCP through the gated TCP accept (wire v2).
 
-Loopback sockets, the ``TCPListener``, ``_accept_until_winner_tcp`` with a
-``HandshakeGate`` made from the test CA and the server's name,
-``server_handshake`` and ``client_handshake`` are real; only the config, key
-store and certificate holders are small stand-ins (the bad-mac1 test also
-wraps ``server_handshake`` and ``build_attest_payload`` as tripwires). The
-other TCP gate tests script the handshake (test_handshake_gate_acceptor.py)
-or bypass the acceptor (test_handshake_admit_hook.py).
+Loopback sockets, the ``TCPListener``, the always-on acceptor (through
+``tests/acceptor_harness.py``) with a ``HandshakeGate`` made from the test CA
+and the server's name, ``server_handshake`` and ``client_handshake`` are real;
+only the config, key store and certificate holders are small stand-ins (the
+bad-mac1 test also wraps ``server_handshake`` and ``build_attest_payload`` as
+tripwires). The other TCP gate tests script the handshake
+(test_handshake_gate_acceptor.py) or bypass the acceptor
+(test_handshake_admit_hook.py).
 
 TCP asks for no cookies, so these tests need no new tuncore calls (no
 XChaCha) and also run against an older tuncore build. Nothing waits on the
@@ -30,7 +31,6 @@ import pytest
 from dsm.crypto import handshake
 from dsm.crypto.cert_allowlist import CNAllowlist
 from dsm.crypto.handshake import HANDSHAKE_FRAME_SIZE, client_handshake
-from dsm.net import handshake_acceptor as hsa
 from dsm.net._addresses import SINGLE_CLIENT_TUNNEL
 from dsm.net.handshake_gate import (
     GateKeys,
@@ -40,6 +40,7 @@ from dsm.net.handshake_gate import (
     stamp_msg1,
 )
 from dsm.net.transport.tcp import TCPListener, TCPTransport
+from tests.acceptor_harness import accept_first
 from tests.test_handshake_admit_hook import CLIENT_CN, SERVER_CN, _Parties
 from tests.test_tcp_accept_concurrency import _Config
 
@@ -74,7 +75,7 @@ async def _gated_tcp_server(
     port = await listener.start("127.0.0.1", 0)
     shutdown = asyncio.Event()
     accept = asyncio.ensure_future(
-        hsa._accept_until_winner_tcp(
+        accept_first(
             _Config(8),
             keystore,
             attest_store,
