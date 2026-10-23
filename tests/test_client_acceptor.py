@@ -1312,3 +1312,45 @@ async def test_a_cancel_of_the_task_awaiting_stop_goes_through() -> None:
         assert stopper.cancelled()
         await run
     assert asyncio.all_tasks() - before == set()
+
+
+def test_the_intake_holds_256_frames() -> None:
+    assert hsa._INTAKE_FRAMES == 256
+
+
+async def test_the_drain_waits_for_every_task_before_it_raises() -> None:
+    """A worker that fails must not cut the drain short. A cancelled worker
+    may still wait for its signing thread, and the server zeroizes the
+    attest key once the acceptor has stopped."""
+    release = asyncio.Event()
+    finished: list[str] = []
+
+    async def _failing() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            raise RuntimeError("a bug in a worker") from None
+
+    async def _slow() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await release.wait()  # as a cancelled worker waits for its thread
+            finished.append("slow")
+            raise
+
+    failing = asyncio.ensure_future(_failing())
+    slow = asyncio.ensure_future(_slow())
+    await _yield()
+    # A list, so the failing worker comes first, whatever the set order.
+    drain = asyncio.ensure_future(hsa._cancel_and_drain([failing, slow]))  # type: ignore[arg-type]
+    try:
+        await _yield()
+        assert not drain.done(), "the drain must wait for the slow worker"
+        release.set()
+        with pytest.raises(RuntimeError, match="a bug in a worker"):
+            await asyncio.wait_for(drain, 5.0)
+        assert finished == ["slow"]
+    finally:
+        release.set()
+        await asyncio.wait({failing, slow, drain})

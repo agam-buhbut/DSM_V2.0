@@ -214,11 +214,11 @@ _MAX_INBOXES = 4096
 # Shutdown/winner check cadence (s), matching the data loop's recv cadence.
 _ACCEPT_DEMUX_POLL = 0.1
 
-# Packets the live session cannot use (did not open, or opened but too far
-# behind the newest), waiting for the in-session accept. Every handshake
-# frame is 1400 bytes, so about 90 KB. When it is full a packet is dropped,
-# like loss on the link.
-_INTAKE_FRAMES = 64
+# Frames no session fits, waiting for the acceptor (spec §2.7). Every new
+# handshake passes here, for the whole run: room for every client's msg1
+# after a restart, plus junk. Every handshake frame is 1400 bytes, so about
+# 360 KB when full. When it is full a frame is dropped, like loss on the link.
+_INTAKE_FRAMES = 256
 
 # Step S (spec §4): stalled attempts must not hold the handshake slots.
 
