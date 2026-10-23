@@ -1,5 +1,7 @@
 """DSM VPN server mode."""
 
+# pylint: disable=too-many-lines  # until Task 8 drops the one-client loop
+
 from __future__ import annotations
 
 import asyncio
@@ -8,6 +10,7 @@ import logging
 import os
 from collections.abc import Awaitable, Callable
 from contextlib import AsyncExitStack
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -23,7 +26,7 @@ from dsm.crypto.auth_loader import (
 )
 from dsm.crypto.cert_allowlist import CNAllowlist, CNAllowlistError
 from dsm.crypto.keystore import KeyStore
-from dsm.net._addresses import SERVER_TUN_IP
+from dsm.net._addresses import SERVER_TUN_IP, TUN_PREFIX_LEN
 from dsm.net.dns import DNSResolver
 from dsm.net.dns_blocklist import DnsBlocklist
 from dsm.net.dns_proxy import DNSProxyPortInUseError, LocalDNSProxy
@@ -55,7 +58,7 @@ from dsm.net.handshake_gate import (
     server_gate_keys,
 )
 from dsm.net.nftables import ServerRateLimitManager, TcpTimestampsDisabler
-from dsm.net.session_slot import SessionSlot
+from dsm.net.session_slot import SessionSlot, SessionTable
 from dsm.net.transport.tcp import TCPListener, TCPTransport
 from dsm.net.transport.udp import UDPTransport
 from dsm.net.tunnel import TunDevice
@@ -140,6 +143,87 @@ async def _open_tcp_listener(config: Config) -> TCPListener:
             f"cannot listen on TCP port {config.listen_port}: {reason}"
         ) from e
     return listener
+
+
+@dataclass(frozen=True)
+class _Host:
+    """The host state sessions use: the shared TUN (for the router and each
+    session's ClientTun) and the DNS proxy (for ``forget``)."""
+
+    tun: TunDevice
+    dns_proxy: LocalDNSProxy
+
+
+async def _set_up_host(  # pyright: ignore[reportUnusedFunction]  # not called yet
+    config: Config,
+    stack: AsyncExitStack,
+    blocklist: DnsBlocklist | None,
+    table: SessionTable,
+) -> _Host:
+    """Build the host state every client shares, once, at start: the TUN,
+    forwarding, the NAT table with client isolation and a flow tag per CN,
+    and the DNS proxy with a cache per client (multi-client spec §2.2). Each
+    teardown goes on ``stack`` right after its setup, so a failure half way
+    unwinds what was built, and the run's end unwinds it all in reverse.
+
+    Raises:
+        RuntimeError: the TUN could not be opened or configured, or the NAT
+            table did not load (the server then stops).
+        DNSProxyPortInUseError: something else holds 10.8.0.1:53.
+        OSError: the DNS proxy could not bind for another reason.
+    """
+    # The TUN first, so it goes last: forwarding and the NAT rules name it.
+    # Its close also restores the host's IPv6 if configure stopped half way.
+    tun = TunDevice(config.tun_name)
+    tun.open()
+    stack.callback(tun.close)
+    tun.configure(local_ip=SERVER_TUN_IP, mtu=config.mtu, server_mode=True)
+    clients = table.addresses()
+    log.info(
+        "tunnel %s/%d up; addresses for %d clients",
+        SERVER_TUN_IP,
+        TUN_PREFIX_LEN,
+        len(clients),
+    )
+
+    # IPv4 forwarding and MASQUERADE, so client traffic reaches the internet
+    # and its replies come back.
+    ip_forward = IPForwardingManager(tun_name=config.tun_name)
+    ip_forward.apply()
+    stack.callback(ip_forward.remove)
+
+    masquerade = MasqueradeManager(tun_name=config.tun_name, clients=clients)
+    masquerade.apply()
+    if not masquerade.applied:
+        # Fail closed: without the table the kernel neither NATs nor keeps
+        # clients apart, and no flow carries a tag. apply() logged why, and a
+        # failed load leaves nothing to remove.
+        raise RuntimeError(
+            "the NAT table (MASQUERADE, client isolation, flow tags) did not load"
+        )
+    stack.callback(masquerade.remove)
+
+    def _resolver() -> DNSResolver:
+        return DNSResolver(
+            providers=config.dns_providers,
+            provider_pins=config.dns_provider_pins,
+            debug_dns=config.debug_dns,
+        )
+
+    # One proxy on the TUN address for every client, each client with its
+    # own resolver (its own cache); the first resolver answers the server's
+    # own queries.
+    dns_proxy = LocalDNSProxy(
+        _resolver(),
+        bind_ip=SERVER_TUN_IP,
+        bind_port=53,
+        debug_dns=config.debug_dns,
+        blocklist=blocklist,
+        per_client=_resolver,
+    )
+    await dns_proxy.start()
+    stack.callback(dns_proxy.stop)  # sync
+    return _Host(tun=tun, dns_proxy=dns_proxy)
 
 
 async def _accept_one_session(
