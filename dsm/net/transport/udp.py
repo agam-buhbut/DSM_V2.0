@@ -15,11 +15,20 @@ log = logging.getLogger(__name__)
 
 # Maximum UDP payload (Ethernet MTU - IP header - UDP header)
 MAX_DATAGRAM = 1472
-# Bounded recv queue. Sized for low-RAM targets: 256 * ~1500B ≈ 384 KiB
-# worst-case. Overflow drops at the kernel→protocol boundary, never at
-# the user-packet boundary, so anonymity is unchanged (attacker cannot
-# distinguish a drop from loss on the link).
+# Bounded recv queue of a client's socket (and of each server session's view,
+# dsm.net.session_slot.SESSION_QUEUE_PACKETS). Sized for low-RAM targets:
+# 256 * ~1500B ≈ 384 KiB worst-case. Overflow drops at the kernel→protocol
+# boundary, never at the user-packet boundary, so anonymity is unchanged
+# (attacker cannot distinguish a drop from loss on the link). The server's
+# own socket asks for more (``recv_queue_size``).
 RECV_QUEUE_SIZE = 256
+# Kernel socket buffer asked per queued packet when a bigger queue is asked
+# for (the server's socket): the kernel counts a full-size datagram as about
+# 2-4 KB and doubles the asked size for its own bookkeeping, so its buffer
+# then holds about as many packets as the queue.
+_KERNEL_BYTES_PER_PACKET = 2048
+# Not exported by Python's socket module (Linux <asm-generic/socket.h>).
+_SO_RCVBUFFORCE = getattr(socket, "SO_RCVBUFFORCE", 33)
 # How long the old socket stays open after a rebind. The server keeps sending
 # to the old port until the new one passes its address check (a
 # PATH_CHALLENGE / PATH_RESPONSE round trip, tried at most once a second), so
@@ -37,10 +46,11 @@ _IP_MTU = getattr(socket, "IP_MTU", 14)
 class UDPTransport:
     """Non-blocking UDP send/receive."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, recv_queue_size: int = RECV_QUEUE_SIZE) -> None:
         self._transport: asyncio.DatagramTransport | None = None
+        self._recv_queue_size = recv_queue_size
         self._recv_queue: asyncio.Queue[tuple[bytes, tuple[str, int]]] = asyncio.Queue(
-            maxsize=RECV_QUEUE_SIZE,
+            maxsize=recv_queue_size,
         )
         self._closed = False
         # True if bind() enabled kernel PMTUD (IP_PMTUDISC_DO). Consulted
@@ -87,6 +97,10 @@ class UDPTransport:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setblocking(False)
         try:
+            if self._recv_queue_size > RECV_QUEUE_SIZE:
+                _ask_kernel_buffer(
+                    sock, self._recv_queue_size * _KERNEL_BYTES_PER_PACKET
+                )
             sock.bind((local_addr, local_port))
             transport, _ = await loop.create_datagram_endpoint(
                 lambda: protocol,
@@ -261,6 +275,23 @@ class UDPTransport:
     async def aclose(self) -> None:
         """Async close (UDP has no pending writes, delegates to sync close)."""
         self.close()
+
+
+def _ask_kernel_buffer(sock: socket.socket, size: int) -> None:
+    """Ask the kernel for a ``size``-byte receive buffer on ``sock``.
+
+    SO_RCVBUFFORCE passes ``net.core.rmem_max`` and needs CAP_NET_ADMIN,
+    which the server has; without it, SO_RCVBUF, which the kernel caps at
+    rmem_max. One WARNING when the kernel keeps less.
+    """
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, _SO_RCVBUFFORCE, size)
+    except OSError:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, size)
+    # Linux reports twice what it keeps (the extra is its bookkeeping).
+    got = sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF) // 2
+    if got < size:
+        log.warning("asked for a %d-byte receive buffer, the kernel gave %d", size, got)
 
 
 class _UDPProtocol(asyncio.DatagramProtocol):
