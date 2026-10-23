@@ -106,8 +106,9 @@ if TYPE_CHECKING:
     from dsm.crypto.attest_store import AttestStore
     from dsm.crypto.auth_loader import CertAuthMaterials
     from dsm.crypto.cert_allowlist import CNAllowlist
+    from dsm.crypto.handshake import VerifiedClient
     from dsm.crypto.keystore import KeyStore
-    from dsm.net.session_slot import SessionSlot
+    from dsm.net.session_slot import SessionSlot, SessionTable
 
 log = logging.getLogger(__name__)
 
@@ -424,6 +425,14 @@ class _PerPeerUDPView(UDPTransport):
         if on_msg2 is not None:
             on_msg2()
 
+    def hand_over(self) -> tuple[UDPTransport, tuple[bytes, ...]]:
+        """The run's socket and the frames still in this peer's inbox, oldest
+        first: what a passing client's new session takes over (spec §2.7)."""
+        held: list[bytes] = []
+        while not self._inbox.empty():
+            held.append(self._inbox.get_nowait())
+        return self._real, tuple(held)
+
 
 async def _run_handshake_worker(
     config: Config,
@@ -474,7 +483,6 @@ async def _run_handshake_worker(
         ClientRefusedError,
         CNNotAllowedError,
         HandshakeError,
-        VerifiedClient,
         server_handshake,
     )
 
@@ -1630,3 +1638,204 @@ class SessionWatch:
             self._held = []  # a second call puts nothing back again
             _reinject_frames(self._real, self._winner_addr, frames)
         return win
+
+
+# --- The always-on acceptor (multi-client, spec §2.7) -----------------------
+# Until dsm.server moves to ClientAcceptor (multi-client step 9), the
+# one-client accept above stays as it was; that step deletes it.
+
+
+@dataclass(frozen=True)
+class AcceptedClient:
+    """A client that passed the full handshake and the session table's
+    checks: what its session is made from (spec §2.2)."""
+
+    # Out of repr: it holds the session's keys.
+    session_keys: tuncore.SessionKeyManager = field(repr=False)
+    client: VerifiedClient
+    tunnel: TunnelAssignment
+    # UDP: the run's socket. TCP: the client's own connection.
+    transport: UDPTransport | TCPTransport
+    # The handshake address: where the session first sends (spec §2.10).
+    peer: tuple[str, int]
+    # UDP frames still in the client's inbox when it passed (spec §2.7).
+    held: tuple[bytes, ...] = ()
+
+
+async def _run_attempt(  # pyright: ignore[reportUnusedFunction]  # _demux uses it next
+    config: Config,
+    keystore: KeyStore,
+    attest_store: AttestStore,
+    materials: CertAuthMaterials,
+    cn_allowlist: CNAllowlist,
+    transport: UDPTransport | TCPTransport,
+    peer_addr: tuple[str, int],
+    on_client: Callable[[AcceptedClient], None],
+    *,
+    who: str,
+    table: SessionTable,
+    gate: HandshakeGate | None = None,
+    limiter: SourceLimiter | None = None,
+    record: _Attempt | None = None,
+) -> None:
+    """Run one handshake attempt under the per-attempt deadline.
+
+    ``transport`` is a :class:`_PerPeerUDPView` or one accepted TCP
+    connection. The hook is ``table.admit``, with this task as the
+    attempt's mark: it picks the client's tunnel address and may refuse the
+    client before the last frame. A client that passes is confirmed in
+    ``table``, its address noted as known in ``limiter`` (the run's), and
+    handed to ``on_client`` with the frames still in its inbox, all with no
+    ``await`` in between (spec §2.7). ``who`` names the peer in log lines:
+    its address for UDP, a fixed label for TCP. A connection error ends
+    only this attempt.
+
+    With ``gate`` (wire v2), a TCP connection's first frame must come within
+    ``_TCP_FIRST_FRAME_DEADLINE`` and be 1400 bytes with a valid mac1 before
+    anything else happens, and every failure counts as trouble. Only then
+    does ``limiter`` charge the shared start limits; once any CN has
+    connected in this run they include the newcomer limit (spec §3.7 E1).
+
+    ``record`` is the attempt's record: over TCP it is marked as signing
+    once the first frame passed, until msg2 has left (UDP's view does that
+    for UDP), and it loses its ``proved`` bit when the shared limits refuse
+    the first frame, which is not the address's doing (spec §3.7 E2).
+    """
+    from cryptography.x509.oid import ExtendedKeyUsageOID
+
+    from dsm.crypto.handshake import (
+        CertAuthError,
+        CertRevokedError,
+        ClientRefusedError,
+        CNNotAllowedError,
+        HandshakeError,
+        server_handshake,
+    )
+
+    attempt: object = asyncio.current_task() or object()
+
+    def _admit(client: VerifiedClient) -> TunnelAssignment:
+        return table.admit(attempt, client)
+
+    conn = transport  # TCP: the connection the session keeps
+    try:
+        try:
+            # Not wait_for: on Python 3.11 it runs the handshake as a second
+            # task and can stop waiting for it when a second cancel lands,
+            # while its signature still runs in a thread. Here the handshake
+            # runs in this task, so its own wait for that thread holds.
+            async with asyncio.timeout(_HANDSHAKE_ATTEMPT_DEADLINE):
+                if gate is not None and isinstance(transport, TCPTransport):
+                    # TCP gets no cookies (its own handshake proved the
+                    # address), but its first frame needs a valid mac1 before
+                    # anything is signed, and it must come soon (spec §4.2).
+                    # A wrong size or a bad mac1 is scanner noise, not
+                    # trouble. No first frame in time, a spent shared limit,
+                    # or a read that resets or breaks framing (the except
+                    # branches below) is trouble.
+                    try:
+                        async with asyncio.timeout(_TCP_FIRST_FRAME_DEADLINE):
+                            first = await transport.recv()
+                    except TimeoutError:
+                        _note_trouble(gate)
+                        _tcp_first_frame_log.log(
+                            "TCP handshake start dropped: no first frame in time"
+                        )
+                        return
+                    if len(first) != HANDSHAKE_FRAME_SIZE or not gate.mac1_ok(first):
+                        log.debug("TCP handshake start dropped: wrong size or bad mac1")
+                        return
+                    # Only now the shared start limits: a silent connection or
+                    # a bad first frame spends none of them (spec §4.2).
+                    if limiter is not None and not limiter.try_shared(
+                        peer_addr[0], in_session=table.ever_confirmed
+                    ):
+                        _note_trouble(gate)
+                        if record is not None:
+                            record.proved = False
+                        return
+                    if record is not None:
+                        # Entering the msg2 signing path: no push-out until
+                        # msg2 has left, any wait for the TPM included.
+                        record.signing = True
+                    transport = _FirstFrameTCP(
+                        transport,
+                        first,
+                        on_msg2=None if record is None else record.msg2_sent,
+                    )
+                session_keys, _client_pub = await server_handshake(
+                    transport,
+                    keystore.identity,
+                    attest_key=attest_store.attest_key,
+                    cert_der=materials.cert_der,
+                    ca_root=materials.ca_root,
+                    cn_allowlist=cn_allowlist,
+                    crl=materials.crl,
+                    required_client_eku=ExtendedKeyUsageOID.CLIENT_AUTH,
+                    rotation_packets=config.rotation_packets,
+                    rotation_seconds=config.rotation_seconds,
+                    admit_client=_admit,
+                )
+        except TimeoutError:
+            _note_trouble(gate)
+            log.info(
+                "handshake attempt from %s exceeded %.0fs deadline — slot reclaimed",
+                who,
+                _HANDSHAKE_ATTEMPT_DEADLINE,
+            )
+            return
+        except ClientRefusedError as e:
+            _note_trouble(gate)
+            # The table logged why, rate-limited and without an address; one
+            # line per attempt here would repeat it.
+            log.debug("handshake refused by the session rules: %s", e)
+            _emit_handshake_failure(e)
+            return
+        except (
+            CNNotAllowedError,
+            CertRevokedError,
+            CertAuthError,
+            HandshakeError,
+        ) as e:
+            _note_trouble(gate)
+            # Same opaque INFO/WARNING logging as before; detail at DEBUG.
+            if isinstance(e, (CNNotAllowedError, CertRevokedError, CertAuthError)):
+                log.warning("handshake rejected (cert auth) from %s", who)
+            else:
+                log.info("handshake failed from %s", who)
+            log.debug("handshake failure detail (%s): %s", who, e)
+            _emit_handshake_failure(e)
+            return
+        except (FramingError, OSError) as e:
+            _note_trouble(gate)
+            # A bad length prefix, a reset or an early close on this connection.
+            log.info("handshake transport error (%s)", type(e).__name__)
+            # Never str(e): asyncio's OSError text can carry addresses. The class
+            # name and the OS error text are enough.
+            detail = type(e).__name__
+            if isinstance(e, OSError) and e.errno:
+                detail = f"{detail}: {os.strerror(e.errno)}"
+            log.debug("handshake transport error detail: %s", detail)
+            return
+
+        # From here to on_client nothing awaits: the session is in the table
+        # before the client's first data packet can arrive (spec §2.7).
+        if not table.is_admitted(attempt):
+            # server_handshake returned without asking the table: a bug.
+            # Fail closed rather than let an unchecked client in.
+            log.error("a handshake ended without the session check; dropped it")
+            return
+        client, tunnel = table.confirm(attempt)
+        if limiter is not None:
+            limiter.note_known(peer_addr[0], client.cn)
+        if isinstance(conn, _PerPeerUDPView):
+            run_socket, held = conn.hand_over()
+            on_client(
+                AcceptedClient(
+                    session_keys, client, tunnel, run_socket, peer_addr, held
+                )
+            )
+        else:
+            on_client(AcceptedClient(session_keys, client, tunnel, conn, peer_addr))
+    finally:
+        table.release(attempt)
