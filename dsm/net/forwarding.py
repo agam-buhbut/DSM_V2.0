@@ -1,4 +1,4 @@
-"""Server-only IPv4 forwarding + NAT/MASQUERADE setup.
+"""Server-only IPv4 forwarding, NAT and client isolation.
 
 The server's data path is:
     client encrypted UDP -> server transport -> decrypt
@@ -9,20 +9,25 @@ The server's data path is:
 
 Both pieces are off by default on Linux:
   * ``net.ipv4.ip_forward`` defaults to 0 (no forwarding).
-  * Without MASQUERADE, replies are addressed to the client's TUN IP
-    (today always 10.8.0.2/24: one client) which is not routable on the
+  * Without MASQUERADE, replies are addressed to the client's TUN IP (each
+    client's own address in 10.8.0.0/24), which is not routable on the
     public internet.
 
-This module owns enabling those two for the duration of the server
-session, and reverting on teardown.
+The NAT table also stops clients reaching each other through the TUN and
+tags each client's flows (multi-client spec §3.2, §3.3). This module owns
+all of it for the server's run, and reverts it on teardown.
 """
 
 from __future__ import annotations
 
+import hashlib
+import ipaddress
 import logging
+from collections.abc import Mapping
 
 from dsm.core._validators import validate_tun_name
 from dsm.core.sysctl import SysctlOverride
+from dsm.net._addresses import SERVER_TUN_IP, TUN_PREFIX_LEN
 from dsm.net.nftables import apply_ruleset, delete_tables
 
 log = logging.getLogger(__name__)
@@ -80,34 +85,88 @@ class IPForwardingManager:
         self._sysctl.restore_all()
 
 
-class MasqueradeManager:
-    """Install a single inet/nat MASQUERADE rule so server-routed traffic
-    leaves under the server's public IP.
+# The clients' tunnel network: a packet from it must come in on the TUN.
+_CLIENTS_NET = ipaddress.IPv4Interface(f"{SERVER_TUN_IP}/{TUN_PREFIX_LEN}").network
 
-    Uses its own nftables table (``dsm_server_nat``) so it cleans up
-    independently of the rate-limiter or kill-switch tables.
+
+def _flow_tag(cn: str) -> int:
+    """The conntrack mark on ``cn``'s flows (multi-client spec §3.3): the
+    first 4 bytes of SHA-256(CN), lowest bit set, so it is never 0, the mark
+    of every flow nobody tagged."""
+    return int.from_bytes(hashlib.sha256(cn.encode()).digest()[:4], "big") | 1
+
+
+class MasqueradeManager:
+    """Install the server's NAT table, ``dsm_server_nat``, in one atomic load:
+
+    * MASQUERADE, so client traffic leaves under the server's public IP;
+    * a forward chain that drops anything the kernel would forward from the
+      TUN back into it, so clients cannot reach each other (spec §3.2);
+    * per client, a flow tag: each new flow a client opens gets its CN's
+      conntrack mark, and a forwarded packet to a client's address whose
+      flow lacks that mark is dropped, so late replies to a former holder of
+      the address never reach its new one (spec §3.3);
+    * a prerouting drop of any packet with a tunnel source that did not come
+      in on the TUN (roadmap 1.4), and a forward drop of packets into the
+      TUN that belong to no flow (invalid or untracked), which the flow tags
+      cannot see.
+
+    Uses its own nftables table so it cleans up independently of the
+    rate-limiter or kill-switch tables.
     """
 
     TABLE = "dsm_server_nat"
 
-    def __init__(self, tun_name: str) -> None:
+    def __init__(
+        self, tun_name: str, *, clients: Mapping[str, str] | None = None
+    ) -> None:
         validate_tun_name(tun_name)
         self._tun_name = tun_name
+        # Tunnel address -> CN. The addresses go into the ruleset, so each
+        # must be a plain IPv4 address (ValueError otherwise).
+        self._clients = {
+            str(ipaddress.IPv4Address(address)): cn
+            for address, cn in (clients or {}).items()
+        }
         self._applied = False
 
+    @property
+    def applied(self) -> bool:
+        """Whether the table is loaded: True after an ``apply()`` that worked,
+        until ``remove()``. ``apply()`` logs a failure and never raises, so
+        the server reads this to stop when the load failed."""
+        return self._applied
+
     def apply(self) -> None:
-        # NAT runs on packets coming OUT of the box. The packet's input
-        # interface is the TUN (where decrypted client traffic is
-        # written); its output interface is whatever the kernel routes it
-        # to (eth0/wlan0/etc.). We MASQUERADE everything that arrived via
-        # the TUN — that gives us a clean SNAT to whichever WAN interface
-        # the kernel picks.
-        ruleset = f"""
+        tun = self._tun_name
+        tags = "".join(
+            f'        iifname "{tun}" ct state new ip saddr {address} '
+            f"ct mark set {_flow_tag(cn):#010x}\n"
+            f'        oifname "{tun}" ip daddr {address} '
+            f"ct mark != {_flow_tag(cn):#010x} counter drop\n"
+            for address, cn in sorted(self._clients.items())
+        )
+        # NAT runs on packets coming OUT of the box: everything that arrived
+        # via the TUN and leaves elsewhere is SNATed to whichever WAN
+        # interface the kernel picks. "add table" then "delete table" empties
+        # a table a crashed run left behind, in the same atomic load: its old
+        # flow tags would drop the replies of an address's new holder.
+        ruleset = f"""add table inet {self.TABLE}
+delete table inet {self.TABLE}
 table inet {self.TABLE} {{
+    chain prerouting {{
+        type filter hook prerouting priority -150; policy accept;
+        iifname != "{tun}" iifname != "lo" ip saddr {_CLIENTS_NET} counter drop
+    }}
     chain postrouting {{
         type nat hook postrouting priority 100; policy accept;
-        iifname "{self._tun_name}" oifname != "{self._tun_name}" masquerade
+        iifname "{tun}" oifname != "{tun}" masquerade
     }}
+    chain forward {{
+        type filter hook forward priority 0; policy accept;
+        iifname "{tun}" oifname "{tun}" counter drop
+        oifname "{tun}" ct state invalid,untracked counter drop
+{tags}    }}
 }}
 """
         try:
