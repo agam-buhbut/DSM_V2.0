@@ -151,12 +151,11 @@ class SessionSlot:
             self._admitted = None
 
     def clear(self) -> None:
-        """The session ended with no client waiting to take it over.
+        """The session ended with no newer one for this client.
 
-        Runs only after the accept drained every attempt, so an attempt still
-        marked here is a bug; it is forgotten too, or every later handshake
-        would be refused until a restart. Should it end later, it cannot
-        win: it is no longer marked, so :meth:`confirm` raises for it.
+        An attempt still marked keeps its mark. With several clients the
+        acceptor runs all the time, so this CN's next attempt may be past the
+        check right now, and it must still be able to win (multi-client spec
+        §2.4). It ends through :meth:`confirm` or :meth:`release` as usual.
         """
         self._holder = None
-        self._admitted = None

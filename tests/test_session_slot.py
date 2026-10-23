@@ -1,5 +1,6 @@
-"""SessionSlot: who holds the server's one session and who may take it over
-while a session runs. A fake clock; no event loop and no sockets."""
+"""SessionSlot: who holds a session and who may take it over while it runs
+(step R; one slot per CN under multi-client, spec §2.4). A fake clock; no
+event loop and no sockets."""
 
 from __future__ import annotations
 
@@ -235,19 +236,22 @@ def test_the_same_device_key_logs_no_warning(
     assert _lines(caplog) == []
 
 
-def test_clear_also_forgets_an_attempt_still_marked() -> None:
-    """clear() runs only after the accept drained every attempt, so one still
-    marked is a bug. It must not refuse every later handshake until the
-    server restarts; the straggler cannot win."""
+def test_clear_keeps_an_attempt_still_marked() -> None:
+    """A CN's session can end while that CN's next attempt is past the check:
+    the acceptor runs all the time (spec §2.4). clear() keeps that attempt's
+    mark, so it can still win, and it is still the only one past the check."""
     slot = SessionSlot(clock=_Clock())
-    straggler = object()
-    slot.admit(straggler, A, session_live=False)
-    slot.clear()
-    assert slot.admitted is None
+    _hold(slot, A)
+    back = object()
+    slot.admit(back, A, session_live=True)
+    slot.clear()  # A's old session ended by itself
     assert slot.holder is None
-    slot.admit(object(), B, session_live=False)  # the next accept is open
-    with pytest.raises(RuntimeError):
-        slot.confirm(straggler)
+    assert slot.admitted is back
+    with pytest.raises(ClientRefusedError):
+        slot.admit(object(), A, session_live=False)
+    slot.confirm(back)
+    assert slot.holder == A
+    assert slot.admitted is None
 
 
 def test_release_after_confirm_changes_nothing() -> None:
