@@ -254,9 +254,7 @@ async def _run_acceptor(
             return
 
 
-def _drive_fsm_to_idle(  # pyright: ignore[reportUnusedFunction]  # _serve_client's error path will call it
-    fsm: SessionFSM,
-) -> None:
+def _drive_fsm_to_idle(fsm: SessionFSM) -> None:
     """Return a session's FSM to IDLE from wherever a failed session left it,
     so its closing FSM lines are logged. Any active state can reach
     TEARDOWN, and TEARDOWN -> IDLE; best-effort, never raises."""
@@ -487,6 +485,16 @@ async def _serve_client(
             session,
             ClientTun(host.tun, session, _TUNNEL.network),
         )
+    except Exception:
+        # A bug in the session's setup or teardown (the data loops contain
+        # their own errors, TUN writes too): it ends this session only. Its
+        # client comes back after its dead-peer timer.
+        log.exception(
+            "session %d failed (client_cn=%s); other clients are not affected",
+            session.number,
+            session.client.cn,
+        )
+        _drive_fsm_to_idle(fsm)
     finally:
         table.remove(session)
         log.info("session %d ended (client_cn=%s)", session.number, session.client.cn)

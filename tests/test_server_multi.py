@@ -420,6 +420,8 @@ class _Sessions:
         # The tun each session got, in the order of ``started``.
         self.tuns: list[Any] = []
         self.end_at_once: set[str] = set()
+        self.fail: set[str] = set()
+        self.fsms: list[SessionFSM] = []
 
     async def __call__(
         self,
@@ -431,10 +433,13 @@ class _Sessions:
     ) -> None:
         fsm.transition(State.ESTABLISHED)
         self.started.append(session)
+        self.fsms.append(fsm)
         self.tuns.append(tun)
         cn = session.client.cn
         self.events.append(f"{cn} started")
         try:
+            if cn in self.fail:
+                raise RuntimeError("session bug")
             if cn not in self.end_at_once:
                 await session.shutdown.wait()
         finally:
@@ -879,3 +884,34 @@ async def test_a_nat_table_that_does_not_load_exits_1_before_any_client(
     assert _Acceptor.made == []
     assert parts.proxy_args == {}
     assert parts.events[-2:] == ["forwarding off", "tun close"]
+
+
+async def test_a_session_crash_ends_only_that_session(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.ERROR, logger="dsm")
+    captured: dict[str, Any] = {}
+    sessions = _Sessions()
+    sessions.fail.add(A)
+    with _multi(captured, sessions):
+        run = await _start()
+        acceptor = _Acceptor.made[0]
+        acceptor.admit(A, PEER_A)
+        acceptor.admit(B, PEER_B)
+        assert await _spin(
+            lambda: len(sessions.started) == 2 and f"{A} ended" in sessions.events
+        )
+        a, b = sessions.started
+        assert captured["table"].sessions() == [b]
+        assert sessions.fsms[0].state is State.IDLE  # its closing FSM lines ran
+        assert not b.shutdown.is_set()
+        sessions.fail.clear()
+        acceptor.admit(A, PEER_A2)  # the client comes back: served again
+        assert await _spin(lambda: len(sessions.started) == 3)
+        rc = await _stop(run, captured)
+    assert rc == 0
+    (error,) = _errors(caplog)
+    assert error.getMessage() == (
+        f"session 1 failed (client_cn={A}); other clients are not affected"
+    )
+    assert error.exc_info is not None
