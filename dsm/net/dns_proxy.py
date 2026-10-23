@@ -11,11 +11,18 @@ instead of a timeout).
 
 Names on the server's DNS blocklist (dsm.net.dns_blocklist) get NXDOMAIN for
 every query type, answered here without asking upstream.
+
+On the server one proxy serves every client (multi-client spec §2.11). In
+its per-client mode each client address gets its own resolver (so its own
+cache), its own in-flight table and its own caps, so no client learns
+another's names, answers or their timing, and no client can use up the
+shared limits. The server's own queries use the shared resolver.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import errno
 import ipaddress
 import logging
@@ -33,6 +40,7 @@ import dns.rdatatype
 import dns.rrset
 
 import dsm.net.dns as _dns
+from dsm.core.log import RepeatLog
 from dsm.net._addresses import TUN_PREFIX_LEN
 from dsm.net.dns import DNSResolver, DnsResult
 from dsm.net.dns_blocklist import NEGATIVE_TTL_S, DnsBlocklist
@@ -56,13 +64,16 @@ class DNSProxyPortInUseError(OSError):
 @dataclass(eq=False)
 class _Client:
     """One client's own DNS state in per-client mode (multi-client spec
-    §2.11): its resolver, so its cache, and its in-flight table, so no client
-    learns from another's answers or their timing."""
+    §2.11): its resolver, so its cache; its in-flight table, so no client
+    learns from another's answers or their timing; and its own caps, so no
+    client can use up the shared ones."""
 
     resolver: DNSResolver
+    upstream: asyncio.Semaphore
     inflight: dict[tuple[str, int], asyncio.Future[DnsResult]] = field(
         default_factory=dict[tuple[str, int], asyncio.Future[DnsResult]]
     )
+    tasks: set[asyncio.Task[None]] = field(default_factory=set[asyncio.Task[None]])
 
 
 class LocalDNSProxy:
@@ -99,6 +110,13 @@ class LocalDNSProxy:
     # are issued. Drop-on-overflow with SERVFAIL is the right policy — the
     # cap is far above legitimate load.
     _MAX_TASKS = 8192
+    # Per client, in per-client mode (multi-client spec §2.11): queries
+    # waiting for an answer, and upstream lookups at once. A browser start-up
+    # asks 50-100 names together, so real use never meets the first; the
+    # second is an eighth of _MAX_CONCURRENT_QUERIES. The shared caps above
+    # stay as a backstop.
+    _MAX_TASKS_PER_CLIENT = 256
+    _MAX_UPSTREAM_PER_CLIENT = 32
 
     def __init__(
         self,
@@ -119,6 +137,11 @@ class LocalDNSProxy:
         # Per-client mode: each client's own state, by its tunnel address.
         # The /24 source filter below bounds it to the clients' addresses.
         self._clients: dict[str, _Client] = {}
+        # No address in the line: it would name the client.
+        self._client_full_log = RepeatLog(log, logging.WARNING)
+        # Distinct queries in flight across every client: _MAX_INFLIGHT caps
+        # the total (spec §2.11 keeps the shared caps as a backstop).
+        self._inflight_total = 0
         self._transport: asyncio.DatagramTransport | None = None
         self._tasks: set[asyncio.Task[None]] = set()
         self._sem = asyncio.Semaphore(self._MAX_CONCURRENT_QUERIES)
@@ -183,9 +206,7 @@ class LocalDNSProxy:
     def stop(self) -> None:
         if self._transport is not None:
             # abort(), not close(): close() keeps the socket open until a
-            # waiting reply is sent, and after a session takeover the next
-            # session binds this address one loop step later (a clash there
-            # stops the server). A dropped reply is like loss: the client
+            # waiting reply is sent. A dropped reply is like loss: the client
             # asks again.
             self._transport.abort()
             self._transport = None
@@ -206,13 +227,16 @@ class LocalDNSProxy:
             return None
         client = self._clients.get(ip)
         if client is None:
-            client = _Client(self._per_client())
+            client = _Client(
+                self._per_client(), asyncio.Semaphore(self._MAX_UPSTREAM_PER_CLIENT)
+            )
             self._clients[ip] = client
         return client
 
-    def _schedule(self, coro: Any) -> None:
+    def _schedule(self, coro: Any, client: _Client | None = None) -> None:
         """Schedule a query-handling coroutine, dropping it when the task
-        set is saturated.
+        set is saturated, or when ``client`` (per-client mode) already has
+        ``_MAX_TASKS_PER_CLIENT`` queries waiting.
 
         The dropped UDP query is not answered — by the nature of UDP the
         client retries, and once the proxy catches up the next retry
@@ -233,9 +257,19 @@ class LocalDNSProxy:
                 self._tasks_shed_last_log = now
                 self._tasks_shed = 0
             return
+        if client is not None and len(client.tasks) >= self._MAX_TASKS_PER_CLIENT:
+            coro.close()
+            self._client_full_log.log(
+                "DNS queries dropped: one client already has %d waiting",
+                self._MAX_TASKS_PER_CLIENT,
+            )
+            return
         task = asyncio.create_task(coro)
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
+        if client is not None:
+            client.tasks.add(task)
+            task.add_done_callback(client.tasks.discard)
 
     def _source_allowed(self, addr: tuple[str, int]) -> bool:
         try:
@@ -354,18 +388,22 @@ class LocalDNSProxy:
             except Exception:  # noqa: BLE001
                 return DnsResult(addresses=[], ttl=0, rcode=-1, authoritative=False)
 
-        if len(inflight) >= self._MAX_INFLIGHT:
+        if self._inflight_total >= self._MAX_INFLIGHT:
             log.debug(
                 "inflight map full (%d entries), SERVFAIL for %s",
-                len(inflight),
+                self._inflight_total,
                 _dns.redact(qname, self._debug_dns),
             )
             return DnsResult(addresses=[], ttl=0, rcode=-1, authoritative=False)
 
         inflight_future = asyncio.get_running_loop().create_future()
         inflight[query_key] = inflight_future
+        self._inflight_total += 1
         try:
-            async with self._sem:
+            # The client's own cap first, so a client that waits on it holds
+            # no shared slot.
+            own_cap = contextlib.nullcontext() if client is None else client.upstream
+            async with own_cap, self._sem:
                 try:
                     result = await self._resolve_upstream(qname, client)
                     inflight_future.set_result(result)
@@ -391,6 +429,7 @@ class LocalDNSProxy:
                     return servfail
         finally:
             del inflight[query_key]
+            self._inflight_total -= 1
 
     @staticmethod
     def _build_response(
@@ -475,7 +514,8 @@ class _ProxyProtocol(asyncio.DatagramProtocol):
         def _send(wire: bytes, to: tuple[str, int]) -> None:
             transport.sendto(wire, to)
 
-        self._proxy._schedule(self._proxy._handle_query(data, addr, _send, client))  # type: ignore[arg-type]  # pylint: disable=protected-access  # intentional sibling-internal access
+        proxy = self._proxy
+        proxy._schedule(proxy._handle_query(data, addr, _send, client), client)  # type: ignore[arg-type]  # pylint: disable=protected-access  # intentional sibling-internal access
 
     def error_received(self, exc: Exception) -> None:  # pragma: no cover
         log.warning("DNS proxy socket error: %s", type(exc).__name__)

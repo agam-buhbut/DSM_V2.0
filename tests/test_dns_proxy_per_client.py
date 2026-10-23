@@ -8,10 +8,12 @@ resolvers are in-memory fakes. Nothing touches the network.
 from __future__ import annotations
 
 import asyncio
+import logging
 
 import dns.message
 import dns.rcode
 import dns.rdatatype
+import pytest
 
 from dsm.net.dns import DnsResult
 from dsm.net.dns_proxy import LocalDNSProxy, _ProxyProtocol
@@ -146,3 +148,79 @@ async def test_without_per_client_every_client_shares_one_resolver() -> None:
     assert run.shared.calls == ["example.com"]  # B got A's cached answer
     assert run.made == []
     assert run.answered() == [A, B]
+
+
+async def test_a_client_over_its_waiting_cap_is_dropped_while_another_is_served(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING, logger="dsm.net.dns_proxy")
+    hold = asyncio.Event()
+    run = _Proxy(hold=hold)
+    cap = LocalDNSProxy._MAX_TASKS_PER_CLIENT
+    for i in range(cap + 1):
+        run.ask(f"n{i}.example", A)
+    run.ask("b.example", B)
+    assert len(run.proxy._clients["10.8.0.2"].tasks) == cap
+    assert len(run.proxy._tasks) == cap + 1  # B was not turned away
+    assert [r.getMessage() for r in caplog.records] == [
+        f"DNS queries dropped: one client already has {cap} waiting"
+    ]
+    hold.set()
+    await run.settle()
+    assert run.answered().count(A) == cap
+    assert run.answered().count(B) == 1
+
+
+async def test_a_clients_upstream_lookups_over_its_cap_wait_their_turn() -> None:
+    hold = asyncio.Event()
+    run = _Proxy(hold=hold)
+    cap = LocalDNSProxy._MAX_UPSTREAM_PER_CLIENT
+    for i in range(cap + 1):
+        run.ask(f"n{i}.example", A)
+    run.ask("b.example", B)
+    await _yield()
+    a_resolver, b_resolver = run.made
+    assert len(a_resolver.calls) == cap  # the last one waits for A's own cap
+    assert b_resolver.calls == ["b.example"]  # B does not wait behind A
+    hold.set()
+    await run.settle()
+    assert len(a_resolver.calls) == cap + 1
+
+
+def test_the_per_client_caps() -> None:
+    assert LocalDNSProxy._MAX_TASKS_PER_CLIENT == 256
+    assert LocalDNSProxy._MAX_UPSTREAM_PER_CLIENT == 32
+
+
+async def test_a_client_waiting_on_its_own_cap_holds_no_shared_slot() -> None:
+    shared_cap = LocalDNSProxy._MAX_CONCURRENT_QUERIES
+    assert LocalDNSProxy._MAX_TASKS_PER_CLIENT >= shared_cap  # A can fill it
+    hold = asyncio.Event()
+    run = _Proxy(hold=hold)
+    for i in range(shared_cap):
+        run.ask(f"n{i}.example", A)
+    run.ask("b.example", B)
+    await _yield()
+    a_resolver, b_resolver = run.made
+    assert len(a_resolver.calls) == LocalDNSProxy._MAX_UPSTREAM_PER_CLIENT
+    assert b_resolver.calls == ["b.example"]  # A's waiting lookups hold no slot
+    hold.set()
+    await run.settle()
+    assert len(a_resolver.calls) == shared_cap
+
+
+async def test_the_shared_inflight_cap_counts_every_clients_queries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(LocalDNSProxy, "_MAX_INFLIGHT", 2)
+    hold = asyncio.Event()
+    run = _Proxy(hold=hold)
+    run.ask("a.example", A)
+    run.ask("b.example", B)
+    run.ask("c.example", A)  # a third distinct name: over the shared cap
+    await _yield()
+    ((wire, to),) = run.transport.sent  # answered at once
+    assert to == A
+    assert dns.message.from_wire(wire).rcode() == dns.rcode.SERVFAIL
+    hold.set()
+    await run.settle()
