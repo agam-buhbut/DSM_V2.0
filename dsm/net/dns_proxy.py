@@ -21,6 +21,7 @@ import ipaddress
 import logging
 import time
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from typing import Any
 
 import dns.exception
@@ -52,6 +53,18 @@ class DNSProxyPortInUseError(OSError):
     """The DNS-proxy bind address is already held by another process."""
 
 
+@dataclass(eq=False)
+class _Client:
+    """One client's own DNS state in per-client mode (multi-client spec
+    §2.11): its resolver, so its cache, and its in-flight table, so no client
+    learns from another's answers or their timing."""
+
+    resolver: DNSResolver
+    inflight: dict[tuple[str, int], asyncio.Future[DnsResult]] = field(
+        default_factory=dict[tuple[str, int], asyncio.Future[DnsResult]]
+    )
+
+
 class LocalDNSProxy:
     """UDP DNS listener that resolves via the pinned DoH/DoT client.
 
@@ -61,6 +74,11 @@ class LocalDNSProxy:
 
     ``blocklist``, when given (server with ``dns_blocklist = true``), answers
     blocked names with NXDOMAIN before anything else.
+
+    ``per_client``, when given (the server), makes a fresh resolver for each
+    client source address: each client then has its own cache and its own
+    in-flight table. The positional ``resolver`` answers only the server's
+    own address.
     """
 
     # Bound task semaphore prevents unbounded growth on DoS.
@@ -89,12 +107,18 @@ class LocalDNSProxy:
         bind_port: int = 53,
         debug_dns: bool = False,
         blocklist: DnsBlocklist | None = None,
+        *,
+        per_client: Callable[[], DNSResolver] | None = None,
     ) -> None:
         self._resolver = resolver
         self._bind_ip = bind_ip
         self._bind_port = bind_port
         self._debug_dns = debug_dns
         self._blocklist = blocklist
+        self._per_client = per_client
+        # Per-client mode: each client's own state, by its tunnel address.
+        # The /24 source filter below bounds it to the clients' addresses.
+        self._clients: dict[str, _Client] = {}
         self._transport: asyncio.DatagramTransport | None = None
         self._tasks: set[asyncio.Task[None]] = set()
         self._sem = asyncio.Semaphore(self._MAX_CONCURRENT_QUERIES)
@@ -168,6 +192,23 @@ class LocalDNSProxy:
         for task in list(self._tasks):
             task.cancel()
         self._tasks.clear()
+
+    def forget(self, client_ip: str) -> None:
+        """Drop a client's resolver and in-flight table (per-client mode).
+        The server calls it when a client's last session ends. Queries still
+        waiting finish on the dropped state."""
+        self._clients.pop(client_ip, None)
+
+    def _client_for(self, ip: str) -> _Client | None:
+        """The client's own state in per-client mode; None for the server's
+        own address and when the mode is off (the shared resolver answers)."""
+        if self._per_client is None or ip == self._bind_ip:
+            return None
+        client = self._clients.get(ip)
+        if client is None:
+            client = _Client(self._per_client())
+            self._clients[ip] = client
+        return client
 
     def _schedule(self, coro: Any) -> None:
         """Schedule a query-handling coroutine, dropping it when the task
@@ -278,26 +319,34 @@ class LocalDNSProxy:
 
         return query, qname, qtype
 
-    async def _resolve_upstream(self, qname: str) -> DnsResult:
-        return await self._resolver.resolve_detailed(qname)
+    async def _resolve_upstream(
+        self, qname: str, client: _Client | None = None
+    ) -> DnsResult:
+        resolver = self._resolver if client is None else client.resolver
+        return await resolver.resolve_detailed(qname)
 
     async def _resolve_with_dedup(
         self,
         qname: str,
         qtype: int,
+        client: _Client | None = None,
     ) -> DnsResult:
         """Resolve ``qname`` for A records, coalescing concurrent duplicates.
 
         The first caller for a (qname, qtype) holds a semaphore slot while
         calling upstream; later callers await the shared future slot-free,
         so the semaphore actually bounds upstream fan-out (not total
-        duplicates waiting).
+        duplicates waiting). With ``client`` (per-client mode) it coalesces
+        only that client's duplicates and asks that client's resolver.
 
         Returns a non-authoritative empty ``DnsResult`` (signals SERVFAIL to
         the caller) on inflight-map saturation or on resolver failure.
         """
+        # One client's duplicates only: a fast answer must not tell a client
+        # that another one is asking for the same name right now.
+        inflight = self._inflight if client is None else client.inflight
         query_key = (qname, qtype)
-        inflight_future = self._inflight.get(query_key)
+        inflight_future = inflight.get(query_key)
         if inflight_future is not None:
             try:
                 return await inflight_future
@@ -305,20 +354,20 @@ class LocalDNSProxy:
             except Exception:  # noqa: BLE001
                 return DnsResult(addresses=[], ttl=0, rcode=-1, authoritative=False)
 
-        if len(self._inflight) >= self._MAX_INFLIGHT:
+        if len(inflight) >= self._MAX_INFLIGHT:
             log.debug(
                 "inflight map full (%d entries), SERVFAIL for %s",
-                len(self._inflight),
+                len(inflight),
                 _dns.redact(qname, self._debug_dns),
             )
             return DnsResult(addresses=[], ttl=0, rcode=-1, authoritative=False)
 
         inflight_future = asyncio.get_running_loop().create_future()
-        self._inflight[query_key] = inflight_future
+        inflight[query_key] = inflight_future
         try:
             async with self._sem:
                 try:
-                    result = await self._resolve_upstream(qname)
+                    result = await self._resolve_upstream(qname, client)
                     inflight_future.set_result(result)
                     return result
                 # any resolver failure maps to SERVFAIL
@@ -341,7 +390,7 @@ class LocalDNSProxy:
                     inflight_future.set_result(servfail)
                     return servfail
         finally:
-            del self._inflight[query_key]
+            del inflight[query_key]
 
     @staticmethod
     def _build_response(
@@ -371,19 +420,21 @@ class LocalDNSProxy:
         data: bytes,
         addr: tuple[str, int],
         send: Callable[[bytes, tuple[str, int]], None],
+        client: _Client | None = None,
     ) -> None:
         """Orchestrate parse → dedup-resolve → respond for one DNS datagram.
 
         Parsing and trivial-response paths run
         outside the semaphore — the semaphore exists to bound concurrent
-        upstream resolver calls, not cheap wire parsing.
+        upstream resolver calls, not cheap wire parsing. ``client``: the
+        sender's own state in per-client mode.
         """
         parsed = self._parse_or_reject(data, addr, send)
         if parsed is None:
             return
         query, qname, qtype = parsed
 
-        result = await self._resolve_with_dedup(qname, qtype)
+        result = await self._resolve_with_dedup(qname, qtype, client)
 
         try:
             if result.addresses:
@@ -418,12 +469,13 @@ class _ProxyProtocol(asyncio.DatagramProtocol):
         if not self._proxy._source_allowed(addr):  # pylint: disable=protected-access  # pyright: ignore[reportPrivateUsage]  # intentional sibling-internal access  # fmt: skip
             self._proxy._note_dropped_source(addr)  # pylint: disable=protected-access  # pyright: ignore[reportPrivateUsage]  # intentional sibling-internal access  # fmt: skip
             return
+        client = self._proxy._client_for(addr[0])  # pylint: disable=protected-access  # pyright: ignore[reportPrivateUsage]  # intentional sibling-internal access  # fmt: skip
         transport = self._transport
 
         def _send(wire: bytes, to: tuple[str, int]) -> None:
             transport.sendto(wire, to)
 
-        self._proxy._schedule(self._proxy._handle_query(data, addr, _send))  # type: ignore[arg-type]  # pylint: disable=protected-access  # intentional sibling-internal access
+        self._proxy._schedule(self._proxy._handle_query(data, addr, _send, client))  # type: ignore[arg-type]  # pylint: disable=protected-access  # intentional sibling-internal access
 
     def error_received(self, exc: Exception) -> None:  # pragma: no cover
         log.warning("DNS proxy socket error: %s", type(exc).__name__)
