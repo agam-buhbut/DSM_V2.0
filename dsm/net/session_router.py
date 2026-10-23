@@ -9,10 +9,15 @@ from __future__ import annotations
 import asyncio
 import enum
 import ipaddress
+import logging
 from collections.abc import Callable
 
-from dsm.net.session_slot import SESSION_QUEUE_PACKETS
+from dsm.core.log import RepeatLog
+from dsm.net.session_slot import SESSION_QUEUE_PACKETS, ServerSession
 from dsm.net.transport.udp import UDPTransport
+from dsm.net.tunnel import TunDevice
+
+log = logging.getLogger(__name__)
 
 # The shortest IPv4 header.
 _IPV4_HEADER_LEN = 20
@@ -104,3 +109,65 @@ class _SessionUDPView(UDPTransport):  # pyright: ignore[reportUnusedClass]
 
     async def aclose(self) -> None:
         """Nothing: the run owns the socket."""
+
+
+class ClientTun(TunDevice):
+    """One session's side of the shared TUN (spec §2.9).
+
+    :meth:`read` takes the packets the router queued for this session.
+    :meth:`awrite` checks every packet the session opened with
+    :func:`check_from_client` and writes only allowed ones to the shared TUN;
+    every DATA payload and every reassembled FRAGMENT passes here.
+
+    Subclasses ``TunDevice`` so ``DataPathContext.tun`` keeps its type and
+    ``dsm/session.py`` does not change; ``__init__`` skips the base
+    initializer. Write errors are the shared TUN's: ``EAGAIN`` drops the
+    packet there, and any other ``OSError`` goes up and ends this session.
+    """
+
+    def __init__(  # pylint: disable=super-init-not-called
+        self, tun: TunDevice, session: ServerSession, network: ipaddress.IPv4Network
+    ) -> None:
+        self._tun = tun
+        self._session = session
+        self._network = network
+        self._own = session.tunnel.client.packed
+        self._server = session.tunnel.server.packed
+        # Per session, at most one line per 10 s each: the CN, never an
+        # address.
+        self._wrong_source_log = RepeatLog(log, logging.WARNING)
+        self._other_client_log = RepeatLog(log, logging.INFO)
+        self._not_ipv4_log = RepeatLog(log, logging.DEBUG)
+
+    async def read(self) -> bytes:
+        return await self._session.tun_queue.get()
+
+    async def awrite(self, data: bytes) -> int:
+        """Write ``data`` to the shared TUN if this client may send it; 0 when
+        it is dropped."""
+        verdict = check_from_client(data, self._own, self._server, self._network)
+        if verdict is Verdict.OK:
+            return await self._tun.awrite(data)
+        cn = self._session.client.cn
+        if verdict is Verdict.WRONG_SOURCE:
+            self._wrong_source_log.log(
+                "dropped a packet from client_cn=%s whose source is not its "
+                "tunnel address",
+                cn,
+            )
+        elif verdict is Verdict.TO_ANOTHER_CLIENT:
+            self._other_client_log.log(
+                "dropped a packet from client_cn=%s to another client "
+                "(client-to-client traffic is blocked)",
+                cn,
+            )
+        else:
+            self._not_ipv4_log.log(
+                "dropped a packet from client_cn=%s that is not IPv4", cn
+            )
+        return 0
+
+    def set_mtu(self, mtu: int) -> None:
+        """The server's TUN MTU is set once, at start; only the client runs
+        the auto-MTU loop."""
+        raise NotImplementedError("the server's TUN MTU is set once, at start")
