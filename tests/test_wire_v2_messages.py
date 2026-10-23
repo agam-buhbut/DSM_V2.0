@@ -5,6 +5,7 @@ start on both ends. Laptop: yes (old wheel + shim).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import random
 from dataclasses import replace
@@ -16,10 +17,9 @@ import pytest
 from dsm.crypto import handshake
 from dsm.crypto.handshake import HandshakeError, client_handshake
 from dsm.net.transport.udp import UDPTransport
-from dsm.server import run_server
 from tests.cert_helpers import make_enrolled_device, make_test_ca
 from tests.test_client_fail_closed import _Run
-from tests.test_server_dns_fatal import _base_patches, _server_config
+from tests.test_server_dns_fatal import _base_patches, _run_until, _server_config
 
 Addr = tuple[str, int]
 SERVER: Addr = ("192.0.2.1", 51820)
@@ -50,14 +50,13 @@ class _Answering(UDPTransport):
 
 
 class _Listener:
-    """A TCP listener that only needs to close."""
+    """A TCP listener: an empty connection queue, and a close."""
+
+    def __init__(self) -> None:
+        self.connections: asyncio.Queue[Any] = asyncio.Queue()
 
     def close(self) -> None:
         pass
-
-
-async def _never(*_a: Any, **_k: Any) -> tuple[Any, Any, Any]:
-    raise AssertionError("this accept must not run")
 
 
 async def _attempt(sock: UDPTransport) -> None:
@@ -99,13 +98,8 @@ async def test_the_server_says_wire_v2_when_it_starts(
 ) -> None:
     caplog.set_level(logging.INFO, logger="dsm")
     captured: dict[str, Any] = {}
-
-    async def _accept(*args: Any, **_k: Any) -> tuple[Any, Any, Any]:
-        args[6].set()  # process_shutdown: stop right away
-        return None, None, args[5]
-
-    with _base_patches(_accept, captured):
-        rc = await run_server(replace(_server_config(), dns_blocklist=False))
+    with _base_patches(captured):
+        rc = await _run_until(replace(_server_config(), dns_blocklist=False), captured)
     assert rc == 0
     lines = [r.getMessage() for r in caplog.records]
     assert "server listening on UDP port 51820 (wire v2)" in lines
@@ -120,17 +114,9 @@ async def test_the_server_says_wire_v2_when_it_starts_on_tcp(
     async def _listener(_config: Any) -> _Listener:
         return _Listener()
 
-    async def _accept(*_a: Any) -> tuple[None, None, None]:
-        captured["event"].set()  # process_shutdown: stop right away
-        return None, None, None
-
-    with (
-        _base_patches(_never, captured),
-        patch("dsm.server._open_tcp_listener", _listener),
-        patch("dsm.server._accept_one_session", _accept),
-    ):
-        rc = await run_server(
-            replace(_server_config(), dns_blocklist=False, transport="tcp")
+    with _base_patches(captured), patch("dsm.server._open_tcp_listener", _listener):
+        rc = await _run_until(
+            replace(_server_config(), dns_blocklist=False, transport="tcp"), captured
         )
     assert rc == 0
     lines = [r.getMessage() for r in caplog.records]

@@ -1,16 +1,19 @@
-"""The server makes one DNS blocklist per run and gives it to every session."""
+"""The server makes one DNS blocklist per run and gives it to the run's one
+DNS proxy."""
 
 from __future__ import annotations
 
 import asyncio
+from contextlib import AsyncExitStack
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
 from dsm.net.dns_blocklist import DnsBlocklist
-from dsm.server import _drive_fsm_to_idle, run_server
-from tests.test_server_dns_fatal import _base_patches, _server_config
+from dsm.net.session_slot import SessionTable
+from dsm.server import _set_up_host
+from tests.test_server_dns_fatal import _base_patches, _run_until, _server_config
 
 
 class _FakeBlocklist:
@@ -29,64 +32,60 @@ class _FakeBlocklist:
         self.stopped = True
 
 
-def _accepter() -> Any:
-    calls = {"n": 0}
+class _Quiet:
+    """TUN, forwarding and NAT stand-ins that do nothing; the NAT table
+    loads."""
 
-    async def _accept(*args: Any, **_k: Any) -> tuple[Any, bytes, Any]:
-        calls["n"] += 1
-        # (session_keys, client_pub, transport): hand back the UDP transport
-        # the acceptor was given (args[5]).
-        return object(), bytes([calls["n"]]) * 32, args[5]
+    applied = True  # as MasqueradeManager.applied after a load that worked
 
-    return _accept
+    def __init__(self, *_a: Any, **_k: Any) -> None:
+        pass
+
+    def open(self) -> None:
+        pass
+
+    def configure(self, *_a: Any, **_k: Any) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+    def apply(self) -> None:
+        pass
+
+    def remove(self) -> None:
+        pass
 
 
-async def _serve_two_sessions(config: Any) -> tuple[int, list[Any]]:
-    """Run the server through two sessions; return its exit code and the
-    blocklist argument each session got."""
+async def _run_once(config: Any) -> tuple[int, dict[str, Any]]:
     captured: dict[str, Any] = {}
-    seen: list[Any] = []
-
-    async def _session(*args: Any) -> None:
-        seen.append(args[7])
-        if len(seen) == 2:
-            captured["event"].set()  # process_shutdown
-        _drive_fsm_to_idle(args[1])
-
     _FakeBlocklist.made = []
-    with (
-        _base_patches(_accepter(), captured),
-        patch("dsm.server.DnsBlocklist", _FakeBlocklist),
-        patch("dsm.server._run_one_session", new=_session),
-    ):
-        rc = await run_server(config)
-    return rc, seen
+    with _base_patches(captured), patch("dsm.server.DnsBlocklist", _FakeBlocklist):
+        rc = await _run_until(config, captured)
+    return rc, captured
 
 
-async def test_one_blocklist_per_run_goes_to_every_session(tmp_path: Path) -> None:
-    rc, seen = await _serve_two_sessions(replace(_server_config(), config_dir=tmp_path))
+async def test_one_blocklist_per_run_goes_to_the_host_setup(tmp_path: Path) -> None:
+    rc, captured = await _run_once(replace(_server_config(), config_dir=tmp_path))
     assert rc == 0
     assert len(_FakeBlocklist.made) == 1
     made = _FakeBlocklist.made[0]
     assert made.dns_dir == tmp_path / "dns"
     assert made.started and made.stopped
-    assert seen == [made, made]
+    assert captured["blocklist"] is made
 
 
 async def test_with_the_key_off_there_is_no_blocklist(tmp_path: Path) -> None:
-    config = replace(_server_config(), config_dir=tmp_path, dns_blocklist=False)
-    rc, seen = await _serve_two_sessions(config)
+    rc, captured = await _run_once(
+        replace(_server_config(), config_dir=tmp_path, dns_blocklist=False)
+    )
     assert rc == 0
     assert _FakeBlocklist.made == []
-    assert seen == [None, None]
+    assert captured["blocklist"] is None
 
 
-async def test_each_session_gives_the_blocklist_to_its_dns_proxy(
-    tmp_path: Path,
-) -> None:
-    # Box only: runs the real _run_one_session, which needs tuncore.Shaper.
+async def test_the_one_dns_proxy_gets_the_runs_blocklist(tmp_path: Path) -> None:
     proxies: list[dict[str, Any]] = []
-    captured: dict[str, Any] = {}
 
     class _RecordingProxy:
         def __init__(self, *_a: Any, **kwargs: Any) -> None:
@@ -98,20 +97,18 @@ async def test_each_session_gives_the_blocklist_to_its_dns_proxy(
         def stop(self) -> None:
             pass
 
-    async def _run_data_loops(*args: Any, **_k: Any) -> None:
-        captured["event"].set()  # process_shutdown: one session only
-        _drive_fsm_to_idle(args[4])
-
-    _FakeBlocklist.made = []
+    blocklist = _FakeBlocklist(tmp_path / "dns")
     with (
-        _base_patches(_accepter(), captured),
-        patch("dsm.server.DnsBlocklist", _FakeBlocklist),
+        patch("dsm.server.TunDevice", _Quiet),
+        patch("dsm.server.IPForwardingManager", _Quiet),
+        patch("dsm.server.MasqueradeManager", _Quiet),
         patch("dsm.server.LocalDNSProxy", _RecordingProxy),
-        patch("dsm.session.run_data_loops", side_effect=_run_data_loops),
     ):
-        rc = await run_server(replace(_server_config(), config_dir=tmp_path))
-    assert rc == 0
-    assert [p["blocklist"] for p in proxies] == [_FakeBlocklist.made[0]]
+        async with AsyncExitStack() as stack:
+            await _set_up_host(
+                _server_config(), stack, blocklist, SessionTable(["dsm-a-client"])  # type: ignore[arg-type]
+            )
+    assert [p["blocklist"] for p in proxies] == [blocklist]
 
 
 class _ProbeBlocklist(DnsBlocklist):

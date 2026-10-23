@@ -1,31 +1,32 @@
-"""Regression: DNSProxyPortInUseError from LocalDNSProxy.start() must be
-FATAL — log at ERROR, return 1, do NOT retry the accept loop.
+"""run_server and the DNS proxy (multi-client spec §2.2, §5): the proxy is
+built once, at start. A busy :53 there stops the server with one ERROR line
+and exit code 1, before any client is served.
 
-Prior behavior: the broad ``except Exception`` in the run_server accept loop
-caught it, logged at WARNING (buried), then looped back to accept the next
-client and immediately hit the same bind error again — infinite retry on a
-persistent operator config error (e.g. unbound already holding :53).
-
-Fixed behavior: explicit ``except DNSProxyPortInUseError`` catches it BEFORE
-the broad handler, logs at ERROR with the actionable message, and returns 1
-(fatal exit).
-
-Mocking strategy mirrors test_lifecycle.py::ServerReAccept._patches: all
-host-state I/O is mocked at the boundary (no root, no network, no real TUN /
-nftables / DNS). Only the LocalDNSProxy.start behaviour is varied here.
+Also the run_server fakes other test files share: ``_server_config``,
+``_base_patches`` (host I/O, keys, stores and the host setup faked at the
+boundary; no root, no network, no real TUN, nftables or DNS) and
+``_run_until``.
 """
 
 from __future__ import annotations
 
+import asyncio
+import errno
 import logging
-import unittest
-from collections.abc import Generator
-from contextlib import contextmanager
+import os
+from collections.abc import Callable, Generator
+from contextlib import AsyncExitStack, contextmanager
+from typing import Any
 from unittest.mock import patch
+
+import pytest
 
 from dsm.core.config import Config
 from dsm.net.dns_proxy import DNSProxyPortInUseError
 from dsm.net.handshake_gate import GateKeys
+from dsm.net.transport.udp import RECV_QUEUE_SIZE
+from dsm.server import _Host, run_server
+from tests.test_handshake_acceptor_limits import _spin
 
 
 def _server_config() -> Config:
@@ -46,7 +47,9 @@ def _server_config() -> Config:
 
 
 class _NonEmptyAllowlist:
-    """Duck-typed CNAllowlist: non-empty so run_server does not abort."""
+    """Duck-typed CNAllowlist: one name, so run_server does not abort."""
+
+    order = ("dsm-a-client",)
 
     def __len__(self) -> int:
         return 1
@@ -78,29 +81,7 @@ class _SyncManager:
         pass
 
 
-class _FakeTun:
-    def __init__(self, *_a: object, **_k: object) -> None:
-        pass
-
-    def open(self) -> None:
-        pass
-
-    def configure(self, *_a: object, **_k: object) -> None:
-        pass
-
-    def close(self) -> None:
-        pass
-
-
-class _FakeResolver:
-    def __init__(self, *_a: object, **_k: object) -> None:
-        pass
-
-    async def close(self) -> None:
-        pass
-
-
-class _FakeScheduler:
+class _FakeScheduler:  # pyright: ignore[reportUnusedClass]  # other test files use it
     def __init__(self, *_a: object, **_k: object) -> None:
         pass
 
@@ -112,34 +93,106 @@ class _FakeScheduler:
 
 
 class _FakeUDPTransport:
-    async def bind(self, *_a: object, **_k: object) -> None:
-        pass
+    """The run's UDP socket: it binds, never receives, and records sends."""
+
+    made: list[_FakeUDPTransport] = []
+
+    def __init__(self, *, recv_queue_size: int = RECV_QUEUE_SIZE) -> None:
+        self.recv_queue_size = recv_queue_size
+        self.sent: list[tuple[bytes, tuple[str, int]]] = []
+        _FakeUDPTransport.made.append(self)
+
+    async def bind(self, *_a: object, **_k: object) -> int:
+        return 51820
+
+    async def recv(self, timeout: float | None = None) -> tuple[bytes, tuple[str, int]]:
+        del timeout
+        await asyncio.Event().wait()  # nothing arrives; ends when cancelled
+        raise AssertionError("unreachable")
+
+    def recv_drops(self) -> int:
+        return 0
+
+    async def send(self, data: bytes, addr: tuple[str, int]) -> None:
+        self.sent.append((bytes(data), addr))
 
     async def aclose(self) -> None:
         pass
 
 
-async def _noop_send(*_a: object, **_k: object) -> None:
+class _FakeTun:
+    """The shared TUN as the router reads it: nothing, until ``fail`` is set;
+    then it fails like a TUN device that went away. With ``events``, a read
+    the stop cancels writes ``routing stopped`` there."""
+
+    def __init__(self, events: list[str] | None = None) -> None:
+        self.fail = asyncio.Event()
+        self.written: list[bytes] = []
+        self._events = events
+
+    async def read(self) -> bytes:
+        try:
+            await self.fail.wait()
+        except asyncio.CancelledError:
+            if self._events is not None:
+                self._events.append("routing stopped")
+            raise
+        raise OSError(errno.EIO, os.strerror(errno.EIO))
+
+    async def awrite(self, data: bytes) -> int:
+        self.written.append(bytes(data))
+        return len(data)
+
+
+class _FakeDNSProxy:
+    def __init__(self) -> None:
+        self.forgotten: list[str] = []
+
+    def forget(self, client_ip: str) -> None:
+        self.forgotten.append(client_ip)
+
+
+async def _noop_send(  # pyright: ignore[reportUnusedFunction]  # other test files use it
+    *_a: object,
+    **_k: object,
+) -> None:
     pass
 
 
+async def _fake_host(  # pyright: ignore[reportUnusedFunction]  # other test files use it
+    *_a: object,
+) -> _Host:
+    """Stands in for _set_up_host: sets up nothing."""
+    return _Host(tun=_FakeTun(), dns_proxy=_FakeDNSProxy())  # type: ignore[arg-type]
+
+
 @contextmanager
-def _base_patches(
-    accept_side_effect: object,
-    captured_shutdown: dict,
-) -> Generator[None, None, None]:
-    """Context manager applying all shared host-I/O mocks.
+def _base_patches(captured: dict[str, Any]) -> Generator[None, None, None]:
+    """Fake everything run_server touches on the host.
 
-    ``captured_shutdown`` receives the ``process_shutdown`` event injected
-    by ``setup_signal_handlers`` so individual tests can trigger shutdown.
-    ``accept_side_effect`` stands in for ``dsm.server._accept_until_winner``:
-    its demux needs real datagrams, which this host-mocked harness never
-    supplies.
+    ``captured`` gets ``event`` (the ``process_shutdown`` event the signal
+    handlers would set), and from the faked host setup ``host`` (a ``_Host``
+    with a ``_FakeTun`` and a ``_FakeDNSProxy``), ``blocklist`` and
+    ``table``; ``captured["events"]`` gets ``host up``, ``routing stopped``
+    and ``host down``. The acceptor, the dispatcher and the router are real:
+    with no packets they only wait.
     """
+    events: list[str] = captured.setdefault("events", [])
 
-    def _capture_signal_handlers(shutdown: object) -> None:
-        captured_shutdown["event"] = shutdown
+    def _capture_signal_handlers(shutdown: asyncio.Event) -> None:
+        captured["event"] = shutdown
 
+    async def _set_up_host(
+        config: Config, stack: AsyncExitStack, blocklist: Any, table: Any
+    ) -> _Host:
+        del config
+        host = _Host(tun=_FakeTun(events), dns_proxy=_FakeDNSProxy())  # type: ignore[arg-type]
+        captured.update(host=host, blocklist=blocklist, table=table)
+        events.append("host up")
+        stack.callback(events.append, "host down")
+        return host
+
+    _FakeUDPTransport.made = []
     patches = [
         patch("tuncore.harden_process"),
         patch("dsm.core.hardening.set_process_nondumpable"),
@@ -156,18 +209,9 @@ def _base_patches(
         patch("dsm.server.AttestStore", _FakeStore),
         patch("dsm.server.ServerRateLimitManager", _SyncManager),
         patch("dsm.server.TcpTimestampsDisabler", _SyncManager),
-        patch("dsm.server.IPForwardingManager", _SyncManager),
-        patch("dsm.server.MasqueradeManager", _SyncManager),
-        patch("dsm.server.TunDevice", _FakeTun),
-        patch("dsm.server.DNSResolver", _FakeResolver),
-        patch("dsm.server.SendScheduler", _FakeScheduler),
-        patch("dsm.server.make_send_fn", return_value=_noop_send),
         patch("dsm.server.UDPTransport", _FakeUDPTransport),
         patch("dsm.server.setup_signal_handlers", _capture_signal_handlers),
-        patch(
-            "dsm.server._accept_until_winner",
-            side_effect=accept_side_effect,
-        ),
+        patch("dsm.server._set_up_host", _set_up_host),
     ]
     for p in patches:
         p.start()
@@ -178,160 +222,40 @@ def _base_patches(
             p.stop()
 
 
-class TestDNSPortConflictFatal(unittest.IsolatedAsyncioTestCase):
-    """When LocalDNSProxy.start() raises DNSProxyPortInUseError, run_server
-    must:
-      1. Log at ERROR (not WARNING or lower).
-      2. Return a non-zero exit code (fatal, not recovered).
-      3. NOT loop back and retry (accept called exactly once).
-    """
+async def _run_until(  # pyright: ignore[reportUnusedFunction]  # other test files use it
+    config: Config, captured: dict[str, Any], until: Callable[[], bool] = lambda: True
+) -> int:
+    """Under ``_base_patches(captured)``: run run_server until its host is
+    up and ``until()`` holds, then stop it as a signal would; its exit code."""
+    run = asyncio.ensure_future(run_server(config))
+    await _spin(lambda: run.done() or ("host" in captured and until()))
+    if not run.done():
+        captured["event"].set()
+    return await asyncio.wait_for(run, 5.0)
 
-    async def test_dns_port_in_use_is_fatal_not_recovered(self) -> None:
-        from dsm.server import run_server
 
-        captured: dict = {}
-        accept_calls = {"n": 0}
+async def test_a_busy_dns_port_at_start_exits_1_before_any_client(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.ERROR, logger="dsm")
+    captured: dict[str, Any] = {}
+    acceptors: list[Any] = []
 
-        async def _accept(*args: object, **_k: object) -> tuple[object, bytes, object]:
-            accept_calls["n"] += 1
-            # (session_keys, client_pub, transport): hand back the UDP
-            # transport the acceptor was given (args[5]).
-            return object(), b"\xbb" * 32, args[5]
-
-        port_in_use_err = DNSProxyPortInUseError(
+    async def _busy(*_a: object) -> _Host:
+        raise DNSProxyPortInUseError(
             "DNS proxy cannot bind 10.8.0.1:53 — another resolver is already "
             "bound there. Stop the host resolver, or change the TUN address."
         )
 
-        class _FailingDNSProxy:
-            def __init__(self, *_a: object, **_k: object) -> None:
-                pass
-
-            async def start(self) -> None:
-                raise port_in_use_err
-
-            def stop(self) -> None:
-                pass
-
-        error_records: list[logging.LogRecord] = []
-
-        class _CapturingHandler(logging.Handler):
-            def emit(self, record: logging.LogRecord) -> None:
-                error_records.append(record)
-
-        handler = _CapturingHandler(level=logging.ERROR)
-        server_logger = logging.getLogger("dsm.server")
-        server_logger.addHandler(handler)
-        try:
-            with (
-                _base_patches(_accept, captured),
-                patch("dsm.server.LocalDNSProxy", _FailingDNSProxy),
-            ):
-                rc = await run_server(_server_config())
-        finally:
-            server_logger.removeHandler(handler)
-
-        # Must exit non-zero (fatal):
-        self.assertNotEqual(
-            rc, 0, "DNSProxyPortInUseError must produce a non-zero exit code"
-        )
-        self.assertEqual(rc, 1, "run_server must return 1 on fatal DNS port conflict")
-
-        # Must have logged at ERROR level (not just WARNING):
-        error_msgs = [
-            r.getMessage() for r in error_records if r.levelno >= logging.ERROR
-        ]
-        self.assertTrue(
-            error_msgs,
-            "run_server must log at ERROR when DNS port is in use; "
-            f"only WARNING/lower found. All captured records: {error_records!r}",
-        )
-
-        # The error message must mention the conflict so the operator knows what to fix:
-        combined = "\n".join(error_msgs)
-        self.assertIn(
-            "DNS",
-            combined,
-            "ERROR log must reference DNS to guide the operator",
-        )
-
-        # Must NOT retry — accept is called once (one successful auth),
-        # then dns_proxy.start() fails, and run_server returns immediately.
-        self.assertEqual(
-            accept_calls["n"],
-            1,
-            "run_server must not retry the accept loop after DNSProxyPortInUseError; "
-            f"got {accept_calls['n']} accept calls",
-        )
-
-    async def test_other_session_errors_still_recover(self) -> None:
-        """Sanity: a plain RuntimeError from _run_one_session still recovers
-        (the broad except is NOT removed — only DNSProxyPortInUseError is fatal).
-        The server loops back and accepts a second client.
-        """
-        from dsm.server import run_server
-
-        captured: dict = {}
-        accept_calls = {"n": 0}
-
-        async def _accept(*args: object, **_k: object) -> tuple[object, bytes, object]:
-            accept_calls["n"] += 1
-            return object(), bytes([accept_calls["n"]]) * 32, args[5]
-
-        run_loops_calls = {"n": 0}
-
-        async def _run_data_loops(*args: object, **_k: object) -> None:
-            run_loops_calls["n"] += 1
-            if run_loops_calls["n"] >= 2:
-                # Second session: simulate SIGTERM so the loop exits.
-                captured["event"].set()
-            # Drive FSM to IDLE to satisfy run_server's re-accept contract.
-            from dsm.core.fsm import State
-
-            fsm = args[4]
-            try:
-                fsm.transition(State.TEARDOWN)
-            except Exception:  # noqa: BLE001
-                pass
-            try:
-                fsm.transition(State.IDLE)
-            except Exception:  # noqa: BLE001
-                pass
-
-        # A proxy that blows up with a non-DNSProxyPortInUseError on the
-        # first session, then works normally on the second.
-        proxy_calls = {"n": 0}
-
-        class _FlakeyDNSProxy:
-            def __init__(self, *_a: object, **_k: object) -> None:
-                pass
-
-            async def start(self) -> None:
-                proxy_calls["n"] += 1
-                if proxy_calls["n"] == 1:
-                    raise RuntimeError("transient TUN fluke")
-
-            def stop(self) -> None:
-                pass
-
-        with (
-            _base_patches(_accept, captured),
-            patch("dsm.server.LocalDNSProxy", _FlakeyDNSProxy),
-            patch("dsm.session.run_data_loops", side_effect=_run_data_loops),
-        ):
-            rc = await run_server(_server_config())
-
-        # Server must have recovered from the first transient error and served
-        # a second session, then exited cleanly (process_shutdown set → exit 0).
-        self.assertEqual(
-            rc, 0, "transient session errors must recover, not kill server"
-        )
-        self.assertGreaterEqual(
-            accept_calls["n"],
-            2,
-            "server must re-accept after a transient session error",
-        )
-
-
-if __name__ == "__main__":
-    unittest.main()
+    with (
+        _base_patches(captured),
+        patch("dsm.server._set_up_host", _busy),
+        patch("dsm.server.ClientAcceptor", lambda *a, **_k: acceptors.append(a)),
+    ):
+        rc = await asyncio.wait_for(run_server(_server_config()), 5.0)
+    assert rc == 1
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert len(errors) == 1
+    assert errors[0].getMessage().startswith("FATAL: DNS proxy port conflict — ")
+    assert errors[0].exc_info is None
+    assert acceptors == []  # no client could be served

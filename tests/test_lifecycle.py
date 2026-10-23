@@ -8,10 +8,10 @@ Covers all four sub-parts:
   * Part B — the client installs signal handlers BEFORE the
     pre-handshake kill switch, so a SIGTERM during connect unwinds the
     AsyncExitStack instead of leaving the kill switch applied.
-  * Part C — the server's OUTER re-accept loop: a session ending on its
-    own (dead-peer timeout / peer SESSION_CLOSE / roam) tears down
-    per-session host state and loops back to accept a new client, while a
-    process shutdown (SIGTERM) breaks the loop. See ``ServerReAccept``.
+  * Part C — the server runs until a signal: a session that ends on its own
+    (dead-peer timeout / peer SESSION_CLOSE / rekey give-up) ends only
+    itself and the acceptor keeps serving, while a process shutdown
+    (SIGTERM) ends every session. See ``ServerKeepsServing``.
   * Part D — ``main()`` config-load failures print ``config: <msg>`` to
     stderr and ``sys.exit(2)`` rather than surfacing a raw traceback.
 
@@ -28,10 +28,10 @@ import io
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 from dsm.core.config import Config
-from dsm.net.handshake_gate import GateKeys
 
 
 def _client_config() -> Config:
@@ -289,286 +289,71 @@ class ConfigLoadErrors(unittest.TestCase):
         self.assertNotIn("Traceback", buf.getvalue())
 
 
-class ServerReAccept(unittest.IsolatedAsyncioTestCase):
-    """Part C: the server's OUTER re-accept loop.
+class ServerKeepsServing(unittest.IsolatedAsyncioTestCase):
+    """Part C: the server runs until a signal. A session that ends on its own
+    ends only itself: the acceptor keeps serving, and the next client gets a
+    session. A signal ends every session and run_server returns 0.
 
-    The design problem this proves solved: ``run_data_loops`` sets the
-    SAME ``ctx.shutdown`` event for BOTH a process-shutdown (SIGTERM) and an
-    ordinary session-end (SESSION_CLOSE / dead-peer timeout / rekey give-up).
-    The fix is two events — a per-session ``session_shutdown`` that
-    ``run_data_loops`` watches, plus a process-lifetime ``process_shutdown``
-    set only by the signal handlers — bridged so a signal during a live
-    session still stops that session. After ``run_data_loops`` returns the
-    loop re-accepts iff ``process_shutdown`` is NOT set.
+    run_server runs with the host I/O faked (test_server_dns_fatal) and a
+    scripted acceptor and sessions (test_server_multi)."""
 
-    These tests drive ``run_server`` end-to-end with every host-state
-    manager mocked at the I/O boundary (no root, no network, no real TUN/
-    nftables/DNS) and assert the LOOP CONTROL FLOW: a session that ends on
-    its own re-accepts; a process shutdown breaks the loop.
-
-    Against the pre-C single-session code these would FAIL: the old
-    ``run_server`` ``break``s out of the accept loop on the first successful
-    handshake, runs exactly one session, and returns — ``server_handshake``
-    is called once, never twice.
-    """
-
-    @staticmethod
-    def _patches(
-        accept_side_effect: object,
-        run_data_loops_impl: object,
-        captured_shutdown: dict,
-    ) -> list:
-        """Build the patch context managers shared by both tests.
-
-        ``accept_side_effect`` stands in for ``dsm.server._accept_until_winner``
-        (the UDP acceptor): it returns the ``(session_keys, client_pub,
-        transport)`` triple the re-accept loop consumes, so the LOOP control
-        flow is exercised without the per-attempt demux machinery.
-
-        ``captured_shutdown`` is populated with the ``process_shutdown``
-        event that ``setup_signal_handlers`` is called with, so the
-        ``run_data_loops`` stand-in can set it to simulate a signal.
-        """
-
-        class _FakeMaterials:
-            cert_der = b""
-            ca_root = object()
-            crl = None
-
-        class _FakeStore:
-            def __init__(self, *_a: object, **_k: object) -> None:
-                # _run_one_session reads keystore.identity.public_key.
-                self.identity = type("_Id", (), {"public_key": b"\x00" * 32})()
-                self.attest_key = object()
-
-            def unload(self) -> None:
-                pass
-
-        class _SyncManager:
-            """apply()/remove() host-state managers (rate limiter, tcp_ts,
-            forwarding, masquerade)."""
-
-            def __init__(self, *_a: object, **_k: object) -> None:
-                pass
-
-            def apply(self) -> None:
-                pass
-
-            def remove(self) -> None:
-                pass
-
-        class _FakeTun:
-            def __init__(self, *_a: object, **_k: object) -> None:
-                pass
-
-            def open(self) -> None:
-                pass
-
-            def configure(self, *_a: object, **_k: object) -> None:
-                pass
-
-            def close(self) -> None:
-                pass
-
-        class _FakeResolver:
-            def __init__(self, *_a: object, **_k: object) -> None:
-                pass
-
-            async def close(self) -> None:
-                pass
-
-        class _FakeDNSProxy:
-            def __init__(self, *_a: object, **_k: object) -> None:
-                pass
-
-            async def start(self) -> None:
-                pass
-
-            def stop(self) -> None:
-                pass
-
-        class _FakeScheduler:
-            def __init__(self, *_a: object, **_k: object) -> None:
-                pass
-
-            async def start(self) -> None:
-                pass
-
-            async def stop(self) -> None:
-                pass
-
-        class _FakeUDPTransport:
-            async def bind(self, *_a: object, **_k: object) -> None:
-                pass
-
-            async def aclose(self) -> None:
-                pass
-
-        def _capture_signal_handlers(shutdown: object) -> None:
-            captured_shutdown["event"] = shutdown
-
-        cn_allowlist = _NonEmptyAllowlist()
-
-        return [
-            patch("tuncore.harden_process"),
-            patch("dsm.core.hardening.set_process_nondumpable"),
-            patch("dsm.crypto.attest_gate.enforce_attest_backend_policy"),
-            patch("dsm.server.load_cert_materials", return_value=_FakeMaterials()),
-            patch(
-                "dsm.server.server_gate_keys",
-                return_value=GateKeys(mac1_key=bytes(32), cookie_key=bytes(32)),
-            ),
-            patch("dsm.server.verify_cert_matches_identity"),
-            patch(
-                "dsm.server.CNAllowlist.from_file",
-                return_value=cn_allowlist,
-            ),
-            patch("dsm.crypto._stores.load_daemon_stores", return_value=True),
-            patch("dsm.server.KeyStore", _FakeStore),
-            patch("dsm.server.AttestStore", _FakeStore),
-            patch("dsm.server.ServerRateLimitManager", _SyncManager),
-            patch("dsm.server.TcpTimestampsDisabler", _SyncManager),
-            patch("dsm.server.IPForwardingManager", _SyncManager),
-            patch("dsm.server.MasqueradeManager", _SyncManager),
-            patch("dsm.server.TunDevice", _FakeTun),
-            patch("dsm.server.DNSResolver", _FakeResolver),
-            patch("dsm.server.LocalDNSProxy", _FakeDNSProxy),
-            patch("dsm.server.SendScheduler", _FakeScheduler),
-            patch("dsm.server.make_send_fn", return_value=_noop_send),
-            patch("dsm.server.UDPTransport", _FakeUDPTransport),
-            patch("dsm.server.setup_signal_handlers", _capture_signal_handlers),
-            # Repoint at the UDP acceptor (the re-accept-loop integration point)
-            # rather than the inner `server_handshake`: `_accept_until_winner`
-            # drives a demux that needs real datagrams fed through the socket,
-            # which this host-mocked harness never supplies — patching it
-            # exercises the loop CONTROL FLOW (re-accept on session-end, break
-            # on process_shutdown) without the demux machinery, exactly as
-            # test_server_malformed_frame.py patches `_accept_one_session`.
-            patch(
-                "dsm.server._accept_until_winner",
-                side_effect=accept_side_effect,
-            ),
-            patch("dsm.session.run_data_loops", side_effect=run_data_loops_impl),
-        ]
-
-    async def test_session_end_re_accepts_next_client(self) -> None:
-        """A session that ends WITHOUT process shutdown loops back and
-        accepts a second client; the loop exits only once
-        ``process_shutdown`` is set."""
-        from dsm.server import run_server
-
-        captured: dict = {}
-        accept_calls = {"n": 0}
-        run_loops_calls = {"n": 0}
-
-        async def _accept(*args: object, **_k: object) -> tuple[object, bytes, object]:
-            accept_calls["n"] += 1
-            # _accept_until_winner returns (session_keys, client_pub,
-            # transport). Hand back the same UDP transport it was given
-            # (args[5]) so the loop proceeds into _run_one_session, and a
-            # distinct client_pub per session — proving fresh keys each accept.
-            return object(), bytes([accept_calls["n"]]) * 32, args[5]
-
-        async def _run_data_loops(*args: object, **_k: object) -> None:
-            run_loops_calls["n"] += 1
-            if run_loops_calls["n"] >= 2:
-                # Second session: simulate a SIGTERM arriving — the signal
-                # handler would set process_shutdown. The outer loop must
-                # then break instead of re-accepting a third time.
-                captured["event"].set()
-            # First session: return WITHOUT touching process_shutdown — a
-            # plain session-end (dead-peer / SESSION_CLOSE / roam). The loop
-            # must re-accept.
-            # Mirror run_data_loops' contract: it drives the FSM through
-            # TEARDOWN → IDLE in its finally, leaving the caller's re-accept
-            # loop free to transition IDLE → CONNECTING.
-            _drive_fsm_to_idle(args[4])
-
-        with _ExitStackPatches(self._patches(_accept, _run_data_loops, captured)):
-            rc = await run_server(_server_config())
-
-        self.assertEqual(
-            accept_calls["n"],
-            2,
-            "_accept_until_winner must be called twice — the server re-accepted "
-            "a second client after the first session ended (this is the Part C "
-            "behaviour; the pre-C code calls it exactly once)",
+    async def test_a_session_that_ends_does_not_stop_the_server(self) -> None:
+        from tests.test_handshake_acceptor_limits import _spin
+        from tests.test_server_multi import (
+            PEER_A,
+            PEER_B,
+            A,
+            B,
+            _Acceptor,
+            _multi,
+            _Sessions,
+            _start,
+            _stop,
         )
-        self.assertEqual(run_loops_calls["n"], 2)
+
+        captured: dict[str, Any] = {}
+        sessions = _Sessions()
+        sessions.end_at_once.add(A)  # as a dead peer would end it
+        with _multi(captured, sessions):
+            run = await _start(_server_config())
+            acceptor = _Acceptor.made[0]
+            acceptor.admit(A, PEER_A)
+            self.assertTrue(await _spin(lambda: f"{A} ended" in sessions.events))
+            acceptor.admit(B, PEER_B)
+            self.assertTrue(await _spin(lambda: f"{B} started" in sessions.events))
+            self.assertFalse(run.done())
+            self.assertEqual((acceptor.runs, acceptor.stops), (1, 0))
+            rc = await _stop(run, captured)
         self.assertEqual(rc, 0)
 
-    async def test_process_shutdown_during_first_session_no_reaccept(self) -> None:
-        """``process_shutdown`` set during the FIRST session → the loop exits
-        after one session, no re-accept, clean exit 0."""
-        from dsm.server import run_server
-
-        captured: dict = {}
-        accept_calls = {"n": 0}
-        run_loops_calls = {"n": 0}
-
-        async def _accept(*args: object, **_k: object) -> tuple[object, bytes, object]:
-            accept_calls["n"] += 1
-            # Return (session_keys, client_pub, transport) — the same UDP
-            # transport it was handed (args[5]) so the session proceeds.
-            return object(), b"\xaa" * 32, args[5]
-
-        async def _run_data_loops(*args: object, **_k: object) -> None:
-            run_loops_calls["n"] += 1
-            # First (and only) session: a SIGTERM arrives mid-session.
-            captured["event"].set()
-            _drive_fsm_to_idle(args[4])
-
-        with _ExitStackPatches(self._patches(_accept, _run_data_loops, captured)):
-            rc = await run_server(_server_config())
-
-        self.assertEqual(
-            accept_calls["n"],
-            1,
-            "process_shutdown during the first session must NOT re-accept",
+    async def test_a_signal_ends_every_session_and_exits_0(self) -> None:
+        from tests.test_handshake_acceptor_limits import _spin
+        from tests.test_server_multi import (
+            PEER_A,
+            PEER_B,
+            A,
+            B,
+            _Acceptor,
+            _multi,
+            _Sessions,
+            _start,
+            _stop,
         )
-        self.assertEqual(run_loops_calls["n"], 1)
+
+        captured: dict[str, Any] = {}
+        sessions = _Sessions()
+        with _multi(captured, sessions):
+            run = await _start(_server_config())
+            acceptor = _Acceptor.made[0]
+            acceptor.admit(A, PEER_A)
+            acceptor.admit(B, PEER_B)
+            self.assertTrue(await _spin(lambda: len(sessions.started) == 2))
+            rc = await _stop(run, captured)
         self.assertEqual(rc, 0)
-
-
-def _drive_fsm_to_idle(fsm: object) -> None:
-    """Replicate run_data_loops' finally: ESTABLISHED → TEARDOWN → IDLE.
-
-    The real ``run_data_loops`` always leaves the FSM in IDLE on return;
-    the re-accept loop relies on that to legally transition IDLE →
-    CONNECTING for the next accept. The stub must honour the same contract.
-    """
-    from dsm.core.fsm import State
-
-    fsm.transition(State.TEARDOWN)  # type: ignore[attr-defined]
-    fsm.transition(State.IDLE)  # type: ignore[attr-defined]
-
-
-async def _noop_send(*_a: object, **_k: object) -> None:
-    """Stand-in for the send_fn make_send_fn would return."""
-
-
-class _NonEmptyAllowlist:
-    """Duck-typed CNAllowlist: non-empty so run_server does not abort, and
-    irrelevant to the loop control flow under test."""
-
-    def __len__(self) -> int:
-        return 1
-
-
-class _ExitStackPatches:
-    """Enter a list of patch() context managers as one ``with`` block."""
-
-    def __init__(self, patches: list) -> None:
-        self._patches = patches
-
-    def __enter__(self) -> _ExitStackPatches:
-        for p in self._patches:
-            p.start()
-        return self
-
-    def __exit__(self, *exc: object) -> None:
-        for p in reversed(self._patches):
-            p.stop()
+        self.assertTrue(all(s.shutdown.is_set() for s in sessions.started))
+        self.assertEqual(
+            sorted(sessions.events[-2:]), sorted([f"{A} ended", f"{B} ended"])
+        )
 
 
 if __name__ == "__main__":

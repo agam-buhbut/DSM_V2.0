@@ -9,29 +9,31 @@ and terminates the process.
 Fix contract:
   1. `dsm.net.transport.tcp` defines ``FramingError(ValueError)`` and raises
      it (not a bare ValueError) at the two validation sites.
-  2. `dsm.server.run_server`'s outer while-loop wraps the
-     ``_accept_one_session(...)`` call in ``try/except Exception``, logging and
-     recovering exactly as the existing ``_run_one_session`` guard does.
+  2. A FramingError raised while one TCP handshake is read ends only that
+     attempt (the acceptor's worker catches it); run_server keeps serving.
 
-This test verifies the fix at the loop level: it stubs ``_accept_one_session``
-so the first call raises ``FramingError``, confirms the run_server loop catches
-it and continues (does NOT re-raise), and then on the second call signals a
-clean process_shutdown so the loop exits normally.
-
-A full in-process server harness for run_server exists in
-``tests/test_lifecycle.py``; the loop-level unit test here is a targeted
-complement that isolates the FramingError recovery path without needing a real
-TUN device, nftables, or cert infrastructure.
+``TestRunServerLoopSurvivesFramingError`` drives run_server with the real
+acceptor, gate and limiter on a faked listener, and a scripted handshake
+after the first frame; the host state is faked.
 """
 
 from __future__ import annotations
 
 import asyncio
+import os
+import time
 import unittest
+from typing import Any
 from unittest.mock import MagicMock, patch
 
-from dsm.net.handshake_gate import GateKeys
+from dsm.core.fsm import State
+from dsm.crypto.handshake import HANDSHAKE_FRAME_SIZE, VerifiedClient
+from dsm.net.handshake_gate import GateKeys, compute_mac1, stamp_msg1
 from dsm.net.transport.tcp import FramingError
+from dsm.server import _drive_fsm_to_idle
+from tests.test_handshake_acceptor_limits import _spin
+from tests.test_server_dns_fatal import _fake_host
+from tests.test_tcp_accept_concurrency import _Conn
 
 
 class TestFramingErrorDefinition(unittest.TestCase):
@@ -50,52 +52,61 @@ class TestFramingErrorDefinition(unittest.TestCase):
             raise FramingError("oversized")
 
 
+KEYS = GateKeys(mac1_key=bytes(32), cookie_key=bytes(32))
+
+
+class _Listener:
+    def __init__(self) -> None:
+        self.connections: asyncio.Queue[Any] = asyncio.Queue()
+
+    def close(self) -> None:
+        pass
+
+
+def _first_frame() -> bytes:
+    """A msg1 with a valid mac1 for the faked gate keys, as a client
+    stamps it (the scripted handshake never reads the Noise part)."""
+    frame = bytearray(os.urandom(HANDSHAKE_FRAME_SIZE))
+    stamp_msg1(frame, compute_mac1(bytes(frame[:32]), KEYS, time.time()))
+    return bytes(frame)
+
+
 class TestRunServerLoopSurvivesFramingError(unittest.IsolatedAsyncioTestCase):
-    """run_server's outer accept loop MUST catch a FramingError and continue.
+    """A FramingError in one TCP handshake (an oversized length prefix) ends
+    only that attempt: run_server keeps serving, and the next connection
+    becomes a session."""
 
-    The fix is verified by patching _accept_one_session at the server module
-    level so the first call raises FramingError (simulating a raw socket
-    sending an oversized length prefix during the handshake recv) and the
-    second call returns (None, None, None) which triggers the clean
-    process_shutdown branch — stopping the loop without re-raising.
-
-    BEFORE the fix: FramingError (a ValueError) propagates out of the while
-    loop, out of run_server's AsyncExitStack, and the coroutine raises — the
-    daemon dies. The mock sequence would never reach the second call.
-
-    AFTER the fix: the except-Exception guard catches and logs FramingError,
-    the loop continues, calls _accept_one_session a second time, receives
-    (None, None, None) and breaks cleanly. run_server returns 0.
-    """
-
-    async def test_framing_error_does_not_exit_run_server(self) -> None:
-        """A FramingError from _accept_one_session must NOT escape run_server."""
+    async def test_framing_error_ends_only_that_attempt(self) -> None:
         import dsm.server as _server_mod
 
-        call_count = 0
+        listener = _Listener()
+        captured: dict[str, asyncio.Event] = {}
+        served: list[Any] = []
+        bad = _Conn(("203.0.113.1", 40001), [_first_frame()])
+        good = _Conn(("203.0.113.2", 40002), [_first_frame()])
 
-        async def _fake_accept(
-            config,
-            fsm,
-            keystore,
-            attest_store,
-            materials,
-            cn_allowlist,
-            transport_obj,
-            ps,
-            limiter=None,
-            listener=None,
-            slot=None,
-            gate=None,
-        ):
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                # Simulate the attacker sending an oversized TCP frame prefix.
+        async def _handshake(
+            conn: Any, *_a: Any, admit_client: Any = None, **_k: Any
+        ) -> tuple[object, bytes]:
+            await conn.recv()  # the first frame, handed back by the gate's view
+            if getattr(conn, "_real", conn) is bad:
                 raise FramingError("frame length 268435457 exceeds max 65536")
-            # Second call: signal shutdown so the loop exits cleanly.
-            ps.set()
-            return None, None, None
+            admit_client(VerifiedClient(cn="dsm-tcp-client", noise_static=b"\x01" * 32))
+            return object(), b"\x01" * 32
+
+        async def _session(
+            _config: Any, fsm: Any, _keystore: Any, session: Any, *_rest: Any
+        ) -> None:
+            fsm.transition(State.ESTABLISHED)
+            served.append(session)
+            await session.shutdown.wait()
+            _drive_fsm_to_idle(fsm)
+
+        async def _open(_config: Any) -> _Listener:
+            return listener
+
+        def _capture(shutdown: asyncio.Event) -> None:
+            captured["event"] = shutdown
 
         mock_config = MagicMock()
         mock_config.transport = "tcp"
@@ -105,98 +116,46 @@ class TestRunServerLoopSurvivesFramingError(unittest.IsolatedAsyncioTestCase):
         mock_config.attest_key_file = "/fake/attest"
         mock_config.max_inflight_handshakes = 8
 
-        mock_materials = MagicMock()
         mock_cn_allowlist = MagicMock()
         mock_cn_allowlist.__len__ = MagicMock(return_value=1)
-        mock_keystore = MagicMock()
-        mock_keystore.unload = MagicMock()
-        mock_attest_store = MagicMock()
-        mock_attest_store.unload = MagicMock()
+        mock_cn_allowlist.order = ("dsm-tcp-client",)
 
-        mock_rate_limiter = MagicMock()
-        mock_rate_limiter.apply = MagicMock()
-        mock_rate_limiter.remove = MagicMock()
-
-        mock_tcp_ts = MagicMock()
-        mock_tcp_ts.apply = MagicMock()
-        mock_tcp_ts.remove = MagicMock()
-
-        # run_server uses several local imports; patch at the source modules.
         patches = [
-            # tuncore.harden_process — local import inside run_server
             patch("tuncore.harden_process", return_value=None),
-            # dsm.core.hardening.set_process_nondumpable — local import
-            patch(
-                "dsm.core.hardening.set_process_nondumpable",
-                return_value=None,
-            ),
-            # attest gate — local import
+            patch("dsm.core.hardening.set_process_nondumpable", return_value=None),
             patch(
                 "dsm.crypto.attest_gate.enforce_attest_backend_policy",
                 return_value=None,
             ),
-            # cert / key loading (module-level imports in server.py)
-            patch(
-                "dsm.server.load_cert_materials",
-                return_value=mock_materials,
-            ),
-            patch(
-                "dsm.server.server_gate_keys",
-                return_value=GateKeys(mac1_key=bytes(32), cookie_key=bytes(32)),
-            ),
-            patch(
-                "dsm.server.CNAllowlist.from_file",
-                return_value=mock_cn_allowlist,
-            ),
-            patch("dsm.server.KeyStore", return_value=mock_keystore),
-            patch("dsm.server.AttestStore", return_value=mock_attest_store),
-            # load_daemon_stores — local import inside run_server; returns
-            # True (success) so we pass the "stores unlocked" gate.
-            patch(
-                "dsm.crypto._stores.load_daemon_stores",
-                return_value=True,
-            ),
-            # cert/identity consistency check — module-level import in server
-            patch(
-                "dsm.server.verify_cert_matches_identity",
-                return_value=None,
-            ),
-            # nftables / network
-            patch(
-                "dsm.server.ServerRateLimitManager",
-                return_value=mock_rate_limiter,
-            ),
-            patch(
-                "dsm.server.TcpTimestampsDisabler",
-                return_value=mock_tcp_ts,
-            ),
-            # signal handlers: no-op in test
-            patch("dsm.server.setup_signal_handlers", return_value=None),
-            # The function under test
-            patch.object(_server_mod, "_accept_one_session", new=_fake_accept),
+            patch("dsm.server.load_cert_materials", return_value=MagicMock()),
+            patch("dsm.server.server_gate_keys", return_value=KEYS),
+            patch("dsm.server.CNAllowlist.from_file", return_value=mock_cn_allowlist),
+            patch("dsm.server.KeyStore", return_value=MagicMock()),
+            patch("dsm.server.AttestStore", return_value=MagicMock()),
+            patch("dsm.crypto._stores.load_daemon_stores", return_value=True),
+            patch("dsm.server.verify_cert_matches_identity", return_value=None),
+            patch("dsm.server.ServerRateLimitManager", return_value=MagicMock()),
+            patch("dsm.server.TcpTimestampsDisabler", return_value=MagicMock()),
+            patch("dsm.server.setup_signal_handlers", _capture),
+            patch("dsm.server._open_tcp_listener", _open),
+            patch("dsm.server._set_up_host", _fake_host),
+            patch("dsm.server._run_one_session", _session),
+            patch("dsm.crypto.handshake.server_handshake", _handshake),
         ]
-
         for p in patches:
             p.start()
-        self.addCleanup(lambda: [p.stop() for p in patches])
+        self.addCleanup(lambda: [p.stop() for p in reversed(patches)])
 
-        # run_server must return 0 (clean shutdown), NOT raise.
-        result = await asyncio.wait_for(
-            _server_mod.run_server(mock_config),
-            timeout=5.0,
+        run = asyncio.ensure_future(_server_mod.run_server(mock_config))
+        listener.connections.put_nowait((bad, bad.peer))
+        listener.connections.put_nowait((good, good.peer))
+        self.assertTrue(
+            await _spin(lambda: run.done() or (len(served) == 1 and bad.closed))
         )
-
-        self.assertEqual(
-            result,
-            0,
-            "run_server must return 0 on clean shutdown after a FramingError recovery",
-        )
-        self.assertEqual(
-            call_count,
-            2,
-            "loop must have continued after FramingError and called "
-            "_accept_one_session a second time",
-        )
+        self.assertFalse(run.done(), "a FramingError must not end run_server")
+        self.assertIs(served[0].transport, good)
+        captured["event"].set()
+        self.assertEqual(await asyncio.wait_for(run, 5.0), 0)
 
 
 class TestTcpRecvRaisesFramingError(unittest.IsolatedAsyncioTestCase):

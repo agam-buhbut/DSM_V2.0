@@ -1935,19 +1935,16 @@ async def test_run_server_warns_at_start_when_too_few_slots(
 ) -> None:
     # [BOX-ONLY] dsm.server needs the new tuncore; imported here so the rest
     # of this file still runs on the laptop.
-    from dsm.server import run_server
-    from tests.test_server_dns_fatal import _base_patches, _server_config
+    from tests.test_server_dns_fatal import _base_patches, _run_until, _server_config
 
     caplog.set_level(logging.WARNING, logger="dsm")
-
-    async def _accept(*args: Any, **_k: Any) -> tuple[Any, Any, Any]:
-        return None, None, args[5]  # no client: the accept loop ends
 
     config = replace(
         _server_config(), max_inflight_handshakes=slots, dns_blocklist=False
     )
-    with _base_patches(_accept, {}):
-        assert await run_server(config) == 0
+    captured: dict[str, Any] = {}
+    with _base_patches(captured):
+        assert await _run_until(config, captured) == 0
     lines = [
         r.getMessage()
         for r in caplog.records

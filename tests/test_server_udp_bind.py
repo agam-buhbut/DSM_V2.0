@@ -21,6 +21,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import dsm.server as server_mod
 from dsm.net.handshake_gate import GateKeys
+from tests.test_server_dns_fatal import _fake_host
 
 
 def _udp_config(port: int) -> MagicMock:
@@ -38,6 +39,7 @@ def _udp_config(port: int) -> MagicMock:
 def _host_patches(rate_limiter: MagicMock) -> list[Any]:
     allowlist = MagicMock()
     allowlist.__len__ = MagicMock(return_value=1)
+    allowlist.order = ("dsm-a-client",)
     return [
         patch("tuncore.harden_process", return_value=None),
         patch("dsm.core.hardening.set_process_nondumpable", return_value=None),
@@ -71,11 +73,11 @@ class _ErrorRecords(logging.Handler):
 class _UdpBindCase(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.rate_limiter = MagicMock()
-        # Stands in for the UDP accept loop, which needs real datagrams.
-        self.accept = AsyncMock()
+        # Stands in for the host setup (TUN, NAT, DNS), which needs root.
+        self.set_up_host = AsyncMock(side_effect=_fake_host)
 
         patches = _host_patches(self.rate_limiter) + [
-            patch("dsm.server._accept_until_winner", new=self.accept)
+            patch("dsm.server._set_up_host", new=self.set_up_host)
         ]
         for p in patches:
             p.start()
@@ -99,7 +101,7 @@ class _UdpBindCase(unittest.IsolatedAsyncioTestCase):
             f"cannot listen on UDP port {port}: {reason}; exiting",
         )
         self.assertIsNone(record.exc_info, "a one-line error, not a traceback")
-        self.accept.assert_not_called()
+        self.set_up_host.assert_not_called()  # the bind fails before any host state
         # The exit unwinds the host state that was set up before the bind.
         self.rate_limiter.remove.assert_called_once_with()
 
@@ -148,20 +150,18 @@ class TestBindFailureAtStartup(_UdpBindCase):
 
 
 class TestBindSuccess(_UdpBindCase):
-    async def test_a_bound_port_goes_on_to_accept_clients(self) -> None:
+    async def test_a_bound_port_goes_on_to_set_up_the_host(self) -> None:
         bind = AsyncMock(return_value=51820)
-
-        async def _accept(*args: Any) -> tuple[None, None, Any]:
-            args[6].set()  # process_shutdown
-            return None, None, args[5]  # transport_obj
-
-        self.accept.side_effect = _accept
-        with patch.object(server_mod.UDPTransport, "bind", bind):
+        with (
+            patch.object(server_mod.UDPTransport, "bind", bind),
+            # A signal at once: the run stops right after its start.
+            patch("dsm.server.setup_signal_handlers", lambda shutdown: shutdown.set()),
+        ):
             rc = await self._run(51820)
 
         self.assertEqual(rc, 0)
         bind.assert_awaited_once_with(local_port=51820, pmtu_discover=False)
-        self.accept.assert_awaited_once()
+        self.set_up_host.assert_awaited_once()
         self.assertEqual(self.errors.records, [])
         self.rate_limiter.remove.assert_called_once_with()
 

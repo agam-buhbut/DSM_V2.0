@@ -1,29 +1,26 @@
-"""End to end on loopback: a client that comes back replaces its old session,
-and another client waits until the session ends.
+"""End to end on loopback: another client gets its own session at once, and
+a client that comes back replaces only its own old session.
 
-Real handshakes, the real acceptor, slot, in-session accept, session
-receive loop, shaper and scheduler; the TUN, the host managers and the DNS
-proxy are fakes. Box only: needs the built tuncore (its Shaper) and the
-soft attest backend.
+Real handshakes, the real acceptor, dispatcher, session table, router,
+session receive loops, shaper and scheduler; the TUN, the host managers and
+the DNS proxy are fakes. test_multi_client_e2e.py reuses this harness.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
-import logging
+import ipaddress
 from collections.abc import AsyncGenerator
 from dataclasses import replace
 from typing import Any
 from unittest.mock import patch
 
-import pytest
-
 import tuncore
 from dsm.core.protocol import INNER_STRUCT, PacketType
-from dsm.crypto import handshake
 from dsm.crypto.cert_allowlist import CNAllowlist
-from dsm.crypto.handshake import HandshakeError, client_handshake
+from dsm.crypto.handshake import client_handshake
+from dsm.net._addresses import TunnelAssignment
 from dsm.net.handshake_gate import SourceLimiter
 from dsm.net.transport.udp import UDPTransport
 from dsm.server import run_server
@@ -39,10 +36,14 @@ from tests.test_server_dns_fatal import _server_config
 Addr = tuple[str, int]
 A_CN = "dsm-e2e-a-client"
 B_CN = "dsm-e2e-b-client"
+C_CN = "dsm-e2e-c-client"
 SERVER_CN = "dsm-e2e-server"
+WAN = "93.184.216.34"  # an internet address
 
 
 class _Quiet:
+    applied = True  # the NAT table loads (MasqueradeManager.applied)
+
     def __init__(self, *_a: Any, **_k: Any) -> None:
         pass
 
@@ -54,10 +55,11 @@ class _Quiet:
 
 
 class _Tun:
-    """Fake TUN: what the server writes goes to ``written``; it never yields
-    a packet to send."""
+    """Fake shared TUN: what sessions write goes to ``written``; a packet put
+    on ``incoming`` is read by the router, as if from the internet."""
 
     written: asyncio.Queue[bytes]
+    incoming: asyncio.Queue[bytes]
 
     def __init__(self, *_a: Any, **_k: Any) -> None:
         pass
@@ -72,11 +74,11 @@ class _Tun:
         pass
 
     async def read(self) -> bytes:
-        await asyncio.Event().wait()
-        return b""
+        return await _Tun.incoming.get()
 
-    async def awrite(self, data: bytes) -> None:
+    async def awrite(self, data: bytes) -> int:
         _Tun.written.put_nowait(bytes(data))
+        return len(data)
 
 
 class _Resolver:
@@ -96,6 +98,9 @@ class _Dns:
 
     def stop(self) -> None:
         pass
+
+    def forget(self, client_ip: str) -> None:
+        del client_ip
 
 
 class _LoopbackUDP(UDPTransport):
@@ -136,14 +141,16 @@ class _Materials:
 
 
 class _World:
-    def __init__(self, allowed: set[str]) -> None:
+    def __init__(self, allowed: list[str]) -> None:
         self.ca = make_test_ca()
         self.server = make_enrolled_device(
             self.ca, subject_cn=SERVER_CN, eku=SERVER_AUTH_OID
         )
         self.a = make_enrolled_device(self.ca, subject_cn=A_CN)
         self.b = make_enrolled_device(self.ca, subject_cn=B_CN)
-        self.allowed = allowed
+        self.c = make_enrolled_device(self.ca, subject_cn=C_CN)
+        # The allowlist file's order: the n-th name gets the n-th address.
+        self.allowlist = CNAllowlist(cns=frozenset(allowed), order=tuple(allowed))
         self.captured: dict[str, asyncio.Event] = {}
 
 
@@ -151,6 +158,7 @@ class _World:
 async def _server(world: _World) -> AsyncGenerator[Addr, None]:
     """run_server on 127.0.0.1 with fake host state; yields its address."""
     _Tun.written = asyncio.Queue()
+    _Tun.incoming = asyncio.Queue()
     _LoopbackUDP.bound = asyncio.get_running_loop().create_future()
     _Stores.identity = world.server.identity
     _Stores.attest_key = world.server.attest_key
@@ -169,7 +177,7 @@ async def _server(world: _World) -> AsyncGenerator[Addr, None]:
         patch("dsm.server.verify_cert_matches_identity"),
         patch(
             "dsm.server.CNAllowlist.from_file",
-            return_value=CNAllowlist(cns=frozenset(world.allowed)),
+            return_value=world.allowlist,
         ),
         patch("dsm.crypto._stores.load_daemon_stores", return_value=True),
         patch("dsm.server.KeyStore", _Stores),
@@ -214,8 +222,8 @@ async def _socket() -> UDPTransport:
 
 async def _connect(
     world: _World, device: EnrolledDevice, sock: UDPTransport, server: Addr
-) -> tuncore.SessionKeyManager:
-    keys, _hash, _server_pub, _tunnel = await asyncio.wait_for(
+) -> tuple[tuncore.SessionKeyManager, TunnelAssignment]:
+    keys, _hash, _server_pub, tunnel = await asyncio.wait_for(
         client_handshake(
             sock,
             device.identity,
@@ -227,21 +235,19 @@ async def _connect(
         ),
         timeout=20.0,
     )
-    return keys
+    return keys, tunnel
 
 
-async def _connect_eventually(
-    world: _World, device: EnrolledDevice, server: Addr
-) -> tuple[tuncore.SessionKeyManager, UDPTransport]:
-    """Connect as a client does after a refusal: try again, a new socket each
-    time (a few useless attempts may still hold the shared loopback address)."""
-    for _ in range(20):
-        sock = await _socket()
-        try:
-            return await _connect(world, device, sock, server), sock
-        except HandshakeError:
-            await sock.aclose()
-    raise AssertionError("the client never connected")
+def _ipv4(src: str, dst: str, payload: bytes = b"") -> bytes:
+    """An IPv4 packet: a 20-byte header (version, length, protocol and the
+    two addresses, which is all the server reads) and ``payload``."""
+    header = bytearray(20)
+    header[0] = 0x45
+    header[2:4] = (20 + len(payload)).to_bytes(2, "big")
+    header[9] = 17  # UDP
+    header[12:16] = ipaddress.IPv4Address(src).packed
+    header[16:20] = ipaddress.IPv4Address(dst).packed
+    return bytes(header) + payload
 
 
 async def _send(
@@ -262,82 +268,60 @@ async def _tun_gets(expected: bytes, timeout: float) -> None:
     assert await asyncio.wait_for(_Tun.written.get(), timeout) == expected
 
 
-async def _slot_logged(
-    caplog: pytest.LogCaptureFixture, line: str, timeout: float
-) -> bool:
-    """Wait until the session slot has logged ``line``."""
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout
-    while loop.time() < deadline:
-        if any(
-            r.name == "dsm.net.session_slot" and r.getMessage() == line
-            for r in caplog.records
-        ):
-            return True
-        await asyncio.sleep(0.01)
-    return False
-
-
-async def test_a_client_that_comes_back_replaces_its_old_session() -> None:
-    world = _World({A_CN})
+async def test_a_client_that_comes_back_replaces_only_its_own_session() -> None:
+    world = _World([A_CN, B_CN])
     async with _server(world) as server:
+        b_sock = await _socket()
         first = await _socket()
+        again: UDPTransport | None = None
         try:
-            a_keys = await _connect(world, world.a, first, server)
-            await _send(first, a_keys, server, 1, PacketType.DATA, b"from A")
-            await _tun_gets(b"from A", 10.0)
-        finally:
+            b_keys, b_tunnel = await _connect(world, world.b, b_sock, server)
+            a_keys, a_tunnel = await _connect(world, world.a, first, server)
+            a_ip, b_ip = str(a_tunnel.client), str(b_tunnel.client)
+            packet = _ipv4(a_ip, WAN, b"from A")
+            await _send(first, a_keys, server, 1, PacketType.DATA, packet)
+            await _tun_gets(packet, 10.0)
             # A dies as by kill -9: its socket closes, no SESSION_CLOSE.
             await first.aclose()
-        # A again (same identity, a new socket): the server ends the old
-        # session at once, not after the 60 s dead-peer timer.
-        again = await _socket()
-        try:
-            a2_keys = await _connect(world, world.a, again, server)
-            await _send(again, a2_keys, server, 1, PacketType.DATA, b"from A again")
-            await _tun_gets(b"from A again", 2.0)
+            # A again (same identity, a new socket) replaces its own old
+            # session at once, not after the 60 s dead-peer timer, and keeps
+            # its address.
+            again = await _socket()
+            a2_keys, a2_tunnel = await _connect(world, world.a, again, server)
+            assert a2_tunnel == a_tunnel
+            packet = _ipv4(a_ip, WAN, b"from A again")
+            await _send(again, a2_keys, server, 1, PacketType.DATA, packet)
+            await _tun_gets(packet, 2.0)
+            # B's session was not touched.
+            packet = _ipv4(b_ip, WAN, b"B still up")
+            await _send(b_sock, b_keys, server, 1, PacketType.DATA, packet)
+            await _tun_gets(packet, 5.0)
         finally:
-            await again.aclose()
+            await first.aclose()
+            if again is not None:
+                await again.aclose()
+            await b_sock.aclose()
 
 
-async def test_another_client_waits_until_the_session_ends(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    caplog.set_level(logging.INFO, logger="dsm.net.session_slot")
-    world = _World({A_CN, B_CN})
+async def test_another_client_gets_its_own_session_at_once() -> None:
+    world = _World([A_CN, B_CN])
     async with _server(world) as server:
-        a_sock = await _socket()
+        a_sock, b_sock = await _socket(), await _socket()
         try:
-            a_keys = await _connect(world, world.a, a_sock, server)
-            await _send(a_sock, a_keys, server, 1, PacketType.DATA, b"from A")
-            await _tun_gets(b"from A", 10.0)
-            with (
-                patch.object(handshake, "HANDSHAKE_TIMEOUT", 0.3),
-                patch.object(handshake, "BACKOFF_BASE", 0.01),
+            a_keys, a_tunnel = await _connect(world, world.a, a_sock, server)
+            # The first try works: no refusal, no wait for A's session to end.
+            b_keys, b_tunnel = await _connect(world, world.b, b_sock, server)
+            assert (str(a_tunnel.client), str(b_tunnel.client)) == (
+                "10.8.0.2",
+                "10.8.0.3",
+            )
+            for sock, keys, tunnel, text in (
+                (a_sock, a_keys, a_tunnel, b"from A"),
+                (b_sock, b_keys, b_tunnel, b"from B"),
             ):
-                b_sock = await _socket()
-                try:
-                    # B gets msg2, then nothing: refused before the last frame.
-                    with pytest.raises(HandshakeError):
-                        await _connect(world, world.b, b_sock, server)
-                finally:
-                    await b_sock.aclose()
-                assert await _slot_logged(
-                    caplog,
-                    "handshake refused: another client is connected "
-                    f"(client_cn={B_CN})",
-                    5.0,
-                )
-                # A's session is untouched.
-                await _send(a_sock, a_keys, server, 2, PacketType.DATA, b"A still up")
-                await _tun_gets(b"A still up", 5.0)
-                # A says goodbye; then B gets in.
-                await _send(a_sock, a_keys, server, 3, PacketType.SESSION_CLOSE)
-                b_keys, b_sock = await _connect_eventually(world, world.b, server)
-            try:
-                await _send(b_sock, b_keys, server, 1, PacketType.DATA, b"from B")
-                await _tun_gets(b"from B", 5.0)
-            finally:
-                await b_sock.aclose()
+                packet = _ipv4(str(tunnel.client), WAN, text)
+                await _send(sock, keys, server, 1, PacketType.DATA, packet)
+                await _tun_gets(packet, 10.0)
         finally:
             await a_sock.aclose()
+            await b_sock.aclose()

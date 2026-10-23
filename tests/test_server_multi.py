@@ -8,19 +8,32 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from collections.abc import Callable
-from contextlib import AsyncExitStack, ExitStack
+from collections.abc import Callable, Generator
+from contextlib import AsyncExitStack, ExitStack, contextmanager
+from dataclasses import replace
 from typing import Any
 from unittest.mock import patch
 
 import pytest
 
+from dsm.core.config import Config
+from dsm.core.fsm import SessionFSM, State
+from dsm.crypto.cert_allowlist import CNAllowlist
+from dsm.crypto.handshake import VerifiedClient
 from dsm.net.dns import DNSResolver
 from dsm.net.dns_proxy import DNSProxyPortInUseError
-from dsm.net.session_slot import SessionTable
-from dsm.server import _run_acceptor, _set_up_host
+from dsm.net.handshake_acceptor import AcceptedClient
+from dsm.net.session_router import _SessionUDPView
+from dsm.net.session_slot import ServerSession, SessionTable
+from dsm.server import (
+    SERVER_RECV_QUEUE_PACKETS,
+    _drive_fsm_to_idle,
+    _run_acceptor,
+    _set_up_host,
+    run_server,
+)
 from tests.test_handshake_acceptor_limits import _spin
-from tests.test_server_dns_fatal import _server_config
+from tests.test_server_dns_fatal import _base_patches, _FakeUDPTransport, _server_config
 
 A = "dsm-a-client"
 B = "dsm-b-client"
@@ -287,3 +300,490 @@ async def test_a_cancel_ends_the_acceptor_loop_without_an_error_line(
         await task
     assert task.cancelled()
     assert caplog.records == []
+
+
+PEER_A = ("198.51.100.7", 40000)
+PEER_A2 = ("198.51.100.7", 40001)  # A again, from a new port
+PEER_B = ("203.0.113.9", 51000)
+
+
+class _Keys:
+    """Session keys as the dispatcher sees them: every header fits."""
+
+    epoch = 0
+
+    def header_matches(self, _wire: bytes) -> bool:
+        return True
+
+
+class _Listener:
+    def __init__(self) -> None:
+        self.connections: asyncio.Queue[Any] = asyncio.Queue()
+
+    def close(self) -> None:
+        pass
+
+
+class _Acceptor:
+    """Stands in for ClientAcceptor and keeps what run_server gave it.
+    ``admit`` does what a worker does after a full handshake (spec §2.7):
+    the table's admit and confirm, then on_client."""
+
+    made: list[_Acceptor] = []
+
+    def __init__(
+        self,
+        config: Any,
+        keystore: Any,
+        attest_store: Any,
+        materials: Any,
+        cn_allowlist: Any,
+        limiter: Any,
+        table: Any,
+        gate: Any,
+        on_client: Any,
+        *,
+        udp: Any = None,
+        tcp: Any = None,
+        clock: Any = None,
+    ) -> None:
+        del config, keystore, attest_store, materials, cn_allowlist, clock
+        self.limiter = limiter
+        self.table = table
+        self.gate = gate
+        self.on_client = on_client
+        self.udp = udp
+        self.tcp = tcp
+        self.offered: list[tuple[bytes, tuple[str, int]]] = []
+        self.runs = 0
+        self.stops = 0
+        self.live_at_stop: list[bool] = []
+        # Raised by stop(), as part B's stop() raises a worker's bug.
+        self.stop_error: Exception | None = None
+        # When set, stop() waits on it (a test cancels the run meanwhile).
+        self.stop_wait: asyncio.Event | None = None
+        _Acceptor.made.append(self)
+
+    def offer(self, data: bytes, addr: tuple[str, int]) -> None:
+        self.offered.append((data, addr))
+
+    async def run(self) -> None:
+        self.runs += 1
+        await asyncio.Event().wait()
+
+    async def stop(self) -> None:
+        self.stops += 1
+        # Whether any session had been told to stop before the acceptor.
+        self.live_at_stop = [s.shutdown.is_set() for s in self.table.sessions()]
+        if self.stop_wait is not None:
+            await self.stop_wait.wait()
+        if self.stop_error is not None:
+            raise self.stop_error
+
+    def admit(
+        self,
+        cn: str,
+        peer: tuple[str, int],
+        *,
+        transport: Any = None,
+        held: tuple[bytes, ...] = (),
+    ) -> None:
+        attempt = object()
+        client = VerifiedClient(cn=cn, noise_static=cn.encode().ljust(32, b"\x00")[:32])
+        self.table.admit(attempt, client)
+        _, tunnel = self.table.confirm(attempt)
+        try:
+            self.on_client(
+                AcceptedClient(
+                    session_keys=_Keys(),  # type: ignore[arg-type]
+                    client=client,
+                    tunnel=tunnel,
+                    transport=transport if transport is not None else self.udp,
+                    peer=peer,
+                    held=held,
+                )
+            )
+        finally:
+            self.table.release(attempt)
+
+
+class _Sessions:
+    """Stands in for _run_one_session: each session runs until its shutdown
+    is set, or ends at once for a CN in ``end_at_once`` (as a dead peer
+    would)."""
+
+    def __init__(self, events: list[str] | None = None) -> None:
+        self.events: list[str] = events if events is not None else []
+        self.started: list[ServerSession] = []
+        self.end_at_once: set[str] = set()
+
+    async def __call__(
+        self,
+        _config: Any,
+        fsm: SessionFSM,
+        _keystore: Any,
+        session: ServerSession,
+        *_rest: Any,
+    ) -> None:
+        fsm.transition(State.ESTABLISHED)
+        self.started.append(session)
+        cn = session.client.cn
+        self.events.append(f"{cn} started")
+        try:
+            if cn not in self.end_at_once:
+                await session.shutdown.wait()
+        finally:
+            self.events.append(f"{cn} ended")
+        _drive_fsm_to_idle(fsm)
+
+
+@contextmanager
+def _multi(
+    captured: dict[str, Any], sessions: _Sessions, cns: tuple[str, ...] = (A, B)
+) -> Generator[None, None, None]:
+    """run_server with host I/O faked, the allowlist ``cns`` in that order,
+    the stand-in acceptor and sessions."""
+    _Acceptor.made = []
+    allowlist = CNAllowlist(cns=frozenset(cns), order=cns)
+    with (
+        _base_patches(captured),
+        patch("dsm.server.CNAllowlist.from_file", return_value=allowlist),
+        patch("dsm.server.ClientAcceptor", _Acceptor),
+        patch("dsm.server._run_one_session", sessions),
+    ):
+        yield
+
+
+async def _start(config: Config | None = None) -> asyncio.Future[int]:
+    """Start run_server; return once its acceptor runs."""
+    run = asyncio.ensure_future(
+        run_server(config or replace(_server_config(), dns_blocklist=False))
+    )
+    assert await _spin(
+        lambda: run.done() or (bool(_Acceptor.made) and _Acceptor.made[0].runs == 1)
+    )
+    assert not run.done(), "run_server ended at start"
+    return run
+
+
+async def _stop(run: asyncio.Future[int], captured: dict[str, Any]) -> int:
+    captured["event"].set()  # as SIGTERM would
+    return await asyncio.wait_for(run, 5.0)
+
+
+def _errors(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+
+async def test_two_clients_are_served_at_once(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.INFO, logger="dsm.server")
+    captured: dict[str, Any] = {}
+    sessions = _Sessions()
+    with _multi(captured, sessions):
+        run = await _start()
+        acceptor = _Acceptor.made[0]
+        acceptor.admit(A, PEER_A)
+        acceptor.admit(B, PEER_B)
+        assert await _spin(lambda: len(sessions.started) == 2)
+        a, b = sessions.started
+        assert (str(a.tunnel.client), str(b.tunnel.client)) == ("10.8.0.2", "10.8.0.3")
+        assert isinstance(a.transport, _SessionUDPView)
+        assert isinstance(b.transport, _SessionUDPView)
+        assert captured["table"].sessions() == [a, b]
+        assert not a.shutdown.is_set() and not b.shutdown.is_set()
+        rc = await _stop(run, captured)
+    assert rc == 0
+    lines = [r.getMessage() for r in caplog.records]
+    assert f"session 1: client_cn={A}, tunnel address 10.8.0.2" in lines
+    assert f"session 2: client_cn={B}, tunnel address 10.8.0.3" in lines
+    assert f"session 1 ended (client_cn={A})" in lines
+
+
+async def test_the_port_and_the_host_come_up_once_before_any_client() -> None:
+    captured: dict[str, Any] = {}
+    events: list[str] = captured.setdefault("events", [])
+
+    class _Socket(_FakeUDPTransport):
+        async def bind(self, *_a: object, **_k: object) -> int:
+            events.append("bind")
+            return 51820
+
+    sessions = _Sessions(events)
+    with _multi(captured, sessions), patch("dsm.server.UDPTransport", _Socket):
+        run = await _start()
+        _Acceptor.made[0].admit(A, PEER_A)
+        assert await _spin(lambda: len(sessions.started) == 1)
+        rc = await _stop(run, captured)
+    assert rc == 0
+    assert events == [
+        "bind",
+        "host up",
+        f"{A} started",
+        f"{A} ended",
+        "routing stopped",
+        "host down",
+    ]
+    assert _FakeUDPTransport.made[-1].recv_queue_size == SERVER_RECV_QUEUE_PACKETS
+    assert SERVER_RECV_QUEUE_PACKETS == 4096
+
+
+async def test_a_takeover_ends_only_that_cns_old_session(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="dsm")
+    captured: dict[str, Any] = {}
+    sessions = _Sessions()
+    with _multi(captured, sessions):
+        run = await _start()
+        acceptor = _Acceptor.made[0]
+        acceptor.admit(A, PEER_A)
+        acceptor.admit(B, PEER_B)
+        acceptor.admit(A, PEER_A2)  # A comes back from a new port
+        assert await _spin(
+            lambda: len(sessions.started) == 3 and f"{A} ended" in sessions.events
+        )
+        old_a, b, new_a = sessions.started
+        assert old_a.shutdown.is_set()
+        assert not b.shutdown.is_set() and not new_a.shutdown.is_set()
+        assert new_a.tunnel == old_a.tunnel
+        table = captured["table"]
+        assert table.by_tunnel(new_a.tunnel.client.packed) is new_a
+        assert table.by_peer(PEER_A2) is new_a and table.by_peer(PEER_A) is None
+        rc = await _stop(run, captured)
+    assert rc == 0
+    assert f"client reconnected (client_cn={A}); ending its old session" in [
+        r.getMessage() for r in caplog.records
+    ]
+
+
+async def test_a_signal_stops_the_acceptor_then_every_session_then_the_host() -> None:
+    captured: dict[str, Any] = {}
+    events: list[str] = captured.setdefault("events", [])
+    sessions = _Sessions(events)
+    with _multi(captured, sessions):
+        run = await _start()
+        acceptor = _Acceptor.made[0]
+        acceptor.admit(A, PEER_A)
+        acceptor.admit(B, PEER_B)
+        assert await _spin(lambda: len(sessions.started) == 2)
+        rc = await _stop(run, captured)
+    assert rc == 0
+    assert acceptor.stops == 1
+    assert acceptor.live_at_stop == [False, False]
+    # Every session, then the routing, then the host state (spec §2.2).
+    assert sorted(events[-4:-2]) == sorted([f"{A} ended", f"{B} ended"])
+    assert events[-2:] == ["routing stopped", "host down"]
+
+
+async def test_a_stop_that_raises_still_ends_every_session_before_the_host(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.ERROR, logger="dsm")
+    captured: dict[str, Any] = {}
+    events: list[str] = captured.setdefault("events", [])
+    sessions = _Sessions(events)
+    with _multi(captured, sessions):
+        run = await _start()
+        acceptor = _Acceptor.made[0]
+        acceptor.stop_error = RuntimeError("a worker bug")
+        acceptor.admit(A, PEER_A)
+        acceptor.admit(B, PEER_B)
+        assert await _spin(lambda: len(sessions.started) == 2)
+        rc = await _stop(run, captured)
+    assert rc == 0
+    assert sorted(events[-4:-2]) == sorted([f"{A} ended", f"{B} ended"])
+    assert events[-2:] == ["routing stopped", "host down"]
+    (error,) = _errors(caplog)
+    assert error.getMessage() == "handshake accept failed while stopping"
+    assert error.exc_info is not None
+
+
+async def test_a_cancel_still_ends_every_session_before_the_host() -> None:
+    captured: dict[str, Any] = {}
+    events: list[str] = captured.setdefault("events", [])
+    sessions = _Sessions(events)
+    with _multi(captured, sessions):
+        run = await _start()
+        acceptor = _Acceptor.made[0]
+        acceptor.admit(A, PEER_A)
+        acceptor.admit(B, PEER_B)
+        assert await _spin(lambda: len(sessions.started) == 2)
+        run.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.wait_for(run, 5.0)
+    assert run.cancelled()
+    assert acceptor.stops == 1
+    assert sorted(events[-4:-2]) == sorted([f"{A} ended", f"{B} ended"])
+    assert events[-2:] == ["routing stopped", "host down"]
+
+
+async def test_a_second_cancel_during_the_stop_still_ends_the_sessions() -> None:
+    captured: dict[str, Any] = {}
+    events: list[str] = captured.setdefault("events", [])
+    sessions = _Sessions(events)
+    with _multi(captured, sessions):
+        run = await _start()
+        acceptor = _Acceptor.made[0]
+        acceptor.stop_wait = asyncio.Event()  # never set: stop() waits
+        acceptor.admit(A, PEER_A)
+        assert await _spin(lambda: len(sessions.started) == 1)
+        run.cancel()
+        assert await _spin(lambda: acceptor.stops == 1)
+        run.cancel()  # lands inside acceptor.stop()
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.wait_for(run, 5.0)
+    assert run.cancelled()
+    assert events[-3:] == [f"{A} ended", "routing stopped", "host down"]
+
+
+async def test_frames_held_at_the_handshake_reach_the_new_session() -> None:
+    captured: dict[str, Any] = {}
+    sessions = _Sessions()
+    with _multi(captured, sessions):
+        run = await _start()
+        _Acceptor.made[0].admit(A, PEER_A, held=(b"late frame 1", b"late frame 2"))
+        assert await _spin(lambda: len(sessions.started) == 1)
+        view = sessions.started[0].transport
+        got = [await asyncio.wait_for(view.recv(), 1.0) for _ in range(2)]
+        rc = await _stop(run, captured)
+    assert rc == 0
+    assert got == [(b"late frame 1", PEER_A), (b"late frame 2", PEER_A)]
+
+
+async def test_tcp_connections_each_become_a_session() -> None:
+    captured: dict[str, Any] = {}
+    sessions = _Sessions()
+    listener = _Listener()
+    conn_a, conn_b = object(), object()
+
+    async def _open(_config: Any) -> _Listener:
+        return listener
+
+    with _multi(captured, sessions), patch("dsm.server._open_tcp_listener", _open):
+        run = await _start(
+            replace(_server_config(), dns_blocklist=False, transport="tcp")
+        )
+        acceptor = _Acceptor.made[0]
+        acceptor.admit(A, PEER_A, transport=conn_a)
+        acceptor.admit(B, PEER_B, transport=conn_b)
+        assert await _spin(lambda: len(sessions.started) == 2)
+        rc = await _stop(run, captured)
+    assert rc == 0
+    assert acceptor.tcp is listener.connections and acceptor.udp is None
+    assert [s.transport for s in sessions.started] == [conn_a, conn_b]
+
+
+async def test_a_tun_read_error_stops_the_run_with_exit_1(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.ERROR, logger="dsm")
+    captured: dict[str, Any] = {}
+    events: list[str] = captured.setdefault("events", [])
+    sessions = _Sessions(events)
+    with _multi(captured, sessions):
+        run = await _start()
+        _Acceptor.made[0].admit(A, PEER_A)
+        assert await _spin(lambda: len(sessions.started) == 1)
+        captured["host"].tun.fail.set()
+        rc = await asyncio.wait_for(run, 5.0)
+    assert rc == 1
+    assert [r.getMessage() for r in _errors(caplog)] == [
+        "the tunnel device failed ([Errno 5] Input/output error); stopping"
+    ]
+    assert events[-2:] == [f"{A} ended", "host down"]
+
+
+async def test_a_dispatcher_bug_stops_the_run_with_exit_1(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.ERROR, logger="dsm")
+    captured: dict[str, Any] = {}
+
+    class _Broken:
+        unmatched = 0
+
+        def __init__(self, *_a: Any) -> None:
+            pass
+
+        async def run(self) -> None:
+            raise RuntimeError("dispatcher bug")
+
+    with _multi(captured, _Sessions()), patch("dsm.server.UDPDispatcher", _Broken):
+        rc = await asyncio.wait_for(
+            run_server(replace(_server_config(), dns_blocklist=False)), 5.0
+        )
+    assert rc == 1
+    (error,) = _errors(caplog)
+    assert error.getMessage() == "packet routing failed; stopping"
+    assert error.exc_info is not None
+
+
+async def test_a_host_setup_failure_at_start_exits_1_before_any_client(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.ERROR, logger="dsm")
+    captured: dict[str, Any] = {}
+
+    async def _broken(*_a: Any) -> Any:
+        raise RuntimeError("TUN configure failed: ip link set mtun0 up")
+
+    with _multi(captured, _Sessions()), patch("dsm.server._set_up_host", _broken):
+        rc = await asyncio.wait_for(
+            run_server(replace(_server_config(), dns_blocklist=False)), 5.0
+        )
+    assert rc == 1
+    assert [r.getMessage() for r in _errors(caplog)] == [
+        "could not set up the tunnel at start: "
+        "TUN configure failed: ip link set mtun0 up; exiting"
+    ]
+    assert _Acceptor.made == []
+
+
+async def test_tunnel_addresses_that_cannot_be_built_exit_1_before_the_host(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.ERROR, logger="dsm")
+    captured: dict[str, Any] = {}
+
+    def _bad(_cns: Any) -> SessionTable:
+        raise ValueError("10.8.0.2 is not in 10.8.0.0/24")
+
+    with _multi(captured, _Sessions()), patch("dsm.server.SessionTable", _bad):
+        rc = await asyncio.wait_for(
+            run_server(replace(_server_config(), dns_blocklist=False)), 5.0
+        )
+    assert rc == 1
+    (error,) = _errors(caplog)
+    assert error.getMessage() == (
+        "tunnel addresses could not be built: 10.8.0.2 is not in 10.8.0.0/24; "
+        "exiting"
+    )
+    assert error.exc_info is None
+    assert captured["events"] == []  # no host state was built
+    assert _Acceptor.made == []
+
+
+async def test_a_nat_table_that_does_not_load_exits_1_before_any_client(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Fail closed (roadmap item 1.8): the real host setup, with a NAT load
+    # that fails.
+    caplog.set_level(logging.ERROR, logger="dsm")
+    captured: dict[str, Any] = {}
+    with (
+        _multi(captured, _Sessions()),
+        _HostParts() as parts,
+        patch("dsm.server._set_up_host", _set_up_host),  # the real one
+    ):
+        parts.nat_loads = False
+        rc = await asyncio.wait_for(
+            run_server(replace(_server_config(), dns_blocklist=False)), 5.0
+        )
+    assert rc == 1
+    assert [r.getMessage() for r in _errors(caplog)] == [
+        "could not set up the tunnel at start: the NAT table (MASQUERADE, "
+        "client isolation, flow tags) did not load; exiting"
+    ]
+    assert _Acceptor.made == []
+    assert parts.proxy_args == {}
+    assert parts.events[-2:] == ["forwarding off", "tun close"]
