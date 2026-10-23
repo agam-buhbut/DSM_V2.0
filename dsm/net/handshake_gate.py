@@ -84,6 +84,10 @@ KNOWN_ADDRESSES_PER_CN = 4
 # times the per-address start rate and burst.
 KNOWN_COOKIE_REPLY_RATE = 0.5  # tokens per second
 KNOWN_COOKIE_REPLY_BURST = 6.0
+# A stranger's start that proved its address and then ended without a
+# session bars that address this long (spec §3.7 E2): as long as trouble
+# keeps cookies on (LOAD_HOLD_S).
+FAILED_START_PENALTY_S = 30.0
 
 
 class TokenBucket:
@@ -114,6 +118,8 @@ class TokenBucket:
 class _Source:
     inflight: int
     bucket: TokenBucket
+    # Set by a failed proven start (spec §3.7 E2): no new start before this.
+    barred_until: float | None = None
 
 
 class SourceLimiter:
@@ -149,6 +155,7 @@ class SourceLimiter:
         self._rate_log = RepeatLog(log, logging.INFO, clock=clock)
         self._overall_log = RepeatLog(log, logging.INFO, clock=clock)
         self._in_session_log = RepeatLog(log, logging.INFO, clock=clock)
+        self._failed_log = RepeatLog(log, logging.INFO, clock=clock)
 
     def __len__(self) -> int:
         """How many addresses are remembered now."""
@@ -179,6 +186,8 @@ class SourceLimiter:
         shared limits still apply.
 
         A known address (spec §3.7) is never charged the shared limits.
+        A stranger barred by a failed start (``finish(ip, failed=True)``) is
+        refused until the bar ends.
         """
         now = self._clock()
         # A known address skips the shared limits (spec §3.7).
@@ -193,6 +202,16 @@ class SourceLimiter:
             self._busy_log.log(
                 "new handshake refused: that address already has %d running",
                 PER_SOURCE_INFLIGHT,
+            )
+            return False
+        if (
+            src is not None
+            and src.barred_until is not None
+            and now < src.barred_until
+            and not known
+        ):
+            self._failed_log.log(
+                "new handshake refused: that address's last handshake failed"
             )
             return False
         if src is not None and not src.bucket.ready(now):
@@ -222,11 +241,15 @@ class SourceLimiter:
         self._sources[ip] = src
         return True
 
-    def finish(self, ip: str) -> None:
+    def finish(self, ip: str, *, failed: bool = False) -> None:
         """End one attempt that ``try_start(ip)`` admitted.
 
         Callers must pair each True from ``try_start`` with exactly one
         ``finish``; a missed ``finish`` is the caller's to prevent.
+        ``failed=True``: the start proved its address and ended without a
+        session (spec §3.7 E2). A stranger's address then may not start
+        again for ``FAILED_START_PENALTY_S``; a known one is never barred.
+        The caller decides what counts as proved.
 
         Raises:
             RuntimeError: ``ip`` has no running attempt to end. Nothing
@@ -237,6 +260,8 @@ class SourceLimiter:
         if src is None or src.inflight <= 0:
             raise RuntimeError("finish without a matching try_start")
         src.inflight -= 1
+        if failed and ip not in self._known_cookies:
+            src.barred_until = self._clock() + FAILED_START_PENALTY_S
 
     def try_shared(self, ip: str, *, in_session: bool = False) -> bool:
         """Charge the shared limits (overall, and in a session the in-session

@@ -12,6 +12,7 @@ import pytest
 from dsm.net import handshake_gate as gate
 from dsm.net.handshake_gate import (
     COOKIE_REPLY_BURST,
+    FAILED_START_PENALTY_S,
     GLOBAL_START_BURST,
     IN_SESSION_START_BURST,
     KNOWN_ADDRESSES_PER_CN,
@@ -166,3 +167,73 @@ def test_a_known_cookie_reply_spends_no_shared_budget() -> None:
         assert hg.cookie_reply(frame, (f"203.0.113.{i}", 1)) is not None
     assert hg.cookie_reply(frame, ("203.0.113.200", 1)) is None  # shared: spent
     assert hg.cookie_reply(frame, (KNOWN, 1), shared_budget=False) is not None
+
+
+_BARRED = "new handshake refused: that address's last handshake failed"
+
+
+def test_the_penalty_number() -> None:
+    assert FAILED_START_PENALTY_S == 30.0
+
+
+def test_a_failed_proven_start_bars_a_stranger_for_the_penalty(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="dsm.net.handshake_gate")
+    clock = _Frozen()
+    limiter = SourceLimiter(clock=clock)
+    ip = "203.0.113.9"
+    assert limiter.try_start(ip)
+    limiter.finish(ip, failed=True)
+    for _ in range(3):
+        assert not limiter.try_start(ip)
+    assert [(r.levelno, r.getMessage()) for r in caplog.records] == [
+        (logging.INFO, _BARRED)
+    ]
+    clock.now += FAILED_START_PENALTY_S - 0.1
+    assert not limiter.try_start(ip)
+    clock.now += 0.1
+    assert limiter.try_start(ip)
+    assert all(ip not in r.getMessage() for r in caplog.records)
+
+
+def test_a_plain_finish_bars_nothing() -> None:
+    # Not proved, or a start that became a session.
+    limiter = SourceLimiter(clock=_Frozen())
+    ip = "203.0.113.9"
+    assert limiter.try_start(ip)
+    limiter.finish(ip)
+    assert limiter.try_start(ip)
+
+
+def test_a_known_address_is_never_barred() -> None:
+    limiter = SourceLimiter(clock=_Frozen())
+    limiter.note_known(KNOWN, CN)
+    assert limiter.try_start(KNOWN)
+    limiter.finish(KNOWN, failed=True)
+    assert limiter.try_start(KNOWN)
+
+
+def test_a_barred_address_that_became_known_may_start() -> None:
+    # Two attempts from one address: one failed, then the other passed.
+    limiter = SourceLimiter(clock=_Frozen())
+    ip = "203.0.113.9"
+    assert limiter.try_start(ip)
+    assert limiter.try_start(ip)
+    limiter.finish(ip, failed=True)
+    limiter.note_known(ip, CN)
+    limiter.finish(ip, failed=True)  # the one that passed: known by now
+    assert limiter.try_start(ip)
+
+
+def test_a_penalty_refusal_spends_nothing() -> None:
+    limiter = SourceLimiter(clock=_Frozen())
+    ip = "203.0.113.9"
+    assert limiter.try_start(ip)
+    limiter.finish(ip, failed=True)
+    for _ in range(5):
+        assert not limiter.try_start(ip, in_session=True)
+    # Only the barred address's own start took an overall token.
+    for i in range(int(GLOBAL_START_BURST) - 1):
+        assert limiter.try_start(f"192.0.2.{i}")
+    assert not limiter.try_start("192.0.2.200")

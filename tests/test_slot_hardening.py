@@ -197,9 +197,9 @@ class _Ledger(SourceLimiter):
         super().__init__(clock=clock)
         self.finished: list[str] = []
 
-    def finish(self, ip: str) -> None:
+    def finish(self, ip: str, *, failed: bool = False) -> None:
         self.finished.append(ip)
-        super().finish(ip)
+        super().finish(ip, failed=failed)
 
 
 def _inflight(limiter: SourceLimiter, ip: str) -> int:
