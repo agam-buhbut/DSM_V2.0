@@ -1,8 +1,8 @@
 # DSM_V2.0
 
 DSM is an open-source VPN for Linux that puts security and anonymity first.
-It runs a single tunnel between one client and one server. It also resists
-traffic analysis: working out what you do from the size and timing of your
+One server serves several clients at once, each in its own tunnel. It also
+resists traffic analysis: working out what you do from the size and timing of your
 packets.
 
 ## Quickstart
@@ -125,20 +125,27 @@ side under `asyncio.gather`: `recv_loop`, `tun_send_loop` and
 
 ### Connection
 
-Each server instance serves one client at a time. It listens on one port: a
-UDP socket, or with `transport = "tcp"` a TCP listener that stays open for
-the whole run (in UDP mode the server opens no TCP port at all). It checks
-several handshakes at once, also while a session runs. A client that
-connects again with the same name (the CN in its certificate), for example
-after a crash, replaces its old session as soon as its full handshake
-passes. Another client waits until the session ends. Over UDP the server
-locks onto the first peer address that passes authentication. A session
-ends cleanly with a SESSION_CLOSE packet.
+One server serves several clients at once. Each allowlisted device (one CN
+in its certificate) gets its own session, its own tunnel address and its own
+DNS cache. The server listens on one port: a UDP socket, or with
+`transport = "tcp"` a TCP listener that stays open for the whole run (in UDP
+mode the server opens no TCP port at all). It checks several handshakes at
+once, also while sessions run. A client that connects again with the same
+CN, for example after a crash, replaces its own old session as soon as its
+full handshake passes; other clients are not touched. Over UDP a session
+sends to the address its handshake came from, and moves only after a
+PATH_CHALLENGE / PATH_RESPONSE check. A session ends cleanly with a
+SESSION_CLOSE packet.
 
-The server tells the client its address inside the tunnel, and its own
-(which is also the client's DNS server), in the last handshake message.
-Today that is always 10.8.0.2 for the client and 10.8.0.1 for the server,
-with a /24 prefix.
+Clients cannot reach each other through the tunnel, and cannot send with
+another client's tunnel address: the server drops such packets.
+
+The server tells each client its address inside the tunnel, and its own
+(which is also the client's DNS server), in the last handshake message. The
+n-th name in the allowlist file gets the n-th address: the first 10.8.0.2,
+the second 10.8.0.3, and so on up to 10.8.0.254, with the server at
+10.8.0.1 and a /24 prefix. A device keeps its address across restarts while
+the file is unchanged.
 
 ### Reliability
 
@@ -484,6 +491,8 @@ server:
 **What it does not hide:**
 
 - that you use DSM at all;
+- how many clients use your server: a watcher of the server's traffic can
+  count them;
 - roughly how much you send: a watcher sees which tier you are on, and a
   long download keeps the rate up for as long as it runs;
 - when your link fills up: with auto cap on, a step down a few seconds
@@ -733,8 +742,11 @@ The config file is TOML, at `/opt/mtun/config.toml`.
   hold a slot for long: once it is 1.5 s old and is not busy making its
   answer, a new start can take its place.
   Each source address may also run at most 2 at once and start 1 every 4 s
-  (3 at once). While a session runs, all addresses together may start only
-  1 a second. These limits are fixed, not settings.
+  (3 at once). Once a client has connected in this run, addresses no client
+  connected from may together start 4 at once, then 1 a second; an address a
+  client connected from skips that limit and the overall one, and an unknown
+  address whose start failed waits 30 s. These limits are fixed, not
+  settings.
 - transport: udp | tcp (default: udp)
 - dns_providers: DoH/DoT URLs (server mode)
 - dns_provider_pins: SPKI SHA-256 pins for each provider (server mode,
@@ -866,8 +878,8 @@ $ cd rust/tuncore && cargo test --no-default-features \
 
 ## Roadmap
 
-The current build (Phase 1 + Phase 2A + Phase 3 TPM) is single-client,
-single-server and Linux-only. It uses certificate-based authentication:
+The current build (Phase 1 + Phase 2A + Phase 3 TPM) runs one server for
+several clients and is Linux-only. It uses certificate-based authentication:
 CA-signed device certificates tie the ECDSA attest key to the X25519 Noise
 static key through a custom critical X.509 extension.
 

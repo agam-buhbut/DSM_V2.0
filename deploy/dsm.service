@@ -184,7 +184,7 @@ PrivateTmp=true
 # Hide other processes in /proc. dsm doesn't scan /proc for siblings.
 # No ProcSubset=pid: it hides /proc/sys too, and the server writes
 # net.ipv4.ip_forward, net.ipv6.conf.*.disable_ipv6, net.ipv4.tcp_timestamps
-# and the redirect sysctls there (every client session failed with it).
+# and the redirect sysctls there (the server could not start with it).
 ProtectProc=invisible
 
 # Skipped because dsm legitimately writes to /proc/sys/net:

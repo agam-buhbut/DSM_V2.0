@@ -100,11 +100,11 @@ expected_server_cn = "dsm-1234abcd-server"
 
 # Server only: peak number of handshake attempts the server validates
 # CONCURRENTLY, over UDP or TCP (default 8, must be 1 to 4096; below 8 logs a
-# WARNING at start, because the handshake slot rule needs 8). Only one session is
-# admitted, but attempts are checked side by side under a 12 s deadline each,
-# so one stalled bogus attempt cannot starve a legitimate client. The default
-# is ample for the single-client model; raise it only on a busy public
-# endpoint (each slot is a live NoiseResponder plus a small per-peer buffer).
+# WARNING at start, because the handshake slot rule needs 8). Attempts are
+# checked side by side under a 12 s deadline each, so one stalled bogus
+# attempt cannot starve a legitimate client. The default suits a server for
+# a few devices; raise it only on a busy public endpoint (each slot is a
+# live NoiseResponder plus a small per-peer buffer).
 # max_inflight_handshakes = 8
 
 # Server only: DNS providers (the server resolves on behalf of clients). The
@@ -135,7 +135,7 @@ expected_server_cn = "dsm-1234abcd-server"
 # mangle UDP (e.g., restrictive corporate firewalls, some mobile carriers).
 # The server listens on one port of this kind only: in UDP mode it opens no
 # TCP port at all; in TCP mode its one TCP listener stays open for the whole
-# run, also while a session runs.
+# run.
 transport = "udp"                            # "udp" | "tcp"
 tun_name = "mtun0"
 log_level = "warning"                        # "debug" | "info" | "warning" | "error"

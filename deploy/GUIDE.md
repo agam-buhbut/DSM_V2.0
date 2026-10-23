@@ -4,7 +4,7 @@ Deployment, operation, verification, and troubleshooting for DSM.
 Sections 0 through 7 taken in order bring up a live tunnel on a fresh
 Linux box; 8 onward are reference.
 
-Architecture in one sentence:  one client connects to one operator-owned
+Architecture in one sentence:  several clients connect to one operator-owned
 server over UDP (default) or TCP. Both ends authenticate with X.509
 device certs signed by your offline CA; the cert binds the device's
 ECDSA attestation signing key AND the device's X25519 Noise static
@@ -918,16 +918,44 @@ $ echo 'dsm-XXXXXXXX-client' | \
 Restart the server after editing — the allowlist is read once at startup.
 Connected clients keep their kill switch up during the restart and connect
 again by themselves. Live SIGHUP reload is on the Phase-2 punch list. To
-REVOKE: remove the CN from the file, restart, and optionally issue a CRL
-update (§7e).
+REVOKE a device: revoke its certificate with a CRL update (§7e) and restart,
+keeping its line in the file, so the other devices keep their addresses
+(below).
 
-Use one CN per device. The server serves one client at a time. A client
-that connects again with the same CN while its session runs (for example
-after a crash) replaces that session as soon as its full handshake passes;
-the server logs `client reconnected (client_cn=...)`. A client with another
-CN waits until the session ends. Two devices that share one CN push each
-other off: the server allows 3 quick takeovers per CN, then one a minute,
-and logs a WARNING (§11).
+Use one CN per device; each device gets its own line. The server serves
+every allowlisted device at once, each in its own session. The n-th line of
+the file gets the n-th tunnel address: the first 10.8.0.2, the second
+10.8.0.3, up to 10.8.0.254 (comments, blank lines and repeated names do not
+count; names past the 253rd get none, §11). Add new devices at the end. To
+retire a device without moving the others, keep its line and revoke its
+certificate. Any other edit (a line removed, added above others, or moved)
+moves the addresses below it at the next restart, so scripts or firewall
+rules that name a client's address must follow the file. A restart drops
+every client; they are back within about 30 s. After a restart every device
+counts as new until it connects once, so the start limits for new addresses
+apply to it (§11, "new handshake refused").
+
+A client that connects again with the same CN while its session runs (for
+example after a crash) replaces its own session as soon as its full
+handshake passes; the server logs `client reconnected (client_cn=...)`.
+Other clients are not touched. Two devices that share one CN push each other
+off: the server allows 3 quick takeovers per CN, then one a minute, and logs
+a WARNING (§11).
+
+The server shapes each client's flow on its own, so it sends the sum of
+every client's tier. While DSM runs, the server host's IPv6 is off and its
+IPv4 forwarding is on, whether or not a client is connected. A process that
+holds 10.8.0.1:53 stops the server at start (§11).
+
+Each client's NAT flows carry a tag of its own (a conntrack mark), and a
+reply whose flow lacks the tag of the address's holder is dropped. So: do
+not run another tool that sets conntrack marks on mtun0 traffic (multi-WAN
+or policy-routing setups); port forwards (DNAT) from the internet to a
+client's tunnel address no longer work, nor does traffic a LAN host routes
+into 10.8.0.0/24; and the first start after this upgrade cuts each older
+client flow once. A packet with a tunnel source (10.8.0.x) that reaches the
+server on any interface but mtun0 is dropped, and so is a packet into mtun0
+that belongs to no flow.
 
 ## 5. Run Both Sides
 
@@ -964,8 +992,8 @@ Expected client log lines (log_level = "info"), in order, within ~5 s:
                                                  (typical on cellular)
 ```
 
-The server hands the client this address in the handshake (today always
-10.8.0.2/24, with the server at 10.8.0.1).
+The server hands the client this address in the handshake: the address of
+the client's line in the allowlist (§4), with the server at 10.8.0.1/24.
 
 If the server cannot be reached, the client does not exit. It keeps all
 traffic blocked, logs `no tunnel: all traffic is blocked until DSM connects
@@ -976,8 +1004,10 @@ Expected server log lines:
 ```
 ... CN allowlist loaded (1 entries)
 ... server listening on UDP port 51820 (wire v2)
+... tunnel 10.8.0.1/24 up; addresses for 1 clients
 ... DNS blocklist loaded: 72,525 names to block, 0 allowed (files read: 1, lines skipped: 13)
 ... handshake complete (server) — client_cn=dsm-XXXXXXXX-client
+... session 1: client_cn=dsm-XXXXXXXX-client, tunnel address 10.8.0.2
 ... client connected (noise_static=<first 16 hex>)
 ```
 
@@ -992,13 +1022,13 @@ TUN + routing:
 
 ```sh
 $ ip link show mtun0          # state UP, mtu from config
-$ ip addr show mtun0          # client: 10.8.0.2/24 (server: 10.8.0.1/24)
+$ ip addr show mtun0          # client: its own address, e.g. 10.8.0.2/24 (server: 10.8.0.1/24)
 $ ip rule                     # expect "10: not from all fwmark 0x1 lookup 100"
 $ ip route show table 100     # expect "default dev mtun0"
 ```
 
-The server hands the client this address in the handshake (today always
-10.8.0.2/24, with the server at 10.8.0.1).
+The server hands the client this address in the handshake: the address of
+the client's line in the allowlist (§4), with the server at 10.8.0.1/24.
 
 nftables tables (2 on the server, 2 on the client):
 
@@ -1006,7 +1036,7 @@ nftables tables (2 on the server, 2 on the client):
 $ sudo nft list tables | grep '^table inet dsm_'
 # Server-side, expect:
 #   table inet dsm_server_ratelimit  (per-source-IP handshake limiter)
-#   table inet dsm_server_nat        (MASQUERADE for decrypted client traffic)
+#   table inet dsm_server_nat        (MASQUERADE, client isolation, flow tags)
 # Client-side, while the tunnel is up, expect:
 #   table inet dsm_killswitch        (default-drop output/input + ICMP rate-limit)
 #   table inet dsm_dns_leak          (DNS/DoT/DoH/mDNS/LLMNR blocked off-tunnel)
@@ -1041,7 +1071,8 @@ $ cat /run/dsm/ipv6_state.json               # per-iface snapshot
 Graceful shutdown of the client (Ctrl-C, or `sudo systemctl stop dsm-client`):
 
 ```sh
-# Within ~1 second the server logs: ... dsm.server: server shutting down
+# Within ~1 second the server logs: ... dsm.session: [s1] session closing
+#   then ... dsm.server: [s1] session 1 ended (client_cn=dsm-XXXXXXXX-client)
 # (SESSION_CLOSE is received silently; the visible line comes from the
 # teardown that follows). On the client:
 $ ip link show mtun0                           # "Device does not exist"
@@ -1955,8 +1986,8 @@ prints "ok".
 
   A later line adds `(N more in the last T s)`. It shows with
   `log_level = "info"` (the default), not with the `"warning"` that
-  `config.example.toml` sets. While a session runs, the same line can also
-  come from the live client's own 1400-byte packets that do not open: network
+  `config.example.toml` sets. While sessions run, the same line can also
+  come from a live client's own 1400-byte packets that do not open: network
   duplicates, packets too late for their key set, or a replay by someone on
   the path. In that case it does not mean a config problem.
 - The client runs a build older than wire v2 and the server a newer one
@@ -1964,7 +1995,7 @@ prints "ok".
 - `handshake recv timed out after 3 attempts` is the same wait at a later
   step: the server answered the first message, but the last reply never came
   (the link broke, or the server refused this client after its second
-  message; see the bullet about another client below).
+  message; see the bullet about the allowlist below).
 - Server actually down, or port blocked. Test plain UDP reachability:
 
   ```sh
@@ -1984,11 +2015,9 @@ prints "ok".
   third raises without sleeping) — about 18 s per try. After a failed
   try the client keeps the kill switch up and tries again by itself
   (1 s, doubling to 30 s, no limit; §7i). You do not need to restart it.
-- Another client holds the server's one session. The server answers with
-  msg2, then refuses this client before the last frame; the server log
-  says `handshake refused: another client is connected (client_cn=...)`
-  (INFO). This client connects once the other session ends. One server
-  serves one client at a time.
+- This client's CN is past the 253rd name of the allowlist: the server logs
+  `client_cn=... has no tunnel address (its allowlist line is past the first
+  253); refused` (WARNING, §11).
 
 ### "handshake failed: could not read the server's reply. The server may run a different DSM wire version ..."
 
@@ -2183,13 +2212,20 @@ every handshake slot. The limits are the same for UDP and TCP:
   then 1 every 4 s.
 - "too many new handshakes overall": all addresses together may start 8 at
   once, then 4 a second.
-- "too many new handshakes while a session runs": while a session is live,
-  all addresses together may start one new handshake a second, on top of
-  the limits above. Each one costs a TPM signature.
+- "too many new handshakes from unknown addresses": once a client has
+  connected in this run, addresses no client connected from in this run may
+  together start 4 at once, then 1 a second, on top of the limits above. An
+  address a client connected from (a known address) skips this limit and
+  the overall one. Each start costs a TPM signature.
+- "that address's last handshake failed": an unknown address whose last
+  handshake proved the address (a cookie over UDP, the connection over TCP)
+  and then failed or stalled may not start another for 30 s.
 
-Over TCP, the last two limits are checked when the connection's first
-handshake message arrives (after its mac1 check), not at accept, so a
-connection they refuse is closed then, up to 3 s after it was accepted.
+Over TCP, the overall limit and the limit for unknown addresses are checked
+when the connection's first handshake message arrives (after its mac1
+check), not at accept, so a connection they refuse is closed then, up to
+3 s after it was accepted. The two per-address limits and the 30 s wait are
+checked at accept.
 
 These are INFO lines. They show with `log_level = "info"` (the default),
 not with the `"warning"` that `config.example.toml` sets.
@@ -2225,16 +2261,26 @@ session check. A TCP connection that has sent nothing yet counts too. The
 server logs `pushed out a stalled handshake attempt to make room for a new
 one` (INFO, at most once per 10 s, with a count). Someone with many
 addresses can still make new devices wait while it lasts: over TCP with no
-key at all (about 22 addresses), over UDP with the CA certificate and the
-server's name (about 4 addresses while a session runs, about 16 otherwise,
-by using up the shared start limits).
+key at all (about 170 addresses, since a failed start bars its address for
+30 s), over UDP with the CA certificate and the server's name (about 31
+addresses once a client has connected, about 125 right after a restart). A
+device coming back from an address it connected from in this run is not
+held back.
 
 With `transport = "tcp"` the server keeps its one listening socket open for
-the whole run, also while a session runs, so one silent connection does not
-hold up other clients and a client that comes back can take its session
-over. It keeps at most 2 connections per address, closes a connection that
+the whole run, so one silent connection does not hold up other clients and
+a client that comes back can take its session over. It keeps at most 2 connections per address, closes a connection that
 has not sent its first handshake message after 3 s, and one that has not
 finished its handshake after 12 s.
+
+### Many devices are slow to reconnect after an outage
+
+The server's TPM (the chip that signs) signs about 5 handshakes a second.
+Up to about 30 known devices that come back within a few seconds get in at
+that pace. Beyond that, some wait for a second or third try, which takes
+tens of seconds (about 5 minutes for 200 at once). Nobody is barred and
+nothing needs doing: it passes on its own. For the numbers, see "Many
+devices coming back at once" in SECURITY.md.
 
 ### Server log: "max_inflight_handshakes=N is too low for the handshake slot rule"
 
@@ -2266,19 +2312,115 @@ once a minute is allowed). The current session stays; the new connection is
 refused and tries again by itself. Usually two devices share one name: give
 each device its own CN.
 
-### Server log: "handshake refused: another client is connected (client_cn=...)"
+### Server log: "session N: client_cn=..., tunnel address ..." and "session N ended (client_cn=...)"
 
-The server serves one client at a time. Another allowed client tried to
-connect while a session runs; it connects once that session ends. The line
-shows at most once every 10 s, with a count. This is an INFO line: it
-shows with `log_level = "info"` (the default), not with the `"warning"`
-that `config.example.toml` sets.
+INFO lines: a client got its session, and the session ended, for any reason
+(a dead peer, a SESSION_CLOSE, a takeover, a stop). Lines a session logs
+carry its label, as in `[s3] dead peer: ...`.
 
-### Server log: "in-session handshake accept failed; this session cannot be replaced until it ends"
+### Server log: "session N failed (client_cn=...); other clients are not affected"
 
-A bug: the part that accepts handshakes during a session stopped. The
-session goes on, and a client that comes back waits until the session times
-out, as before. Report it with the traceback that follows the line.
+An ERROR with a traceback: a bug in a session's setup or teardown ended
+that session. Other clients go on; this client reconnects by itself after
+its dead-peer timer. Report it with the traceback.
+
+### Server log: "data loop 'recv' terminated unexpectedly — shutting down session"
+
+An ERROR with a traceback: one of a session's loops failed, so that session
+ended and its client reconnects. If every session ends this way with
+`OSError: [Errno 5] Input/output error`, the server's `mtun0` is down. The
+TUN is built once, at start, so check `ip link show mtun0`, then
+`sudo ip link set mtun0 up` or restart dsm.
+
+### Server log: "could not start a session for client_cn=..."
+
+An ERROR with a traceback: a bug stopped a checked client from getting its
+session. It reconnects by itself after its dead-peer timer. Report it.
+
+### Server log: "client_cn=... has no tunnel address (its allowlist line is past the first 253); refused"
+
+The allowlist has more names than the pool has addresses (253); names past
+the 253rd cannot connect. At start the server also logs `the allowlist has
+N names; only the first 253 get a tunnel address` once. Remove names you no
+longer use, keeping the order of the others (§4).
+
+### Server log: "dropped a packet from client_cn=... whose source is not its tunnel address"
+
+A WARNING, at most once per 10 s per session: that client sent a packet
+with a source other than its own tunnel address, and the server dropped it.
+Software on that client is sending as another address. The line names no
+address.
+
+### Server log: "dropped a packet from client_cn=... to another client (client-to-client traffic is blocked)"
+
+INFO, at most once per 10 s per session: clients cannot reach each other
+through the tunnel, by design.
+
+### Server log: "the tunnel device failed (...); stopping"
+
+An ERROR: reading the server's TUN failed, so the server stops with exit
+code 1 and systemd starts it again after its delay. Every client reconnects
+by itself within about 30 s. Check `dmesg` for the TUN device.
+
+### Server log: "packet routing failed; stopping"
+
+An ERROR with a traceback: a bug in the part that hands packets to
+sessions. The server stops (exit code 1) rather than route with state that
+may be wrong; systemd restarts it. Report it with the traceback. The
+same kind of bug during a stop logs `packet routing failed while stopping`;
+the stop still finishes. Report that one too.
+
+### Server log: "handshake accept failed; retrying after a backoff"
+
+An ERROR with a traceback: a bug stopped the part that accepts handshakes.
+It starts again after a short wait (0.5 s, doubling up to 5 s); live
+sessions are not touched, and new clients wait for the restart. At a stop,
+the same kind of bug logs `handshake accept failed while stopping`, and the
+stop goes on. Report it.
+
+### Server log: "could not set up the tunnel at start: ...; exiting"
+
+An ERROR at start: the server could not set up its TUN device, its NAT
+table (see the next entry) or its DNS proxy, so it stops with exit code 1
+before any client connects. systemd starts it again every 10 s and gives up
+after 5 failed starts in 10 minutes. The text after "start:" says why.
+Check that the daemon runs under its systemd unit (it needs root) and that
+`/dev/net/tun` exists. After the fix:
+`sudo systemctl reset-failed dsm && sudo systemctl start dsm`. (A forwarding
+sysctl that cannot be set logs only a WARNING, `could not set ...`, and the
+server runs on.)
+
+### Server log: "MASQUERADE not applied; client traffic won't reach WAN: ..."
+
+A WARNING at start: the server's NAT table (`dsm_server_nat`) did not load.
+Without it there is no NAT, no kernel drop of client-to-client or spoofed
+traffic and no flow tags, so the server does not run on: right after the
+WARNING the journal shows `ERROR dsm.server: could not set up the tunnel at
+start: the NAT table (MASQUERADE, client isolation, flow tags) did not
+load; exiting`, and the server stops with exit code 1 before any client
+connects (systemd retries as in the entry above). The text after "WAN:"
+says why. Check that `sudo nft list ruleset` works, fix the cause, then
+`sudo systemctl reset-failed dsm && sudo systemctl start dsm`.
+
+### Server log: "tunnel addresses could not be built: ...; exiting"
+
+An ERROR at start, before any host state: a bug in the tunnel address pool.
+The server exits with code 1. Report it.
+
+### Server log: "asked for a N-byte receive buffer, the kernel gave M"
+
+A WARNING at start: the kernel kept a smaller receive buffer for the
+server's socket than DSM asked for (the daemon lacks CAP_NET_ADMIN, or
+`net.core.rmem_max` caps it). Under load the server may then drop packets
+(`nstat -az UdpRcvbufErrors` counts them; `netstat -su` calls them
+`RcvbufErrors`). Run the daemon under its systemd unit, or raise
+`net.core.rmem_max`.
+
+### Server log: "DNS queries dropped: one client already has 256 waiting"
+
+A WARNING, at most once per 10 s: one client had 256 DNS queries waiting
+for an answer, so its newest were dropped unanswered (it asks again). Other
+clients are not affected. Usually a client stuck in a lookup loop.
 
 ### "config: dns_provider_pins has entries that are not in dns_providers: ..."
 
@@ -2297,6 +2439,11 @@ A host resolver (`unbound`, `systemd-resolved`, or `dnsmasq`) is listening
 on the TUN address or on `0.0.0.0:53`, which blocks the dsm DNS proxy from
 binding port 53 on the TUN IP. The daemon now surfaces this as a specific
 actionable error (rather than a bare `OSError`).
+The proxy binds once, at start, so the server stops there with exit code 1
+(`FATAL: DNS proxy port conflict ...`) before any client connects, and
+systemd starts it again every 10 s, giving up after 5 failed starts in 10
+minutes. After you free the port:
+`sudo systemctl reset-failed dsm && sudo systemctl start dsm`.
 
 Remedies (pick one):
 
