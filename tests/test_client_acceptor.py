@@ -1281,3 +1281,34 @@ async def test_a_cancelled_run_leaves_the_loop_for_stop_to_end() -> None:
     for ip, _port in (A, B):  # each address may run its two again
         assert limiter.try_start(ip)
         assert limiter.try_start(ip)
+
+
+async def test_a_cancel_of_the_task_awaiting_stop_goes_through() -> None:
+    release = asyncio.Event()
+    started: list[Addr] = []
+
+    async def _slow(view: Any, *_a: Any, **_k: Any) -> tuple[object, bytes]:
+        started.append(_peer_of(view))
+        await view.recv()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await release.wait()  # as a cancelled worker waits for its thread
+            raise
+        raise AssertionError("unreachable")
+
+    before = asyncio.all_tasks()
+    acceptor = _acceptor(SessionTable([A_CN]), None, udp=_Transport())
+    with patch("dsm.crypto.handshake.server_handshake", new=_slow):
+        run = asyncio.ensure_future(acceptor.run())
+        acceptor.offer(_frame(A), A)
+        assert await _spin(lambda: started == [A])
+        stopper = asyncio.ensure_future(acceptor.stop())
+        await _yield()
+        stopper.cancel()
+        release.set()
+        with contextlib.suppress(asyncio.CancelledError):
+            await stopper
+        assert stopper.cancelled()
+        await run
+    assert asyncio.all_tasks() - before == set()

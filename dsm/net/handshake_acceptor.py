@@ -2325,7 +2325,10 @@ class ClientAcceptor:
         run (its slot, share, inbox and connection are back). A client that
         already had its bootstrap reply is not served: the server is
         stopping. Raises the first error an attempt raised while it was being
-        stopped (a bug), once all are done."""
+        stopped (a bug), once all are done. A cancel of the task that awaits
+        it still goes through, once every attempt has ended."""
+        current = asyncio.current_task()
+        cancels = current.cancelling() if current is not None else 0
         tasks = set(self._workers)
         if self._serving is not None:
             tasks.add(self._serving)
@@ -2342,3 +2345,7 @@ class ClientAcceptor:
             # every one left here is done, so this takes one loop pass.
             if self._workers:
                 await asyncio.wait(set(self._workers))
+        # _cancel_and_drain swallows CancelledError, so a cancel aimed at our
+        # caller would otherwise vanish into the worker it awaits.
+        if current is not None and current.cancelling() > cancels:
+            raise asyncio.CancelledError
