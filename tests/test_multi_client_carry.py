@@ -14,7 +14,11 @@ import pytest
 
 from dsm.crypto.handshake import VerifiedClient
 from dsm.net import handshake_acceptor as hsa
-from dsm.net.handshake_gate import SourceLimiter
+from dsm.net.handshake_gate import (
+    IN_SESSION_START_BURST,
+    PER_SOURCE_INFLIGHT,
+    SourceLimiter,
+)
 from dsm.net.session_slot import SessionTable
 from tests.test_client_acceptor import (
     A2,
@@ -221,3 +225,27 @@ def test_abandon_of_a_cn_with_no_slot_does_nothing(
     table.confirm(attempt)
     table.release(attempt)
     assert caplog.records == []
+
+
+def _newcomer_burst_is_whole(limiter: SourceLimiter) -> None:
+    """Exactly the burst's worth of in-session starts from fresh addresses
+    succeed, and the next is refused (the clock is frozen: no refill)."""
+    for i in range(int(IN_SESSION_START_BURST)):
+        assert limiter.try_shared(f"203.0.113.{i + 1}", in_session=True)
+    assert not limiter.try_shared("203.0.113.200", in_session=True)
+
+
+def test_a_refusal_by_another_limit_spends_no_newcomer_token_at_any_burst() -> None:
+    limiter = SourceLimiter(clock=_Frozen())
+    busy = "198.51.100.1"
+    for _ in range(PER_SOURCE_INFLIGHT):
+        assert limiter.try_start(busy, shared=False)
+    # Refused by the address's in-flight cap, not by the newcomer limit.
+    assert not limiter.try_start(busy, in_session=True)
+    _newcomer_burst_is_whole(limiter)
+
+
+def test_a_per_address_only_start_spends_no_newcomer_token() -> None:
+    limiter = SourceLimiter(clock=_Frozen())
+    assert limiter.try_start("198.51.100.9", in_session=True, shared=False)
+    _newcomer_burst_is_whole(limiter)
