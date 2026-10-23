@@ -1,8 +1,9 @@
 """Concurrency tests for the bounded UDP handshake acceptor.
 
-These exercise ``dsm.net.handshake_acceptor._accept_until_winner`` and its
-``_demux_loop`` / ``_PerPeerUDPView`` collaborators — the machinery that fixes
-the connection-starvation DoS where a single stalled bogus ``msg1`` blocks the
+These exercise ``dsm.net.handshake_acceptor.ClientAcceptor`` (mostly through
+``tests/acceptor_harness.py``, which runs it until its first client) and its
+``_demux`` / ``_PerPeerUDPView`` collaborators — the machinery that fixes the
+connection-starvation DoS where a single stalled bogus ``msg1`` blocks the
 serial responder ~18-30 s and starves the real client.
 
 The Noise crypto itself is exercised elsewhere (``test_handshake_dos.py``,
@@ -12,19 +13,18 @@ net, no sleeps tied to wall-clock handshake timeouts. The fake reads the peer
 addr off the ``_PerPeerUDPView`` it is handed and behaves per a per-addr script
 (stall forever / authenticate after consuming N frames / fail). The real
 session-keys object (a genuine ``tuncore.SessionKeyManager`` bootstrap pair) is
-only needed for the handoff case so the winner's keys are a real object.
+only needed for the handoff case so the client's keys are a real object.
 
 Cases:
   1. no-starvation: a stalled bogus attempt does NOT block a concurrent legit
-     attempt from winning within the bound. (Designed to FAIL against the old
+     attempt from passing within the bound. (Designed to FAIL against the old
      serial path — asserted here against a serial reference driver.)
   2. bounded concurrency: never more than ``max_inflight_handshakes`` workers.
   3. per-attempt deadline frees the slot.
-  4. first-to-auth wins + losers cancelled cleanly (no orphaned tasks, one
-     winner).
-  5. clean teardown on shutdown-during-accept.
-  6. post-handshake socket handoff loses no frame (the delicate point).
-  7. fresh per-session counters across cycles.
+  4. every client that passes is served: no winner, no losers.
+  5. clean teardown on shutdown.
+  6. frames that reached a client's inbox before it passed go with it.
+  7. fresh state per session.
 """
 
 from __future__ import annotations
@@ -36,12 +36,17 @@ from unittest.mock import patch
 
 from dsm.crypto.handshake import HANDSHAKE_FRAME_SIZE
 from dsm.net import handshake_acceptor as hsa
-from dsm.net.handshake_acceptor import (
-    _accept_until_winner,
-    _PerPeerUDPView,
-)
+from dsm.net.handshake_acceptor import _PerPeerUDPView
 from dsm.net.handshake_gate import SourceLimiter
+from dsm.net.session_slot import SessionTable
 from dsm.net.transport.udp import UDPTransport
+from tests.acceptor_harness import (
+    HARNESS_CN,
+    accept_first,
+    fakes_admitted,
+    first_client,
+)
+from tests.test_handshake_acceptor_limits import _spin
 
 try:
     import tuncore
@@ -199,7 +204,7 @@ class HandshakeAcceptorConcurrency(unittest.IsolatedAsyncioTestCase):
         stub = _Stub()
         ps = process_shutdown or asyncio.Event()
         return await asyncio.wait_for(
-            _accept_until_winner(
+            accept_first(
                 config,  # type: ignore[arg-type]
                 stub,  # type: ignore[arg-type]  keystore
                 stub,  # type: ignore[arg-type]  attest_store
@@ -361,37 +366,42 @@ class HandshakeAcceptorConcurrency(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(keys, "winner must land in the slot freed by the deadline")
         self.assertEqual(pub, b"pub-198.51.100.7:51820")
 
-    # ----- Case 4: first-to-auth wins, losers cancelled cleanly ----------
+    # ----- Case 4: every client that passes is served ---------------------
 
-    async def test_first_to_auth_wins_losers_cancelled_no_orphans(self) -> None:
-        """Two concurrent attempts both eventually authenticate; the FIRST wins
-        and the loser is cancelled cleanly — exactly one winner result, no
-        pending/destroyed tasks left behind."""
+    async def test_every_client_that_passes_is_served(self) -> None:
+        """Two concurrent attempts both authenticate (both as HARNESS_CN, so
+        the second takes over the first): each is handed on (spec §2.7: no
+        winner, no losers), and stop leaves no task."""
         observed = {"active": 0, "max_active": 0}
-        # A wins immediately; B would also win but only after a second frame
-        # that never arrives, so it is a live loser when A wins and must be
-        # cancelled.
+        # A passes at once; B only after a second frame, which comes later.
         script = {_WINNER: "win", _SECOND_WINNER: "win_after2"}
-        inbound = [
-            _seed_frame(_SECOND_WINNER, 0),  # B starts first, then stalls on 2nd
-            _seed_frame(_WINNER, 0),  # A wins
-        ]
-        transport = _FakeRealTransport(inbound)
-
+        clients: list[hsa.AcceptedClient] = []
         before = asyncio.all_tasks()
-        with self._patch_handshake(script, observed):
-            keys, pub, _returned = await self._accept(transport, max_inflight=8)
-        # Let any cancellations settle.
+        with self._patch_handshake(script, observed), fakes_admitted():
+            acceptor = hsa.ClientAcceptor(
+                _FakeConfig(8),
+                _Stub(),
+                _Stub(),
+                _Stub(),
+                _Stub(),
+                SourceLimiter(),
+                SessionTable([HARNESS_CN]),
+                None,
+                clients.append,
+                udp=_FakeRealTransport([]),
+            )
+            run = asyncio.ensure_future(acceptor.run())
+            acceptor.offer(*_seed_frame(_SECOND_WINNER, 0))
+            acceptor.offer(*_seed_frame(_WINNER, 0))
+            self.assertTrue(await _spin(lambda: len(clients) == 1))
+            acceptor.offer(*_seed_frame(_SECOND_WINNER, 1))  # B's second frame
+            self.assertTrue(await _spin(lambda: len(clients) == 2))
+            await acceptor.stop()
+            await run
         await asyncio.sleep(0)
-        after = asyncio.all_tasks()
-
-        self.assertIsNotNone(keys)
-        self.assertEqual(pub, b"pub-198.51.100.7:51820", "the FIRST to auth wins")
-        # No acceptor-spawned task outlived the accept (loser fully cancelled).
-        leaked = (after - before) - {asyncio.current_task()}
+        self.assertEqual([c.peer for c in clients], [_WINNER, _SECOND_WINNER])
+        leaked = (asyncio.all_tasks() - before) - {asyncio.current_task()}
         self.assertEqual(len(leaked), 0, f"acceptor leaked pending tasks: {leaked!r}")
-        # Exactly one winner: active count is back to zero (every worker
-        # returned/cancelled), and the loser never produced a second result.
         self.assertEqual(observed["active"], 0, "all workers must have unwound")
 
     # ----- Case 5: clean teardown on shutdown-during-accept --------------
@@ -430,90 +440,80 @@ class HandshakeAcceptorConcurrency(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(observed["active"], 0, "all stallers must be cancelled")
 
-    # ----- Case 6: post-handshake socket handoff loses no frame ----------
+    # ----- Case 6: frames in the inbox go with the client ------------------
 
-    async def test_post_handshake_frames_remain_on_real_socket(self) -> None:
-        """THE delicate point: after the winner authenticates, datagrams the
-        winner already sent (its first DATA packets) must REMAIN on the real
-        socket for the data path — the demux must stop draining the moment a
-        winner is set, never pulling the post-handshake frames into a per-peer
-        inbox the data path can't see."""
+    async def test_held_frames_reach_the_new_session(self) -> None:
+        """THE delicate point: datagrams the client sent right after its
+        handshake (its first DATA packets) that reached its inbox before it
+        passed are handed on with it, in order, for its new session (spec
+        §2.7); the acceptor loses none of them."""
         observed = {"active": 0, "max_active": 0}
         script = {_WINNER: "win"}
-        winner_data_1 = (b"post-handshake-DATA-1", _WINNER)
-        winner_data_2 = (b"post-handshake-DATA-2", _WINNER)
-        # The winner's msg1, then immediately two DATA frames it sent right
-        # after completing the handshake (a real client pipelines these).
-        inbound = [
-            _seed_frame(_WINNER),
-            winner_data_1,
-            winner_data_2,
-        ]
-        transport = _FakeRealTransport(inbound)
-
+        data_1 = b"post-handshake-DATA-1"
+        data_2 = b"post-handshake-DATA-2"
+        transport = _FakeRealTransport(
+            [_seed_frame(_WINNER), (data_1, _WINNER), (data_2, _WINNER)]
+        )
         with self._patch_handshake(script, observed):
-            keys, _pub, returned = await self._accept(transport, max_inflight=8)
+            won = await asyncio.wait_for(
+                first_client(
+                    _FakeConfig(8),
+                    _Stub(),
+                    _Stub(),
+                    _Stub(),
+                    _Stub(),
+                    transport,
+                    asyncio.Event(),
+                ),
+                timeout=5.0,
+            )
+        assert won is not None
+        self.assertIs(won.transport, transport)
+        self.assertEqual(won.held, (data_1, data_2))
 
-        self.assertIsNotNone(keys)
-        self.assertIs(returned, transport)
-        # The two post-handshake DATA frames were NOT consumed by the acceptor:
-        # they remain on the real socket for run_data_loops' recv_loop.
-        residual = transport.residual()
-        self.assertIn(
-            winner_data_1,
-            residual,
-            "a post-handshake frame was drained by the acceptor and lost to the "
-            "data path — the undrained-socket handoff is broken",
-        )
-        self.assertIn(winner_data_2, residual)
+    # ----- Case 7: fresh state per session --------------------------------
 
-    # ----- Case 7: fresh per-session counters across cycles --------------
-
-    async def test_fresh_state_across_accept_cycles(self) -> None:
-        """Running the acceptor twice (re-accept loop) starts each cycle with a
-        fresh winner future, fresh semaphore, and no carried-over worker tasks —
-        a second client is admitted exactly like the first, and no state from
-        cycle 1 bleeds into cycle 2."""
-        # Cycle 1.
-        observed1 = {"active": 0, "max_active": 0}
-        script1 = {_STALLER_A: "stall", _WINNER: "win"}
-        transport1 = _FakeRealTransport([_seed_frame(_STALLER_A), _seed_frame(_WINNER)])
+    async def test_fresh_state_per_session(self) -> None:
+        """One acceptor serves a client, then another: the second is admitted
+        (the same CN taking over) with its own keys and peer, nothing from the
+        first bleeds into it, and after stop no task is left."""
+        keys = iter([object(), object()])
+        observed = {
+            "active": 0,
+            "max_active": 0,
+            "keys_factory": lambda: next(keys),
+        }
+        script = {_STALLER_A: "stall", _WINNER: "win", _SECOND_WINNER: "win"}
+        clients: list[hsa.AcceptedClient] = []
         before = asyncio.all_tasks()
-        with self._patch_handshake(script1, observed1):
-            keys1, pub1, _r1 = await self._accept(transport1, max_inflight=4)
+        with self._patch_handshake(script, observed), fakes_admitted():
+            acceptor = hsa.ClientAcceptor(
+                _FakeConfig(4),
+                _Stub(),
+                _Stub(),
+                _Stub(),
+                _Stub(),
+                SourceLimiter(),
+                SessionTable([HARNESS_CN]),
+                None,
+                clients.append,
+                udp=_FakeRealTransport([]),
+            )
+            run = asyncio.ensure_future(acceptor.run())
+            acceptor.offer(*_seed_frame(_STALLER_A))
+            acceptor.offer(*_seed_frame(_WINNER))
+            self.assertTrue(await _spin(lambda: len(clients) == 1))
+            acceptor.offer(*_seed_frame(_SECOND_WINNER))
+            self.assertTrue(await _spin(lambda: len(clients) == 2))
+            await acceptor.stop()
+            await run
         await asyncio.sleep(0)
-        mid = asyncio.all_tasks()
-        self.assertIsNotNone(keys1)
-        self.assertEqual(pub1, b"pub-198.51.100.7:51820")
-        self.assertEqual(
-            len((mid - before) - {asyncio.current_task()}),
-            0,
-            "cycle 1 left a task that would corrupt cycle 2's accounting",
-        )
-
-        # Cycle 2 — a DIFFERENT client, fresh transport, fresh observed dict.
-        observed2 = {"active": 0, "max_active": 0}
-        script2 = {_STALLER_B: "stall", _SECOND_WINNER: "win"}
-        transport2 = _FakeRealTransport(
-            [_seed_frame(_STALLER_B), _seed_frame(_SECOND_WINNER)]
-        )
-        with self._patch_handshake(script2, observed2):
-            keys2, pub2, _r2 = await self._accept(transport2, max_inflight=4)
-        await asyncio.sleep(0)
-        after = asyncio.all_tasks()
-        self.assertIsNotNone(keys2)
-        self.assertEqual(
-            pub2,
-            b"pub-198.51.100.8:51821",
-            "the second cycle must admit the second client independently",
-        )
-        # observed dicts are independent: cycle 2's worker accounting is its own.
-        self.assertEqual(observed2["active"], 0)
-        self.assertEqual(
-            len((after - before) - {asyncio.current_task()}),
-            0,
-            "no acceptor task leaked across either cycle",
-        )
+        first, second = clients
+        self.assertEqual((first.peer, second.peer), (_WINNER, _SECOND_WINNER))
+        self.assertIsNot(first.session_keys, second.session_keys)
+        self.assertEqual(observed["active"], 0)
+        leaked = (asyncio.all_tasks() - before) - {asyncio.current_task()}
+        self.assertEqual(len(leaked), 0, "no acceptor task outlived the stop")
 
 
 @unittest.skipUnless(_HAS_TUNCORE, "requires tuncore for the real keys object")
@@ -542,7 +542,7 @@ class HandshakeAcceptorRealKeysHandoff(unittest.IsolatedAsyncioTestCase):
 
         with patch("dsm.crypto.handshake.server_handshake", new=fake):
             keys, _pub, _returned = await asyncio.wait_for(
-                _accept_until_winner(
+                accept_first(
                     config,  # type: ignore[arg-type]
                     stub,  # type: ignore[arg-type]
                     stub,  # type: ignore[arg-type]
@@ -603,17 +603,17 @@ class HandshakeAcceptorInboxLifecycle(unittest.IsolatedAsyncioTestCase):
 
     @staticmethod
     def _capture_inboxes(captured: dict):
-        """Patch ``_demux_loop`` with a passthrough that records the live
+        """Patch ``_demux`` with a passthrough that records the live
         ``inboxes`` dict so the test can observe its size over time. The real
         demux runs unchanged."""
-        real_demux = hsa._demux_loop
+        real_demux = hsa._demux
 
         async def _wrapper(*args, **kwargs):
-            # inboxes is the 11th positional arg (index 10) of _demux_loop.
+            # inboxes is the 11th positional arg (index 10) of _demux.
             captured["inboxes"] = args[10]
             await real_demux(*args, **kwargs)
 
-        return patch.object(hsa, "_demux_loop", new=_wrapper)
+        return patch.object(hsa, "_demux", new=_wrapper)
 
     # ----- Finding #1: inboxes eviction (memory-exhaustion DoS) -----------
 
@@ -650,7 +650,7 @@ class HandshakeAcceptorInboxLifecycle(unittest.IsolatedAsyncioTestCase):
                 stub = _Stub()
                 task = asyncio.ensure_future(
                     asyncio.wait_for(
-                        _accept_until_winner(
+                        accept_first(
                             config,  # type: ignore[arg-type]
                             stub,  # type: ignore[arg-type]
                             stub,  # type: ignore[arg-type]
@@ -735,7 +735,7 @@ class HandshakeAcceptorInboxLifecycle(unittest.IsolatedAsyncioTestCase):
                     config = _FakeConfig(n_sources + 5)  # semaphore not binding
                     stub = _Stub()
                     task = asyncio.ensure_future(
-                        _accept_until_winner(
+                        accept_first(
                             config,  # type: ignore[arg-type]
                             stub,  # type: ignore[arg-type]
                             stub,  # type: ignore[arg-type]
@@ -765,7 +765,7 @@ class HandshakeAcceptorInboxLifecycle(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_default_backoff_used_when_none_injected(self) -> None:
-        """When no backoff is injected, _accept_until_winner falls back to the
+        """When no backoff is injected, the acceptor falls back to the
         module-local ``_default_backoff`` (the cycle-free fallback; production
         passes in dsm.server._backoff_or_shutdown). A single winner accept
         completes normally with the default in place."""
@@ -776,7 +776,7 @@ class HandshakeAcceptorInboxLifecycle(unittest.IsolatedAsyncioTestCase):
             config = _FakeConfig(8)
             stub = _Stub()
             keys, pub, _ret = await asyncio.wait_for(
-                _accept_until_winner(
+                accept_first(
                     config,  # type: ignore[arg-type]
                     stub,  # type: ignore[arg-type]
                     stub,  # type: ignore[arg-type]
