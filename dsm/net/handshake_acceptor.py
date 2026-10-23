@@ -2283,6 +2283,9 @@ class ClientAcceptor:
         )
         self._workers: set[asyncio.Task[None]] = set()
         self._serving: asyncio.Task[None] | None = None
+        # True from run() until the next stop(): the order is run(), stop(),
+        # run(), and a second loop would leave the first out of stop()'s reach.
+        self._started = False
 
     def offer(self, data: bytes, addr: tuple[str, int]) -> None:
         """Take one UDP packet that no session fits. Only 1400-byte frames
@@ -2297,8 +2300,16 @@ class ClientAcceptor:
 
     async def run(self) -> None:
         """Serve handshakes until :meth:`stop`. Raises only a bug in the
-        demux or the admit loop. Call :meth:`stop` after it ends or is
-        cancelled: a cancel of this task alone leaves the loop running."""
+        demux or the admit loop. The order is: ``run()``, then :meth:`stop`
+        once it ended or was cancelled (a cancel of this task alone leaves
+        the loop running), then the next ``run()``.
+
+        Raises:
+            RuntimeError: called again before :meth:`stop`.
+        """
+        if self._started:
+            raise RuntimeError("run() was called again before stop()")
+        self._started = True
         semaphore = asyncio.Semaphore(self._config.max_inflight_handshakes)
         if self._udp is not None:
             work = _demux(
@@ -2355,6 +2366,7 @@ class ClientAcceptor:
         stopping. Raises the first error an attempt raised while it was being
         stopped (a bug), once all are done. A cancel of the task that awaits
         it still goes through, once every attempt has ended."""
+        self._started = False
         current = asyncio.current_task()
         cancels = current.cancelling() if current is not None else 0
         tasks = set(self._workers)
