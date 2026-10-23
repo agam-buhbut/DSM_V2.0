@@ -23,6 +23,7 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import logging
+import subprocess
 from collections.abc import Mapping
 
 from dsm.core._validators import validate_tun_name
@@ -172,7 +173,7 @@ table inet {self.TABLE} {{
         try:
             apply_ruleset(ruleset, log_label=f"MASQUERADE for {self._tun_name}")
             self._applied = True
-        except (RuntimeError, FileNotFoundError) as e:
+        except (RuntimeError, FileNotFoundError, subprocess.TimeoutExpired) as e:
             log.warning("MASQUERADE not applied; client traffic won't reach WAN: %s", e)
 
     def remove(self) -> None:

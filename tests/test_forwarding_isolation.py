@@ -59,7 +59,7 @@ def test_the_forward_chain_drops_tun_to_tun_traffic_with_a_counter() -> None:
 
 
 def test_each_client_gets_a_tag_rule_and_a_drop_rule_in_the_same_load() -> None:
-    nft = _apply(dict([A, B]))
+    nft = _apply(dict([B, A]))  # given out of order; the ruleset sorts them
     assert nft.argv == [["nft", "-f", "-"]]
     (ruleset,) = nft.rulesets
     for address, cn in (A, B):
@@ -72,6 +72,7 @@ def test_each_client_gets_a_tag_rule_and_a_drop_rule_in_the_same_load() -> None:
             in ruleset
         )
     assert ruleset.count("ct mark set") == 2
+    assert ruleset.index(f"saddr {A[0]} ") < ruleset.index(f"saddr {B[0]} ")
 
 
 def test_a_tag_is_the_cns_hash_with_the_low_bit_set() -> None:
@@ -121,6 +122,62 @@ def test_applied_says_whether_the_table_is_loaded() -> None:
         assert nat.applied
         nat.remove()
     assert not nat.applied
-    with patch.object(nftables.subprocess, "run", side_effect=FileNotFoundError("nft")):
-        nat.apply()  # logs a WARNING
+
+
+def test_a_load_that_fails_leaves_applied_false_and_a_good_one_standing() -> None:
+    gone = FileNotFoundError("nft")
+    fresh = MasqueradeManager("mtun0", clients=dict([A]))
+    with patch.object(nftables.subprocess, "run", side_effect=gone):
+        fresh.apply()  # logs a WARNING
+    assert not fresh.applied
+    # nft -f is one transaction: a failed re-load leaves the old table loaded.
+    nat = MasqueradeManager("mtun0", clients=dict([A]))
+    with patch.object(nftables.subprocess, "run", _Nft()):
+        nat.apply()
+    with patch.object(nftables.subprocess, "run", side_effect=gone):
+        nat.apply()
+    assert nat.applied
+
+
+def test_an_nft_that_hangs_does_not_raise_and_is_not_applied() -> None:
+    nat = MasqueradeManager("mtun0", clients=dict([A]))
+    hang = subprocess.TimeoutExpired(["nft", "-f", "-"], 5)
+    with patch.object(nftables.subprocess, "run", side_effect=hang):
+        nat.apply()
     assert not nat.applied
+
+
+def _chains(ruleset: str) -> dict[str, str]:
+    """Each chain's block, header line to closing brace, by chain name."""
+    close = "    }" + chr(10)
+    blocks = ruleset.split("    chain ")[1:]
+    return {
+        block.split(" ", 1)[0]: "    chain " + block.split(close)[0] + close
+        for block in blocks
+    }
+
+
+def test_every_rule_sits_in_its_own_chain() -> None:
+    (ruleset,) = _apply(dict([B, A])).rulesets
+    assert _chains(ruleset) == {
+        "prerouting": """    chain prerouting {
+        type filter hook prerouting priority -150; policy accept;
+        iifname != "mtun0" iifname != "lo" ip saddr 10.8.0.0/24 counter drop
+    }
+""",
+        "postrouting": """    chain postrouting {
+        type nat hook postrouting priority 100; policy accept;
+        iifname "mtun0" oifname != "mtun0" masquerade
+    }
+""",
+        "forward": f"""    chain forward {{
+        type filter hook forward priority 0; policy accept;
+        iifname "mtun0" oifname "mtun0" counter drop
+        oifname "mtun0" ct state invalid,untracked counter drop
+        iifname "mtun0" ct state new ip saddr {A[0]} ct mark set {_tag(A[1])}
+        oifname "mtun0" ip daddr {A[0]} ct mark != {_tag(A[1])} counter drop
+        iifname "mtun0" ct state new ip saddr {B[0]} ct mark set {_tag(B[1])}
+        oifname "mtun0" ip daddr {B[0]} ct mark != {_tag(B[1])} counter drop
+    }}
+""",
+    }
