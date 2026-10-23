@@ -5,7 +5,10 @@ sessions. Host I/O is faked at the boundary; no sockets, no root.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
+from collections.abc import Callable
 from contextlib import AsyncExitStack, ExitStack
 from typing import Any
 from unittest.mock import patch
@@ -15,7 +18,8 @@ import pytest
 from dsm.net.dns import DNSResolver
 from dsm.net.dns_proxy import DNSProxyPortInUseError
 from dsm.net.session_slot import SessionTable
-from dsm.server import _set_up_host
+from dsm.server import _run_acceptor, _set_up_host
+from tests.test_handshake_acceptor_limits import _spin
 from tests.test_server_dns_fatal import _server_config
 
 A = "dsm-a-client"
@@ -186,3 +190,100 @@ async def test_a_nat_table_that_does_not_load_stops_the_setup() -> None:
         "forwarding off",
         "tun close",
     ]
+
+
+class _CrashingAcceptor:
+    """run() raises ``crashes`` times, then runs until cancelled. stop()
+    raises ``stop_errors`` times, as part B's does with a worker's bug."""
+
+    def __init__(self, crashes: int, stop_errors: int = 0) -> None:
+        self.crashes = crashes
+        self.stop_errors = stop_errors
+        self.runs = 0
+        self.stops = 0
+
+    async def run(self) -> None:
+        self.runs += 1
+        if self.runs <= self.crashes:
+            raise RuntimeError("acceptor bug")
+        await asyncio.Event().wait()
+
+    async def stop(self) -> None:
+        self.stops += 1
+        if self.stops <= self.stop_errors:
+            raise RuntimeError("worker bug")
+
+
+def _backoffs(
+    calls: list[int], *, shutdown_at: int | None = None
+) -> Callable[[int, asyncio.Event], Any]:
+    async def _backoff(failures: int, shutdown: asyncio.Event) -> bool:
+        calls.append(failures)
+        if failures == shutdown_at:
+            shutdown.set()
+            return True
+        return False
+
+    return _backoff
+
+
+async def test_an_acceptor_crash_is_logged_stopped_and_run_again(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.ERROR, logger="dsm.server")
+    acceptor = _CrashingAcceptor(crashes=2)
+    calls: list[int] = []
+    with patch("dsm.server._backoff_or_shutdown", _backoffs(calls)):
+        task = asyncio.ensure_future(_run_acceptor(acceptor, asyncio.Event()))  # type: ignore[arg-type]
+        assert await _spin(lambda: acceptor.runs == 3)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+    assert calls == [1, 2]
+    assert acceptor.stops == 2
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert [r.getMessage() for r in errors] == [
+        "handshake accept failed; retrying after a backoff"
+    ] * 2
+    assert all(r.exc_info is not None for r in errors)
+
+
+async def test_a_stop_that_raises_after_a_crash_is_logged_and_run_again(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.ERROR, logger="dsm.server")
+    acceptor = _CrashingAcceptor(crashes=1, stop_errors=1)
+    calls: list[int] = []
+    with patch("dsm.server._backoff_or_shutdown", _backoffs(calls)):
+        task = asyncio.ensure_future(_run_acceptor(acceptor, asyncio.Event()))  # type: ignore[arg-type]
+        assert await _spin(lambda: acceptor.runs == 2)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+    assert (acceptor.stops, calls) == (1, [1])
+    # The crash, then the worker's bug that stop() raised.
+    assert [r.getMessage() for r in caplog.records] == [
+        "handshake accept failed; retrying after a backoff"
+    ] * 2
+
+
+async def test_shutdown_during_the_backoff_ends_the_acceptor_loop() -> None:
+    acceptor = _CrashingAcceptor(crashes=5)
+    calls: list[int] = []
+    with patch("dsm.server._backoff_or_shutdown", _backoffs(calls, shutdown_at=1)):
+        await asyncio.wait_for(_run_acceptor(acceptor, asyncio.Event()), 5.0)  # type: ignore[arg-type]
+    assert (acceptor.runs, acceptor.stops, calls) == (1, 1, [1])
+
+
+async def test_a_cancel_ends_the_acceptor_loop_without_an_error_line(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.ERROR, logger="dsm.server")
+    acceptor = _CrashingAcceptor(crashes=0)
+    task = asyncio.ensure_future(_run_acceptor(acceptor, asyncio.Event()))  # type: ignore[arg-type]
+    assert await _spin(lambda: acceptor.runs == 1)
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+    assert task.cancelled()
+    assert caplog.records == []

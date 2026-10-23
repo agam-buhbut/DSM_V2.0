@@ -50,7 +50,7 @@ from dsm.net.handshake_acceptor import (
 
 # isort: split
 # Its own statement too: isort would merge it into the one above.
-from dsm.net.handshake_acceptor import SessionWatch, Winner
+from dsm.net.handshake_acceptor import ClientAcceptor, SessionWatch, Winner
 from dsm.net.handshake_gate import (
     GateKeyError,
     HandshakeGate,
@@ -80,9 +80,9 @@ if TYPE_CHECKING:
     import tuncore
     from dsm.crypto.auth_loader import CertAuthMaterials
 
-# Backoff after an unexpected accept error (see the accept loop in
-# run_server), so an error that repeats cannot spin. Failed handshakes do
-# not back off: the acceptors drop and rate-limit them without waiting.
+# Backoff after the acceptor crashes (a bug; see _run_acceptor), so a crash
+# that repeats cannot spin. Failed handshakes do not back off: the acceptor
+# drops and rate-limits them without waiting.
 _HANDSHAKE_RETRY_BACKOFF_BASE = 0.5  # seconds
 _HANDSHAKE_RETRY_BACKOFF_MAX = 5.0  # seconds
 _HANDSHAKE_RETRY_BACKOFF_JITTER = 0.5  # ±this fraction of base
@@ -97,14 +97,14 @@ class ListenError(Exception):
 async def _backoff_or_shutdown(
     consecutive_failures: int, process_shutdown: asyncio.Event
 ) -> bool:
-    """Sleep the jittered backoff after an unexpected accept error, or return
+    """Sleep the jittered backoff after an acceptor crash, or return
     early on shutdown.
 
     Failed handshakes do not come here: they end only their own attempt.
 
     Returns:
         ``True`` if ``process_shutdown`` was set during the wait (the caller
-        must abandon the accept), ``False`` if the backoff elapsed normally.
+        stops), ``False`` if the backoff elapsed normally.
     """
     # Doubles per failure up to _HANDSHAKE_RETRY_BACKOFF_MAX, with ±50%
     # jitter so an accept error that repeats does not retry on a fixed beat
@@ -224,6 +224,32 @@ async def _set_up_host(  # pyright: ignore[reportUnusedFunction]  # not called y
     await dns_proxy.start()
     stack.callback(dns_proxy.stop)  # sync
     return _Host(tun=tun, dns_proxy=dns_proxy)
+
+
+async def _run_acceptor(  # pyright: ignore[reportUnusedFunction]  # not called yet
+    acceptor: ClientAcceptor, process_shutdown: asyncio.Event
+) -> None:
+    """Run the run's one acceptor until shutdown (multi-client spec §2.7).
+
+    ``run()`` ends only by a bug: log it with its traceback, stop the
+    acceptor (every attempt ends and gives back what it held), wait the
+    jittered backoff, and run it again with empty inboxes. ``stop()`` raises
+    a bug a worker hit while being stopped, once every attempt has ended; it
+    is logged the same way. Live sessions are not touched.
+    """
+    failures = 0
+    while True:
+        try:
+            await acceptor.run()
+        except Exception:
+            log.exception("handshake accept failed; retrying after a backoff")
+        try:
+            await acceptor.stop()
+        except Exception:
+            log.exception("handshake accept failed; retrying after a backoff")
+        failures += 1
+        if await _backoff_or_shutdown(failures, process_shutdown):
+            return
 
 
 async def _accept_one_session(
