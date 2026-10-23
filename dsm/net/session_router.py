@@ -55,7 +55,7 @@ def check_from_client(
     return Verdict.OK
 
 
-class _SessionUDPView(UDPTransport):  # pyright: ignore[reportUnusedClass]
+class _SessionUDPView(UDPTransport):
     """One session's packets from the run's UDP socket (spec §2.5).
 
     The dispatcher puts each packet whose header fits this session on its
@@ -224,3 +224,60 @@ class TunRouter:
         except asyncio.QueueFull:
             session.tun_drops += 1
             self._full_log.log("dropped a TUN packet: its session's queue is full")
+
+
+class UDPDispatcher:
+    """The one reader of the server's UDP socket (spec §2.5).
+
+    Each packet goes, unopened, to the first session whose header check
+    passes: the holder of the sender's hint first, then every other live
+    session. A packet no session fits is counted in :attr:`unmatched` and
+    offered to the handshake acceptor. Only the session opens its packets,
+    once, with today's ``decrypt_packet``; the header check changes nothing,
+    and a packet never moves a hint.
+    """
+
+    def __init__(
+        self,
+        transport: UDPTransport,
+        table: SessionTable,
+        offer: Callable[[bytes, tuple[str, int]], None],
+    ) -> None:
+        self._transport = transport
+        self._table = table
+        self._offer = offer
+        self._unmatched = 0
+        self._full_log = RepeatLog(log, logging.DEBUG)
+
+    @property
+    def unmatched(self) -> int:
+        """Packets no session fitted, each offered to the acceptor."""
+        return self._unmatched
+
+    async def run(self) -> None:
+        """Route packets until cancelled."""
+        while True:
+            data, addr = await self._transport.recv()
+            self.route(data, addr)
+
+    def route(self, data: bytes, addr: tuple[str, int]) -> None:
+        """Give one packet to its session, or to the acceptor. Never raises."""
+        hinted = self._table.by_peer(addr)
+        if hinted is not None and hinted.session_keys.header_matches(data):
+            self._deliver(hinted, data, addr)
+            return
+        for session in self._table.sessions():
+            if session is not hinted and session.session_keys.header_matches(data):
+                self._deliver(session, data, addr)
+                return
+        self._unmatched += 1
+        self._offer(data, addr)
+
+    def _deliver(
+        self, session: ServerSession, data: bytes, addr: tuple[str, int]
+    ) -> None:
+        view = session.transport
+        # Every session of a UDP run reads through its view, so anything else
+        # is dropped (fail closed). A full view counts the drop itself.
+        if isinstance(view, _SessionUDPView) and not view.deliver(data, addr):
+            self._full_log.log("dropped a UDP packet: its session's queue is full")
