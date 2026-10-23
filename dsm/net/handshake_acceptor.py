@@ -1662,7 +1662,7 @@ class AcceptedClient:
     held: tuple[bytes, ...] = ()
 
 
-async def _run_attempt(  # pyright: ignore[reportUnusedFunction]  # _demux uses it next
+async def _run_attempt(
     config: Config,
     keystore: KeyStore,
     attest_store: AttestStore,
@@ -1839,3 +1839,196 @@ async def _run_attempt(  # pyright: ignore[reportUnusedFunction]  # _demux uses 
             on_client(AcceptedClient(session_keys, client, tunnel, conn, peer_addr))
     finally:
         table.release(attempt)
+
+
+async def _demux(  # pyright: ignore[reportUnusedFunction]  # ClientAcceptor uses it next
+    config: Config,
+    keystore: KeyStore,
+    attest_store: AttestStore,
+    materials: CertAuthMaterials,
+    cn_allowlist: CNAllowlist,
+    transport: UDPTransport,
+    on_client: Callable[[AcceptedClient], None],
+    table: SessionTable,
+    workers: set[asyncio.Task[None]],
+    semaphore: asyncio.Semaphore,
+    inboxes: dict[tuple[str, int], asyncio.Queue[bytes]],
+    limiter: SourceLimiter,
+    *,
+    gate: HandshakeGate | None = None,
+    attempts: dict[asyncio.Task[None], _Attempt] | None = None,
+    clock: Callable[[], float] = time.monotonic,
+    intake: asyncio.Queue[tuple[bytes, tuple[str, int]]] | None = None,
+) -> None:
+    """Route handshake frames to per-source inboxes, until cancelled.
+
+    Frames come from ``intake`` (what the dispatcher offers the acceptor)
+    or, without it, from ``transport.recv()`` (tests). Replies leave on
+    ``transport``, the run's socket, and each passing client is handed on
+    with it. A frame from a new source starts a worker only if it is a full
+    handshake frame, finds room (a free slot, its address below its
+    in-flight cap) or, with ``gate``, may push out a stalled attempt (spec
+    §4.3), and ``limiter`` admits its address; once any CN has connected in
+    this run that includes the newcomer limit (spec §3.7 E1). Nothing here
+    awaits but the read and a cookie reply's send. ``inboxes`` and
+    ``workers`` belong to the caller.
+
+    ``gate`` (wire v2) checks mac1, and under load mac2, right after the
+    size check, before any slot. ``attempts`` holds each running attempt's
+    record (tests pass their own); ``clock`` is Step S's own, never the
+    limiter's, and dates each attempt's start.
+    """
+    # (inboxes stays the 11th positional parameter: a test wraps this
+    # function and reads it by position.)
+    records: dict[asyncio.Task[None], _Attempt] = {} if attempts is None else attempts
+    size_drops = RepeatLog(log, logging.DEBUG)
+
+    def _start(
+        src: tuple[str, int], frame: bytes, started: float, proved: bool
+    ) -> None:
+        """Start one attempt in a slot the caller holds for it: a free one,
+        or a pushed-out attempt's. Its msg1 is already here, so it is
+        signing from the start until its view has sent msg2."""
+        new_inbox: asyncio.Queue[bytes] = asyncio.Queue(maxsize=_PER_PEER_INBOX_FRAMES)
+        new_inbox.put_nowait(frame)
+        inboxes[src] = new_inbox
+        record = _Attempt(ip=src[0], started=started, signing=True, proved=proved)
+        view = _PerPeerUDPView(transport, src, new_inbox, on_msg2=record.msg2_sent)
+
+        # A done-callback, not a ``finally`` in the worker: a task cancelled
+        # before its first step never runs its body, but its done-callbacks
+        # still run, exactly once.
+        def _end_attempt(done: asyncio.Task[None], a: tuple[str, int] = src) -> None:
+            # The record first, so an error below cannot leave it behind.
+            rec = records.pop(done)
+            if rec.passed_on is None:
+                # A pushed-out attempt's slot belongs to the one that took it.
+                semaphore.release()
+            # Evict so failing sources cannot grow ``inboxes``. A client that
+            # passed took its held frames with it.
+            inboxes.pop(a, None)
+            # Last, so an error in ``finish`` cannot leave a dead inbox. After
+            # a same-address push-out the new attempt holds this share.
+            if rec.passed_on is not _PassedOn.SLOT_AND_SHARE:
+                limiter.finish(a[0])
+
+        task = asyncio.ensure_future(
+            _run_attempt(
+                config,
+                keystore,
+                attest_store,
+                materials,
+                cn_allowlist,
+                view,
+                src,
+                on_client,
+                who=str(src),
+                table=table,
+                gate=gate,
+                limiter=limiter,
+            )
+        )
+        records[task] = record
+        task.add_done_callback(_end_attempt)
+        workers.add(task)
+        task.add_done_callback(workers.discard)
+
+    while True:
+        if intake is not None:
+            data, addr = await intake.get()
+        else:
+            data, addr = await transport.recv()
+
+        inbox = inboxes.get(addr)
+        if inbox is not None:
+            # Sources whose worker has finished were evicted, so they fall
+            # through below and may start a fresh attempt.
+            try:
+                inbox.put_nowait(data)
+            except asyncio.QueueFull:
+                log.debug("per-peer inbox full for %s — dropping frame", addr)
+            continue
+
+        # A new source must open with a full handshake frame. Scanners,
+        # probes and stray packets are dropped before they can take a slot.
+        if len(data) != HANDSHAKE_FRAME_SIZE:
+            size_drops.log("dropped a new-source datagram of the wrong size")
+            continue
+
+        # Wire v2: mac1, and under load a cookie, before any slot or state.
+        # Under load only a msg1 with a valid mac2 gets past here, so it
+        # proved its address (spec §3.7 E2).
+        under_load = False
+        if gate is not None:
+            under_load = gate.load.under_load(len(workers))
+            verdict = gate.check_msg1(data, addr, under_load=under_load)
+            if verdict is Msg1Verdict.NEED_COOKIE:
+                reply = gate.cookie_reply(data, addr)
+                if reply is not None:
+                    await _send_cookie_reply(transport, reply, addr)
+                continue
+            if verdict is Msg1Verdict.DROP:
+                continue
+
+        now = clock()
+        pool_full = semaphore.locked()
+        # No room: a full pool, or the address at its in-flight cap. With the
+        # run's gate a start that got this far proved its address (with any
+        # slot in use the server is under load, so it carried a valid mac2),
+        # and it may push out a stalled attempt (spec §4.3); a known address
+        # may push out a stranger's of any age (E3). Without a gate (tests
+        # only) nothing is pushed out.
+        push = (
+            _choose_push_out(
+                records,
+                now,
+                addr[0],
+                pool_full=pool_full,
+                past_admit=table.is_admitted,
+                is_known=limiter.is_known,
+            )
+            if gate is not None
+            else None
+        )
+        if push is not None:
+            victim, how = push
+            # Asked before anything changes, so a refusal leaves the old
+            # attempt alone. The new attempt takes the old one's slot.
+            if not limiter.try_start(
+                addr[0],
+                in_session=table.ever_confirmed,
+                inherits_share=how is _PassedOn.SLOT_AND_SHARE,
+            ):
+                _note_trouble(gate)
+                continue
+            _push_out(records, victim, how)
+            _start(addr, data, now, under_load)
+            continue
+
+        # New source without a free slot: drop it. A genuine client's msg1
+        # retransmit gets in once a slot frees.
+        if pool_full:
+            log.debug(
+                "handshake pool saturated — dropping new-source frame from %s", addr
+            )
+            _note_trouble(gate)
+            continue
+        if len(inboxes) >= _MAX_INBOXES:
+            log.warning(
+                "handshake inbox cap (%d) reached — dropping new-source frame "
+                "from %s",
+                _MAX_INBOXES,
+                addr,
+            )
+            _note_trouble(gate)
+            continue
+        # Never waits: the pool has a free slot (checked above).
+        await semaphore.acquire()
+        # Asked last, so a packet dropped above spends none of its address's
+        # budget. From here to the done-callback nothing awaits, so the slot
+        # and the address are always given back.
+        if not limiter.try_start(addr[0], in_session=table.ever_confirmed):
+            semaphore.release()
+            _note_trouble(gate)
+            continue
+        _start(addr, data, now, under_load)

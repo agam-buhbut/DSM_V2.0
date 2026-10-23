@@ -8,6 +8,8 @@ fake. No sockets; nothing waits on the wall clock."""
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import errno
 import logging
 import random
 from typing import Any
@@ -26,14 +28,16 @@ from dsm.net.handshake_gate import (
     compute_mac1,
     stamp_msg1,
 )
-from dsm.net.session_slot import SessionTable
+from dsm.net.session_slot import REPLACE_BURST, SessionTable
 from dsm.net.transport.tcp import TCPTransport
 from tests.test_handshake_acceptor_limits import (
     _Config,
     _Frozen,
     _minutes,
+    _spin,
     _Stub,
     _Transport,
+    _yield,
 )
 from tests.test_tcp_accept_concurrency import _Conn
 
@@ -415,3 +419,222 @@ async def test_once_a_cn_connected_a_first_frame_pays_the_newcomer_limit() -> No
         _Hs(), conn, PEER, table, gate=_gate(), limiter=limiter, record=record
     )
     assert won.client.cn == A_CN
+
+
+A: Addr = PEER
+A2: Addr = ("198.51.100.7", 40002)  # the same device, restarted
+B: Addr = ("203.0.113.9", 40009)
+
+
+def _frame(addr: Addr, n: int = 0) -> bytes:
+    return f"{addr[0]}:{addr[1]}-{n}".encode().ljust(HANDSHAKE_FRAME_SIZE, b"\x00")
+
+
+class _Demux:
+    """The UDP demux on an in-memory socket (read through its own recv),
+    with the run's table, limiter and gate and Step S's clock. Leaving
+    cancels it and every worker and waits for them, so every done-callback
+    has run."""
+
+    def __init__(
+        self,
+        hs: Any,
+        table: SessionTable,
+        *,
+        limiter: SourceLimiter | None = None,
+        gate: HandshakeGate | None = None,
+        max_inflight: int = 8,
+        clock: _Frozen | None = None,
+    ) -> None:
+        self.sock = _Transport()
+        self.table = table
+        # Not ``limiter or ...``: an empty SourceLimiter is falsy (__len__).
+        self.limiter = (
+            limiter if limiter is not None else SourceLimiter(clock=_minutes())
+        )
+        self.gate = gate
+        self.clock = clock if clock is not None else _Frozen()
+        self.max_inflight = max_inflight
+        self.clients: list[hsa.AcceptedClient] = []
+        self.workers: set[asyncio.Task[None]] = set()
+        self.semaphore = asyncio.Semaphore(max_inflight)
+        self.inboxes: dict[Addr, asyncio.Queue[bytes]] = {}
+        self._patch = patch("dsm.crypto.handshake.server_handshake", new=hs)
+        self.task: asyncio.Future[None] | None = None
+
+    def feed(self, data: bytes, addr: Addr) -> None:
+        self.sock._recv_queue.put_nowait((data, addr))
+
+    def sent_to(self, addr: Addr) -> list[bytes]:
+        return [data for data, dest in self.sock.sent if dest == addr]
+
+    async def __aenter__(self) -> _Demux:
+        self._patch.start()
+        self.task = asyncio.ensure_future(
+            hsa._demux(
+                _Config(self.max_inflight),
+                _Stub(),
+                _Stub(),
+                _Stub(),
+                _Stub(),
+                self.sock,
+                self.clients.append,
+                self.table,
+                self.workers,
+                self.semaphore,
+                self.inboxes,
+                self.limiter,
+                gate=self.gate,
+                clock=self.clock,
+            )
+        )
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        try:
+            assert self.task is not None
+            self.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self.task
+            await hsa._cancel_and_drain(set(self.workers))
+            await _yield()
+        finally:
+            self._patch.stop()
+
+
+async def test_two_cns_both_become_sessions() -> None:
+    table = SessionTable([A_CN, B_CN])
+    async with _Demux(_Hs({A: A_CN, B: B_CN}), table) as run:
+        run.feed(_frame(A), A)
+        assert await _spin(lambda: len(run.clients) == 1)
+        run.feed(_frame(B), B)  # while A's session is live
+        assert await _spin(lambda: len(run.clients) == 2)
+    a, b = run.clients
+    assert (a.client.cn, a.peer, a.tunnel) == (A_CN, A, table.assignment_for(A_CN))
+    assert (b.client.cn, b.peer, b.tunnel) == (B_CN, B, table.assignment_for(B_CN))
+    assert a.tunnel != b.tunnel
+    assert a.transport is run.sock and b.transport is run.sock
+    assert run.inboxes == {}  # each attempt's inbox left with it
+
+
+async def test_the_same_cn_takes_over_within_its_allowance(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="dsm.net.session_slot")
+    hs = _Hs()
+    # The device comes back from a new port each time; the table's clock
+    # never refills its takeover allowance.
+    peers = [("198.51.100.7", 41000 + i) for i in range(int(REPLACE_BURST) + 2)]
+    async with _Demux(hs, SessionTable([A_CN], clock=_Frozen())) as run:
+        for peer in peers:
+            run.feed(_frame(peer), peer)
+            assert await _spin(lambda p=peer: p in hs.started and not run.workers)
+    served = int(REPLACE_BURST) + 1  # the first session, then its takeovers
+    assert [c.peer for c in run.clients] == peers[:served]
+    assert run.sent_to(peers[-1]) == [MSG2]  # past the allowance: no reply
+    lines = [r.getMessage() for r in caplog.records if r.name == "dsm.net.session_slot"]
+    taken_over = "client reconnected (client_cn=dsm-a-client); ending its old session"
+    assert lines.count(taken_over) == served - 1
+    assert any("reconnected too often" in line for line in lines)
+
+
+async def test_a_second_attempt_of_one_cn_is_refused_while_the_first_finishes() -> None:
+    hs = _Hs()
+    hs.hold[A] = asyncio.Event()
+    async with _Demux(hs, SessionTable([A_CN])) as run:
+        run.feed(_frame(A), A)
+        assert await _spin(lambda: A in hs.admitted)
+        run.feed(_frame(A2), A2)  # the same CN while A is past the check
+        assert await _spin(lambda: A2 in hs.started and len(run.workers) == 1)
+        assert A2 not in hs.admitted
+        hs.hold[A].set()
+        assert await _spin(lambda: len(run.clients) == 1)
+    assert run.sent_to(A2) == [MSG2]  # no bootstrap reply
+    assert [c.peer for c in run.clients] == [A]
+
+
+async def test_a_cn_with_no_address_gets_no_bootstrap_reply() -> None:
+    hs = _Hs({B: B_CN})
+    async with _Demux(hs, SessionTable(PAST_THE_POOL)) as run:
+        run.feed(_frame(B), B)
+        assert await _spin(lambda: B in hs.started and not run.workers)
+    assert run.clients == []
+    assert run.sent_to(B) == [MSG2]
+
+
+class _FailsOnceAfterCheck(_Hs):
+    """The first attempt passes the table's check, then its bootstrap reply
+    cannot be sent. Later attempts run as in :class:`_Hs`."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.failed = False
+
+    async def __call__(
+        self, transport: Any, *a: Any, admit_client: Any, **k: Any
+    ) -> tuple[object, bytes]:
+        if self.failed:
+            return await super().__call__(transport, *a, admit_client=admit_client, **k)
+        self.failed = True
+        peer = _peer_of(transport)
+        self.started.append(peer)
+        await transport.recv()
+        admit_client(_client(A_CN))
+        self.admitted.append(peer)
+        raise OSError(errno.EPIPE, "send failed")
+
+
+async def test_a_failure_after_the_check_gives_the_cn_back() -> None:
+    """Else the CN stays marked and every later handshake of it is refused
+    until the server restarts."""
+    hs = _FailsOnceAfterCheck()
+    async with _Demux(hs, SessionTable([A_CN])) as run:
+        run.feed(_frame(A), A)
+        assert await _spin(lambda: A in hs.admitted and not run.workers)
+        assert run.clients == []
+        run.feed(_frame(A, 1), A)  # the client resends msg1: a new attempt
+        assert await _spin(lambda: len(run.clients) == 1)
+    assert hs.admitted == [A, A]
+
+
+async def test_held_frames_reach_the_session_in_order() -> None:
+    hs = _Hs()
+    hs.hold[A] = asyncio.Event()
+    async with _Demux(hs, SessionTable([A_CN])) as run:
+        run.feed(_frame(A, 0), A)
+        assert await _spin(lambda: A in hs.admitted)
+        # A resent frame and its first data packet reach its inbox while its
+        # bootstrap reply is on its way.
+        run.feed(_frame(A, 1), A)
+        run.feed(_frame(A, 2), A)
+        await _yield()
+        hs.hold[A].set()
+        assert await _spin(lambda: len(run.clients) == 1)
+    assert run.clients[0].held == (_frame(A, 1), _frame(A, 2))
+
+
+async def test_from_the_first_connection_new_starts_pay_the_newcomer_limit() -> None:
+    limiter = SourceLimiter(clock=_Frozen())
+    hs = _Hs()
+    strangers = [(f"203.0.113.{i}", 1) for i in range(int(IN_SESSION_START_BURST) + 1)]
+    hs.stall.update(strangers)
+    async with _Demux(hs, SessionTable([A_CN]), limiter=limiter) as run:
+        run.feed(_frame(A), A)  # before any connection: the overall limit only
+        assert await _spin(lambda: len(run.clients) == 1)
+        for stranger in strangers:
+            run.feed(_frame(stranger), stranger)
+        burst = int(IN_SESSION_START_BURST)
+        assert await _spin(lambda: len(hs.started) == 1 + burst)
+        await _yield()
+    assert hs.started == [A, *strangers[:-1]]  # the last waits (spec §3.7 E1)
+
+
+async def test_a_known_address_skips_the_shared_limits() -> None:
+    limiter = SourceLimiter(clock=_Frozen())
+    async with _Demux(_Hs(), SessionTable([A_CN]), limiter=limiter) as run:
+        run.feed(_frame(A), A)
+        assert await _spin(lambda: len(run.clients) == 1)
+        while limiter.try_shared("192.0.2.1", in_session=True):
+            pass  # the newcomer limit is spent
+        run.feed(_frame(A2), A2)  # the same device, back from its known address
+        assert await _spin(lambda: len(run.clients) == 2)
