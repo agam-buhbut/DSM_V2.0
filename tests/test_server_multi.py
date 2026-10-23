@@ -21,6 +21,7 @@ import pytest
 from dsm import server
 from dsm.core.config import Config
 from dsm.core.fsm import SessionFSM, State
+from dsm.core.log import SESSION_LABEL
 from dsm.core.protocol import InnerPacket, PacketType
 from dsm.crypto.cert_allowlist import CNAllowlist
 from dsm.crypto.handshake import VerifiedClient
@@ -433,6 +434,7 @@ class _Sessions:
         self.end_at_once: set[str] = set()
         self.fail: set[str] = set()
         self.fsms: list[SessionFSM] = []
+        self.labels: list[str] = []
 
     async def __call__(
         self,
@@ -445,6 +447,7 @@ class _Sessions:
     ) -> None:
         fsm.transition(State.ESTABLISHED)
         self.started.append(session)
+        self.labels.append(SESSION_LABEL.get())
         self.fsms.append(fsm)
         self.tuns.append(tun)
         cn = session.client.cn
@@ -1179,3 +1182,39 @@ async def test_a_tcp_session_closes_its_connection_when_it_ends() -> None:
             lambda addr: table.note_peer(session, addr),
         )
     assert conn.closed  # the session's stack closed it
+
+
+async def test_each_session_task_carries_its_own_label() -> None:
+    captured: dict[str, Any] = {}
+    sessions = _Sessions()
+    with _multi(captured, sessions):
+        run = await _start()
+        acceptor = _Acceptor.made[0]
+        acceptor.admit(A, PEER_A)
+        acceptor.admit(B, PEER_B)
+        assert await _spin(lambda: len(sessions.started) == 2)
+        assert SESSION_LABEL.get() == ""  # nothing outside a session
+        rc = await _stop(run, captured)
+    assert rc == 0
+    assert sessions.labels == ["1", "2"]
+
+
+async def test_a_session_end_reports_its_tun_drops_only_when_there_were_some(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG, logger="dsm.server")
+    captured: dict[str, Any] = {}
+    sessions = _Sessions()
+    with _multi(captured, sessions):
+        run = await _start()
+        acceptor = _Acceptor.made[0]
+        acceptor.admit(A, PEER_A)
+        acceptor.admit(B, PEER_B)
+        assert await _spin(lambda: len(sessions.started) == 2)
+        sessions.started[0].tun_drops = 3
+        rc = await _stop(run, captured)
+    assert rc == 0
+    lines = [r.getMessage() for r in caplog.records]
+    drops = [line for line in lines if "TUN packets dropped" in line]
+    assert drops == ["session 1: 3 TUN packets dropped (its queue was full)"]
+    assert f"session 1 ended (client_cn={A})" in lines  # the spec's text

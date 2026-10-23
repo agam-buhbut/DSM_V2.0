@@ -14,6 +14,7 @@ from pathlib import Path
 
 from dsm.core.config import Config
 from dsm.core.fsm import ProtocolError, SessionFSM, State
+from dsm.core.log import SESSION_LABEL
 from dsm.core.preflight import check_clock_sync
 from dsm.core.protocol import WIRE_VERSION, PacketType, ReassemblyBuffer
 from dsm.crypto.attest_store import AttestStore
@@ -478,6 +479,9 @@ async def _serve_client(
 ) -> None:
     """One session's task (multi-client spec §2.2): run the session, then
     take it out of the table, whatever ended it."""
+    # Every line this session logs, and every task it starts, carries its
+    # label (spec §2.13).
+    SESSION_LABEL.set(str(session.number))
     # The handshake is done: the session's FSM starts where the accept left
     # it before.
     fsm = SessionFSM()
@@ -508,6 +512,12 @@ async def _serve_client(
             # follows live sessions. A takeover keeps it (same CN, address).
             host.dns_proxy.forget(str(session.tunnel.client))
         log.info("session %d ended (client_cn=%s)", session.number, session.client.cn)
+        if session.tun_drops:
+            log.debug(
+                "session %d: %d TUN packets dropped (its queue was full)",
+                session.number,
+                session.tun_drops,
+            )
 
 
 async def run_server(
