@@ -12,7 +12,8 @@ Two parts, both used by the acceptor (``dsm.net.handshake_acceptor``):
   (stamping msg1, reading a cookie reply) lives here too, so both ends share
   one copy of the formulas.
 * Limits (``SourceLimiter``): per address and overall, on starting attempts.
-  They change nothing on the wire.
+  An address from which some CN connected in this run is known and skips the
+  shared ones (spec §3.7). They change nothing on the wire.
 
 Each admitted msg1 costs the server an attest-key signature (a TPM call on
 TPM builds) and holds one of ``max_inflight_handshakes`` slots for up to
@@ -72,6 +73,17 @@ IN_SESSION_START_BURST = 1.0
 # Addresses remembered at once. When full, the idle address that started an
 # attempt longest ago is forgotten; one with an attempt running never is.
 MAX_TRACKED_SOURCES = 4096
+# Known addresses (spec §3.7): an address from which a CN finished a full,
+# admitted handshake in this run skips the shared start limits (overall and
+# newcomer), never the per-address ones. Kept per CN: home, work, a phone
+# network and one spare.
+KNOWN_ADDRESSES_PER_CN = 4
+# Each known address's own cookie-reply budget, used under load instead of
+# the shared one, so a spoofed flood that empties the shared budget cannot
+# keep a known device waiting: 2 replies per attempt (MAX_COOKIE_REPLIES)
+# times the per-address start rate and burst.
+KNOWN_COOKIE_REPLY_RATE = 0.5  # tokens per second
+KNOWN_COOKIE_REPLY_BURST = 6.0
 
 
 class TokenBucket:
@@ -124,6 +136,10 @@ class SourceLimiter:
         self._max_sources = max_sources
         # Oldest start first: try_start moves an address to the end.
         self._sources: dict[str, _Source] = {}
+        # Known addresses (spec §3.7): each CN's, oldest first, and each
+        # known address's own cookie budget. In memory only, never logged.
+        self._known: dict[str, list[str]] = {}
+        self._known_cookies: dict[str, TokenBucket] = {}
         now = clock()
         self._overall = TokenBucket(GLOBAL_START_RATE, GLOBAL_START_BURST, now)
         self._in_session = TokenBucket(
@@ -161,8 +177,13 @@ class SourceLimiter:
         adds nothing to the address's running count (the pushed-out attempt
         never calls ``finish``); its rate limit and, when ``shared``, the
         shared limits still apply.
+
+        A known address (spec §3.7) is never charged the shared limits.
         """
         now = self._clock()
+        # A known address skips the shared limits (spec §3.7).
+        known = ip in self._known_cookies
+        shared = shared and not known
         src = self._sources.get(ip)
         if (
             not inherits_share
@@ -224,15 +245,55 @@ class SourceLimiter:
 
         All or nothing, like ``try_start``. Nothing to pair with ``finish``:
         the caller still ends the attempt, which calls ``finish(ip)`` once.
+        A known address (spec §3.7) is never charged: True at once.
         """
-        # The known-address lane (spec §3.7) will let a known ip skip these;
-        # Step S charges every address.
-        del ip
+        if ip in self._known_cookies:
+            return True
         now = self._clock()
         if not self._shared_ready(now, in_session=in_session):
             return False
         self._take_shared(in_session=in_session)
         return True
+
+    def is_known(self, ip: str) -> bool:
+        """Whether some CN finished a full, admitted handshake from ``ip`` in
+        this run (spec §3.7)."""
+        return ip in self._known_cookies
+
+    def note_known(self, ip: str, cn: str) -> None:
+        """``cn`` just finished a full, admitted handshake from ``ip``. A CN
+        keeps its ``KNOWN_ADDRESSES_PER_CN`` most recent addresses."""
+        addresses = self._known.setdefault(cn, [])
+        if ip in addresses:
+            addresses.remove(ip)
+        addresses.append(ip)
+        if ip not in self._known_cookies:
+            self._known_cookies[ip] = TokenBucket(
+                KNOWN_COOKIE_REPLY_RATE, KNOWN_COOKIE_REPLY_BURST, self._clock()
+            )
+        if len(addresses) > KNOWN_ADDRESSES_PER_CN:
+            self._drop_unused(addresses.pop(0))
+
+    def forget_cn(self, cn: str) -> None:
+        """Forget ``cn``'s known addresses: it left the allowlist or was
+        revoked. An address another CN also used stays known."""
+        for ip in self._known.pop(cn, []):
+            self._drop_unused(ip)
+
+    def take_known_cookie(self, ip: str) -> bool:
+        """Spend one token of known ``ip``'s own cookie-reply budget (spec
+        §3.7, C1). False when it is spent or ``ip`` is not known; nothing is
+        logged either way."""
+        bucket = self._known_cookies.get(ip)
+        if bucket is None or not bucket.ready(self._clock()):
+            return False
+        bucket.take()
+        return True
+
+    def _drop_unused(self, ip: str) -> None:
+        """``ip`` left one CN's list: forget it unless another CN has it."""
+        if not any(ip in addresses for addresses in self._known.values()):
+            del self._known_cookies[ip]
 
     def _shared_ready(self, now: float, *, in_session: bool) -> bool:
         """True if the overall budget, and in a session the in-session one,
@@ -534,21 +595,28 @@ class HandshakeGate:
             return Msg1Verdict.ADMIT
         return Msg1Verdict.NEED_COOKIE
 
-    def cookie_reply(self, frame: bytes, src: tuple[str, int]) -> bytes | None:
+    def cookie_reply(
+        self, frame: bytes, src: tuple[str, int], *, shared_budget: bool = True
+    ) -> bytes | None:
         """A 1400-byte cookie reply to ``frame`` from ``src``; None when
         ``frame`` is not 1400 bytes (so a reply is never bigger than its
         request, whatever the caller does), the reply budget is spent or
-        ``src`` is not IPv4 (the msg1 is then just dropped)."""
+        ``src`` is not IPv4 (the msg1 is then just dropped).
+
+        ``shared_budget=False``: the caller already took a token of a known
+        address's own budget (spec §3.7), so the shared one is not touched.
+        """
         if len(frame) != FRAME_SIZE:
             return None
-        if not self._replies.ready(self._clock()):
+        if shared_budget and not self._replies.ready(self._clock()):
             self._budget_log.log("cookie reply budget spent; dropped a handshake start")
             return None
         secret, _ = self._secrets()
         cookie = make_cookie(secret, src)
         if cookie is None:
             return None
-        self._replies.take()
+        if shared_budget:
+            self._replies.take()
         nonce = self._rand(COOKIE_NONCE_SIZE)
         sealed = tuncore.xchacha_seal(
             self._keys.cookie_key, nonce, cookie, bytes(frame[MAC1_AT:MAC2_AT])
