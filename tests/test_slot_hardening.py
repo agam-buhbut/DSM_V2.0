@@ -135,9 +135,12 @@ def test_an_in_session_inherit_takes_the_newcomer_token_too() -> None:
     for _ in range(PER_SOURCE_INFLIGHT):
         assert limiter.try_start(ip, shared=False)
     assert limiter.try_start(ip, in_session=True, inherits_share=True)
+    # The inherit took one newcomer token: one fewer is left in the burst.
+    for i in range(int(IN_SESSION_START_BURST) - 1):
+        assert limiter.try_shared(f"203.0.113.{100 + i}", in_session=True)
     assert not limiter.try_shared("203.0.113.1", in_session=True)
     # The overall limit lost exactly one token to that inherit.
-    for i in range(int(GLOBAL_START_BURST) - 1):
+    for i in range(int(GLOBAL_START_BURST - IN_SESSION_START_BURST)):
         assert limiter.try_shared(f"203.0.113.{10 + i}")
     assert not limiter.try_shared("203.0.113.200")
 
@@ -145,8 +148,8 @@ def test_an_in_session_inherit_takes_the_newcomer_token_too() -> None:
 def test_a_per_address_only_start_ignores_in_session() -> None:
     limiter = SourceLimiter(clock=_Frozen())
     assert limiter.try_start("198.51.100.9", in_session=True, shared=False)
-    # Nothing shared was spent: the one newcomer token and every overall
-    # token are still there.
+    # Nothing shared was spent: every newcomer token and every overall
+    # token is still there.
     assert limiter.try_shared("203.0.113.1", in_session=True)
     for i in range(int(GLOBAL_START_BURST) - 1):
         assert limiter.try_shared(f"203.0.113.{10 + i}")
@@ -547,9 +550,13 @@ async def test_in_a_session_the_first_frame_also_pays_the_newcomer_limit() -> No
     async with _Tcp(
         hs, max_inflight=8, limiter=_Ledger(clock=_Frozen()), ever_confirmed=True
     ) as run:
-        run.connect(_A, [_good(1)])
-        assert await _spin(lambda: _A in hs.sent_msg2)
-        second = run.connect(_B, [_good(2)])
+        # The newcomer burst lets this many first frames through ...
+        for i in range(int(IN_SESSION_START_BURST)):
+            peer = (f"198.51.100.{i + 1}", 40000 + i)
+            run.connect(peer, [_good(1 + i)])
+            assert await _spin(lambda p=peer: p in hs.sent_msg2)
+        # ... and no more.
+        second = run.connect(_B, [_good(20)])
         assert await _spin(lambda: second.closed)
         assert second._frames.empty()  # charged after its first frame
     assert _B not in hs.started
@@ -1158,7 +1165,10 @@ async def test_an_in_session_push_out_needs_the_newcomer_token_too(
     clock = _Frozen()  # the limiter's: the newcomer token does not refill
     limiter = _Ledger(clock=clock)
     async with _Udp(hs, limiter=limiter, ever_confirmed=True) as run:
-        await _started(run, hs, _A, 0.0)  # its start took the one newcomer token
+        await _started(run, hs, _A, 0.0)  # its start took a newcomer token
+        # Spend the rest of the newcomer burst (the limiter's clock is frozen).
+        for i in range(int(IN_SESSION_START_BURST) - 1):
+            assert limiter.try_shared(f"192.0.2.{i}", in_session=True)
         victim = next(iter(run.attempts))
         run.clock.now = 2.0  # _A is pushable
         run.feed(_B)
@@ -1169,7 +1179,7 @@ async def test_an_in_session_push_out_needs_the_newcomer_token_too(
         assert list(run.attempts) == [victim]
         assert limiter.finished == []
         assert await _slots_free(run.semaphore) == 0  # _A still holds it
-        assert any("while a session runs" in r.getMessage() for r in caplog.records)
+        assert any("from unknown addresses" in r.getMessage() for r in caplog.records)
         # The refusal spent nothing: with the token back, _B pushes _A out.
         clock.now = 1.0
         run.feed(_B, 1)

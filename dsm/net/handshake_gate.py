@@ -65,11 +65,12 @@ PER_SOURCE_BURST = 3.0
 # from 219 ms to 6 ms).
 GLOBAL_START_RATE = 4.0  # tokens per second
 GLOBAL_START_BURST = 8.0
-# New attempts from all addresses together while a session runs, on top of
-# the limits above (owner decision 2026-10-09). Each admitted attempt costs
-# a TPM signature; this caps that work while a session is live.
+# New attempts from addresses that are not known (spec §3.7), on top of the
+# limits above, once any CN has connected in this run (owner decisions
+# 2026-10-09 and D4, spec §3.7 E1). Each admitted attempt costs a TPM
+# signature; the burst lets a few devices that come back together in at once.
 IN_SESSION_START_RATE = 1.0  # tokens per second
-IN_SESSION_START_BURST = 1.0
+IN_SESSION_START_BURST = 4.0
 # Addresses remembered at once. When full, the idle address that started an
 # attempt longest ago is forgotten; one with an attempt running never is.
 MAX_TRACKED_SOURCES = 4096
@@ -173,8 +174,8 @@ class SourceLimiter:
 
         All or nothing: a refusal spends no token and remembers nothing.
         Pair every True with exactly one ``finish(ip)``. ``in_session`` is
-        True for the accept that runs while a session is live: such a start
-        also needs the in-session budget (one a second).
+        True once any CN has connected in this run (spec §3.7 E1): a start
+        from an address that is not known then also needs the newcomer budget.
 
         ``shared=False`` charges only the per-address limits: a TCP connection
         at accept, which pays the shared ones with :meth:`try_shared` once its
@@ -330,7 +331,8 @@ class SourceLimiter:
             return False
         if in_session and not self._in_session.ready(now):
             self._in_session_log.log(
-                "new handshake refused: too many new handshakes while a session runs"
+                "new handshake refused: too many new handshakes from unknown "
+                "addresses"
             )
             return False
         return True
