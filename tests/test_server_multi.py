@@ -617,6 +617,25 @@ async def test_a_session_that_ends_by_itself_leaves_the_table(
     ]
 
 
+async def test_dns_state_is_forgotten_only_when_a_cn_has_no_newer_session() -> None:
+    captured: dict[str, Any] = {}
+    sessions = _Sessions()
+    sessions.end_at_once.add(B)  # B's session ends by itself
+    with _multi(captured, sessions):
+        run = await _start()
+        acceptor = _Acceptor.made[0]
+        proxy = captured["host"].dns_proxy
+        acceptor.admit(A, PEER_A)
+        acceptor.admit(A, PEER_A2)  # a takeover: A's old session ends
+        assert await _spin(lambda: f"{A} ended" in sessions.events)
+        assert proxy.forgotten == []  # A's newer session keeps the cache
+        acceptor.admit(B, PEER_B)
+        assert await _spin(lambda: proxy.forgotten == ["10.8.0.3"])
+        rc = await _stop(run, captured)  # A's last session ends at the stop
+    assert rc == 0
+    assert proxy.forgotten == ["10.8.0.3", "10.8.0.2"]
+
+
 async def test_a_signal_stops_the_acceptor_then_every_session_then_the_host() -> None:
     captured: dict[str, Any] = {}
     events: list[str] = captured.setdefault("events", [])

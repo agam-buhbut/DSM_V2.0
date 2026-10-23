@@ -503,7 +503,10 @@ async def _serve_client(
         )
         _drive_fsm_to_idle(fsm)
     finally:
-        table.remove(session)
+        if table.remove(session):
+            # No newer session for this CN: its DNS state goes too, so memory
+            # follows live sessions. A takeover keeps it (same CN, address).
+            host.dns_proxy.forget(str(session.tunnel.client))
         log.info("session %d ended (client_cn=%s)", session.number, session.client.cn)
 
 
