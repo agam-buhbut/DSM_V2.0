@@ -20,12 +20,16 @@ import pytest
 from dsm.crypto.handshake import HANDSHAKE_FRAME_SIZE, HandshakeError, VerifiedClient
 from dsm.net import handshake_acceptor as hsa
 from dsm.net.handshake_gate import (
+    COOKIE_REPLY_BURST,
     GLOBAL_START_BURST,
     IN_SESSION_START_BURST,
+    KNOWN_COOKIE_REPLY_BURST,
     GateKeys,
     HandshakeGate,
     SourceLimiter,
     compute_mac1,
+    open_cookie_reply,
+    stamp_mac2,
     stamp_msg1,
 )
 from dsm.net.session_slot import REPLACE_BURST, SessionTable
@@ -638,3 +642,226 @@ async def test_a_known_address_skips_the_shared_limits() -> None:
             pass  # the newcomer limit is spent
         run.feed(_frame(A2), A2)  # the same device, back from its known address
         assert await _spin(lambda: len(run.clients) == 2)
+
+
+def _with_cookie(msg1: bytes, reply: bytes) -> bytes:
+    """The client's resend after a cookie reply: same e and mac1, with mac2."""
+    cookie = open_cookie_reply(reply, KEYS, msg1[32:48])
+    assert cookie is not None
+    frame = bytearray(msg1)
+    stamp_mac2(frame, cookie)
+    return bytes(frame)
+
+
+async def test_under_load_a_known_address_gets_its_cookie_from_its_own_budget() -> None:
+    gate = _gate()  # a frozen clock: no budget refills
+    gate.load.note_trouble()  # under load: every new msg1 needs a cookie
+    limiter = SourceLimiter(clock=_minutes())
+    limiter.note_known(A[0], A_CN)  # A's device connected earlier in this run
+    async with _Demux(_Hs(), SessionTable([A_CN]), limiter=limiter, gate=gate) as run:
+        spoofed = [
+            (f"203.0.{i // 250}.{i % 250}", 7000 + i)
+            for i in range(int(COOKIE_REPLY_BURST) + 1)
+        ]
+        for i, src in enumerate(spoofed):
+            run.feed(_msg1(100 + i), src)
+        assert await _spin(run.sock._recv_queue.empty)
+        await _yield()
+        assert len(run.sock.sent) == COOKIE_REPLY_BURST  # the shared budget is dry
+        first = _msg1(1)
+        run.feed(first, A)
+        assert await _spin(lambda: len(run.sent_to(A)) == 1)  # from its own budget
+        run.feed(_with_cookie(first, run.sent_to(A)[0]), A)
+        assert await _spin(lambda: len(run.clients) == 1)
+
+
+async def test_a_spoofed_known_address_empties_only_its_own_budget(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG, logger="dsm")
+    gate = _gate()
+    gate.load.note_trouble()
+    # Frozen: a clock that moves would refill A's own budget before each take.
+    limiter = SourceLimiter(clock=_Frozen())
+    other: Addr = ("198.51.100.8", 40008)
+    limiter.note_known(A[0], A_CN)
+    limiter.note_known(other[0], B_CN)
+    async with _Demux(
+        _Hs(), SessionTable([A_CN, B_CN]), limiter=limiter, gate=gate
+    ) as run:
+        caplog.clear()
+        # Someone who knows A's public address fakes it, from many ports.
+        for i in range(int(KNOWN_COOKIE_REPLY_BURST) + 3):
+            run.feed(_msg1(200 + i), (A[0], 9000 + i))
+        assert await _spin(run.sock._recv_queue.empty)
+        await _yield()
+        assert len(run.sock.sent) == KNOWN_COOKIE_REPLY_BURST  # capped
+        # Its dry budget logs nothing: no line may tell that it is known.
+        assert [r for r in caplog.records if r.name.startswith("dsm")] == []
+        run.feed(_msg1(1), other)  # another known address: its own budget
+        run.feed(_msg1(2), B)  # a stranger: the shared budget is untouched
+        assert await _spin(
+            lambda: len(run.sent_to(other)) == 1 and len(run.sent_to(B)) == 1
+        )
+
+
+async def test_a_strangers_failed_start_is_penalized_only_when_it_was_proved(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="dsm.net.handshake_gate")
+    clock = _Frozen()  # the gate's and the limiter's: nothing refills
+    gate = _gate(clock)
+    limiter = SourceLimiter(clock=clock)
+    quiet: Addr = ("203.0.113.1", 1)
+    loaded: Addr = ("203.0.113.2", 2)
+    hs = _Hs()
+    hs.fail.update({quiet, loaded})
+    async with _Demux(hs, SessionTable([A_CN]), limiter=limiter, gate=gate) as run:
+        run.feed(_msg1(1), quiet)  # a quiet server asks no cookie: not proved
+        assert await _spin(lambda: quiet in hs.started and not run.workers)
+        assert gate.load.under_load(0)  # its failure turned cookies on
+        first = _msg1(2)
+        run.feed(first, loaded)
+        assert await _spin(lambda: len(run.sent_to(loaded)) == 1)
+        run.feed(_with_cookie(first, run.sent_to(loaded)[0]), loaded)  # proved
+        assert await _spin(lambda: loaded in hs.started and not run.workers)
+    assert limiter.try_start(quiet[0])  # may start again at once
+    assert not limiter.try_start(loaded[0])  # barred (spec §3.7 E2)
+    assert any("last handshake failed" in r.getMessage() for r in caplog.records)
+
+
+async def test_a_strangers_stall_is_penalized_only_when_it_was_proved() -> None:
+    # A stall that runs into the attempt deadline (spec §3.7 E2).
+    clock = _Frozen()  # the gate's and the limiter's: nothing refills
+    gate = _gate(clock)
+    limiter = SourceLimiter(clock=clock)
+    quiet: Addr = ("203.0.113.1", 1)
+    loaded: Addr = ("203.0.113.2", 2)
+    hs = _Hs()
+    hs.stall.update({quiet, loaded})
+    with patch.object(hsa, "_HANDSHAKE_ATTEMPT_DEADLINE", 0.0):  # fires next pass
+        async with _Demux(hs, SessionTable([A_CN]), limiter=limiter, gate=gate) as run:
+            run.feed(_msg1(1), quiet)  # a quiet server asks no cookie: not proved
+            assert await _spin(lambda: quiet in hs.started and not run.workers)
+            assert gate.load.under_load(0)  # its timeout turned cookies on
+            first = _msg1(2)
+            run.feed(first, loaded)
+            assert await _spin(lambda: len(run.sent_to(loaded)) == 1)
+            run.feed(_with_cookie(first, run.sent_to(loaded)[0]), loaded)  # proved
+            assert await _spin(lambda: loaded in hs.started and not run.workers)
+    assert limiter.try_start(quiet[0])  # may start again at once
+    assert not limiter.try_start(loaded[0])  # barred
+
+
+async def test_a_proved_start_that_passes_bars_nothing() -> None:
+    clock = _Frozen()
+    gate = _gate(clock)
+    gate.load.note_trouble()  # under load: A's msg1 needs a cookie
+    limiter = SourceLimiter(clock=clock)
+    async with _Demux(_Hs(), SessionTable([A_CN]), limiter=limiter, gate=gate) as run:
+        first = _msg1(1)
+        run.feed(first, A)
+        assert await _spin(lambda: len(run.sent_to(A)) == 1)
+        run.feed(_with_cookie(first, run.sent_to(A)[0]), A)
+        assert await _spin(lambda: len(run.clients) == 1 and not run.workers)
+    # Its finish said failed=True (it was proved), but its address was known
+    # by then, and a known address is never barred.
+    assert limiter.try_start(A[0])
+
+
+async def test_a_known_address_pushes_out_a_young_stranger_from_a_full_pool() -> None:
+    # Pins Task 5's E3 wiring, and that the young stranger, which did not
+    # stall, costs its address nothing (spec §3.7 E2, E3).
+    clock = _Frozen()  # the gate's and the limiter's: nothing refills
+    gate = _gate(clock)
+    gate.load.note_trouble()  # under load: every msg1 needs a cookie
+    limiter = SourceLimiter(clock=clock)
+    limiter.note_known(A[0], A_CN)
+    hs = _Hs({B: B_CN})
+    hs.stall.add(B)
+    async with _Demux(
+        hs, SessionTable([A_CN, B_CN]), limiter=limiter, gate=gate, max_inflight=1
+    ) as run:
+        stranger = _msg1(1)
+        run.feed(stranger, B)
+        assert await _spin(lambda: len(run.sent_to(B)) == 1)  # a cookie
+        run.feed(_with_cookie(stranger, run.sent_to(B)[0]), B)  # proved
+        # It takes the one slot and stalls after msg2 (not signing now).
+        assert await _spin(lambda: run.sent_to(B)[1:] == [MSG2])
+        first = _msg1(2)
+        run.feed(first, A)  # Step S's clock never moves: B is 0 s old
+        assert await _spin(lambda: len(run.sent_to(A)) == 1)  # its own cookie
+        run.feed(_with_cookie(first, run.sent_to(A)[0]), A)
+        assert await _spin(lambda: len(run.clients) == 1)
+    assert run.clients[0].peer == A
+    assert B not in hs.admitted
+    assert limiter.try_start(B[0])  # pushed out young: not barred
+
+
+async def test_a_known_address_never_pushes_out_an_attempt_past_admit() -> None:
+    # Pins Task 5's E3 wiring.
+    limiter = SourceLimiter(clock=_minutes())
+    limiter.note_known(A[0], A_CN)
+    hs = _Hs({B: B_CN})
+    hs.hold[B] = asyncio.Event()  # past the table's check, its reply on its way
+    async with _Demux(
+        hs, SessionTable([A_CN, B_CN]), limiter=limiter, gate=_gate(), max_inflight=1
+    ) as run:
+        run.feed(_msg1(1), B)
+        assert await _spin(lambda: B in hs.admitted)
+        first = _msg1(2)
+        run.feed(first, A)
+        assert await _spin(lambda: len(run.sent_to(A)) == 1)
+        run.feed(_with_cookie(first, run.sent_to(A)[0]), A)
+        await _yield()
+        assert A not in hs.started  # dropped: every slot is full
+        hs.hold[B].set()
+        assert await _spin(lambda: len(run.clients) == 1)
+    assert run.clients[0].peer == B
+
+
+async def test_a_proved_stranger_pushed_out_after_it_stalled_is_barred() -> None:
+    # An old push-out victim did stall: its address pays (spec §3.7 E2).
+    clock = _Frozen()  # the gate's and the limiter's: nothing refills
+    gate = _gate(clock)
+    gate.load.note_trouble()  # under load: every msg1 needs a cookie
+    limiter = SourceLimiter(clock=clock)
+    other: Addr = ("203.0.113.10", 40010)
+    hs = _Hs()
+    hs.stall.add(B)
+    async with _Demux(
+        hs, SessionTable([A_CN]), limiter=limiter, gate=gate, max_inflight=1
+    ) as run:
+        stalled = _msg1(1)
+        run.feed(stalled, B)
+        assert await _spin(lambda: len(run.sent_to(B)) == 1)  # a cookie
+        run.feed(_with_cookie(stalled, run.sent_to(B)[0]), B)  # proved
+        # It takes the one slot and stalls after msg2 (not signing now).
+        assert await _spin(lambda: run.sent_to(B)[1:] == [MSG2])
+        run.clock.now = 2.0  # Step S's clock: B is past _PUSH_OUT_AFTER_S
+        first = _msg1(2)
+        run.feed(first, other)
+        assert await _spin(lambda: len(run.sent_to(other)) == 1)
+        run.feed(_with_cookie(first, run.sent_to(other)[0]), other)
+        assert await _spin(lambda: len(run.clients) == 1)
+    assert run.clients[0].peer == other
+    assert B not in hs.admitted
+    assert not limiter.try_start(B[0])  # barred
+
+
+async def test_a_proved_start_the_table_refuses_is_barred() -> None:
+    clock = _Frozen()  # the gate's and the limiter's: nothing refills
+    gate = _gate(clock)
+    gate.load.note_trouble()  # under load: B's msg1 needs a cookie
+    limiter = SourceLimiter(clock=clock)
+    hs = _Hs({B: B_CN})
+    async with _Demux(
+        hs, SessionTable(PAST_THE_POOL), limiter=limiter, gate=gate
+    ) as run:
+        first = _msg1(1)
+        run.feed(first, B)
+        assert await _spin(lambda: len(run.sent_to(B)) == 1)  # a cookie
+        run.feed(_with_cookie(first, run.sent_to(B)[0]), B)  # proved
+        assert await _spin(lambda: B in hs.started and not run.workers)
+    assert run.clients == []
+    assert not limiter.try_start(B[0])  # refused by the table: barred

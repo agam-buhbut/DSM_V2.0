@@ -1841,6 +1841,14 @@ async def _run_attempt(
         table.release(attempt)
 
 
+def _penalized(done: asyncio.Task[None], rec: _Attempt) -> bool:
+    """Whether an ended attempt costs its address the failed-start penalty
+    (spec §3.7 E2): its start proved the address, and no stop cancelled it
+    (a push-out is not a stop). A success says True too: its address is
+    known by then, and the limiter never bars a known address."""
+    return rec.proved and not (done.cancelled() and rec.passed_on is None)
+
+
 async def _demux(  # pyright: ignore[reportUnusedFunction]  # ClientAcceptor uses it next
     config: Config,
     keystore: KeyStore,
@@ -1910,7 +1918,7 @@ async def _demux(  # pyright: ignore[reportUnusedFunction]  # ClientAcceptor use
             # Last, so an error in ``finish`` cannot leave a dead inbox. After
             # a same-address push-out the new attempt holds this share.
             if rec.passed_on is not _PassedOn.SLOT_AND_SHARE:
-                limiter.finish(a[0])
+                limiter.finish(a[0], failed=_penalized(done, rec))
 
         task = asyncio.ensure_future(
             _run_attempt(
@@ -1963,9 +1971,15 @@ async def _demux(  # pyright: ignore[reportUnusedFunction]  # ClientAcceptor use
             under_load = gate.load.under_load(len(workers))
             verdict = gate.check_msg1(data, addr, under_load=under_load)
             if verdict is Msg1Verdict.NEED_COOKIE:
-                reply = gate.cookie_reply(data, addr)
-                if reply is not None:
-                    await _send_cookie_reply(transport, reply, addr)
+                # A known address's reply comes from its own small budget, so
+                # a spoofed flood that empties the shared one cannot keep it
+                # waiting (spec §3.7, C1). A spent one is not logged: no line
+                # may tell that an address is known.
+                known = limiter.is_known(addr[0])
+                if not known or limiter.take_known_cookie(addr[0]):
+                    reply = gate.cookie_reply(data, addr, shared_budget=not known)
+                    if reply is not None:
+                        await _send_cookie_reply(transport, reply, addr)
                 continue
             if verdict is Msg1Verdict.DROP:
                 continue
@@ -2001,6 +2015,10 @@ async def _demux(  # pyright: ignore[reportUnusedFunction]  # ClientAcceptor use
             ):
                 _note_trouble(gate)
                 continue
+            if now - records[victim].started < _PUSH_OUT_AFTER_S:
+                # Pushed out young (E3): it did not stall, so it costs its
+                # address nothing (spec §3.7 E2).
+                records[victim].proved = False
             _push_out(records, victim, how)
             _start(addr, data, now, under_load)
             continue
