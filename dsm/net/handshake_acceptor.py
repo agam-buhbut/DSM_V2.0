@@ -263,8 +263,8 @@ class _PassedOn(enum.Enum):
 
 @dataclass(eq=False)
 class _Attempt:
-    """One running attempt, as push-out sees it (spec §4.3). Step S keeps no
-    ``proved`` bit: only the failed-start penalty (spec §3.7) reads one."""
+    """One running attempt, as push-out (spec §4.3) and the failed-start
+    penalty (spec §3.7 E2) see it."""
 
     ip: str
     # Step S's clock at the attempt's start (UDP: its msg1; TCP: the accept).
@@ -274,6 +274,10 @@ class _Attempt:
     # until msg2 has been sent: no push-out meanwhile.
     signing: bool
     passed_on: _PassedOn | None = None
+    # The start proved its address: over UDP its msg1 needed a cookie (the
+    # server was under load); over TCP the connection itself, with the gate.
+    # Only a proved start that ends without a session costs the penalty.
+    proved: bool = False
 
     def msg2_sent(self) -> None:
         self.signing = False
@@ -291,15 +295,17 @@ def _running_from(attempts: Mapping[asyncio.Task[None], _Attempt], ip: str) -> i
 def _pick_victim(
     attempts: Mapping[asyncio.Task[None], _Attempt],
     now: float,
-    slot: SessionSlot | None,
+    past_admit: Callable[[asyncio.Task[None]], bool],
     *,
     ip: str | None = None,
+    any_age: Callable[[str], bool] | None = None,
 ) -> asyncio.Task[None] | None:
     """The oldest attempt that can be pushed out (from ``ip`` only, when
     given), or None (spec §4.3): at least ``_PUSH_OUT_AFTER_S`` old, not
     signing (a wait for the TPM counts; a TCP connection that has sent
-    nothing yet is not signing), not past the slot's ``admit``, not passed on
-    already, not ended.
+    nothing yet is not signing), not ``past_admit`` (past the session
+    check), not passed on already, not ended. A record whose address
+    ``any_age`` says yes to may go at any age (E3, spec §3.7).
     A clock that stepped back gives a negative age, which reads as too young.
     A tie keeps the earlier record, and the dict holds records in start order.
     """
@@ -310,9 +316,10 @@ def _pick_victim(
             continue
         if ip is not None and rec.ip != ip:
             continue
-        if now - rec.started < _PUSH_OUT_AFTER_S:
+        too_young = now - rec.started < _PUSH_OUT_AFTER_S
+        if too_young and (any_age is None or not any_age(rec.ip)):
             continue
-        if slot is not None and slot.admitted is task:
+        if past_admit(task):
             continue
         if victim is None or rec.started < oldest:
             victim, oldest = task, rec.started
@@ -322,10 +329,11 @@ def _pick_victim(
 def _choose_push_out(
     attempts: Mapping[asyncio.Task[None], _Attempt],
     now: float,
-    slot: SessionSlot | None,
     ip: str,
     *,
     pool_full: bool,
+    past_admit: Callable[[asyncio.Task[None]], bool],
+    is_known: Callable[[str], bool],
 ) -> tuple[asyncio.Task[None], _PassedOn] | None:
     """The attempt a new start from ``ip`` may push out, and how, or None.
 
@@ -334,13 +342,20 @@ def _choose_push_out(
     takes over that attempt's share and slot. If it has none, None: it is
     refused as today: dropped as pool saturated when every slot is full,
     else by the limiter's in-flight line. Case 2: the pool is full, so the
-    oldest pushable attempt of any address gives up its slot.
+    oldest pushable attempt of any address gives up its slot; when ``ip`` is
+    known, a stranger's attempt may go at any age (E3, spec §3.7).
+    ``past_admit`` tells an attempt past the session check.
     """
     if _running_from(attempts, ip) >= PER_SOURCE_INFLIGHT:
-        own = _pick_victim(attempts, now, slot, ip=ip)
+        own = _pick_victim(attempts, now, past_admit, ip=ip)
         return None if own is None else (own, _PassedOn.SLOT_AND_SHARE)
     if pool_full:
-        other = _pick_victim(attempts, now, slot)
+
+        def _stranger(rec_ip: str) -> bool:
+            return not is_known(rec_ip)
+
+        any_age = _stranger if is_known(ip) else None
+        other = _pick_victim(attempts, now, past_admit, any_age=any_age)
         return None if other is None else (other, _PassedOn.SLOT_ONLY)
     return None
 
@@ -780,7 +795,14 @@ async def _demux_loop(
         # and it may push out a stalled attempt (spec §4.3). Without a gate
         # (tests only) nothing is pushed out.
         push = (
-            _choose_push_out(records, now, slot, addr[0], pool_full=pool_full)
+            _choose_push_out(
+                records,
+                now,
+                addr[0],
+                pool_full=pool_full,
+                past_admit=lambda task: slot is not None and slot.admitted is task,
+                is_known=lambda _ip: False,
+            )
             if gate is not None
             else None
         )
@@ -1111,7 +1133,14 @@ async def _tcp_admit_loop(
         now = clock()
         pool_full = semaphore.locked()
         push = (
-            _choose_push_out(records, now, slot, peer[0], pool_full=pool_full)
+            _choose_push_out(
+                records,
+                now,
+                peer[0],
+                pool_full=pool_full,
+                past_admit=lambda task: slot is not None and slot.admitted is task,
+                is_known=lambda _ip: False,
+            )
             if gate is not None
             else None
         )
