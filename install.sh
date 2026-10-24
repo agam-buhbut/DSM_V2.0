@@ -1,6 +1,6 @@
 #!/bin/sh
 # DSM installer — verify-before-execute bootstrap for the supported target
-# (Debian 12+ / Ubuntu 22.04+ / x86_64 / TPM 2.0). Downloads the wheel +
+# (Debian 12+ / Ubuntu 24.04+ / x86_64 / TPM 2.0). Downloads the wheel +
 # SHA256SUMS + minisign signature, VERIFIES the minisign signature and the
 # checksum BEFORE installing anything (apt/pip/venv), then installs into a
 # dedicated venv.
@@ -67,9 +67,10 @@ done
 
 [ "$(id -u)" = "0" ] || die "must run as root (sudo)"
 [ "$(uname -m)" = "x86_64" ] || die "unsupported arch $(uname -m); build from source (deploy/GUIDE.md §1)"
-command -v apt-get >/dev/null 2>&1 || die "no apt-get; supported targets are Debian 12+/Ubuntu 22.04+. Build from source for others."
+command -v apt-get >/dev/null 2>&1 || die "no apt-get; supported targets are Debian 12+/Ubuntu 24.04+. Build from source for others."
 
-# Supported-distro warning (warn+continue: Debian 12+ / Ubuntu 22.04+).
+# Supported-distro warning (warn+continue: Debian 12+ / Ubuntu 24.04+; DSM
+# needs Python 3.11 or newer, and an older Ubuntu's python3 is too old).
 # /etc/os-release is sourced in a subshell so its variables (VERSION_ID,
 # VERSION, ID, …) cannot leak into and shadow our own state.
 if [ -r /etc/os-release ]; then
@@ -85,12 +86,12 @@ if [ -r /etc/os-release ]; then
         ;;
       ubuntu)
         _major="${VERSION_ID:-0}"; _major="${_major%%.*}"
-        if [ "${_major:-0}" -lt 22 ] 2>/dev/null; then
-          echo "WARNING — Ubuntu ${VERSION_ID:-?} is below the supported Ubuntu 22.04+ baseline; continuing."
+        if [ "${_major:-0}" -lt 24 ] 2>/dev/null; then
+          echo "WARNING — Ubuntu ${VERSION_ID:-?} is below the supported Ubuntu 24.04+ baseline; continuing."
         fi
         ;;
       *)
-        echo "WARNING — ${PRETTY_NAME:-unknown distro} is not a declared supported target (Debian 12+/Ubuntu 22.04+); continuing."
+        echo "WARNING — ${PRETTY_NAME:-unknown distro} is not a declared supported target (Debian 12+/Ubuntu 24.04+); continuing."
         ;;
     esac
   )"
@@ -228,7 +229,7 @@ apt-get install -y nftables iproute2 ca-certificates python3-venv \
 if [ "$EVAL" = 0 ]; then
   # TPM 2.0 runtime stack: the .so.0 provider + the device TCTI. No vendoring.
   apt-get install -y libtss2-esys-3.0.2-0t64 libtss2-tcti-device0 \
-    || apt-get install -y libtss2-esys libtss2-tcti-device0 \
+    || apt-get install -y libtss2-esys-3.0.2-0 libtss2-tcti-device0 \
     || die "could not install the libtss2 TPM runtime stack"
 else
   # Eval allows swtpm for software-TPM testing (still NO hardware binding).

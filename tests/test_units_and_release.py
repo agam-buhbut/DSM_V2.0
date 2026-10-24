@@ -220,3 +220,46 @@ def test_eval_fetches_no_unit_file(install: Install) -> None:
     _, logs = install("--eval", "--systemd")
     fetched = (logs / "curl.log").read_text().split()
     assert not [n for n in fetched if n in SHIPPED], fetched
+
+
+# --- supported systems and the TPM runtime ----------------------------------
+
+
+def test_the_tpm_runtime_falls_back_to_debian_12s_package() -> None:
+    assert "apt-get install -y libtss2-esys-3.0.2-0 libtss2-tcti-device0" in INSTALL
+    # No release ships a package named plain libtss2-esys.
+    assert "libtss2-esys libtss2-tcti-device0" not in INSTALL
+
+
+def test_install_sh_names_ubuntu_24_04_everywhere() -> None:
+    # DSM needs Python 3.11; Ubuntu 22.04's python3 is 3.10.
+    assert "22.04" not in INSTALL
+    assert "(Debian 12+ / Ubuntu 24.04+ / x86_64 / TPM 2.0)" in INSTALL
+    assert "supported targets are Debian 12+/Ubuntu 24.04+." in INSTALL
+
+
+def _distro_warning(tmp_path: Path, os_release: str) -> str:
+    start = INSTALL.index("if [ -r /etc/os-release ]; then")
+    end = INSTALL.index("# TPM presence gate")
+    release = tmp_path / "os-release"
+    release.write_text(os_release)
+    snippet = INSTALL[start:end].replace("/etc/os-release", str(release))
+    done = subprocess.run(
+        ["/bin/sh", "-c", snippet],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    return done.stderr
+
+
+@pytest.mark.parametrize(
+    ("version", "warned"),
+    [("22.04", True), ("23.10", True), ("24.04", False), ("26.04", False)],
+)
+def test_ubuntu_below_24_04_gets_a_warning(
+    tmp_path: Path, version: str, warned: bool
+) -> None:
+    err = _distro_warning(tmp_path, f'ID=ubuntu\nVERSION_ID="{version}"\n')
+    assert ("below the supported Ubuntu 24.04+ baseline" in err) is warned, err
