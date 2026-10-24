@@ -20,10 +20,14 @@ File permissions are enforced (mode 0o400/0o600/0o640) via the same
 
 from __future__ import annotations
 
+import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
 from dsm.core.path_security import check_user_file_permissions
+
+log = logging.getLogger(__name__)
 
 
 class CNAllowlistError(Exception):
@@ -48,6 +52,14 @@ class CNAllowlist:
         try:
             check_user_file_permissions(path)
         except Exception as e:
+            # Chained either way (tests/test_cert_allowlist_io.py wants the
+            # OS error kept). os.path.lexists: a dangling symlink is "there"
+            # and gets the permission check's own text.
+            if not os.path.lexists(path):
+                raise CNAllowlistError(
+                    f"{path} not found: create it with one client CN per line "
+                    "(deploy/GUIDE.md §4)"
+                ) from e
             raise CNAllowlistError(
                 f"refusing to load CN allowlist with insecure permissions: {e}"
             ) from e
@@ -56,17 +68,34 @@ class CNAllowlist:
         except OSError as e:
             raise CNAllowlistError(f"failed to read CN allowlist {path}: {e}") from e
         names: list[str] = []
+        first_line: dict[str, int] = {}
         for lineno, raw in enumerate(text.splitlines(), start=1):
             line = raw.strip()
             if not line or line.startswith("#"):
                 continue
+            if "#" in line:
+                raise CNAllowlistError(
+                    f"{path}:{lineno}: put a comment on a line of its own "
+                    "(a CN has no '#')"
+                )
             if " " in line or "\t" in line:
                 raise CNAllowlistError(
                     f"{path}:{lineno}: CN must not contain whitespace"
                 )
+            if line in first_line:
+                # Only the first line of a name counts, so it keeps its
+                # tunnel address; say so, as a repeat is usually a slip.
+                log.warning(
+                    "%s:%d: %s is already on line %d; this line does not count",
+                    path,
+                    lineno,
+                    line,
+                    first_line[line],
+                )
+                continue
+            first_line[line] = lineno
             names.append(line)
-        # A dict keeps each repeated CN once, at its first line.
-        order = tuple(dict.fromkeys(names))
+        order = tuple(names)
         return cls(cns=frozenset(order), order=order)
 
     def is_allowed(self, cn: str) -> bool:
