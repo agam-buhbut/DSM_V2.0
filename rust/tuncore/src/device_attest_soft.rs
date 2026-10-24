@@ -9,8 +9,11 @@
 //! user.
 
 use p256::ecdsa::{signature::Signer, Signature, SigningKey, VerifyingKey};
+// `Generate::generate` draws from the OS RNG (getrandom's `SysRng`) and
+// panics if it fails, as `SigningKey::random(&mut OsRng)` did before p256
+// 0.14 (rand 0.8's `OsRng` no longer meets the new rand_core bound).
+use p256::elliptic_curve::Generate;
 use p256::pkcs8::{EncodePrivateKey, EncodePublicKey};
-use rand::rngs::OsRng;
 use zeroize::Zeroizing;
 
 // Argon2id + XChaCha20-Poly1305 sealed-blob shape lives in
@@ -32,7 +35,7 @@ pub struct SoftAttestKey {
 
 impl SoftAttestKey {
     pub fn generate() -> Result<Self, String> {
-        let signing_key = SigningKey::random(&mut OsRng);
+        let signing_key = SigningKey::generate();
         Self::from_signing_key(signing_key)
     }
 
@@ -94,7 +97,7 @@ impl SoftAttestKey {
     /// replacement key technically has a corresponding pubkey, callers
     /// cannot obtain it from this instance.
     pub fn zeroize(&mut self) {
-        let replacement = SigningKey::random(&mut OsRng);
+        let replacement = SigningKey::generate();
         let old = std::mem::replace(&mut self.signing_key, Box::new(replacement));
         drop(old); // ZeroizeOnDrop wipes the scalar here.
         use zeroize::Zeroize;
