@@ -181,10 +181,14 @@ async def _set_up_host(
     tun.configure(local_ip=SERVER_TUN_IP, mtu=config.mtu, server_mode=True)
     clients = table.addresses()
     log.info(
-        "tunnel %s/%d up; addresses for %d clients",
+        "tunnel %s/%d up; %s",
         SERVER_TUN_IP,
         TUN_PREFIX_LEN,
-        len(clients),
+        (
+            "an address for 1 client"
+            if len(clients) == 1
+            else f"addresses for {len(clients)} clients"
+        ),
     )
 
     # IPv4 forwarding and MASQUERADE, so client traffic reaches the internet
@@ -221,6 +225,7 @@ async def _set_up_host(
         debug_dns=config.debug_dns,
         blocklist=blocklist,
         per_client=_resolver,
+        client_names=clients,
     )
     await dns_proxy.start()
     stack.callback(dns_proxy.stop)  # sync
@@ -544,6 +549,18 @@ async def run_server(
     if not harden_and_gate(config):
         return 1
 
+    # DSM no longer reads hosts.txt (fixed answers; see CHANGELOG). Say so
+    # once, so a user whose names stopped working knows why (QA Minor 19).
+    old_hosts = config.config_dir / "hosts.txt"
+    if old_hosts.exists():
+        log.warning(
+            "%s is no longer read: DSM gives no fixed answers now. To block "
+            "those names, copy the file into %s (deploy/GUIDE.md §7h); "
+            "otherwise delete it.",
+            old_hosts,
+            config.config_dir / "dns" / "block",
+        )
+
     # Cert auth materials must load BEFORE we touch any host state, so a
     # missing cert file aborts cleanly with no rules / no TUN created.
     try:
@@ -721,12 +738,7 @@ async def run_server(
         except DNSProxyPortInUseError as e:
             # A host resolver holds :53. Retrying cannot fix that, so exit
             # with a clear message, before any client.
-            log.error(
-                "FATAL: DNS proxy port conflict — %s. "
-                "Stop the host resolver or change the TUN address, "
-                "then restart dsm.",
-                e,
-            )
+            log.error("FATAL: DNS proxy port conflict — %s Then restart DSM.", e)
             return 1
         except (OSError, RuntimeError) as e:
             log.error("could not set up the tunnel at start: %s; exiting", e)

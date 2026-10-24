@@ -27,7 +27,7 @@ import errno
 import ipaddress
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -74,6 +74,10 @@ class _Client:
         default_factory=dict[tuple[str, int], asyncio.Future[DnsResult]]
     )
     tasks: set[asyncio.Task[None]] = field(default_factory=set[asyncio.Task[None]])
+    # The client's CN, when the server gave the proxy its names, so the cap
+    # line can say who (QA Minor 10); its own rate limit for that line.
+    cn: str | None = None
+    full_log: RepeatLog = field(default_factory=lambda: RepeatLog(log, logging.WARNING))
 
 
 class LocalDNSProxy:
@@ -85,6 +89,8 @@ class LocalDNSProxy:
 
     ``blocklist``, when given (server with ``dns_blocklist = true``), answers
     blocked names with NXDOMAIN before anything else.
+
+    ``client_names`` maps a client's tunnel address to its CN, for the log.
 
     ``per_client``, when given (the server), makes a fresh resolver for each
     client source address: each client then has its own cache and its own
@@ -127,6 +133,7 @@ class LocalDNSProxy:
         blocklist: DnsBlocklist | None = None,
         *,
         per_client: Callable[[], DNSResolver] | None = None,
+        client_names: Mapping[str, str] | None = None,
     ) -> None:
         self._resolver = resolver
         self._bind_ip = bind_ip
@@ -137,8 +144,7 @@ class LocalDNSProxy:
         # Per-client mode: each client's own state, by its tunnel address.
         # The /24 source filter below bounds it to the clients' addresses.
         self._clients: dict[str, _Client] = {}
-        # No address in the line: it would name the client.
-        self._client_full_log = RepeatLog(log, logging.WARNING)
+        self._client_names = dict(client_names or {})
         # Distinct queries in flight across every client: _MAX_INFLIGHT caps
         # the total (spec §2.11 keeps the shared caps as a backstop).
         self._inflight_total = 0
@@ -179,10 +185,10 @@ class LocalDNSProxy:
         except OSError as e:
             if e.errno == errno.EADDRINUSE:
                 raise DNSProxyPortInUseError(
-                    f"DNS proxy cannot bind {self._bind_ip}:{self._bind_port} — "
-                    f"another resolver (unbound / systemd-resolved / dnsmasq) is "
-                    f"already bound there. Stop the host resolver, or change the "
-                    f"TUN address."
+                    f"DNS proxy cannot bind {self._bind_ip}:{self._bind_port}: "
+                    "another program already holds it (often a local DNS resolver: "
+                    "unbound, systemd-resolved or dnsmasq). Stop it, or make it "
+                    "listen on other addresses only."
                 ) from e
             raise
         self._transport = transport  # type: ignore[assignment]
@@ -228,7 +234,9 @@ class LocalDNSProxy:
         client = self._clients.get(ip)
         if client is None:
             client = _Client(
-                self._per_client(), asyncio.Semaphore(self._MAX_UPSTREAM_PER_CLIENT)
+                self._per_client(),
+                asyncio.Semaphore(self._MAX_UPSTREAM_PER_CLIENT),
+                cn=self._client_names.get(ip),
             )
             self._clients[ip] = client
         return client
@@ -259,10 +267,17 @@ class LocalDNSProxy:
             return
         if client is not None and len(client.tasks) >= self._MAX_TASKS_PER_CLIENT:
             coro.close()
-            self._client_full_log.log(
-                "DNS queries dropped: one client already has %d waiting",
-                self._MAX_TASKS_PER_CLIENT,
-            )
+            if client.cn is None:
+                client.full_log.log(
+                    "DNS queries dropped: one client already has %d waiting",
+                    self._MAX_TASKS_PER_CLIENT,
+                )
+            else:
+                client.full_log.log(
+                    "DNS queries dropped: client_cn=%s already has %d waiting",
+                    client.cn,
+                    self._MAX_TASKS_PER_CLIENT,
+                )
             return
         task = asyncio.create_task(coro)
         self._tasks.add(task)
