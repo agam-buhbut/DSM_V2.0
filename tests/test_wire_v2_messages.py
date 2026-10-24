@@ -30,8 +30,9 @@ UNREADABLE = (
 )
 NO_ANSWER = (
     "no answer after 3 tries. Check the server address and port, "
-    "expected_server_cn and the CA file, the clock (within 5 minutes), and "
-    "that the server runs DSM wire v2."
+    "expected_server_cn and the CA file, the clock (within 5 minutes), that "
+    "both ends set the same transport (udp or tcp), and that the server "
+    "runs DSM wire v2."
 )
 
 

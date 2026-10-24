@@ -120,11 +120,25 @@ class HandshakeError(Exception):
 
 
 class CertAuthError(HandshakeError):
-    """Cert / binding-attestation verification failed."""
+    """Cert / binding-attestation verification failed.
+
+    ``cn`` is the peer's CN when the refusal came after its cert chained to
+    the CA and its attest signature checked out, so a log line may name it
+    (QA M3); otherwise None.
+    """
+
+    def __init__(self, message: str, *, cn: str | None = None) -> None:
+        super().__init__(message)
+        self.cn = cn
 
 
 class CNNotAllowedError(CertAuthError):
     """Server saw a client cert whose CN is not in the allowlist."""
+
+
+class WrongCertTypeError(CertAuthError):
+    """Server saw a client cert without the clientAuth EKU, for example one
+    signed with the server profile."""
 
 
 class CNMismatchError(CertAuthError):
@@ -439,7 +453,8 @@ async def client_handshake(
         gave_up=(
             f"no answer after {MAX_RETRIES} tries. Check the server address "
             "and port, expected_server_cn and the CA file, the clock (within "
-            f"5 minutes), and that the server runs DSM wire v{tuncore.WIRE_VERSION}."
+            "5 minutes), that both ends set the same transport (udp or tcp), "
+            f"and that the server runs DSM wire v{tuncore.WIRE_VERSION}."
         ),
     )
     _pin_source(transport, recv_addr, server_addr, "msg2")
@@ -694,20 +709,28 @@ async def server_handshake(
             handshake_hash=binding_hash_for_msg3,
             expected_remote_static=client_static,
             expected_peer_role=PeerRole.INITIATOR,
-            required_eku=required_client_eku,
+            # The EKU is checked below, once the attest signature has shown
+            # the peer holds this cert's key, so a refusal line may name it.
+            required_eku=None,
         )
     except (AttestError, CertError) as e:
         raise CertAuthError(f"client attestation verify failed: {e}") from e
 
-    if not cn_allowlist.is_allowed(client_cert.subject_cn):
-        raise CNNotAllowedError(
-            f"client CN {client_cert.subject_cn!r} not in allowlist"
+    cn = client_cert.subject_cn
+    if required_client_eku is not None and not client_cert.has_eku(required_client_eku):
+        raise WrongCertTypeError(
+            f"client cert {cn!r} is not a client certificate (its EKU lacks "
+            f"{required_client_eku.dotted_string})",
+            cn=cn,
         )
+    if not cn_allowlist.is_allowed(cn):
+        raise CNNotAllowedError(f"client CN {cn!r} not in allowlist", cn=cn)
     if crl is not None:
         try:
             if crl.is_revoked(client_cert.serial_number):
                 raise CertRevokedError(
-                    f"client cert serial {client_cert.serial_number} " "is revoked"
+                    f"client cert serial {client_cert.serial_number} is revoked",
+                    cn=cn,
                 )
         except CRLError as e:
             raise CertAuthError(f"CRL check failed: {e}") from e

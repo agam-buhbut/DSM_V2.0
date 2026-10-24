@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from cryptography.hazmat.primitives import serialization
+from cryptography.x509.oid import ExtendedKeyUsageOID
 
 from dsm.core.atomic_io import atomic_write
 from dsm.crypto.attest_store import AttestStore
@@ -281,6 +282,7 @@ def import_signed_cert(
     keystore: KeyStore,
     attest_store: AttestStore,
     now: datetime.datetime | None = None,
+    role: str | None = None,
 ) -> DeviceCert:
     """Verify a CA-signed cert matches the local enrollment and persist it.
 
@@ -290,6 +292,8 @@ def import_signed_cert(
         loaded identity's Noise static pubkey
       * cert's subject pubkey SPKI matches the loaded attest key SPKI
       * cert is currently within its validity window
+      * with ``role``, the cert's EKU fits it (clientAuth for a client,
+        serverAuth for a server)
 
     Writes the cert to ``cert_output_path`` with mode 0o600.
     """
@@ -308,6 +312,21 @@ def import_signed_cert(
         validate_chain(leaf, ca_root, now=now)
     except CertError as e:
         raise EnrollError(f"chain / validity check failed: {e}") from e
+
+    if role is not None:
+        wanted = (
+            ExtendedKeyUsageOID.CLIENT_AUTH
+            if role == "client"
+            else ExtendedKeyUsageOID.SERVER_AUTH
+        )
+        if not leaf.has_eku(wanted):
+            # The easy slip: a client CSR signed with the server profile, or
+            # the other way round (QA M3). Caught here, not at the server.
+            raise EnrollError(
+                f"this certificate is not a {role} certificate, and this host "
+                f'is a {role} (mode = "{role}"). Sign its CSR again with '
+                f"-extensions dsm_{role}_leaf (deploy/GUIDE.md §3c, §3f)."
+            )
 
     expected_static = bytes(keystore.identity.public_key)
     if leaf.noise_static_pub != expected_static:

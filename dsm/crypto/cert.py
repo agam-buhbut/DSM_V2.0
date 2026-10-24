@@ -204,6 +204,16 @@ class DeviceCert:
             raise CertError("cert CN must be a string attribute")
         return value
 
+    def has_eku(self, oid: x509.ObjectIdentifier) -> bool:
+        """True if the leaf's extendedKeyUsage lists ``oid``."""
+        try:
+            eku = self.cert.extensions.get_extension_for_class(
+                x509.ExtendedKeyUsage
+            ).value
+        except x509.ExtensionNotFound:
+            return False
+        return oid in list(eku)
+
     @property
     def noise_static_pub(self) -> bytes:
         """Extract the 32-byte X25519 Noise static pubkey from the

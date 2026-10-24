@@ -120,9 +120,10 @@ def _emit_handshake_failure(err: Exception) -> None:
     """Emit the failed-handshake netaudit event with a coarse error label.
 
     Every ``CertAuthError`` subclass collapses to ``"cert_auth"`` so the audit
-    stream cannot tell an allowlist miss from a CRL hit (the human log lines
-    hide that too). Other errors keep their class name; the exception
-    message is never emitted (``tests/test_netaudit_no_leak.py``).
+    stream cannot tell an allowlist miss from a CRL hit. The human log line
+    (``_log_cert_refusal``) does, for a client that proved its cert (QA M3).
+    Other errors keep their class name; the exception message is never
+    emitted (``tests/test_netaudit_no_leak.py``).
     """
     from dsm.core import netaudit
     from dsm.crypto.handshake import CertAuthError
@@ -134,6 +135,38 @@ def _emit_handshake_failure(err: Exception) -> None:
         outcome="failed",
         error=error_label,
     )
+
+
+def _log_cert_refusal(err: Exception) -> None:
+    """One line for a client the cert checks refused, with no address (QA
+    M3, owner 2026-10-24). A client that proved its cert (``err.cn`` set) is
+    named with the reason, at INFO: "client_cn=X refused: not in the
+    allowlist". Without a proven CN the line stays opaque. The netaudit
+    event stays coarse (``cert_auth``, see _emit_handshake_failure)."""
+    from dsm.crypto.handshake import (
+        CertAuthError,
+        CertRevokedError,
+        CNNotAllowedError,
+        WrongCertTypeError,
+    )
+
+    cn = err.cn if isinstance(err, CertAuthError) else None
+    if cn is None:
+        log.warning("handshake rejected (cert auth)")
+        return
+    if isinstance(err, CNNotAllowedError):
+        reason = "not in the allowlist"
+    elif isinstance(err, CertRevokedError):
+        reason = "revoked"
+    elif isinstance(err, WrongCertTypeError):
+        reason = "wrong certificate type"
+    else:
+        reason = "cert check failed"
+    # The CN comes from the client's cert. A newline in it would forge a
+    # second journal line, so a CN that is not plain printable text is
+    # shown escaped.
+    shown = cn if cn.isprintable() else ascii(cn)
+    log.info("client_cn=%s refused: %s", shown, reason)
 
 
 def _note_trouble(gate: HandshakeGate | None) -> None:
@@ -619,9 +652,9 @@ async def _run_attempt(
                 # Nobody off the path can slip a frame into a TCP connection,
                 # so there it pays like any failure (owner, 2026-10-24).
                 record.proved = False
-            # Same opaque INFO/WARNING logging as before; detail at DEBUG.
-            if isinstance(e, (CNNotAllowedError, CertRevokedError, CertAuthError)):
-                log.warning("handshake rejected (cert auth) from %s", who)
+            # A refusal names a proven CN and why, never the address. Detail at DEBUG.
+            if isinstance(e, CertAuthError):
+                _log_cert_refusal(e)
             else:
                 log.info("handshake failed from %s", who)
             log.debug("handshake failure detail (%s): %s", who, e)
