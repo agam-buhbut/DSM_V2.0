@@ -652,7 +652,9 @@ async def _run_attempt(
                 # Nobody off the path can slip a frame into a TCP connection,
                 # so there it pays like any failure (owner, 2026-10-24).
                 record.proved = False
-            # A refusal names a proven CN and why, never the address. Detail at DEBUG.
+            # The INFO/WARNING line names a proven CN and why, and has no
+            # address. The DEBUG detail line below, on only at log_level
+            # debug, has the peer's address and the error text.
             if isinstance(e, CertAuthError):
                 _log_cert_refusal(e)
             else:

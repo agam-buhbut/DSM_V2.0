@@ -86,7 +86,7 @@ def make_leaf_cert(
     leaf_public_spki_der: bytes,
     noise_static_pub: bytes,
     validity_days: int = 365,
-    eku: x509.ObjectIdentifier = CLIENT_AUTH_OID,
+    eku: x509.ObjectIdentifier | None = CLIENT_AUTH_OID,
     not_before: datetime.datetime | None = None,
     not_after: datetime.datetime | None = None,
     binding_critical: bool = True,
@@ -130,11 +130,9 @@ def make_leaf_cert(
             ),
             critical=True,
         )
-        .add_extension(
-            x509.ExtendedKeyUsage([eku]),
-            critical=False,
-        )
     )
+    if eku is not None:
+        builder = builder.add_extension(x509.ExtendedKeyUsage([eku]), critical=False)
     if not omit_binding:
         builder = builder.add_extension(
             x509.UnrecognizedExtension(
@@ -191,7 +189,7 @@ def make_enrolled_device(
     ca: IssuingCA,
     *,
     subject_cn: str,
-    eku: x509.ObjectIdentifier = CLIENT_AUTH_OID,
+    eku: x509.ObjectIdentifier | None = CLIENT_AUTH_OID,
     validity_days: int = 365,
     not_before: datetime.datetime | None = None,
     not_after: datetime.datetime | None = None,

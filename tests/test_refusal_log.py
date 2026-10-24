@@ -16,10 +16,12 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from cryptography import x509
 from cryptography.hazmat.primitives.serialization import Encoding
 from cryptography.x509.oid import ExtendedKeyUsageOID
 
 from dsm.crypto import handshake
+from dsm.crypto.cert import DeviceCert
 from dsm.crypto.cert_allowlist import CNAllowlist
 from dsm.crypto.enroll import EnrollError, import_signed_cert
 from dsm.crypto.handshake import (
@@ -33,6 +35,7 @@ from dsm.crypto.handshake import (
 from dsm.net.handshake_acceptor import _log_cert_refusal, _run_attempt
 from tests.cert_helpers import SERVER_AUTH_OID, make_enrolled_device, make_test_ca
 from tests.test_handshake_admit_hook import _udp_pair
+from tests.test_handshake_integration import _build_crl_with_revoked
 
 CLIENT_CN = "dsm-refused-client"
 SERVER_CN = "dsm-refused-server"
@@ -50,10 +53,23 @@ def _no_so_mark() -> Iterator[None]:
 
 
 async def _server_result(
-    *, client_eku: object, allow: set[str]
+    *,
+    client_eku: x509.ObjectIdentifier | None,
+    allow: set[str],
+    revoke_client: bool = False,
+    foreign_client: bool = False,
 ) -> BaseException | None:
     ca = make_test_ca()
-    client = make_enrolled_device(ca, subject_cn=CLIENT_CN, eku=client_eku)  # type: ignore[arg-type]
+    client = make_enrolled_device(
+        make_test_ca() if foreign_client else ca,
+        subject_cn=CLIENT_CN,
+        eku=client_eku,
+    )
+    crl = (
+        _build_crl_with_revoked(ca, [client.cert.serial_number])
+        if revoke_client
+        else None
+    )
     server = make_enrolled_device(ca, subject_cn=SERVER_CN, eku=SERVER_AUTH_OID)
     server_t, client_t, addr = await _udp_pair()
     try:
@@ -75,6 +91,7 @@ async def _server_result(
                     cert_der=server.cert_der,
                     ca_root=ca.certificate,
                     cn_allowlist=CNAllowlist(cns=frozenset(allow)),
+                    crl=crl,
                     required_client_eku=ExtendedKeyUsageOID.CLIENT_AUTH,
                 ),
                 return_exceptions=True,
@@ -199,3 +216,64 @@ async def test_the_acceptor_logs_the_refusal_without_the_address(
     lines = [r.getMessage() for r in caplog.records]
     assert f"client_cn={CLIENT_CN} refused: not in the allowlist" in lines
     assert not any("203.0.113.5" in line for line in lines)
+
+
+def test_has_eku_is_false_for_a_leaf_with_no_eku_extension() -> None:
+    ca = make_test_ca()
+    device = make_enrolled_device(ca, subject_cn=CLIENT_CN, eku=None)
+    assert not DeviceCert(device.cert).has_eku(ExtendedKeyUsageOID.CLIENT_AUTH)
+
+
+async def test_a_client_cert_with_no_eku_is_the_wrong_type() -> None:
+    err = await _server_result(client_eku=None, allow={CLIENT_CN})
+    assert isinstance(err, WrongCertTypeError)
+    assert err.cn == CLIENT_CN
+
+
+async def test_a_revoked_client_is_named_as_revoked(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    err = await _server_result(
+        client_eku=ExtendedKeyUsageOID.CLIENT_AUTH,
+        allow={CLIENT_CN},
+        revoke_client=True,
+    )
+    assert isinstance(err, CertRevokedError)
+    assert err.cn == CLIENT_CN
+    caplog.set_level(logging.DEBUG, logger="dsm")
+    caplog.clear()
+    _log_cert_refusal(err)
+    assert [(r.levelno, r.getMessage()) for r in caplog.records] == [
+        (logging.INFO, f"client_cn={CLIENT_CN} refused: revoked")
+    ]
+
+
+async def test_a_client_from_a_foreign_ca_is_never_named(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    err = await _server_result(
+        client_eku=ExtendedKeyUsageOID.CLIENT_AUTH,
+        allow={CLIENT_CN},
+        foreign_client=True,
+    )
+    assert type(err) is CertAuthError
+    assert err.cn is None
+    caplog.set_level(logging.DEBUG, logger="dsm")
+    caplog.clear()
+    _log_cert_refusal(err)
+    assert [(r.levelno, r.getMessage()) for r in caplog.records] == [
+        (logging.WARNING, "handshake rejected (cert auth)")
+    ]
+
+
+@pytest.mark.parametrize("role", ["clinet", "", "Server"])
+def test_enroll_import_refuses_a_mistyped_role(tmp_path: Path, role: str) -> None:
+    with pytest.raises(ValueError, match="role must be"):
+        import_signed_cert(
+            cert_input_path=tmp_path / "a",
+            cert_output_path=tmp_path / "b",
+            ca_root_path=tmp_path / "c",
+            keystore=MagicMock(),
+            attest_store=MagicMock(),
+            role=role,  # type: ignore[arg-type]
+        )

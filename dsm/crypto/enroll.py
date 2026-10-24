@@ -34,7 +34,7 @@ import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.x509.oid import ExtendedKeyUsageOID
@@ -282,7 +282,7 @@ def import_signed_cert(
     keystore: KeyStore,
     attest_store: AttestStore,
     now: datetime.datetime | None = None,
-    role: str | None = None,
+    role: Literal["client", "server"] | None = None,
 ) -> DeviceCert:
     """Verify a CA-signed cert matches the local enrollment and persist it.
 
@@ -297,6 +297,8 @@ def import_signed_cert(
 
     Writes the cert to ``cert_output_path`` with mode 0o600.
     """
+    if role not in (None, "client", "server"):
+        raise ValueError(f"role must be 'client' or 'server', got {role!r}")
     if not cert_input_path.is_file():
         raise EnrollError(f"cert input not found: {cert_input_path}")
     if not ca_root_path.is_file():
