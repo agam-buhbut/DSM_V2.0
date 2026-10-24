@@ -211,12 +211,26 @@ silent: the client's first message carries a code tied to the time. The
 client then logs `handshake failed: no answer after 3 tries. ...` and keeps
 trying.
 
+While DSM waits to start because a date looks wrong (a CRL past its next
+update, a cert outside its dates), its kill switch lets systemd-timesyncd
+reach the NTP servers that its config or DHCP names by IP address
+(`timedatectl show-timesync`), so the clock can heal. A pool name such as
+`0.debian.pool.ntp.org` cannot be looked up through the block, and chrony
+or ntpd get no opening: on such a host, set the clock before DSM starts.
+Once the clock is right, DSM goes on by itself. A CRL that really is out
+of date needs a fresh CRL, or a clock that timesyncd has synced: a clock
+set by hand is not marked synchronized, so DSM does not use an old CRL on
+it.
+
 ## 1. Build
 
 The dsm process runs under `sudo` (CAP_NET_ADMIN + CAP_NET_BIND_SERVICE),
 which means Python's interpreter is the system one at /usr/bin/python3 —
 not a venv and not a --user install. Every Python module dsm imports
 (tuncore, dns, cryptography) MUST be visible to /usr/bin/python3.
+
+The systemd units run `/usr/local/bin/dsm`. §1b puts the `dsm` command
+there; `install.sh` links the same path to its own venv.
 
 If you previously created a .venv under the repo from an earlier
 attempt, delete it now so you don't get confused later:
@@ -339,6 +353,9 @@ Ubuntu 23.10+, Fedora 38+). It's the right flag here: we're
 knowingly installing into the system Python because root needs to
 see these packages.
 
+pip writes the `dsm` command to `/usr/local/bin/dsm`, the path the systemd
+units run (`deploy/dsm.service`, `deploy/dsm-client.service`).
+
 For a fully reproducible, exactly-pinned install (recommended for
 production), the repo ships requirements.lock (a uv-compiled pin set:
 cryptography==50.0.2, dnspython==2.8.0, plus their transitive deps).
@@ -383,6 +400,9 @@ fails:
   Re-run 1b and read pip's output.
 - "No module named 'dns'" — dnspython didn't install.
 - "No module named 'cryptography'" — same fix as above.
+
+Then check the command the units run: `ls -l /usr/local/bin/dsm`. If it is
+not there, re-run §1b.
 
 ### 1d. Optional: run the test suite
 
@@ -509,8 +529,10 @@ $ openssl req -config openssl-ca.cnf \
 ### 2c. Generate the initial (empty) CRL
 
 The daemon ships fail-closed: `crl_strict` defaults to true, so every dsm
-host REFUSES to start unless a `crl_file` is present and current (see §3a,
-§7e). You must therefore produce a CRL now — even on a fresh CA with an
+host REFUSES to start without a `crl_file` (see §3a). A CRL past its next
+update holds the start too (a client waits behind its kill switch, a
+server does not start), unless the host's clock is NTP-synchronized
+(§7e). You must therefore produce a CRL now — even on a fresh CA with an
 empty `index.txt`, before any cert has been revoked — and distribute it
 alongside the root cert in §2f.
 
@@ -519,8 +541,13 @@ $ openssl ca -config openssl-ca.cnf -gencrl -out crl/dsm_ca.crl
 ```
 
 This writes an empty but valid CRL whose `next_update` is `default_crl_days`
-(31) out. Re-run this command (and re-walk the CRL) before it expires, and
-whenever you revoke a cert (§7e).
+(395) out. That is a month longer than a cert lasts (365 days), so a cert
+runs out a month before the CRL made with it, and the two never run out on
+the same day. Re-run this command, and carry the CRL to every host (the
+server and each client), before it runs out and whenever you revoke a cert
+(§7e). A CA set up with an older copy of `openssl-ca.cnf` sets
+`default_crl_days` to 31: change it to 395 in your CA's copy, or add
+`-crldays 395` to the command.
 
 ### 2d. Record the root cert fingerprint in your physical safe
 
@@ -558,6 +585,7 @@ On Stick B, place a copy of BOTH dsm_ca_root.pem and the initial CRL
 crl/dsm_ca.crl from §2c (both public, safe to walk). On each dsm host:
 
 ```sh
+$ sudo install -d -m 0700 /opt/mtun /etc/dsm   # DSM's folders, made once
 $ sudo install -m 0600 -o root -g root /mnt/transport/dsm_ca_root.pem \
       /opt/mtun/dsm_ca_root.pem
 $ sudo install -m 0600 -o root -g root /mnt/transport/dsm_ca.crl \
@@ -575,8 +603,9 @@ anchor — defense-in-depth is appropriate, and the REQUIRED
 than silently trusting the new anchor.
 
 The CRL goes to /opt/mtun/dsm_ca.crl (the `crl_file` path in §3a). Because
-`crl_strict` defaults true, the daemon will not start without it. Refresh
-it on the CRL cadence (§7e).
+`crl_strict` defaults true, the daemon will not start without it. Every
+host needs it: the server and each client. Carry a new one before it runs
+out (§7e).
 
 Re-wipe Stick B (`shred -v`) before reusing it.
 
@@ -587,18 +616,18 @@ configure clients (clients pin the server's CN via `expected_server_cn`).
 
 ### 3a. Server: write /opt/mtun/config.toml
 
-Pick the server's public IP and a UDP port (default 51820). Stash
+Pick a UDP port (default 51820). Stash
 the DoH provider's SPKI pin (see 3a.1 below).
 
 ```sh
-$ sudo mkdir -p /opt/mtun
+$ sudo install -d -m 0700 /opt/mtun /etc/dsm     # made in §2f; safe to run again
 # install -m 0600 writes the file mode 0600 directly. A plain `sudo tee`
 # would create it mode 0644 under root's umask, and the daemon's
 # path-security check REFUSES to load a config with any group/world bits
 # ("refusing to load config with insecure permissions ... chmod 600").
 $ sudo install -m 0600 /dev/stdin /opt/mtun/config.toml <<'EOF'
 mode               = "server"
-server_ip          = "10.0.0.5"         # THIS host's public IP (literal)
+server_ip          = "10.0.0.5"         # not used by a server: any IPv4 address
 server_port        = 51820
 listen_port        = 51820
 
@@ -762,9 +791,12 @@ $ openssl ca -config openssl-ca.cnf -extensions dsm_server_leaf -notext \
       -in /mnt/transport/dsm-csr-server.der -inform DER \
       -out certs/dsm-cert-server.pem -batch
 
-# 3. Copy the signed cert back to Stick B (the cert ONLY — never
-#    walk the CA private key or index.txt anywhere)
-$ cp certs/dsm-cert-server.pem /mnt/transport/
+# 3. Make a fresh CRL in the same sitting (§2c): a CRL made when you sign
+#    a cert outlives that cert by a month. Copy the signed cert and the CRL
+#    back to Stick B (never walk the CA private key or index.txt anywhere);
+#    the CRL goes to /opt/mtun/dsm_ca.crl, mode 0600, as in §2f.
+$ openssl ca -config openssl-ca.cnf -gencrl -out crl/dsm_ca.crl
+$ cp certs/dsm-cert-server.pem crl/dsm_ca.crl /mnt/transport/
 
 # 4. Eject Stick B, eject Stick A, return both to the safe.
 ```
@@ -788,6 +820,10 @@ dsm verifies:
   static pubkey
 - cert subject pubkey SPKI matches the loaded attest key SPKI
 - cert is within its validity window
+- the cert's type fits this host: a server needs a cert signed with
+  `-extensions dsm_server_leaf`, a client one signed with
+  `dsm_client_leaf`. A cert of the wrong type is refused here, with the
+  fix, instead of failing later at the server.
 
 On success, writes /opt/mtun/device.crt (mode 0o600) and prints
 cn / serial / not_after.
@@ -795,6 +831,10 @@ cn / serial / not_after.
 ### 3e. Server: stash the passphrase for non-interactive restarts
 
 Pick ONE source:
+
+`sudo dsm init ... --install-unit` (§3f) writes `/etc/dsm/passphrase` for
+you, with the passphrase that has just unlocked the keys, when that file is
+missing or empty.
 
 (i) Plain file (0600, read once at startup):
 
@@ -806,7 +846,7 @@ $ printf '%s' "$DSM_PP" | sudo install -m 0600 /dev/stdin /etc/dsm/passphrase
 $ unset DSM_PP
 ```
 
-Then start with:
+You start it in §5, once the allowlist has a client CN (§4), with:
 
 ```sh
 sudo python3 -m dsm --mode server \
@@ -822,7 +862,7 @@ The shipped deploy/dsm.service already does this:
 
 ```
 LoadCredential=passphrase:/etc/dsm/passphrase
-ExecStart=/opt/dsm/venv/bin/dsm --mode server \
+ExecStart=/usr/local/bin/dsm --mode server \
     --passphrase-env-file=${CREDENTIALS_DIRECTORY}/passphrase
 ```
 
@@ -837,14 +877,22 @@ $ printf '%s' "$DSM_PP" | sudo install -m 0600 /dev/stdin /etc/dsm/passphrase
 $ unset DSM_PP
 $ sudo cp deploy/dsm.service /etc/systemd/system/dsm.service
 $ sudo systemctl daemon-reload
-$ sudo systemctl enable --now dsm
+$ sudo systemctl enable dsm
 ```
+
+Do not start it yet: the server needs at least one client CN in its
+allowlist first (§4). You start it in §5. If `/etc/dsm/passphrase` is
+missing, systemd refuses to start the unit; if it is empty, DSM stops with
+`cannot unlock the keys: passphrase must not be empty ...` (§11).
 
 (iii) Environment variable (CI / one-shot test only — visible in
 /proc/$pid/environ):
 
 ```sh
-DSM_PASSPHRASE='...' sudo -E python3 -m dsm --mode server
+# Run this in §5, once the allowlist has a client CN (§4):
+$ read -rs DSM_PASSPHRASE && export DSM_PASSPHRASE   # typed, not in shell history
+$ sudo -E python3 -m dsm --mode server
+$ unset DSM_PASSPHRASE
 ```
 
 ### 3f. Client: mirror 3a – 3e
@@ -891,9 +939,28 @@ Do not start it yet: the server must know this client first (§4), and
 you start the client in §5. A client that cannot reach a server blocks all
 traffic, SSH too, and keeps trying.
 
+So does a start that the network or the clock holds up: a server name that
+does not resolve, a CRL past its next update while the clock is not
+synchronized, a cert outside its dates (§7i). Under `dsm-client.service`
+every start error after the block is up keeps it too, a wrong or empty
+passphrase file included; a few errors come before the block and raise
+none (§7i).
+
+**Headless client** (no screen or keyboard, reached only over SSH): such a
+block cuts your SSH session. A date or a lookup problem clears by itself
+once it is gone. A start error does not: systemd gives up after 5 starts,
+the block stays, and the next boot raises it again (the unit is enabled).
+From the console, `sudo dsm cleanup` frees the host; after the fix, `sudo
+systemctl reset-failed dsm-client && sudo systemctl start dsm-client`.
+Before you enable the unit, make sure you can reach the console (a screen
+and keyboard, a serial line, or the hypervisor's console). Keep the CRL
+fresh and the clock right.
+
 `sudo dsm init client --install-unit` and `install.sh --systemd --client`
-install the same unit. Unlike the server's, the client unit takes the kill
-switch down only after a stop you ask for (`systemctl stop`); see §7i.
+install the same unit. `dsm init ... --install-unit` also writes
+`/etc/dsm/passphrase` when it is missing or empty. Unlike the server's, the
+client unit takes the kill switch down only after a stop you ask for
+(`systemctl stop`); see §7i.
 
 Record the client's CN — you need it for §4.
 
@@ -910,7 +977,7 @@ $ sudo touch /opt/mtun/allowed_cns.txt
 $ sudo chown root:root /opt/mtun/allowed_cns.txt
 $ sudo chmod 0600 /opt/mtun/allowed_cns.txt
 
-# Append the client's CN (from §3f). One CN per line. '#' comments allowed.
+# Append the client's CN (from §3f). One CN per line; a '#' comment goes on a line of its own.
 $ echo 'dsm-XXXXXXXX-client' | \
       sudo tee -a /opt/mtun/allowed_cns.txt >/dev/null
 ```
@@ -928,7 +995,9 @@ the file gets the n-th tunnel address: the first 10.8.0.2, the second
 10.8.0.3, up to 10.8.0.254 (comments, blank lines and repeated names do not
 count; names past the 253rd get none, §11). Add new devices at the end. To
 retire a device without moving the others, keep its line and revoke its
-certificate. Any other edit (a line removed, added above others, or moved)
+certificate. A `#` in front of the line does not keep its place: a comment
+line takes no address, so the names below it move up, as when the line is
+deleted. Any other edit (a line removed, added above others, or moved)
 moves the addresses below it at the next restart, so scripts or firewall
 rules that name a client's address must follow the file. A restart drops
 every client; they are back within about 30 s. After a restart every device
@@ -947,22 +1016,27 @@ every client's tier. While DSM runs, the server host's IPv6 is off and its
 IPv4 forwarding is on, whether or not a client is connected. A process that
 holds 10.8.0.1:53 stops the server at start (§11).
 
-Each client's NAT flows carry a tag of its own (a conntrack mark), and a
-reply whose flow lacks the tag of the address's holder is dropped. This has
-four effects:
+Every client can reach the server itself (10.8.0.1, and its services) and
+the server's LAN. Clients cannot reach each other through the tunnel.
+
+Each client's NAT connections carry a tag of its own, so a reply can only
+reach the client that opened the connection. What that means for you:
 
 - Do not run another tool that sets conntrack marks on mtun0 traffic
-  (multi-WAN or policy-routing setups).
-- Port forwards (DNAT) from the internet to a client's tunnel address no
-  longer work, nor does traffic a LAN host routes into 10.8.0.0/24.
-- The first start after this upgrade cuts each older client flow once.
-- A packet with a tunnel source (10.8.0.x) that reaches the server on any
-  interface but mtun0 is dropped, and so is a packet into mtun0 that
-  belongs to no flow.
+  (multi-WAN or policy-routing setups): its marks would clash with DSM's.
+- A port forward from the internet to a client's tunnel address does not
+  work, and neither does traffic that a LAN host routes into 10.8.0.0/24.
+- The first start after this upgrade cuts each older client connection
+  once; the apps open it again.
+- A packet that claims a tunnel address (10.8.0.x) but arrives on another
+  interface, and a packet into mtun0 that belongs to no connection, are
+  dropped.
 
 ## 5. Run Both Sides
 
 Server:
+
+Start the server once its allowlist has at least one client CN (§4).
 
 ```sh
 $ sudo systemctl start dsm                   # if you installed the unit
@@ -1007,7 +1081,7 @@ Expected server log lines:
 ```
 ... CN allowlist loaded (1 entries)
 ... server listening on UDP port 51820 (wire v2)
-... tunnel 10.8.0.1/24 up; addresses for 1 clients
+... tunnel 10.8.0.1/24 up; an address for 1 client
 ... DNS blocklist loaded: 72,525 names to block, 0 allowed (files read: 1, lines skipped: 13)
 ... handshake complete (server) — client_cn=dsm-XXXXXXXX-client
 ... session 1: client_cn=dsm-XXXXXXXX-client, tunnel address 10.8.0.2
@@ -1102,17 +1176,23 @@ If the server's CN DOES change (it will any time the server's Noise
 static rotates — see §7c), push the new value to every client's
 /opt/mtun/config.toml `expected_server_cn` and restart them.
 
-### 7b. Revoke a client
+### 7b. Revoke a client (retire a device)
 
-On the server:
+1. On the CA laptop, revoke its certificate and make a new CRL (§7e).
+2. Carry the new CRL to the server, put it at `/opt/mtun/dsm_ca.crl`
+   (mode 0600), then `sudo systemctl restart dsm`. The server now logs
+   `client_cn=... refused: revoked` for that device.
+3. Keep the device's line in `/opt/mtun/allowed_cns.txt` as it is. Do not
+   delete it, and do not put a `#` in front of it: either way every device
+   listed below it gets a new tunnel address at the restart, and its open
+   connections are cut (§4).
 
-```sh
-$ sudo sed -i '/^dsm-XXXXXXXX-client$/d' /opt/mtun/allowed_cns.txt
-$ sudo systemctl restart dsm
-```
+The clients need the new CRL only to refuse a revoked server; take it to
+them on your next round (§7e).
 
-Optionally issue a CRL update (§7e) so other servers in the fleet
-refuse the cert too.
+To revoke the server's own cert: revoke it the same way, then carry the new
+CRL to every client while the old CRL is still in date. A client refuses a
+revoked server only once it has a CRL that lists it.
 
 ### 7c. Rotate the server identity
 
@@ -1132,11 +1212,11 @@ $ sudo python3 -m dsm --config /opt/mtun/config.toml \
 $ sudo systemctl start dsm
 ```
 
-Push the new CN to every client's `expected_server_cn` before the
-client reconnects, otherwise it will refuse the cert with
-"server CN check failed".
+Push the new CN to every client's `expected_server_cn`. Until then a client
+gets no answer (`handshake failed: no answer after 3 tries`): the server
+stays silent to a client that does not know its name.
 
-### 7d. Change MTU live, or change transport (UDP <-> TCP)
+### 7d. Change the MTU or the transport (UDP <-> TCP)
 
 Stop both sides, edit /opt/mtun/config.toml, restart. The TUN device
 is rebuilt on startup; cert auth is transport-independent.
@@ -1166,20 +1246,53 @@ $ openssl ca -config openssl-ca.cnf \
 $ openssl ca -config openssl-ca.cnf -gencrl -out crl/dsm_ca.crl
 ```
 
-The CRL number auto-increments in ca/crlnumber. Walk crl/dsm_ca.crl
-via fresh transport USB to every server (and to clients that have a
-CRL configured). Place at /opt/mtun/dsm_ca.crl. Restart the daemon
-to pick it up (no SIGHUP reload yet).
+The CRL number goes up by one each time (ca/crlnumber). Carry
+crl/dsm_ca.crl on a freshly wiped stick to every host: the server and each
+client (`dsm init` gives every client a `crl_file`). Put it at
+/opt/mtun/dsm_ca.crl. Restart the server to pick it up (no SIGHUP reload
+yet). A client that waits on a stale CRL reads the new one by itself; a
+running client takes it at its next start.
 
 Default validity:
 
-- Leaf cert  : 1 year   (default_days = 365 in openssl-ca.cnf)
-- CRL        : 31 days  (default_crl_days = 31)
+- Leaf cert  : 1 year     (default_days = 365 in openssl-ca.cnf)
+- CRL        : 13 months  (default_crl_days = 395)
 
-dsm FAILS CLOSED when crl_file is absent or the CRL is past its
-next_update timestamp (crl_strict defaults to true, audit H-CRYPT-3
-flip). To allow startup without a CRL (lab/dev only — accepts
-revoked certs silently), set `crl_strict = false` in config.toml.
+The CRL lasts a month longer than a cert. So a cert runs out a month
+before the CRL made with it, and the two never run out on the same day.
+Put both dates in your calendar, each a few weeks early. A CRL made
+before a cert was signed can run out first: make a fresh CRL each time you
+sign a cert (§3c), and carry it with the cert.
+
+A CRL reaches a host only when you carry it there, so each round goes to
+every host: the server and each client. To revoke a cert, make the new CRL
+and carry it at once; do not wait for the old one to run out.
+
+When a CRL is past its next update (with `crl_strict`, the default):
+
+- A client whose clock is NTP-synchronized keeps going on it, and logs a
+  WARNING: `CRL at ... is past its next update (...); DSM uses it because
+  the clock is synchronized. ...`. Every revocation in it still holds.
+- A client whose clock is not synchronized keeps its kill switch up and
+  waits, because the date may be the clock's fault. It logs `cert auth
+  materials not usable now: ...` once, lets the time daemon sync (§0f) and
+  tries again. Copy the new CRL into place, or set the clock: DSM goes on by
+  itself.
+- A server whose clock is NTP-synchronized starts on it, with the same
+  WARNING. Every revocation in it still holds.
+- A server whose clock is not synchronized does not start: `cert auth
+  materials missing or invalid: CRL at ... is past its next update (...).
+  Carry the CA's current CRL here`. Copy the new CRL (or set the clock),
+  then `sudo systemctl reset-failed dsm && sudo systemctl restart dsm`
+  (after 5 failed starts systemd refuses a plain restart for 10 minutes).
+
+In both cases carry the new CRL soon: a cert revoked after the old CRL was
+made is not in it.
+
+A missing CRL, one your CA did not sign, or one older than the last one a
+host took is always refused. To run without a CRL (lab or dev only: it
+accepts revoked certs without a word), set `crl_strict = false` in
+config.toml.
 
 ### 7f. Disaster recovery — CA private key lost
 
@@ -1308,20 +1421,25 @@ skip the list. Pi-hole has the same limit.
 
 ### 7i. Client: when the tunnel is down
 
-The client's kill switch is up whenever DSM runs, also while there is no
-tunnel. It comes down when you stop DSM. Two cases differ: a setup error at
-the first try also removes it (DSM exits 1), and a `systemctl stop` sent
-while DSM waits to restart (after a crash or a signal sent straight to it)
-leaves it up; run `sudo dsm cleanup`.
+The client's kill switch is up whenever DSM runs, from the very start
+(before it reads its cert files, looks up a server name or asks for the
+passphrase), and also while there is no tunnel. It comes down when you stop
+DSM. Two cases differ: on a run by hand a setup error also removes it (DSM
+exits 1), and a `systemctl stop` sent while DSM waits to restart (after a
+crash, a start error or a signal sent straight to it) leaves it up; run
+`sudo dsm cleanup`. Under `dsm-client.service` a setup error keeps it
+(below).
 
 - **The tunnel drops** (no packets from the server for 60 s, the server
   restarts or closes the session, a TCP reset, a key change that gives up,
   a handshake that fails). The client goes back to the start-up kill
   switch, `table inet dsm_killswitch_pre`, in one nft step. It lets
-  through only loopback, DHCP and the server's IP and port. Then it
-  connects again by itself: after 1 s, then 2, 4, 8, 16 and 30 s, then
-  every 30 s, with no limit (plus the time each try takes). It logs this
-  once per outage, and at most once a minute:
+  through only loopback, DHCP and DSM's own packets to the server's IP and
+  port, and only the replies to them. Then it connects again by itself:
+  after about 1 s, then 2, 4, 8, 16 and 30 s, then every 30 s, with no
+  limit (plus the time each try takes; each wait moves up to a quarter
+  either way at random, so many clients do not come back in step). It logs
+  this once per outage, and at most once a minute:
 
   ```
   no tunnel: all traffic is blocked until DSM connects again; it keeps trying. To get internet back without the VPN, stop DSM: Ctrl-C, or `sudo systemctl stop dsm-client`. If DSM is not running, run `sudo dsm cleanup`.
@@ -1341,8 +1459,9 @@ leaves it up; run `sudo dsm cleanup`.
   purpose, and the log says so. The next start replaces the old tables in
   the same nft step, so the host is never open in between. Under
   `dsm-client.service`, systemd starts DSM again after 5 s. If it keeps
-  failing, systemd gives up after 5 failed starts in 10 minutes. After
-  crashes the block stays; after setup errors (below) it is already gone.
+  failing, systemd gives up after 5 failed starts in 10 minutes. The
+  block stays after crashes, and under the unit after setup errors too
+  (below).
   Read `journalctl -u dsm-client`, then fix the problem or run
   `sudo dsm cleanup`. To start DSM again after systemd gave up, run
   `sudo systemctl reset-failed dsm-client`, then
@@ -1355,45 +1474,112 @@ leaves it up; run `sudo dsm cleanup`.
   packets for the old session reach it during its handshake and spoil it,
   and it waits for the old session to time out (about 65 s). Over TCP the
   client connects from a new port each time.
-- **Setup errors at the first start** (a wrong passphrase, keys or cert
-  that do not match, a UDP `listen_port` in use, a read-only
-  `/etc/resolv.conf`): DSM removes the kill switch and exits 1, as before:
-  you are there, and nothing was protected yet. The same errors on a
-  later reconnect keep the block, and DSM tries again. Under
-  `dsm-client.service` a UDP port in use keeps the block and retries too: a
-  program may take the port while DSM restarts.
+- **Setup errors at the first start** (a wrong or empty passphrase, a
+  missing or bad cert, CA or CRL file, a wrong `ca_root_sha256`, keys and
+  a cert that do not match, a UDP `listen_port` in use, a read-only
+  `/etc/resolv.conf`): on a run by hand DSM removes the kill switch and
+  exits 1, as before: you are there. Under `dsm-client.service` it keeps
+  the kill switch and exits 1, because nobody may be at the host. The log
+  shows the error, then `DSM could not start (see the error above), and the
+  kill switch stays up ...`. systemd tries again every 5 s and gives up
+  after 5 starts in 10 minutes; the block stays. Fix the problem, then
+  `sudo systemctl reset-failed dsm-client && sudo systemctl restart
+  dsm-client` (after 5 failed starts systemd refuses a plain restart for 10
+  minutes), or get internet back with `sudo systemctl stop dsm-client` and
+  `sudo dsm cleanup`. A UDP port in use is
+  not a setup error under the unit: DSM keeps the block and tries again,
+  since a program may take the port while DSM restarts. The same errors on
+  a later reconnect keep the block, and DSM tries again.
+- **Errors before the block.** Some errors stop DSM before it can raise
+  its kill switch, so DSM raises no block of its own, under the unit too.
+  After a boot the host then uses the internet without the VPN while DSM
+  is down. After a `systemctl restart`, a crash or a signal, the start-up
+  block of the earlier run stays up instead (SSH too): `sudo dsm cleanup`
+  removes it. What you see:
+  - `/etc/dsm/passphrase` is missing: systemd does not start DSM at all.
+    `systemctl status dsm-client` shows `status=243/CREDENTIALS`, and the
+    journal shows `Failed to set up credentials`.
+  - `config.toml` does not load: one line that starts with `config:`.
+  - An evaluation build without `allow_soft_attest`: one line that starts
+    with `active device-attestation backend is software-based`.
+  - nft refuses the first table: `pre-handshake kill switch could not be
+    installed: ...`.
+  - DSM cannot run at all: no `/usr/local/bin/dsm` or a broken venv
+    (`status=203/EXEC`; `ls -l /usr/local/bin/dsm`, §1c), a tuncore built
+    without the attest gate (`tuncore is missing ATTEST_BACKEND_IS_SOFTWARE
+    ...`), or a broken or half-upgraded install that fails on import (a
+    Python traceback before `client starting`), for example after a Python
+    upgrade.
+
+  systemd tries again and gives up after 5 starts in 10 minutes; the host
+  stays as it was (open, or blocked by the earlier run's table) all that
+  time. DSM has no block of its own for these cases. They are setup
+  mistakes, and each shows on the first start, so check them before you
+  enable the unit on a headless host: `sudo dsm init ... --install-unit`
+  writes the passphrase file, and one run by hand at the console (§3)
+  shows the others. Not over SSH: DSM raises its block before it asks for
+  the passphrase, so the SSH session freezes. §11 has each line.
+- **A start the clock or the network holds up:** a CRL past its next
+  update while the clock is not NTP-synchronized, this client's cert or
+  the CA cert outside its dates, or a server name that does not resolve
+  (below). DSM keeps the start-up kill switch, logs the problem once
+  (`cert auth materials not usable now: ...` or `could not look up the
+  server name: ...`, then `all traffic stays blocked, and DSM tries again
+  ...`), and tries again, 1 s doubling up to 30 s, until it works or you
+  stop DSM. While a date holds it, the time daemon may sync (§0f). Copy a
+  fresh CRL into place, set the clock, or wait for the network: DSM goes
+  on by itself. A stop takes the block down as usual. On a headless
+  client, see §3f.
 - **Server cert or CN errors** (`server CN check failed`, `server cert
   auth failed`, `server cert revoked`) keep the block too: someone on the
-  network can send them. If your config is wrong, stop DSM, fix it, start
-  it again.
-- **A DDNS server name:** DSM looks the name up once, at start, and keeps
-  that address while it reconnects; no lookup goes out through the block.
-  If the server's address changes during an outage, the client logs
-  `server IP may have changed ...` after 5 failed tries: stop DSM, then
-  start it. Once a handshake with a looked-up address works, DSM saves
-  the name and that address in `/run/dsm/server-endpoint.json` (root only;
-  gone at reboot; `dsm cleanup` leaves it). A run whose handshake never
-  works leaves the file as it was. If a later start cannot look the name
-  up, for example because a kill switch left by a crash blocks the lookup,
+  network can send them. A wrong `expected_server_cn` or CA file shows as
+  `handshake failed: no answer after 3 tries` instead: the server stays
+  silent to a client that does not know its name (§11). Stop DSM, fix the
+  config, start it again.
+- **A DDNS server name:** DSM raises the kill switch first, then looks the
+  name up itself: one A query from a socket that carries DSM's mark, to
+  the IPv4 resolvers in `/etc/resolv.conf` (at most three). On
+  systemd-resolved hosts it asks the upstreams listed in
+  `/run/systemd/resolve/resolv.conf`; after a crash that left DSM's own
+  resolv.conf, it reads the original saved in
+  `/var/lib/dsm/resolv.conf.orig`. Only while that query runs does the
+  kill switch let out port 53 (UDP or TCP) to those resolvers, from DSM
+  running as root, and take back their replies; then it allows only the
+  server, one nft step each way. Keep an IPv4 resolver in the list: IPv6
+  ones are not asked. The query is plain DNS sent straight to the
+  resolver, even where systemd-resolved would use DNS-over-TLS.
+  If your DNS goes through a local forwarder other than systemd-resolved
+  (dnsmasq or unbound on 127.0.0.1, or NetworkManager's 127.0.1.1), DSM
+  cannot look the name up behind the block: the forwarder's own questions
+  to its upstream are not DSM's marked packets, so the block drops them.
+  Only a saved address helps there. Set `server_ip` to the server's IP
+  address, or let the client connect once so that its address is saved.
+  Once a handshake with a looked-up address works, DSM saves the name and
+  that address in `/var/lib/dsm/server-endpoint.json` (root only; kept
+  across reboots; `dsm cleanup` leaves it). A run whose handshake never
+  works leaves the file as it was. A later start tries the fresh answer
+  first and the saved address second, taking turns. If the lookup fails,
   DSM uses the saved address and logs `could not look up the server name;
-  using the last address it had`. A lookup that works always wins, and
-  its address replaces the saved one once a handshake with it works. With
-  no saved address for that name, DSM exits with `could not resolve
-  server endpoint`: run `sudo dsm cleanup`, then start DSM.
+  using the last address it had`. With no saved address for that name, it
+  logs `could not look up the server name: ...` once and tries again, with
+  the block up. During an outage, after 5 failed tries the client logs
+  `server IP may have changed ...` and looks the name up again, at most
+  every 5 minutes; a new address goes first. If DSM dies while the query
+  runs (a crash, a SIGKILL), the start-up table and its port-53 opening
+  stay until the next start or `sudo dsm cleanup`. Only a program with
+  CAP_NET_ADMIN or CAP_NET_RAW can mark its socket.
 - **`systemctl restart dsm-client`** keeps the kill switch up: the old run
   leaves the start-up kill switch in place and the new start replaces it
   in one nft step, so the host is never open. The same goes for a signal
   sent straight to DSM (`kill`, `systemctl kill`): systemd starts DSM
   again and the block stays. A shutdown or reboot keeps it up too, so apps
   that still run cannot send in the clear; the tables are gone after boot.
-  A restart can also keep the old server address (the block can stop the
-  name lookup, and then DSM uses the saved one): after the server's address
-  changed, stop DSM and start it instead. Apart from `sudo dsm cleanup`,
-  only `sudo systemctl stop dsm-client` and Ctrl-C on a run by hand take
-  the kill switch down, with two exceptions: a setup error at the first try
-  also removes it (DSM exits 1), and a `systemctl stop` sent while DSM
-  waits to restart (after a crash or a signal sent straight to it) leaves
-  it up; run `sudo dsm cleanup`.
+  A restart looks the server name up again, through the block. Apart from
+  `sudo dsm cleanup`, only `sudo systemctl stop dsm-client` and Ctrl-C on
+  a run by hand take the kill switch down, with two exceptions: a setup
+  error on a run by hand also removes it (DSM exits 1), and a `systemctl
+  stop` sent while DSM waits to restart (after a crash, a start error or a
+  signal sent straight to it) leaves it up; run `sudo dsm cleanup`.
 
 ### 7j. Upgrade to wire v2 (once, server and clients together)
 
