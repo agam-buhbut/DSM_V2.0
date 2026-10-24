@@ -113,7 +113,12 @@ def loaded_stores_cli(
             sys.exit(2)
         if on_unlocked is not None:
             # Both stores opened with it, so it is the right passphrase.
-            on_unlocked(passphrase)
+            try:
+                on_unlocked(passphrase)
+            except BaseException:
+                attest_store.unload()
+                keystore.unload()
+                raise
     finally:
         wipe_passphrase(passphrase)
 

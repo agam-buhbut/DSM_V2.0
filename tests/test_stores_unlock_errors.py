@@ -65,7 +65,7 @@ def test_a_missing_file_is_one_error_line(
 def test_under_systemd_the_line_names_the_real_file(
     tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    creds = tmp_path / "credentials"
+    creds = tmp_path / "dsm-client.service"
     path = _pass_file(creds, b"")
     monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(creds))
     caplog.set_level(logging.ERROR, logger="dsm")
@@ -79,6 +79,8 @@ def test_under_systemd_the_line_names_the_real_file(
     assert line.startswith("cannot unlock the keys: passphrase must not be empty")
     assert "/etc/dsm/passphrase" in line
     assert "restart the unit" in line
+    assert "systemctl reset-failed dsm-client.service" in line
+    assert "systemctl restart dsm-client.service" in line
 
 
 def test_the_cli_variant_exits_2_with_one_line(
@@ -133,3 +135,24 @@ def test_on_unlocked_is_not_called_when_a_store_does_not_open(tmp_path: Path) ->
         ):
             pass
     assert seen == []
+
+
+def test_a_failing_on_unlocked_unloads_both_stores(tmp_path: Path) -> None:
+    path = _pass_file(tmp_path, b"hunter2hunter2\n")
+    keystore, attest = MagicMock(), MagicMock()
+
+    def boom(_pw: bytearray) -> None:
+        raise OSError("disk full")
+
+    with pytest.raises(OSError, match="disk full"):
+        with loaded_stores_cli(
+            keystore,
+            attest,
+            passphrase_env_file=str(path),
+            key_file_label="identity.key",
+            attest_key_file_label="attest.key",
+            on_unlocked=boom,
+        ):
+            pass
+    keystore.unload.assert_called_once()
+    attest.unload.assert_called_once()

@@ -26,8 +26,8 @@ log = logging.getLogger(__name__)
 
 
 class PassphraseError(ValueError):
-    """The key passphrase could not be read, or is empty. ``str()`` is one
-    line for the user."""
+    """The key passphrase could not be read, is empty, or the two typed
+    answers differ. ``str()`` is one line for the user."""
 
 
 def wipe_passphrase(buf: bytearray) -> None:
@@ -130,12 +130,14 @@ def _read_named_file(path: str) -> bytearray:
     terminal: under systemd stdin is /dev/null, so a prompt would read
     nothing and hide the real cause (QA B2).
     """
-    # os.path.lexists: a dangling symlink is "there" (the permission check
-    # then refuses it); Path.exists(follow_symlinks=False) needs 3.12.
-    if not os.path.lexists(path):
-        raise PassphraseError(f"passphrase file {path} not found")
     try:
+        # lstat: a dangling symlink is "there" (the permission check then
+        # refuses it). Only a truly absent path is "not found"; an
+        # unreadable folder is a read error.
+        os.lstat(path)
         buf = _read_from_file(path)
+    except FileNotFoundError as e:
+        raise PassphraseError(f"passphrase file {path} not found") from e
     except OSError as e:
         raise PassphraseError(f"cannot read the passphrase file {path}: {e}") from e
     if not buf:
@@ -148,7 +150,7 @@ def _try_source(
     warn_msg: str,
     *warn_args: object,
 ) -> bytearray | None:
-    """The three file/fd sources share the same shape ("try read; on OS-level
+    """The fd and file sources share the same shape ("try read; on OS-level
     failure log and fall through"); centralising the try/except keeps the
     fallback chain readable without changing observable behavior (each
     source still emits its caller-supplied warning string).
@@ -247,12 +249,17 @@ def read_passphrase(
     Raises:
         PassphraseError: a named file is missing, unsafe or empty, the two
             answers differ, or the passphrase is empty.
+        ValueError: ``DSM_PASSPHRASE_FILE`` is set but cannot be read.
     """
     p = _read_noninteractive(passphrase_fd, passphrase_env_file)
     if p is None:
         p = _read_from_tty(prompt)
         if confirm and p and sys.stdin.isatty():
-            again = _read_from_tty("Type it again: ")
+            try:
+                again = _read_from_tty("Type it again: ")
+            except BaseException:
+                wipe_passphrase(p)
+                raise
             try:
                 same = hmac.compare_digest(p, again)
             finally:

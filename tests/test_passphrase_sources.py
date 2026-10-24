@@ -9,6 +9,7 @@ asked twice. No real terminal is read: the tty reader is faked.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -100,13 +101,67 @@ def test_a_new_passphrase_is_asked_twice_at_a_terminal() -> None:
 
 
 def test_two_different_answers_stop_with_one_line() -> None:
-    tty = _tty(b"one secret", b"one secrte")
+    answers = [bytearray(b"one secret"), bytearray(b"one secrte")]
+    tty = MagicMock(side_effect=answers)
     with (
         patch.object(passphrase, "_read_from_tty", tty),
         patch.object(passphrase.sys, "stdin", _stdin(tty=True)),
         pytest.raises(PassphraseError, match="the two passphrases do not match"),
     ):
         read_passphrase(prompt="New passphrase: ", confirm=True)
+    assert all(not any(a) for a in answers)
+
+
+def test_a_cut_off_second_prompt_wipes_the_first_answer() -> None:
+    first = bytearray(b"one secret")
+    tty = MagicMock(side_effect=[first, KeyboardInterrupt()])
+    with (
+        patch.object(passphrase, "_read_from_tty", tty),
+        patch.object(passphrase.sys, "stdin", _stdin(tty=True)),
+        pytest.raises(KeyboardInterrupt),
+    ):
+        read_passphrase(prompt="New passphrase: ", confirm=True)
+    assert not any(first)
+
+
+def test_a_bare_enter_with_confirm_asks_only_once() -> None:
+    tty = _tty(b"")
+    with (
+        patch.object(passphrase, "_read_from_tty", tty),
+        patch.object(passphrase.sys, "stdin", _stdin(tty=True)),
+        pytest.raises(PassphraseError, match="must not be empty"),
+    ):
+        read_passphrase(confirm=True)
+    assert tty.call_count == 1
+
+
+def test_env_sources_do_not_rescue_a_missing_named_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    other = _file(tmp_path, b"from the env file\n")
+    monkeypatch.setenv("DSM_PASSPHRASE_FILE", str(other))
+    monkeypatch.setenv("DSM_PASSPHRASE", "from the env")
+    missing = tmp_path / "nope"
+    with patch.object(passphrase, "_read_from_tty", _no_tty):
+        with pytest.raises(PassphraseError, match="not found"):
+            read_passphrase(passphrase_env_file=str(missing))
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory modes")
+def test_a_file_in_an_unreadable_folder_is_not_called_missing(tmp_path: Path) -> None:
+    folder = tmp_path / "locked"
+    folder.mkdir()
+    path = folder / "passphrase"
+    path.write_bytes(b"secret\n")
+    path.chmod(0o600)
+    folder.chmod(0o000)
+    try:
+        with patch.object(passphrase, "_read_from_tty", _no_tty):
+            with pytest.raises(PassphraseError) as err:
+                read_passphrase(passphrase_env_file=str(path))
+    finally:
+        folder.chmod(0o700)
+    assert str(err.value).startswith(f"cannot read the passphrase file {path}: ")
 
 
 def test_without_confirm_the_terminal_is_asked_once() -> None:
