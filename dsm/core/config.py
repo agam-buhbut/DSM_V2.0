@@ -140,11 +140,11 @@ class Config:
     # When True (the default), refuse to start if either:
     #   (a) no crl_file is configured, OR
     #   (b) the configured CRL is past its ``next_update`` timestamp.
-    # Default fail-closed: silent revocation-bypass is the worst kind of
-    # failure for a VPN whose compromise-recovery story relies on CRL
-    # distribution. Dev / lab deployments that genuinely have no CA
-    # workflow can set ``crl_strict = false`` to fall back to a warning,
-    # which logs and continues.
+    # For (b), if the clock is NTP-synchronized, DSM warns and goes on, as
+    # long as the CRL is still valid and not older than the last one taken.
+    # Otherwise it refuses: carry the CA's current CRL here (deploy/GUIDE.md
+    # §7e). Dev / lab deployments that genuinely have no CA workflow can set
+    # ``crl_strict = false``, which warns and continues.
     crl_strict: bool = True
     # Client-only: subject CN we will accept on the server cert.
     expected_server_cn: str | None = None

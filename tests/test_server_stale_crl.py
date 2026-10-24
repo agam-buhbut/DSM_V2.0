@@ -23,7 +23,11 @@ from tests.test_server_dns_fatal import (
 async def test_the_server_asks_the_clock_about_a_stale_crl() -> None:
     captured: dict[str, Any] = {}
     load = MagicMock(return_value=_FakeMaterials())
-    with _base_patches(captured), patch("dsm.server.load_cert_materials", load):
+    with (
+        _base_patches(captured),
+        patch("dsm.server.load_cert_materials", load),
+        patch("dsm.server.check_clock_sync", return_value=None),
+    ):
         assert await _run_until(_server_config(), captured) == 0
     assert "check_own_dates" not in load.call_args.kwargs
     clock_synced = load.call_args.kwargs["clock_synced"]

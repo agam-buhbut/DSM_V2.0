@@ -11,6 +11,7 @@ WARNING (re-decision 4(i), client and server alike).
 from __future__ import annotations
 
 import datetime
+import logging
 import secrets
 import unittest
 from unittest.mock import MagicMock, patch
@@ -88,15 +89,34 @@ class TestDateProblems(unittest.TestCase):
         self.assertNotIn("crl_strict=false", str(err.exception))
 
     def test_a_synchronized_clock_keeps_going_on_a_stale_crl(self) -> None:
-        with self.assertLogs("dsm", level="WARNING") as logs:
+        with (
+            patch("dsm.crypto.auth_loader.netaudit.emit") as emit,
+            self.assertLogs("dsm", level="WARNING") as logs,
+        ):
             materials = load_cert_materials(self._stale(), clock_synced=lambda: True)
         self.assertIsNotNone(materials.crl)
-        self.assertTrue(
-            any(
-                "DSM uses it because the clock is synchronized" in m
-                for m in logs.output
-            )
+        warnings = [r for r in logs.records if r.levelno == logging.WARNING]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn(
+            "DSM uses it because the clock is synchronized", warnings[0].getMessage()
         )
+        stale = [c for c in emit.call_args_list if c.args[0] == "crl_stale"]
+        self.assertEqual(len(stale), 1)
+        self.assertEqual(stale[0].kwargs["action"], "warned")
+
+    def test_the_clock_is_not_asked_without_crl_strict(self) -> None:
+        der = _build_crl(
+            self.fx.ca, this_update=self.now - 10 * DAY, next_update=self.now - DAY
+        )
+        lax = self.fx.make_config(
+            ca_root_sha256=self.fx.ca_sha256,
+            crl_file=str(self.fx.write_crl_600(der)),
+            crl_strict=False,
+        )
+        clock = MagicMock(return_value=True)
+        materials = load_cert_materials(lax, clock_synced=clock)
+        self.assertIsNotNone(materials.crl)
+        clock.assert_not_called()
 
     def test_an_unsynchronized_clock_is_refused_a_stale_crl(self) -> None:
         with self.assertRaises(AuthMaterialsTimeError):
