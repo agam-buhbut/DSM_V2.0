@@ -15,6 +15,7 @@ from unittest import mock
 import pytest
 
 from dsm import init as dsm_init
+from dsm.core import passphrase
 from dsm.core.config import load as config_load
 from dsm.crypto.enroll import EnrollError
 from tests.test_init import _fake_enrollment, _server_flags
@@ -554,3 +555,36 @@ def test_the_resume_hint_quotes_a_path_with_a_space(
     with _enrolls():
         assert dsm_init.main(_server_flags(inst)) == 0
     assert f"--install-dir '{inst}'" in capsys.readouterr().out
+
+
+def test_force_with_two_different_answers_keeps_the_old_keys(
+    cfg_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # A typo in the second answer must leave the old enrollment in place, so
+    # "nothing was changed" is true.
+    monkeypatch.delenv("DSM_PASSPHRASE_FILE", raising=False)
+    monkeypatch.delenv("DSM_PASSPHRASE", raising=False)
+    for name in ("identity.key", "attest.key", ".dsm-init-state.json"):
+        (cfg_dir / name).write_bytes(b"old")
+    stdin = mock.MagicMock()
+    stdin.isatty.return_value = True
+    tty = mock.MagicMock(
+        side_effect=[bytearray(b"one secret"), bytearray(b"one secrte")]
+    )
+    flags = _without(_server_flags(cfg_dir), "--passphrase-env-file") + ["--force"]
+    with (
+        _enrolls() as gen,
+        mock.patch.object(passphrase, "_read_from_tty", tty),
+        mock.patch.object(passphrase.sys, "stdin", stdin),
+        pytest.raises(SystemExit) as err,
+    ):
+        dsm_init.main(flags)
+    assert err.value.code == 2
+    gen.assert_not_called()
+    for name in ("identity.key", "attest.key", ".dsm-init-state.json"):
+        assert (cfg_dir / name).read_bytes() == b"old", name
+    stderr = capsys.readouterr().err
+    assert "the two passphrases do not match; nothing was changed" in stderr
+    assert "removing existing enrollment keys" not in stderr

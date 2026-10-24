@@ -308,9 +308,7 @@ def _phase_a(role: str, args: argparse.Namespace) -> int:
             f"init already in progress ({state_path} exists); resume with "
             "`--resume` or re-run with `--force` to restart"
         )
-    if args.force:
-        _force_remove_enrollment(install_dir, state_path)
-    else:
+    if not args.force:
         # Refuse before anything is written, so a re-run on an enrolled host
         # leaves its config as it is (QA M6).
         for key in (install_dir / "identity.key", install_dir / "attest.key"):
@@ -360,6 +358,9 @@ def _phase_a(role: str, args: argparse.Namespace) -> int:
             # key), and on two answers that differ. Surface it cleanly.
             _fail(str(e))
         try:
+            if args.force:
+                # Only now: a refusal or a typo above keeps the old keys.
+                _force_remove_enrollment(install_dir, state_path)
             try:
                 result = generate_enrollment(
                     keystore=keystore,
