@@ -100,8 +100,7 @@ closed as known:
   takes about 31 real addresses, because there every failed start costs
   its address 30 s.
   Over TCP, someone with nothing at all can make new devices wait too,
-  but needs many addresses (about 22, or about 170 once a failed start
-  costs its address 30 s).
+  but needs about 170 addresses, for the same reason.
 
   Right after the server starts or restarts, no device is "known" yet,
   so every device counts as new until it connects once. While such an
@@ -109,8 +108,7 @@ closed as known:
   device out, until the attack stops and one device gets in. Over UDP
   that takes about 16 addresses, or no real address at all by keeping
   the cookie budget empty. Over TCP it takes about 125 addresses with
-  the certificate and the name, or about 22 (about 170) with nothing at
-  all.
+  the certificate and the name, or about 170 with nothing at all.
 
   Once a device has connected in this run, these limits no longer hold
   it back when it comes back from the same public address. Nobody can

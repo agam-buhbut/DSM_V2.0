@@ -39,8 +39,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     answer at all gives `handshake failed: no answer after 3 tries. Check
     ...`. Both ends say `(wire v2)` when they start.
   - The last handshake message tells the client its tunnel address and DNS
-    server; the client no longer assumes 10.8.0.2 and 10.8.0.1 (the server
-    still sends exactly those).
+    server; the client no longer assumes 10.8.0.2 and 10.8.0.1.
 - A client that crashes and starts again is back within seconds instead of
   about 65 s. That wait applied over UDP, or to a TCP connection left half
   open: over TCP a killed client's connection closes at once, and that

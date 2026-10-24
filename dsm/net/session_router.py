@@ -11,6 +11,7 @@ import enum
 import ipaddress
 import logging
 from collections.abc import Callable
+from typing import assert_never
 
 from dsm.core.log import RepeatLog
 from dsm.net.session_slot import SESSION_QUEUE_PACKETS, ServerSession, SessionTable
@@ -161,10 +162,12 @@ class ClientTun(TunDevice):
                 "(client-to-client traffic is blocked)",
                 cn,
             )
-        else:
+        elif verdict is Verdict.NOT_IPV4:
             self._not_ipv4_log.log(
                 "dropped a packet from client_cn=%s that is not IPv4", cn
             )
+        else:
+            assert_never(verdict)
         return 0
 
     def set_mtu(self, mtu: int) -> None:

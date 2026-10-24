@@ -50,7 +50,8 @@ session per CN, and each CN's takeover allowance) is handed to
   §3.7 E3). Without a gate (tests only) nothing is pushed out.
 * A stranger's start that proved its address (a valid mac2, or a TCP
   connection) and then ended without a session bars that address for 30 s
-  (spec §3.7 E2).
+  (spec §3.7 E2), except a UDP start whose msg3 did not open, and a push-out
+  victim whose msg2 left less than ``_REPLY_ALLOWANCE_S`` ago.
 
 Handoff: the frames still in a passing client's inbox go with it
 (``AcceptedClient.held``). Nothing awaits between its bootstrap reply and

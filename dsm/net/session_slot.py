@@ -105,9 +105,10 @@ class SessionSlot:
         """Let ``client`` have the last handshake frame, or refuse it.
 
         ``attempt`` marks the handshake; pass the same object to
-        :meth:`confirm` or :meth:`release`. ``session_live`` is True for the
-        accept that runs during a session. A takeover spends one token of the
-        CN's budget here, after every check passed.
+        :meth:`confirm` or :meth:`release`. ``session_live`` is True when the
+        slot has a holder (a live session, or the next one): this start is a
+        takeover. A takeover spends one token of the CN's budget here, after
+        every check passed.
 
         Raises:
             ClientRefusedError: another attempt is finishing; or a session
@@ -328,7 +329,12 @@ class SessionTable:
         """Make ``session`` its CN's session, the owner of its tunnel address
         and the holder of its hint (its handshake address). Returns the CN's
         old session, or None. The caller ends the returned session (sets its
-        ``shutdown``); ``add`` only reroutes."""
+        ``shutdown``); ``add`` only reroutes.
+
+        The caller runs ``add`` in the same loop step as :meth:`confirm`,
+        with nothing awaited between them (spec §2.7), so no packet can arrive
+        for a confirmed client that has no session yet.
+        """
         cn = session.client.cn
         old = self._by_cn.get(cn)
         if old is not None:
