@@ -141,7 +141,7 @@ def _unit_line(key: str) -> str:
 
 def test_the_unit_passes_the_flag() -> None:
     assert _unit_line("ExecStart").startswith(
-        "ExecStart=/opt/dsm/venv/bin/dsm --mode client --stop-keeps-block "
+        "ExecStart=/usr/local/bin/dsm --mode client --stop-keeps-block "
     )
 
 

@@ -60,12 +60,12 @@ LoadCredential=passphrase:/etc/dsm/passphrase
 # --mode server is the correct CLI form: `server` is not a subcommand and
 # --mode accepts only {client,server}. Transport (udp/tcp) lives in config.toml.
 #
-# install.sh creates a dedicated venv at /opt/dsm/venv and installs the wheel
-# into it, producing the `dsm` console-script at /opt/dsm/venv/bin/dsm (its
-# shebang pins the venv interpreter). systemd runs with cwd=/, so this
-# absolute path is what guarantees the right interpreter + the installed
-# `dsm` + `tuncore` packages — no system-Python pollution.
-ExecStart=/opt/dsm/venv/bin/dsm --mode server \
+# /usr/local/bin/dsm is the `dsm` command of both install paths: install.sh
+# links it to its venv (/opt/dsm/venv), and a source install with
+# `sudo python3 -m pip install` (deploy/GUIDE.md §1b) writes it there. Its
+# shebang picks the right Python, so systemd (cwd=/) runs the installed
+# `dsm` + `tuncore`.
+ExecStart=/usr/local/bin/dsm --mode server \
           --passphrase-env-file=${CREDENTIALS_DIRECTORY}/passphrase
 
 # Graceful shutdown: dsm.session.setup_signal_handlers wires SIGINT, SIGTERM,
@@ -79,7 +79,7 @@ TimeoutStopSec=15
 # the host never stays with the kill switch up, a dead resolv.conf, a stale
 # table-100 route / ip rule, or modified sysctls. Idempotent — safe to run
 # when there is nothing to clean.
-ExecStopPost=/opt/dsm/venv/bin/dsm cleanup
+ExecStopPost=/usr/local/bin/dsm cleanup
 
 Restart=on-failure
 RestartSec=10s

@@ -39,7 +39,7 @@ def _code(path: Path) -> list[str]:
 def test_the_client_unit_runs_dsm_as_a_client() -> None:
     starts = [line for line in _code(CLIENT_UNIT) if line.startswith("ExecStart=")]
     assert len(starts) == 1
-    assert starts[0].startswith("ExecStart=/opt/dsm/venv/bin/dsm --mode client ")
+    assert starts[0].startswith("ExecStart=/usr/local/bin/dsm --mode client ")
     assert "--passphrase-env-file=${CREDENTIALS_DIRECTORY}/passphrase" in starts[0]
     assert not any("--mode server" in line for line in _code(CLIENT_UNIT))
 

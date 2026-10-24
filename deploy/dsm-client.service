@@ -8,9 +8,9 @@ After=network-online.target
 Wants=network-online.target
 
 # StartLimit* is only honored in [Unit]. If DSM keeps failing at start,
-# systemd stops trying after 5 starts in 10 minutes. After a crash the kill
-# switch stays up even then (see ExecStopPost), so the host stays blocked,
-# not open.
+# systemd stops trying after 5 starts in 10 minutes. After a crash or a
+# start error the kill switch stays up even then (see ExecStopPost), so the
+# host stays blocked, not open.
 StartLimitIntervalSec=10min
 StartLimitBurst=5
 
@@ -31,9 +31,9 @@ SupplementaryGroups=tss
 LoadCredential=passphrase:/etc/dsm/passphrase
 
 # --stop-keeps-block: on SIGTERM (or Ctrl-C) DSM swaps back to the start-up
-# kill switch, exits 0 and leaves that table up. ExecStopPost below decides
-# whether it comes down.
-ExecStart=/opt/dsm/venv/bin/dsm --mode client --stop-keeps-block \
+# kill switch, exits 0 and leaves that table up; on a start error it leaves
+# it up too and exits 1. ExecStopPost below decides whether it comes down.
+ExecStart=/usr/local/bin/dsm --mode client --stop-keeps-block \
           --passphrase-env-file=${CREDENTIALS_DIRECTORY}/passphrase
 
 # `systemctl stop` and `systemctl restart` send SIGTERM: DSM ends the
@@ -66,10 +66,14 @@ TimeoutStopSec=30
 # which is the safe side.
 ExecStopPost=/bin/sh -c 'if [ "$$SERVICE_RESULT" = success ]; then queued=$$(systemctl list-jobs --no-legend --plain dsm-client.service 2>/dev/null) || queued=""; case "$$queued" in *" stop "*) [ "$$(systemctl is-system-running 2>/dev/null)" = stopping ] || for t in dsm_killswitch_pre dsm_killswitch dsm_dns_leak; do nft delete table inet "$$t" 2>/dev/null; done ;; esac; fi; exit 0'
 
-# DSM exits only when stopped (0), on a setup error at its first try (1;
-# it took the kill switch down itself) or on a crash (the kill switch stays
-# up). Restart=always brings it back after a crash; the new start replaces
-# the old kill switch in one nft commit, so the host is never open between.
+# DSM exits when stopped (0), on a start error (1) or on a crash. With
+# --stop-keeps-block each of these keeps the start-up kill switch up, except
+# the few errors that come before it is raised (deploy/GUIDE.md §7i). A date
+# problem or a server name that does not resolve does not end DSM: it keeps
+# the block and tries again. Restart=always brings DSM back; the new start
+# replaces the old kill switch in one nft commit, so the host is never open
+# between. After 5 failed starts in 10 minutes systemd stops trying and the
+# block stays: run `sudo systemctl reset-failed dsm-client` before a restart.
 Restart=always
 RestartSec=5s
 

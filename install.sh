@@ -195,6 +195,31 @@ for dep in $DEP_WHEELS; do
     || die "dependency wheel checksum mismatch for $dep — refusing to install"
 done
 
+# systemd units: a `curl | sh` install has no deploy/ folder, so with
+# --systemd fetch the unit files from the release too, into ./deploy (this
+# working dir, where the unit install below looks), each checked against the
+# same signed SHA256SUMS before anything is installed. Exact-field selection
+# and `sha256sum -c`, as for the wheels above.
+if [ "$SYSTEMD" = 1 ] && [ "$EVAL" = 0 ]; then
+  if [ "$CLIENT" = 1 ]; then
+    UNIT_FILES="dsm-client.service"
+  else
+    UNIT_FILES="dsm.service dsm-blocklist-update.sh dsm-blocklist-update.service dsm-blocklist-update.timer"
+  fi
+  mkdir -p "$WORK/deploy" || die "could not create $WORK/deploy"
+  for f in $UNIT_FILES; do
+    f_line="$(awk -v w="$f" '$2 == w {n++; line=$1"  "$2} END {if (n==1) print line}' "$WORK/SHA256SUMS")"
+    [ -n "$f_line" ] \
+      || die "signed SHA256SUMS has no single entry for ${f} — refusing"
+    curl -fsSL --proto '=https' --tlsv1.2 "$BASE/$f" -o "$WORK/deploy/$f" \
+      || die "cannot fetch $f"
+    printf '%s\n' "$f_line" > "$WORK/expected.sha256" \
+      || die "could not stage the expected checksum for $f"
+    ( cd "$WORK/deploy" && sha256sum -c "$WORK/expected.sha256" ) \
+      || die "checksum mismatch for $f — refusing to install"
+  done
+fi
+
 #  VERIFIED-ARTIFACT GATE PASSED. Only past this line may we run apt/pip/venv.
 
 apt-get update || die "apt-get update failed"
@@ -229,7 +254,9 @@ if [ "$EVAL" = 0 ]; then
   echo "      deploy/dsm.service and deploy/dsm-client.service set SupplementaryGroups=tss already." >&2
   if [ "$SYSTEMD" = 1 ] && [ "$CLIENT" = 0 ]; then
     UNIT_SRC=""
-    for c in /opt/dsm/deploy/dsm.service ./deploy/dsm.service; do
+    # ./deploy (in $WORK) holds the copies just checked against the signed
+    # SHA256SUMS: they win over an older /opt/dsm/deploy.
+    for c in ./deploy/dsm.service /opt/dsm/deploy/dsm.service; do
       [ -f "$c" ] && { UNIT_SRC="$c"; break; }
     done
     if [ -n "$UNIT_SRC" ]; then
@@ -269,7 +296,8 @@ if [ "$EVAL" = 0 ]; then
         systemctl start dsm-blocklist-update.service \
           || echo "install.sh: WARNING — could not download the DNS block lists now; the daily timer tries again (journalctl -u dsm-blocklist-update, deploy/GUIDE.md §7h)." >&2
       fi
-      echo "Installed dsm.service. Start with: sudo systemctl enable --now dsm" >&2
+      echo "Installed dsm.service. Enable it with: sudo systemctl enable dsm. Start it once dsm init is done and its allowlist has a client CN (deploy/GUIDE.md §4, §5)." >&2
+      echo "Give --install-unit to the first dsm init command: it writes the file this unit reads at start (deploy/GUIDE.md §3e)." >&2
     else
       echo "install.sh: WARNING — --systemd requested but deploy/dsm.service not found locally; skipping unit install." >&2
     fi
@@ -277,7 +305,7 @@ if [ "$EVAL" = 0 ]; then
     # A client gets only the client unit: never dsm.service (it runs DSM as
     # a server) and never the server's DNS block list download.
     UNIT_SRC=""
-    for c in /opt/dsm/deploy/dsm-client.service ./deploy/dsm-client.service; do
+    for c in ./deploy/dsm-client.service /opt/dsm/deploy/dsm-client.service; do
       [ -f "$c" ] && { UNIT_SRC="$c"; break; }
     done
     if [ -n "$UNIT_SRC" ]; then
@@ -285,6 +313,7 @@ if [ "$EVAL" = 0 ]; then
         || die "could not install dsm-client.service"
       systemctl daemon-reload || die "systemctl daemon-reload failed"
       echo "Installed dsm-client.service. Enable it with: sudo systemctl enable dsm-client" >&2
+      echo "Give --install-unit to the first dsm init command: it writes the file this unit reads at start (deploy/GUIDE.md §3e)." >&2
       echo "Start it only after the server has this client's CN (deploy/GUIDE.md §4); until then it blocks all traffic, SSH too. Then: sudo systemctl start dsm-client" >&2
     else
       echo "install.sh: WARNING — --systemd --client requested but deploy/dsm-client.service not found locally; skipping unit install." >&2
