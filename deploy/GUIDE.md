@@ -1755,10 +1755,9 @@ To see the quick reconnect instead of cleaning up, start the client again
 ```sh
 $ sudo systemctl start dsm-client
 # Within seconds the client logs "tunnel established" and the server logs
-# "client reconnected (client_cn=...); ending its old session" at INFO
-# (shown with log_level = "info", the default, not with the "warning" that
-# config.example.toml sets), instead of waiting about 65 s for the old
-# session to time out. That wait applies over UDP, or to a TCP connection
+# "client reconnected (client_cn=...); ending its old session" at INFO,
+# instead of waiting about 65 s for the old session to time out. That wait
+# applies over UDP, or to a TCP connection
 # left half open: over TCP the killed client's connection closed at once
 # and ended the old session, so the restarted client connects as a new
 # one and the server logs no "client reconnected".
@@ -2035,14 +2034,15 @@ In the CLIENT's /opt/mtun/config.toml, point `server_ip` at the DDNS name
 and turn on the cellular-friendly MTU knobs:
 
 ```toml
-server_ip     = "my-dsm.duckdns.org"   # DDNS hostname (resolved once at startup)
+server_ip     = "my-dsm.duckdns.org"   # DDNS name (looked up at start, behind the kill switch)
 server_port   = 51820                  # = the server's forwarded listen_port
 auto_mtu      = true                   # adapt TUN MTU to the path
 pmtu_discover = true                   # required by auto_mtu
 ```
 
 `server_ip` takes either the DDNS hostname or a literal IPv4. A literal
-avoids the single startup hostname lookup (privacy-max — see §10f); the
+avoids the hostname lookups (at start, and during an outage; privacy-max —
+see §10f); the
 hostname is the convenient choice for a home server on a changing IP.
 `auto_mtu` + `pmtu_discover` matter on cellular, where the path MTU is
 small and oversized packets are often silently black-holed — the client
@@ -2092,14 +2092,29 @@ The point is reachability from a foreign network, so test from one:
 
 ### 10f. Security / privacy note
 
-With a DDNS hostname the client makes ONE cleartext DNS A-lookup at startup
-(before the kill switch installs) to turn the name into an IP — that lookup
-reveals the *hostname* to the local network. It is NOT a trust anchor: the
-server is still authenticated by Noise + the cert/CN pin, so a spoofed or
-poisoned DNS answer makes the handshake fail CLOSED rather than redirecting
-you to an attacker. While the tunnel is down the client keeps that first
-address and does not look the name up again (§7i). Set `server_ip` to a
-literal IPv4 if you want to avoid even that single lookup.
+With a DDNS hostname the client sends one cleartext DNS A query at start to
+turn the name into an IP, and one more after each 5 failed tries in an
+outage (at most every 5 minutes). DSM sends it itself, after its kill
+switch is up, from a marked socket; the kill switch lets out only that
+query, and only while it runs. The query shows the *hostname* to the local
+network and to the resolver. It is plain DNS on port 53, sent straight to
+the resolver, even on a host where systemd-resolved would use
+DNS-over-TLS.
+
+The answer is NOT a trust anchor: the server is still authenticated by
+Noise and the cert/CN pin, so a spoofed or poisoned answer makes the
+handshake fail closed instead of sending you to an attacker. Once a
+handshake has worked, the address it proved stays a second address to try,
+so a bad answer then costs one try, not the connection. On a first start
+(no proven address yet) a resolver that keeps lying keeps the client out
+while it lies. Set `server_ip` to a literal IPv4 if you
+want no lookup at all.
+
+Whoever controls the DDNS name controls where clients go first. A stolen
+server box that still runs the provider's updater can point the name at
+another host. That host still cannot pass the handshake without the
+server's keys and TPM, so clients stay blocked, not exposed; revoke the
+server's cert and carry the new CRL to every client (§7b).
 
 ## 11. Debugging by Symptom
 
@@ -2173,14 +2188,18 @@ prints "ok".
   dropped a handshake start with a bad mac1 (wrong CA or CN, a clock more than 5 minutes off, a DSM client older than wire v2, or not a DSM client)
   ```
 
-  A later line adds `(N more in the last T s)`. It shows with
-  `log_level = "info"` (the default), not with the `"warning"` that
-  `config.example.toml` sets. While sessions run, the same line can also
-  come from a live client's own 1400-byte packets that do not open: network
+  A later line adds `(N more in the last T s)`. It is an INFO line
+  (`log_level = "info"`, the default). While sessions run, the same line
+  can also come from a live client's own 1400-byte packets that do not
+  open: network
   duplicates, packets too late for their key set, or a replay by someone on
   the path. In that case it does not mean a config problem.
 - The client runs a build older than wire v2 and the server a newer one
   (same INFO line on the server): upgrade the client (§7j).
+- The two ends set a different `transport`: a UDP client gets no answer
+  from a TCP server (a TCP client gets `cannot connect to the server:
+  Connection refused` from a UDP one). Set the same `transport` on both
+  (§7d).
 - `handshake recv timed out after 3 attempts` is the same wait at a later
   step: the server answered the first message, but the last reply never came
   (the link broke, or the server refused this client after its second
@@ -2204,6 +2223,11 @@ prints "ok".
   third raises without sleeping) — about 18 s per try. After a failed
   try the client keeps the kill switch up and tries again by itself
   (1 s, doubling to 30 s, no limit; §7i). You do not need to restart it.
+- This client's CN is not on the server's allowlist (a new device, or a
+  typo in the file): the client sees `handshake recv timed out after 3
+  attempts`, and the server logs `client_cn=... refused: not in the
+  allowlist` (INFO). Add the CN exactly as `dsm init` or `dsm enroll`
+  printed it (§4), then restart the server.
 - This client's CN is past the 253rd name of the allowlist: the server logs
   `client_cn=... has no tunnel address (its allowlist line is past the first
   253); refused` (WARNING, §11).
@@ -2219,19 +2243,31 @@ prints "ok".
   damaged or forged bytes. If it shows once and the next try works, it was
   not a version mismatch.
 
-### Server log shows "handshake rejected (CNNotAllowedError): client CN '...' not in allowlist"
+### Server log: "client_cn=... refused: not in the allowlist" (or "revoked", "wrong certificate type")
 
-Expected on first connect — see §4. The client's CN must be on a line
-of /opt/mtun/allowed_cns.txt (mode 0o600). If you DID add a line and
-still see this, the line doesn't match the cert the client actually
-presents — compare exactly against the CN the client's `dsm enroll
---csr-out` printed.
+INFO lines, one per refused try, with no address. The client proved it
+holds that cert, so the line names the CN it really has.
+
+- `not in the allowlist`: expected on a device's first connect (§4). Add
+  the CN to /opt/mtun/allowed_cns.txt, exactly as `dsm init` or `dsm
+  enroll` printed it, then restart the server. If you added it and still
+  see this, compare the two spellings: the line shows the client's.
+- `revoked`: the CRL lists this cert (§7b, §7e).
+- `wrong certificate type`: the cert was not signed as a client cert, most
+  often with `-extensions dsm_server_leaf` by mistake. Sign the client's
+  CSR again with `-extensions dsm_client_leaf` (§3f) and import it; `dsm
+  enroll --import` now refuses such a cert at once.
+
+A cert that does not chain to your CA, or whose signature fails, gets
+`handshake rejected (cert auth)` at WARNING, with no name and no address.
 
 ### Client log: "server CN check failed: server CN ... does not match expected ..."
 
-The client's expected_server_cn does not match the cert the server
-presents. Either correct the client's config, or roll the server back
-if the CN changed unexpectedly (implies unauthorized re-enrollment).
+Rare since wire v2. A wrong `expected_server_cn`, or a wrong CA file, now
+shows as `handshake failed: no answer after 3 tries` (above): the server
+stays silent to a client that does not know its name. This line means a
+server that does know the name sent a cert with another CN. Roll the
+server back if its CN changed without you (an enrollment you did not do).
 
 The client keeps the kill switch up and keeps trying (someone on the
 network could send a wrong cert). Stop it, fix the config, start it again.
@@ -2258,6 +2294,103 @@ or prctl(PR_SET_DUMPABLE) didn't stick. Usually one of:
     CAP_NET_ADMIN + CAP_NET_BIND_SERVICE only. If a future change
     needs another cap, add it to deploy/dsm.service and restart.
 (c) Running outside systemd without the right caps. Use sudo.
+
+### "dsm: DSM must run as root: use sudo"
+
+DSM and `dsm cleanup` change nftables, routes, sysctls and resolv.conf,
+and every DSM file belongs to root. Run the same command with `sudo`, or
+start the systemd unit.
+
+### "pre-handshake kill switch could not be installed: ... — refusing to start"
+
+nft refused the client's first table, so DSM stops before it does
+anything (exit 1). Check that nftables is installed (`sudo nft list
+ruleset`) and that DSM runs as root. With "Operation not permitted" it ran
+without root or without CAP_NET_ADMIN. DSM raises no block in this case,
+also under the unit: after a boot the host uses the internet without the
+VPN until DSM runs, and a block an earlier run left stays (§7i).
+
+### "active device-attestation backend is software-based (dev-soft-attest): ... Refusing to start."
+
+This DSM was built for testing: its attestation key is not held by
+hardware. DSM stops before its kill switch is up, so it raises no block,
+also under the unit; a block an earlier run left stays (§7i). Use a
+tuncore built with a hardware
+attest backend. On a lab host only, set `allow_soft_attest = true` in
+config.toml (`dsm init` writes it on such a build, with a comment).
+
+### "cannot unlock the keys: passphrase must not be empty: ... is empty" (or "passphrase file ... not found")
+
+The passphrase file is empty or not there. Put the key passphrase in it
+(§3e). Under systemd the path is `/run/credentials/<unit>/passphrase`: that
+is a copy of `/etc/dsm/passphrase`, so fix that file, then `sudo systemctl
+reset-failed dsm-client && sudo systemctl restart dsm-client` (or `dsm`;
+after 5 failed starts a plain restart is refused for 10 minutes). Under
+`dsm-client.service` the kill switch
+stays up meanwhile (§7i); on a run by hand DSM takes it down and exits 1.
+A file that others can read gives `cannot read the passphrase file ...
+Run: chmod 600 ...`.
+
+### systemd: "Failed to set up credentials" (status 243/CREDENTIALS)
+
+`/etc/dsm/passphrase` is missing, so systemd does not start DSM at all.
+No kill switch comes up from this start: the host uses the internet
+without the VPN until DSM runs (a block an earlier run left stays). Make
+the file (§3e), then `sudo systemctl reset-failed dsm-client && sudo
+systemctl start dsm-client` (or `dsm`). `sudo dsm init ... --install-unit`
+writes it for you.
+
+### "DSM could not start (see the error above), and the kill switch stays up ..."
+
+Under `dsm-client.service` a start error keeps the block (§7i). The line
+before it says what went wrong. Fix it, then `sudo systemctl reset-failed
+dsm-client && sudo systemctl restart dsm-client` (after 5 failed starts a
+plain restart is refused for 10 minutes). To get internet back without the
+VPN: `sudo systemctl stop
+dsm-client`, then `sudo dsm cleanup`.
+
+### "cert auth materials not usable now: ...; all traffic stays blocked, and DSM tries again ..."
+
+A date holds the client's start: a CRL past its next update while the
+clock is not synchronized, or this client's cert or the CA cert outside
+its dates. With `the clock is not NTP-synchronized` in the line, check the
+clock first (`date -u`). If it is wrong, set it (§0f). If it is right, the
+file is out of date: a right clock that is not NTP-synchronized does not
+let DSM use an old CRL, so carry the CA's current CRL here (§7e), or let
+timesyncd sync (behind the block only NTP servers given by IP address can,
+§0f). If this host's cert ran out, enroll it again (§3f). DSM goes on by
+itself once the date is right.
+
+### "could not look up the server name: ...; all traffic stays blocked, and DSM tries again ..."
+
+The client's own lookup of a DDNS name got no address, and no address was
+saved from an earlier good handshake. Check the name and the resolvers in
+`/etc/resolv.conf` (IPv4 ones; §7i). DSM tries again by itself. If your DNS
+goes through a local forwarder other than systemd-resolved (dnsmasq or
+unbound on 127.0.0.1, or NetworkManager's 127.0.1.1), the lookup cannot
+work behind the block, and waiting does not help: set `server_ip` to the
+server's IP address, or let the client connect once so that its address is
+saved (§7i).
+
+### "CRL at ... is past its next update (...); DSM uses it because the clock is synchronized. ..."
+
+A WARNING on a client or a server: its CRL is out of date, but its clock
+is synchronized, so DSM keeps going on it. Every revocation in it still
+holds. Carry the CA's current CRL here soon (§7e): a cert revoked since is
+not in it. A server whose clock is not synchronized refuses to start on
+such a CRL instead (`cert auth materials missing or invalid: CRL at ...
+is past its next update ...`).
+
+### "cannot connect to the server: Connection refused. Check server_ip and server_port, ..."
+
+A TCP client found nothing listening. Check the server's address and port,
+that the server runs, and that both ends set the same `transport`: a UDP
+server opens no TCP port.
+
+### "config: unknown setting '...' (did you mean '...'?)"
+
+config.toml has a key DSM does not know, often a typo. Fix the spelling or
+remove the line; `config.example.toml` lists every setting.
 
 ### Tunnel up but `curl` through it is very slow or hangs
 
@@ -2345,7 +2478,7 @@ If `src_valid_mark` stays 0, look in the client log for
 `could not set net.ipv4.conf.all.src_valid_mark` (the service may lack
 permission to write it).
 
-### "rekey giving up after 9 retries — tearing down"
+### "rekey giving up after 10 retries — tearing down"
 
 REKEY_ACK never reached the initiator. Check the peer log for
 "rekey completed as responder" — if missing, the server never
@@ -2392,6 +2525,10 @@ $ sudo systemctl start dsm
 
 ### Server log: "new handshake refused: ..."
 
+What to do: usually nothing. A device that is refused tries again by
+itself. If one device is refused for minutes, check that it has a CN of its
+own, and that nothing else behind its address floods the server.
+
 The server limits how many handshakes can start, so one address cannot take
 every handshake slot. The limits are the same for UDP and TCP:
 
@@ -2408,9 +2545,8 @@ every handshake slot. The limits are the same for UDP and TCP:
   the overall one. Each start costs a TPM signature.
 - "that address's last handshake failed": an unknown address whose last
   handshake proved the address (a cookie over UDP, the connection over TCP)
-  and then failed or stalled may not start another for 30 s. Two starts cost
-  nothing: one over UDP whose final handshake message does not open, and
-  one pushed out less than 1.29 s after the server's reply left.
+  and then failed or stalled may not start another for 30 s. A few kinds of
+  failed start cost nothing; SECURITY.md ("Start limits") lists them.
 
 Over TCP, the overall limit and the limit for unknown addresses are checked
 when the connection's first handshake message arrives (after its mac1
@@ -2418,8 +2554,7 @@ check), not at accept, so a connection they refuse is closed then, up to
 3 s after it was accepted. The two per-address limits and the 30 s wait are
 checked at accept.
 
-These are INFO lines. They show with `log_level = "info"` (the default),
-not with the `"warning"` that `config.example.toml` sets.
+These are INFO lines (`log_level = "info"`, the default).
 
 A healthy client should not cause these lines, but a client with a config
 error may cause a few on its early retries. A few lines while someone scans
@@ -2432,34 +2567,15 @@ several of them connect to this server at the same moment, some may need
 their next retry. These lines never show the address, and each reason is
 logged at most once every 10 s, with a count.
 
-If a client that works is refused for a long time with "already has 2
-running", someone may be targeting its address. Since wire v2 a sender that
-fakes source addresses can no longer do this over UDP: its packets are
-dropped before these limits unless it has the CA certificate and the
-server's name, and once a handshake is running it also needs a cookie, which
-goes to the address it fakes. Anyone who captured one client first message
-can replay it from any address for up to 15 minutes. An idle server (no
-cookie asked) answers it and gives it the one handshake slot such a server
-gives, which costs the server a signature. When the server is busy, it asks
-for a cookie, and then only a replay from the same address and port works,
-for 2 to 4 minutes (the cookie covers the address and port, not the
-message); that sender could also just drop packets. A stalled handshake
-cannot hold a slot for long: when a new start finds no room (no free slot,
-or its address already runs 2), the server ends the oldest attempt (its own
-oldest, if its address already runs 2) that is at least 1.5 s old, is not
-busy making its answer (a wait for the TPM counts) and has not passed the
-session check. A TCP connection that has sent nothing yet counts too. The
-server logs `pushed out a stalled handshake attempt to make room for a new
-one` (INFO, at most once per 10 s, with a count). Someone with many
-addresses can still make new devices wait while it lasts. Over TCP with no
-key at all it takes about 170 addresses, since a failed start bars its
-address for 30 s. Over UDP with the CA certificate and the server's name, it
-takes about 4 addresses once a client has connected, and about 16 right
-after a restart, if each start ends with a bad final message (over UDP that
-costs its address nothing, as said above). An attacker who stalls instead,
-or who uses TCP, needs about 31 (once a client has connected) or about 125
-(right after a restart). A device coming back from an address it connected
-from in this run is not held back.
+If a device that works is refused for a long time with "already has 2
+running", someone may be targeting its address. SECURITY.md ("Start
+limits") says who can do this and how many addresses they need. A stalled
+handshake cannot hold a slot for long: when a new start finds no room, the
+server ends the oldest attempt that is at least 1.5 s old and not busy
+making its answer, and logs `pushed out a stalled handshake attempt to make
+room for a new one` (INFO, at most once per 10 s, with a count). A device
+coming back from an address it connected from in this run is not held
+back.
 
 With `transport = "tcp"` the server keeps its one listening socket open for
 the whole run, so one silent connection does not hold up other clients and
@@ -2489,9 +2605,8 @@ remove the setting to use the default (8, enough).
 Normal after a client crashed or restarted: it came back with the same name
 and passed the full handshake, so the server ended its old session at once
 instead of waiting for it to time out. Nobody without that client's Noise
-key and TPM attest key can cause this line. This is an INFO line: it shows
-with `log_level = "info"` (the default), not with the `"warning"` that
-`config.example.toml` sets.
+key and TPM attest key can cause this line. This is an INFO line
+(`log_level = "info"`, the default).
 
 ### Server log: "client_cn=... reconnected with a different device key ..."
 
@@ -2499,6 +2614,13 @@ A client with this name connected again, but with another device key (the
 16-hex `noise_static_sha256`). Either the device was enrolled again, or two
 devices share this name. If the line repeats, give each device its own CN
 (§3f, §4).
+
+To see which device has which key, run this on each device; it prints the
+same 16 hex characters as the server's `noise_static_sha256`:
+
+```sh
+$ sudo dsm show-pubkey | xxd -r -p | sha256sum | cut -c1-16
+```
 
 ### Server log: "client_cn=... reconnected too often; keeping its current session ..."
 
@@ -2536,14 +2658,21 @@ session. It reconnects by itself after its dead-peer timer. Report it.
 
 The allowlist has more names than the pool has addresses (253); names past
 the 253rd cannot connect. At start the server also logs `the allowlist has
-N names; only the first 253 get a tunnel address` once. Remove names you no
-longer use, keeping the order of the others (§4).
+N names; only the first 253 get a tunnel address` once. Every name takes an
+address, a revoked device's too. To make room, remove names you no longer
+use. That moves the address of every name below a removed one at the next
+restart, and cuts its open connections (§4), so do it when that is fine.
 
 ### Server log: "dropped a packet from client_cn=... whose source is not its tunnel address"
 
 A WARNING, at most once per 10 s per session: that client sent a packet
 with a source other than its own tunnel address, and the server dropped it.
-Software on that client is sending as another address. The line names no
+Software on that client sends from an address that is not its tunnel
+address. The usual causes: connections a program opened before the tunnel
+came up (they keep their LAN address; they end by themselves, or restart
+that program), a program bound to a LAN address, or a second VPN on the
+client. DSM's client does not pass on traffic from other hosts (a LAN,
+containers, VMs): its kill switch drops it, NAT or not. The line names no
 address.
 
 ### Server log: "dropped a packet from client_cn=... to another client (client-to-client traffic is blocked)"
@@ -2631,11 +2760,11 @@ An ERROR, at most once per 10 s: the server found a session whose UDP
 wiring is missing, so it dropped the packet. This is a bug in the server,
 not a network problem. Report it.
 
-### Server log: "DNS queries dropped: one client already has 256 waiting"
+### Server log: "DNS queries dropped: client_cn=... already has 256 waiting"
 
-A WARNING, at most once per 10 s: one client had 256 DNS queries waiting
+A WARNING, at most once per 10 s for each client: that client had 256 DNS queries waiting
 for an answer, so its newest were dropped unanswered (it asks again). Other
-clients are not affected. Usually a client stuck in a lookup loop.
+clients are not affected. The line names the client. Usually a program on it is stuck in a lookup loop: restart that program, or the client.
 
 ### "config: dns_provider_pins has entries that are not in dns_providers: ..."
 
@@ -2648,12 +2777,11 @@ above the header. If a name is meant as a pin, it must match a
 `dns_providers`, or remove the pin. dsm exits with status 2 before it
 starts anything.
 
-### Server log: "DNS proxy cannot bind \<tun-ip\>:53 — another resolver … is already bound there"
+### Server log: "DNS proxy cannot bind 10.8.0.1:53: another program already holds it ..."
 
 A host resolver (`unbound`, `systemd-resolved`, or `dnsmasq`) is listening
 on the TUN address or on `0.0.0.0:53`, which blocks the dsm DNS proxy from
-binding port 53 on the TUN IP. The daemon now surfaces this as a specific
-actionable error (rather than a bare `OSError`).
+binding port 53 on the TUN address.
 The proxy binds once, at start, so the server stops there with exit code 1
 (`FATAL: DNS proxy port conflict ...`) before any client connects, and
 systemd starts it again every 10 s, giving up after 5 failed starts in 10
@@ -2669,8 +2797,9 @@ Remedies (pick one):
    $ sudo systemctl disable unbound        # prevent it from restarting
    ```
 
-2. If you need the host resolver for other purposes, change the TUN address
-   in config.toml so it no longer conflicts with the resolver's bind address.
+2. If you need the host resolver, make it listen on other addresses only
+   (for example `127.0.0.1`), not on `0.0.0.0` or 10.8.0.1. The TUN address
+   is fixed; there is no setting to change it.
 
 To identify which process holds :53:
 
@@ -2798,8 +2927,10 @@ $ sudo /usr/bin/python3 -m pip install --break-system-packages \
 $ sudo systemctl disable --now dsm                          # server
 $ sudo systemctl disable --now dsm-blocklist-update.timer   # server
 $ sudo systemctl disable --now dsm-client                   # client
-$ sudo rm -rf /opt/mtun /etc/dsm /run/dsm
+$ sudo dsm cleanup     # first: puts back /etc/resolv.conf from /var/lib/dsm and removes DSM's tables (it also sets net.ipv4.ip_forward=0)
+$ sudo rm -rf /opt/mtun /etc/dsm /run/dsm /var/lib/dsm
 $ sudo /usr/bin/python3 -m pip uninstall --break-system-packages dsm   # if pip-installed
+$ sudo rm -rf /opt/dsm /usr/local/bin/dsm                    # if install.sh installed it
 $ sudo rm -f /etc/systemd/system/dsm.service /etc/systemd/system/dsm-client.service
 $ sudo rm /etc/systemd/system/dsm-blocklist-update.service \
       /etc/systemd/system/dsm-blocklist-update.timer \
@@ -2835,7 +2966,10 @@ $ for iface in $(ls /sys/class/net); do
 /opt/mtun/allowed_cns.txt             # server only: one CN per line (0o600)
 /etc/dsm/passphrase                   # non-interactive passphrase source (0o600)
 /run/dsm/ipv6_state.json              # per-iface IPv6 state snapshot
-/run/dsm/server-endpoint.json         # client: last address of server_ip's name
+/var/lib/dsm/server-endpoint.json     # client: the address a handshake proved for server_ip's name
+/var/lib/dsm/resolv.conf.orig         # client: resolv.conf from before DSM changed it
+/usr/local/bin/dsm                    # the dsm command (the units run it)
+/opt/dsm/venv/                        # install.sh only: DSM's own Python venv
 /opt/mtun/dns/sources.txt             # server: DNS block list URLs (0o600)
 /opt/mtun/dns/block/*.txt             # server: DNS block lists (0o600)
 /opt/mtun/dns/allow.txt               # server: names never blocked (0o600)
@@ -2853,12 +2987,17 @@ python3 -m dsm --config PATH                     Override config file path
 python3 -m dsm --debug-net                       Emit JSON audit events on
                                                  the dsm.netaudit logger
 python3 -m dsm --passphrase-fd N                 Read passphrase from FD N
-python3 -m dsm --passphrase-env-file PATH        Read passphrase from a
-                                                 0600-mode file at PATH
-python3 -m dsm --stop-keeps-block                Client: Ctrl-C or SIGTERM
-                                                 leaves the start-up kill
-                                                 switch up (dsm-client.service
-                                                 passes it)
+python3 -m dsm --passphrase-env-file PATH        Read the passphrase from the
+                                                 0600-mode file at PATH; the
+                                                 file holds only the
+                                                 passphrase, not KEY=VALUE
+python3 -m dsm --version                         Print the version and the
+                                                 wire version
+python3 -m dsm --stop-keeps-block                Client: Ctrl-C, SIGTERM or
+                                                 a start error leaves the
+                                                 start-up kill switch up
+                                                 (dsm-client.service passes
+                                                 it)
 
 python3 -m dsm enroll --csr-out PATH             Provision identity +
                                                  attest key, write a CSR
@@ -2875,4 +3014,11 @@ python3 -m dsm show-pubkey                       Print the local identity's
 python3 -m dsm cleanup                           Remove every DSM table, rule
                                                  and setting (gets the host
                                                  back after a crash)
+
+python3 -m dsm init {server,client} ...          Set up this host: config,
+                                                 CA copy, keys, CSR
+                                                 (`dsm init --help` lists
+                                                 every option)
+python3 -m dsm init {server,client} --resume     Import the signed cert;
+      --signed-cert PATH                         print what is left to do
 ```
