@@ -93,10 +93,10 @@ async def test_a_stop_without_the_flag_takes_the_kill_switch_down() -> None:
     assert _tables_after(run.events) == set()
 
 
-async def test_a_setup_error_with_the_flag_still_takes_it_down() -> None:
-    # The flag is about stops only: a read-only resolv.conf at the first try
-    # is still a setup error that removes the kill switch and exits 1. (A
-    # UDP port in use is not one under the flag: see
+async def test_a_setup_error_with_the_flag_keeps_the_block() -> None:
+    # Under dsm-client.service nobody may be at the host, so a read-only
+    # resolv.conf at the first try keeps the block and exits 1
+    # (re-decision 3). (A UDP port in use is retried instead: see
     # tests/test_client_port_taken_under_unit.py.)
     run = _Run()
     run.raise_on = {
@@ -108,7 +108,8 @@ async def test_a_setup_error_with_the_flag_still_takes_it_down() -> None:
     rc = await _run_with_flag(run)
 
     assert rc == 1
-    assert run.events[-1] == "pre.remove"
+    assert "pre.remove" not in run.events
+    assert _tables_after(run.events) == {"pre"}
 
 
 @pytest.mark.parametrize(

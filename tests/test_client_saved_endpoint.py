@@ -1,9 +1,9 @@
 """The client remembers the last address it found for a server name (F3).
 
 Once a handshake with a looked-up address works, the client saves the name
-and the address in /run/dsm/server-endpoint.json; a run with no good
-handshake leaves the file alone. A later start whose lookup fails (a kill
-switch left up blocks it) uses the saved address instead of exiting. A
+and the address in /var/lib/dsm/server-endpoint.json; a run with no good
+handshake leaves the file alone. A later start whose lookup fails (the
+network refuses it) uses the saved address instead of waiting. A
 working lookup always wins, and a file that cannot be trusted counts as no
 file. The file lives in ``tmp_path``; besides the host parts the ``_Run``
 harness of tests/test_client_fail_closed.py fakes, only the lookup is faked.
@@ -158,7 +158,7 @@ async def test_a_working_lookup_wins_and_is_saved_after_its_handshake(
         json.dumps([NAME, "10.0.0.9"]),  # not an object
     ],
 )
-async def test_a_failed_lookup_without_a_usable_saved_address_exits(
+async def test_a_failed_lookup_without_a_usable_saved_address_keeps_the_block(
     saved: Path, caplog: pytest.LogCaptureFixture, content: str
 ) -> None:
     saved.parent.mkdir(mode=0o700)
@@ -166,15 +166,18 @@ async def test_a_failed_lookup_without_a_usable_saved_address_exits(
     saved.chmod(0o600)
     caplog.set_level(logging.ERROR, logger="dsm")
     run = _Run()
+    run.stop_at_wait = 1
     lookup = AsyncMock(side_effect=OSError("timed out"))
 
     with patch("dsm.client._resolve_server_endpoint", lookup):
         rc = await run.run(_config(server_ip=NAME))
 
-    assert rc == 1
-    assert run.events == []  # nothing on the host changed
+    assert rc == 0
+    # No usable address, so no handshake: the block, a wait, the stop.
+    assert run.events == ["pre.apply", "wait", "pre.remove"]
+    assert run.waits == [1.0]
     assert any(
-        r.getMessage().startswith("could not resolve server endpoint")
+        r.getMessage().startswith("could not look up the server name:")
         for r in caplog.records
     )
 

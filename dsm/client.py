@@ -1,5 +1,10 @@
 """DSM VPN client mode."""
 
+# run_client keeps the whole start (the kill switch first, the cert files,
+# the lookup, the waits) and the reconnect loop in one place, so the module
+# is over pylint's 1000-line ceiling.
+# pylint: disable=too-many-lines
+
 from __future__ import annotations
 
 import asyncio
@@ -7,8 +12,9 @@ import ipaddress
 import json
 import logging
 import os
+import subprocess
 import time
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Sequence
 from contextlib import AsyncExitStack
 from enum import Enum, auto
 from pathlib import Path
@@ -23,12 +29,14 @@ from dsm.core.config import Config
 from dsm.core.fsm import SessionFSM, State
 from dsm.core.log import RepeatLog
 from dsm.core.path_security import check_user_file_permissions
-from dsm.core.preflight import check_clock_sync
+from dsm.core.preflight import check_clock_sync, ntp_synchronized
 from dsm.core.protocol import WIRE_VERSION, ReassemblyBuffer
 from dsm.core.rand import csprng_float
 from dsm.crypto.attest_store import AttestStore
 from dsm.crypto.auth_loader import (
     AuthMaterialsError,
+    AuthMaterialsTimeError,
+    CertAuthMaterials,
     load_cert_materials,
     verify_cert_matches_identity,
 )
@@ -39,6 +47,7 @@ from dsm.net.nftables import (
     PreHandshakeKillSwitch,
     TcpTimestampsDisabler,
 )
+from dsm.net.ntp_opening import NtpOpening, time_daemon_opening
 from dsm.net.resolv_conf import ResolvConfError, ResolvConfManager
 from dsm.net.transport.tcp import FramingError, TCPTransport
 from dsm.net.transport.udp import UDPTransport
@@ -101,11 +110,26 @@ _KEPT_ON_STOP = (
     "it otherwise. If it is still up when you want internet back, run "
     "`sudo dsm cleanup`."
 )
+_KEPT_AFTER_START_ERROR = (
+    "DSM could not start (see the error above), and the kill switch stays "
+    "up, as dsm-client.service asks (--stop-keeps-block): all traffic is "
+    "blocked, SSH too. Fix the problem, then run `sudo systemctl "
+    "reset-failed dsm-client && sudo systemctl restart dsm-client` (after 5 "
+    "failed starts systemd refuses a plain restart for 10 minutes). To get "
+    "internet back without the VPN, run `sudo systemctl stop dsm-client`, "
+    "then `sudo dsm cleanup`."
+)
+_START_HELD_UP = (
+    "%s; all traffic stays blocked, and DSM tries again (1 s, doubling up to "
+    "30 s). To get internet back without the VPN, stop DSM: Ctrl-C, or "
+    "`sudo systemctl stop dsm-client`."
+)
 
-# The address a server name had at the last run whose handshake worked. A
-# start whose lookup fails (a kill switch left up blocks it) uses it instead
-# of exiting. In /run, so a reboot clears it; `dsm cleanup` leaves it alone.
-_SERVER_ENDPOINT_FILE = Path("/run/dsm/server-endpoint.json")
+# The address a handshake proved for a server name, kept across runs and
+# reboots (re-decision 1): a start whose lookup fails (the network refuses
+# it) uses it instead of waiting, and after a working lookup it stays a
+# second address to try. Root only; `dsm cleanup` leaves it alone.
+_SERVER_ENDPOINT_FILE = Path("/var/lib/dsm/server-endpoint.json")
 _USING_SAVED_ADDRESS = (
     "could not look up the server name; using the last address it had"
 )
@@ -167,7 +191,7 @@ async def _resolve_server_endpoint(
 def _save_server_endpoint(name: str, ip: str) -> None:
     """Keep ``ip`` as the last address found for the server name ``name``.
 
-    Written like the other /run/dsm state files (folder 0700, file 0600,
+    Written like DSM's other state files (folder 0700, file 0600,
     temp file then rename). A failure logs one WARNING; DSM goes on.
     """
     try:
@@ -210,6 +234,24 @@ def _saved_server_ip(name: str) -> str | None:
     except ipaddress.AddressValueError:
         return None
     return ip
+
+
+def _clock_synced() -> bool:
+    """True only when timedatectl says the clock is NTP-synchronized."""
+    return ntp_synchronized() is True
+
+
+def _held_by_dates(err: AuthMaterialsTimeError) -> str:
+    """The line for a start that a date holds up. A clock that is not
+    synchronized is named apart: then the clock may be what is wrong, not
+    the file (fix 2)."""
+    text = f"cert auth materials not usable now: {err}"
+    if ntp_synchronized() is False:
+        text += (
+            "; the clock is not NTP-synchronized, so the clock may be wrong, "
+            "not the file"
+        )
+    return text
 
 
 def _emit_handshake_failure(err: Exception) -> None:
@@ -355,34 +397,42 @@ async def run_client(
 ) -> int:
     """Run DSM in client mode until the user stops it.
 
-    The kill switch stays up from before the passphrase read until the user
-    stops DSM (a signal: Ctrl-C, ``systemctl stop``). Each session swaps the
-    pre-handshake kill switch for the full one and, when it ends, swaps it
-    back, each time in one nft commit. A session that ends any other way
-    (dead peer, SESSION_CLOSE, a TCP reset, a rekey that gives up) and a
-    connect or handshake that fails keep the block: the client tries again
-    with backoff, with the address it found at start. A server name is
-    looked up once, at start; its address is saved once a handshake with it
-    works, and a later start whose lookup fails uses the address saved for
-    the same name.
+    The kill switch goes up first, before anything that depends on the
+    clock or the network (the cert dates, the CRL, the server name) and
+    before the passphrase read, and stays up until the user stops DSM (a
+    signal: Ctrl-C, ``systemctl stop``). A server name has no address yet:
+    while DSM looks it up itself, from a marked socket, the kill switch also
+    lets out that one query, and nothing else to the network. A start the
+    clock or the network holds up (a CRL past its next update while the
+    clock is not synchronized, a cert outside its dates, a name that does
+    not resolve) keeps the block: DSM says so once and tries again, 1 s
+    doubling up to 30 s. While a date holds the start, the time daemon may
+    reach the NTP servers its config names by IP address. A failed lookup
+    uses the address a handshake proved for the name before, if there is
+    one. Each session swaps the start-up kill switch for the full one and,
+    when it ends, swaps it back, each time in one nft commit. A session that
+    ends any other way (dead peer, SESSION_CLOSE, a TCP reset, a rekey that
+    gives up) and a connect or handshake that fails keep the block: the
+    client tries again with backoff.
 
     Every host change of a session is registered on that session's
     ``AsyncExitStack`` the moment it succeeds, so any failure unwinds them in
     reverse order and never leaves the host half configured.
 
     With ``stop_keeps_block`` (``--stop-keeps-block``, which
-    dsm-client.service passes) a stop leaves the pre-handshake kill switch
-    up: the unit's ExecStopPost takes it down only for ``systemctl stop``
-    and keeps it otherwise (a restart, a signal sent straight to DSM); the
-    next start replaces it.
+    dsm-client.service passes) every exit keeps the start-up kill switch up:
+    a stop, and a start error too, since nobody may be at the host
+    (re-decision 3). The unit's ExecStopPost takes it down only for
+    ``systemctl stop``; the next start replaces it.
 
     Returns:
-        0 when the user stops DSM, 1 on a setup error a retry cannot fix
-        (keys, cert, or a UDP port in use or a read-only resolv.conf at the
+        0 when the user stops DSM, 1 on a setup error a retry cannot fix (a
+        missing or bad cert, CA or CRL file, keys or a passphrase that do not
+        unlock them, or a UDP port in use or a read-only resolv.conf at the
         first try; with ``stop_keeps_block`` a port in use is retried
-        instead). Both take the kill switch down, except a stop with
-        ``stop_keeps_block``. An unexpected error goes up with the kill
-        switch still up (fail closed); the next start replaces it.
+        instead). Without ``stop_keeps_block`` both take the kill switch
+        down. An unexpected error goes up with the kill switch still up
+        (fail closed); the next start replaces it.
     """
     import tuncore
     from dsm.core.hardening import harden_and_gate
@@ -394,14 +444,6 @@ async def run_client(
     # which one this build speaks.
     log.info("client starting (wire v%d)", WIRE_VERSION)
 
-    # Cert auth materials must load BEFORE we touch any host state, so a
-    # missing cert file aborts cleanly with no rules / no TUN created.
-    try:
-        materials = load_cert_materials(config)
-    except AuthMaterialsError as e:
-        log.error("cert auth materials missing or invalid: %s", e)
-        return 1
-
     async with AsyncExitStack() as stack:
         # Create the shutdown event and install signal handlers BEFORE the
         # pre-handshake kill switch, so a SIGTERM during startup unwinds the
@@ -411,61 +453,34 @@ async def run_client(
         shutdown = asyncio.Event()
         setup_signal_handlers(shutdown)
 
-        # The kill-switch rules need a literal address, so a hostname is
-        # resolved and pinned here, before the kill switch goes up. This one
-        # cleartext lookup is accepted; see config._validate_server_ip. The
-        # name is not looked up again in this run, not even while the client
-        # reconnects: no lookup goes out through the kill switch.
-        # save_address: the address came from a working lookup of a name; it
-        # is saved once a handshake with it works (F3).
-        save_address = False
-        try:
-            server_ip = await _resolve_server_endpoint(
-                config.server_ip, config.server_port
-            )
-        except OSError as e:
-            saved_ip = _saved_server_ip(config.server_ip)
-            if saved_ip is None:
-                log.error(
-                    "could not resolve server endpoint %r: %s — refusing to "
-                    "start (fail-closed)",
-                    config.server_ip,
-                    e,
-                )
-                log.error(
-                    "if an earlier DSM run left its kill switch up, it blocks "
-                    "this lookup: run `sudo dsm cleanup`, then start DSM "
-                    "again, or set server_ip to the server's IP address"
-                )
-                return 1
-            # A kill switch left up (by a crash, or kept for a restart)
-            # blocks the lookup: use the address saved for this name after
-            # an earlier good handshake. The log line names no address.
-            log.warning(_USING_SAVED_ADDRESS)
-            server_ip = saved_ip
-        else:
-            if server_ip != config.server_ip:
-                log.info(
-                    "resolved server hostname %s -> %s", config.server_ip, server_ip
-                )
-                # A working lookup always wins. Its address replaces the
-                # saved one only once a handshake with it works.
-                save_address = True
+        # The server addresses the start-up kill switch lets DSM try. A
+        # literal IPv4 is the one address. A name has none until DSM looks
+        # it up, behind the kill switch (R1). ``proven`` is the address a
+        # handshake proved for this name in an earlier run (F3): a start
+        # whose lookup fails uses it instead of waiting.
+        literal = _ipv4_literal(config.server_ip)
+        looked_up_name = literal is None
+        candidates: list[str] = [] if literal is None else [literal]
+        proven = _saved_server_ip(config.server_ip) if looked_up_name else None
 
-        # Pre-handshake kill switch: applied BEFORE the (possibly interactive)
-        # passphrase read + key unlock below, so the host is fail-closed for
-        # the ENTIRE startup window. Allows only loopback, DHCP renewal and
-        # the configured server endpoint. It replaces, in the same nft
-        # commit, any client kill-switch table a crashed run left, so a
-        # restart has no gap. Each session upgrades it to the full kill
-        # switch (which also covers the TUN and DNS leaks) and swaps it back
-        # when the session ends.
-        pre_killswitch = PreHandshakeKillSwitch(server_ip, config.server_port)
+        # Pre-handshake kill switch, FIRST: before anything that depends on
+        # the clock or the network (the cert dates, the CRL, the server
+        # name) and before the (possibly interactive) passphrase read + key
+        # unlock below, so the host is fail-closed for the ENTIRE startup
+        # window. It lets out only loopback, DHCP and DSM's own marked
+        # packets to the server's address and port; for a name not looked
+        # up yet, not even those. It replaces, in the same nft commit, any
+        # client kill-switch table a crashed run left, so a restart has no
+        # gap. Each session upgrades it to the full kill switch (which also
+        # covers the TUN and DNS leaks) and swaps it back when it ends.
+        pre_killswitch = PreHandshakeKillSwitch(candidates, config.server_port)
         try:
             pre_killswitch.apply()
-        except OSError as e:
-            # Fail closed: never proceed to connect without the egress lock.
-            # OSError covers a missing/unresolvable nft (FileNotFoundError).
+        except (OSError, RuntimeError, subprocess.SubprocessError) as e:
+            # Fail closed: never go on without the egress lock. OSError: no
+            # nft (FileNotFoundError); RuntimeError: nft refused the rules
+            # (no CAP_NET_ADMIN); SubprocessError: nft timed out. One line,
+            # no traceback (QA M4).
             log.error(
                 "pre-handshake kill switch could not be installed: %s — "
                 "refusing to start (fail-closed). Ensure nftables is present "
@@ -473,6 +488,22 @@ async def run_client(
                 e,
             )
             return 1
+        lookup_open = False
+
+        def _swap(
+            *, resolvers: Sequence[str] = (), ntp: NtpOpening | None = None
+        ) -> None:
+            """Swap the start-up kill switch for one that lets DSM try
+            ``candidates`` and has these openings, in one nft commit. No
+            try: an error goes up and the table up before stays (fail
+            closed)."""
+            nonlocal pre_killswitch, lookup_open
+            table = PreHandshakeKillSwitch(
+                candidates, config.server_port, resolvers=resolvers, ntp=ntp
+            )
+            table.apply()
+            pre_killswitch = table
+            lookup_open = bool(resolvers)
 
         def _release_kill_switch(
             exc_type: type[BaseException] | None,
@@ -480,20 +511,119 @@ async def run_client(
             _tb: TracebackType | None,
         ) -> bool:
             # Only a stop the user asked for, or a setup error a retry cannot
-            # fix, gets here without an error: take the kill switch down. An
-            # error leaves it up (fail closed); the next start replaces it.
-            # With --stop-keeps-block a stop leaves it up too, and the unit's
-            # ExecStopPost decides: down only for `systemctl stop`. A setup
-            # error that meets a stop also keeps it: the safe side.
+            # fix, gets here without an error. By hand both take the kill
+            # switch down (owner ruling Q1). An error leaves it up (fail
+            # closed); the next start replaces it. With --stop-keeps-block
+            # (dsm-client.service) every exit leaves it up, a setup error
+            # too: nobody may be at the host, and the unit's ExecStopPost
+            # takes it down only for `systemctl stop` (re-decision 3).
             if exc_type is not None:
                 log.error(_KEPT_AFTER_ERROR)
             elif stop_keeps_block and shutdown.is_set():
                 log.info(_KEPT_ON_STOP)
+            elif stop_keeps_block:
+                log.error(_KEPT_AFTER_START_ERROR)
             else:
                 pre_killswitch.remove()
             return False
 
         stack.push(_release_kill_switch)
+
+        async def _look_up() -> str | None:
+            """DSM's own lookup of the server name. While it runs, the kill
+            switch also lets out port 53 to the resolvers it asks, one nft
+            commit each way (re-decision 1). Returns the address, or None if
+            the user stopped DSM first. Raises OSError when the name does
+            not resolve; port 53 is closed again before that."""
+            try:
+                return await _unless_stopped(
+                    shutdown,
+                    _resolve_server_endpoint(
+                        config.server_ip,
+                        config.server_port,
+                        before_lookup=lambda servers: _swap(resolvers=servers),
+                    ),
+                )
+            except OSError:
+                if lookup_open:
+                    _swap()
+                raise
+
+        # Mistakes in the cert files or the config (a missing or bad file, a
+        # wrong pin) exit 1, as before (owner ruling Q1). A date problem or a
+        # name that does not resolve can mend by itself (a fresh CRL copied
+        # in, the clock set right, the network back): keep the block, say so
+        # once per kind and try again, 1 s doubling up to 30 s. The name is
+        # looked up only once the materials load, so no DNS goes out for a
+        # start that cannot go on. While a date holds the start, the time
+        # daemon may reach the NTP servers its config names by IP address,
+        # so a wrong clock can heal (re-decision 2).
+        loaded: CertAuthMaterials | None = None
+        said: set[str] = set()
+        waits = 0
+        ntp_open = False
+        while True:
+            problem: tuple[str, str] | None = None
+            if loaded is None:
+                try:
+                    loaded = load_cert_materials(
+                        config, check_own_dates=True, clock_synced=_clock_synced
+                    )
+                except AuthMaterialsTimeError as e:
+                    problem = ("dates", _held_by_dates(e))
+                except AuthMaterialsError as e:
+                    log.error("cert auth materials missing or invalid: %s", e)
+                    if stop_keeps_block and ntp_open:
+                        _swap()  # the block the unit keeps has no NTP line (D8)
+                    return 1
+                else:
+                    if ntp_open:
+                        _swap()  # the dates are fine now: NTP closed again
+                        ntp_open = False
+            if problem is None and not candidates:
+                try:
+                    found = await _look_up()
+                except OSError as e:
+                    if proven is None:
+                        problem = ("lookup", f"could not look up the server name: {e}")
+                    else:
+                        # The network refuses the lookup: use the address a
+                        # handshake proved for this name before. The log
+                        # line names no address.
+                        log.warning(_USING_SAVED_ADDRESS)
+                        candidates = [proven]
+                else:
+                    if found is None:
+                        if stop_keeps_block and lookup_open:
+                            _swap()  # the kept block has no port-53 line (D7)
+                        return 0  # the user stopped DSM during the lookup
+                    log.info(
+                        "resolved server hostname %s -> %s", config.server_ip, found
+                    )
+                    candidates = [found]
+            if problem is None:
+                break
+            kind, text = problem
+            if kind not in said:
+                said.add(kind)
+                log.error(_START_HELD_UP, text)
+            if kind == "dates" and not ntp_open:
+                opening = time_daemon_opening()
+                if opening is not None:
+                    _swap(ntp=opening)
+                    ntp_open = True
+            if await _wait_or_stop(shutdown, _backoff_s(waits)):
+                if stop_keeps_block and ntp_open:
+                    _swap()  # the block the unit keeps has no NTP line (D8)
+                return 0
+            waits += 1
+        # The loop ends only with the materials and an address.
+        assert loaded is not None and candidates
+        materials = loaded
+        if looked_up_name:
+            # The address is known: the server's address only, in one nft
+            # commit that also drops the lookup lines.
+            _swap()
 
         # Read the passphrase once and unlock both stores, now BEHIND the kill
         # switch. Identity (X25519 Noise static) and attest key (ECDSA P-256)
@@ -549,22 +679,24 @@ async def run_client(
             config.expected_server_cn is not None
         ), "client mode requires expected_server_cn (validated in Config)"
         expected_server_cn: str = config.expected_server_cn
-        server_addr = (server_ip, config.server_port)
-        reconnect = _Reconnect(looked_up_name=server_ip != config.server_ip)
+        reconnect = _Reconnect(looked_up_name=looked_up_name)
 
-        async def _connect_and_run(first_try: bool) -> _End:
-            """One try: connect, handshake, and run a session until it ends.
+        async def _connect_and_run(first_try: bool, server_ip: str) -> _End:
+            """One try at ``server_ip``: connect, handshake, and run a session
+            until it ends.
 
             At the first try, a UDP port in use or a read-only resolv.conf is
-            a setup error: DSM exits and removes the kill switch, as the user
-            is there and nothing was protected yet. With ``stop_keeps_block``
-            (the systemd unit) a port in use is not one: every restart is a
-            first try there and nobody may be at the host, so it keeps the
-            block and tries again. On later tries every failure keeps the
-            block, so nothing on the host or the network can turn the kill
-            switch off.
+            a setup error: DSM exits 1. By hand that removes the kill switch,
+            as the user is there and nothing was protected yet. With
+            ``stop_keeps_block`` (the systemd unit) a port in use is retried
+            instead (every restart is a first try there and nobody may be at
+            the host), and a read-only resolv.conf swaps back to the start-up
+            table before DSM exits 1 with the block kept. On later tries
+            every failure keeps the block, so nothing on the host or the
+            network can turn the kill switch off.
             """
-            nonlocal save_address
+            nonlocal candidates, proven
+            server_addr = (server_ip, config.server_port)
             fsm = SessionFSM()
             async with AsyncExitStack() as attempt:
                 transport: UDPTransport | TCPTransport
@@ -679,12 +811,15 @@ async def run_client(
 
                 fsm.transition(State.ESTABLISHED)
 
-                if save_address:
-                    # The run's first good handshake proves the looked-up
-                    # address: keep it for a start whose lookup fails (F3).
-                    # A run with no good handshake leaves the old file alone.
-                    _save_server_endpoint(config.server_ip, server_ip)
-                    save_address = False
+                if looked_up_name:
+                    # A good handshake proves this address for the name. Keep
+                    # it for a start whose lookup fails (F3), unless it is
+                    # the saved one already, and try only it from now on. A
+                    # run with no good handshake leaves the old file alone.
+                    if server_ip != proven:
+                        _save_server_endpoint(config.server_ip, server_ip)
+                        proven = server_ip
+                    candidates = [server_ip]
 
                 # Host-mutating resources.
                 #
@@ -740,11 +875,12 @@ async def run_client(
                         resolv = ResolvConfManager(nameserver=str(tunnel.server))
                         resolv.apply()
                     except ResolvConfError:
-                        if not first_try:
-                            # Keep the block: back to the pre-handshake table
-                            # in one commit. If that fails, its error goes up
+                        if not first_try or stop_keeps_block:
+                            # Keep the block: back to the start-up table in
+                            # one commit (under the unit at the first try too,
+                            # re-decision 3). If that fails, its error goes up
                             # and DSM stops with the full kill switch up.
-                            pre_killswitch.apply()
+                            _swap()
                             raise
                         # First try: DSM exits and removes every table.
                         try:
@@ -776,7 +912,7 @@ async def run_client(
                 # (AsyncExitStack pops LIFO): resolv.remove first, then
                 # tun.close under the full kill switch, then the swap back to
                 # the pre-handshake table.
-                attempt.callback(pre_killswitch.apply)
+                attempt.callback(_swap)
                 attempt.callback(tun.close)
                 attempt.callback(resolv.remove)
 
@@ -902,14 +1038,17 @@ async def run_client(
 
         # Connect, run the session, and connect again when it ends, until the
         # user stops DSM. Between tries only the pre-handshake table is up.
+        # With two addresses for a name, the tries take turns.
         first = True
+        tries = 0
         while not shutdown.is_set():
-            end = await _connect_and_run(first)
+            end = await _connect_and_run(first, candidates[tries % len(candidates)])
             if end is _End.SETUP_ERROR:
                 return 1
             if shutdown.is_set():
                 break
             first = False
+            tries += 1
             if end is _End.FAILED:
                 reconnect.failed()
             if await _wait_or_stop(shutdown, reconnect.next_wait()):

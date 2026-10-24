@@ -526,10 +526,14 @@ async def test_a_name_is_looked_up_once_and_the_hint_names_no_address(
     assert "10.0.0.1" not in hints[0]
 
 
-async def test_a_failed_lookup_with_no_saved_address_exits(
+async def test_a_failed_lookup_with_no_saved_address_keeps_the_block(
     caplog: pytest.LogCaptureFixture, tmp_path: Path
 ) -> None:
+    # A network that refuses the server name at boot must not leave the host
+    # open: the block is up before the lookup, and DSM looks again, 1 s
+    # doubling up to 30 s (R1).
     run = _Run()
+    run.stop_at_wait = 2  # Ctrl-C during the second wait
     caplog.set_level(logging.ERROR, logger="dsm")
     lookup = AsyncMock(side_effect=OSError("timed out resolving server hostname"))
 
@@ -540,6 +544,14 @@ async def test_a_failed_lookup_with_no_saved_address_exits(
     ):
         rc = await run.run(_config(server_ip="vpn.example.org"))
 
-    assert rc == 1
-    assert run.events == []  # a kill switch a crash left stays as it is
-    assert any("sudo dsm cleanup" in r.getMessage() for r in caplog.records)
+    assert rc == 0
+    assert lookup.await_count == 2
+    assert run.events == ["pre.apply", "wait", "wait", "pre.remove"]
+    assert run.waits == [1.0, 2.0]
+    assert run.blocked_during_waits == [True, True]
+    held = [
+        r
+        for r in caplog.records
+        if r.getMessage().startswith("could not look up the server name:")
+    ]
+    assert len(held) == 1  # said once, not on every try
