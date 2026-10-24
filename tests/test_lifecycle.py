@@ -116,6 +116,7 @@ class MainPropagatesExitCode(unittest.TestCase):
 
         argv = ["dsm", "--mode", "client"]
         with (
+            patch.object(entry.os, "geteuid", return_value=0),  # main() wants root
             patch.object(entry.sys, "argv", argv),
             patch.object(entry, "_load_config_or_exit", return_value=_client_config()),
             patch("dsm.core.log.configure"),

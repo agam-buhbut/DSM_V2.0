@@ -117,6 +117,7 @@ async def test_a_setup_error_with_the_flag_keeps_the_block() -> None:
 )
 def test_main_hands_the_flag_to_run_client(flags: list[str], keeps: bool) -> None:
     with (
+        patch.object(entry.os, "geteuid", return_value=0),  # main() wants root
         patch.object(entry.sys, "argv", ["dsm", "--mode", "client", *flags]),
         patch.object(entry, "_load_config_or_exit", return_value=_config()),
         patch("dsm.core.log.configure"),

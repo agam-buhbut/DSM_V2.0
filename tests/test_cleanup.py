@@ -157,7 +157,10 @@ class CleanupCliDispatch(unittest.TestCase):
             called["ran"] = True
 
         argv = ["dsm", "cleanup"]
-        with patch.object(cli.sys, "argv", argv):
+        with (
+            patch.object(cli.sys, "argv", argv),
+            patch.object(cli.os, "geteuid", return_value=0),  # cleanup wants root
+        ):
             with patch("dsm.net.cleanup.cleanup_host_state", fake_cleanup):
                 # No SystemExit expected: main() returns for the cleanup branch.
                 cli.main()

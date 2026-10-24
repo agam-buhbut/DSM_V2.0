@@ -6,12 +6,16 @@ Usage:
     python -m dsm enroll --csr-out PATH [--cn CN] [--role client|server]
     python -m dsm enroll --import CERT_PATH
     python -m dsm show-pubkey
+    python -m dsm --version
+    python -m dsm cleanup
+    python -m dsm init {server,client} ...
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import importlib.metadata
 import os
 import sys
 import tomllib
@@ -23,14 +27,22 @@ from dsm.core import netaudit
 from dsm.core.config import Config, ConfigError, load
 
 
-def _load_config_or_exit(config_path: Path | None) -> Config:
+def _load_config_or_exit(config_path: Path | None, mode: str | None = None) -> Config:
     """Load config, turning every load-time failure into a clean stderr
     message + exit(2) instead of a raw traceback.
+
+    ``mode`` (``--mode``) overrides the config's mode inside the same
+    checks, so a config that does not fit that mode is one line too (QA
+    Minor 4).
     """
+    with_mode = f" (with --mode {mode})" if mode is not None else ""
     try:
-        return load(config_path)
+        config = load(config_path)
+        if mode is not None and mode != config.mode:
+            config = replace(config, mode=mode)
+        return config
     except ConfigError as e:
-        print(f"config: {e}", file=sys.stderr)
+        print(f"config: {e}{with_mode}", file=sys.stderr)
         sys.exit(2)
     except tomllib.TOMLDecodeError as e:
         print(f"config: malformed TOML: {e}", file=sys.stderr)
@@ -40,7 +52,7 @@ def _load_config_or_exit(config_path: Path | None) -> Config:
         print(f"config: invalid or unknown key: {e}", file=sys.stderr)
         sys.exit(2)
     except ValueError as e:
-        print(f"config: {e}", file=sys.stderr)
+        print(f"config: {e}{with_mode}", file=sys.stderr)
         sys.exit(2)
 
 
@@ -61,12 +73,55 @@ def _add_passphrase_args(p: argparse.ArgumentParser) -> None:
         "--passphrase-env-file",
         type=str,
         default=argparse.SUPPRESS,
-        help="Read passphrase from file at PATH (must be 0600)",
+        help=(
+            "Read the passphrase from the file at PATH (mode 0600). The file "
+            "holds only the passphrase, not a KEY=VALUE line."
+        ),
     )
 
 
+def _need_root(what: str) -> None:
+    """Exit 1 with one line unless this runs as root (QA M4, M5): the
+    daemons and `dsm cleanup` change nftables, routes, sysctls and
+    resolv.conf, and every DSM file is owned by root."""
+    if os.geteuid() != 0:
+        print(f"dsm: {what} must run as root: use sudo", file=sys.stderr)
+        sys.exit(1)
+
+
+def _package_version() -> str:
+    try:
+        return importlib.metadata.version("dsm")
+    except importlib.metadata.PackageNotFoundError:
+        return "unknown"
+
+
 def main() -> None:
+    try:
+        _main()
+    except KeyboardInterrupt:
+        # Ctrl-C at an interactive prompt (e.g. the passphrase tty read in
+        # dsm.core.passphrase raises a bare KeyboardInterrupt) or during a
+        # running session. Here, not only under `if __name__ == "__main__"`:
+        # the installed `dsm` script calls main() (QA Minor 4).
+        print("aborted", file=sys.stderr)
+        sys.exit(130)
+
+
+def _main() -> None:
+    argv = sys.argv[1:]
+    if argv[:1] == ["init"]:
+        # Every init flag, --help too, goes to init's own parser (QA Minor
+        # 3): a REMAINDER argument does not take a leading --help.
+        from dsm import init as dsm_init
+
+        sys.exit(dsm_init.main(argv[1:]))
     parser = argparse.ArgumentParser(description="DSM VPN")
+    parser.add_argument(
+        "--version",
+        action="store_true",
+        help="Print the DSM version and its wire version, then exit",
+    )
     parser.add_argument(
         "--mode",
         choices=["client", "server"],
@@ -83,14 +138,14 @@ def main() -> None:
         action="store_true",
         help="Emit structured JSON events on the dsm.netaudit logger "
         "(handshake/nft/tun/rekey/liveness/shutdown). Overrides "
-        "config.debug_net. See deploy/GUIDE.md §9 for capture flow.",
+        "config.debug_net. See deploy/GUIDE.md §9g and §11 for how to capture them.",
     )
     parser.add_argument(
         "--stop-keeps-block",
         action="store_true",
-        help="Client only: on Ctrl-C or SIGTERM, leave the start-up kill "
-        "switch up. For dsm-client.service, whose stop step takes it down "
-        "only for `systemctl stop` and keeps it for a restart.",
+        help="Client only: on Ctrl-C, SIGTERM or a start error, leave the "
+        "start-up kill switch up. For dsm-client.service, whose stop step "
+        "takes it down only for `systemctl stop` and keeps it for a restart.",
     )
     _add_passphrase_args(parser)
 
@@ -148,7 +203,13 @@ def main() -> None:
     )
     init_parser.add_argument("init_args", nargs=argparse.REMAINDER)
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+
+    if args.version:
+        import tuncore
+
+        print(f"dsm {_package_version()} (wire v{tuncore.WIRE_VERSION})")
+        return
 
     if args.command == "enroll":
         _run_enroll(
@@ -172,6 +233,7 @@ def main() -> None:
 
     if args.command == "cleanup":
         # Teardown utility: no config load, no store unlock, no passphrase.
+        _need_root("dsm cleanup")
         from dsm.net.cleanup import cleanup_host_state
 
         dsm_log.configure("info")
@@ -183,9 +245,8 @@ def main() -> None:
 
         sys.exit(dsm_init.main(args.init_args))
 
-    config = _load_config_or_exit(args.config)
-    if args.mode:
-        config = replace(config, mode=args.mode)
+    _need_root("DSM")
+    config = _load_config_or_exit(args.config, mode=args.mode)
 
     dsm_log.configure(config.log_level)
 
@@ -258,6 +319,14 @@ def _run_enroll(
                 file=sys.stderr,
             )
             sys.exit(2)
+        if cn is not None and (not cn or any(c.isspace() for c in cn) or "#" in cn):
+            # The server's allowlist holds one CN per line, with no spaces
+            # and no '#', so such a name could never be let in (QA Minor 6).
+            print(
+                "enroll: --cn must be one word, with no spaces and no '#'",
+                file=sys.stderr,
+            )
+            sys.exit(2)
 
         # Validate the CSR output path before we persist any keys.
         # generate_enrollment writes identity + attest keys to disk; if the CSR
@@ -304,6 +373,7 @@ def _run_enroll(
                 passphrase_fd=passphrase_fd,
                 passphrase_env_file=passphrase_env_file,
                 prompt=prompt,
+                confirm=True,
             )
         except ValueError as e:
             # read_passphrase fails closed on an empty passphrase (would
@@ -373,6 +443,7 @@ def _run_enroll(
                     ca_root_path=Path(config.ca_root_file),
                     keystore=keystore,
                     attest_store=attest_store,
+                    role=config.mode,
                 )
             except EnrollError as e:
                 print(f"enroll: {e}", file=sys.stderr)
@@ -398,10 +469,14 @@ def _run_show_pubkey(
     # show-pubkey is strictly read-only — if no identity has been provisioned,
     # silently auto-generating one would mislead the operator who's trying to
     # *inspect* their existing key. Fail loudly instead.
-    passphrase = read_passphrase(
-        passphrase_fd=passphrase_fd,
-        passphrase_env_file=passphrase_env_file,
-    )
+    try:
+        passphrase = read_passphrase(
+            passphrase_fd=passphrase_fd,
+            passphrase_env_file=passphrase_env_file,
+        )
+    except ValueError as e:
+        print(f"show-pubkey: {e}", file=sys.stderr)
+        sys.exit(2)
     try:
         try:
             keystore.load_with_passphrase(passphrase)
@@ -423,12 +498,4 @@ def _run_show_pubkey(
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        # Ctrl-C at an interactive prompt (e.g. the passphrase tty read in
-        # dsm.core.passphrase raises a bare KeyboardInterrupt) or during a
-        # running session. Exit cleanly with the conventional 128+SIGINT code
-        # instead of dumping a raw traceback.
-        print("aborted", file=sys.stderr)
-        sys.exit(130)
+    main()
