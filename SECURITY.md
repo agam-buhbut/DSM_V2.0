@@ -73,6 +73,55 @@ closed as known:
   recognizable traffic pattern before cover traffic is active, allowing an
   observer to identify that DSM is in use. Masking pre-key traffic is
   post-v1 research.
+- **Client start-up openings.** The client's kill switch is up from the
+  first moment of a start, but it opens two narrow holes, each only while
+  needed. While DSM looks up a DDNS server name, DSM itself (root, a
+  socket with its mark) may send DNS on port 53 to the resolvers it chose,
+  in the clear: the local network and the resolver see the name. This
+  happens at start, and during an outage after 5 failed tries, at most
+  every 5 minutes. A spoofed answer cannot redirect the client (the
+  handshake authenticates the server). Once a handshake has worked, the
+  address it proved stays a second one to try, so a hostile resolver then
+  gains at most a delay; before that (a first start, a new host), a
+  resolver that keeps lying keeps the client out, and sees its handshake
+  starts, for as long as it lies. If the host's DNS goes through a local
+  forwarder other than systemd-resolved (dnsmasq or unbound on 127.0.0.1,
+  or NetworkManager's 127.0.1.1), the name cannot be looked up behind the
+  block: only a proven address or a literal IP works there.
+  While a date problem holds a start, systemd-timesyncd may send NTP on
+  UDP port 123 to the servers its config or DHCP names by IP address, in
+  the clear, so the clock can heal. Only a program with CAP_NET_ADMIN or
+  CAP_NET_RAW can set DSM's mark, and the kill switch takes marked packets
+  to the server and the resolvers only from root. The start-up block stops
+  the normal network traffic of other programs; it does not promise more.
+  A program with raw-packet rights (CAP_NET_RAW) can get around any
+  firewall rule of this kind.
+- **A stale CRL on a synchronized host.** A client or a server whose clock
+  is NTP-synchronized keeps going on a CRL past its next update, with a
+  WARNING. Every revocation in that CRL still holds, and an older CRL than
+  the last one taken is still refused; what it can miss is a revocation in
+  a newer CRL that nobody has carried to this host yet. A host whose clock
+  is not synchronized refuses such a CRL (a client keeps its kill switch
+  up and waits; a server does not start). CRLs reach hosts only when
+  someone carries them, so carry each new one to every host at once. A new
+  CRL lasts 395 days and a cert 365, so a cert runs out a month before the
+  CRL made with it, and the two never run out on the same day.
+- **Client start errors before the kill switch.** Some errors stop the
+  client before its kill switch is up, so DSM raises no block for them,
+  also under `dsm-client.service`, while systemd tries again and gives up.
+  After a boot the host then uses the internet without the VPN while DSM
+  is down; after a `systemctl restart`, a crash or a signal, the earlier
+  run's start-up block stays (`sudo dsm cleanup` removes it). They are a
+  missing `/etc/dsm/passphrase` (systemd does not start DSM: status
+  243/CREDENTIALS), a `config.toml` that does not load, an evaluation
+  build without `allow_soft_attest`, nft refusing the first table, and any
+  failure to run DSM at all (no `/usr/local/bin/dsm` or a broken venv:
+  status 203/EXEC; a tuncore without the attest gate; an install that
+  fails on import). Each shows in the journal on the first start. `dsm
+  init --install-unit` writes the passphrase file; check the rest with one
+  run by hand at the console (not over SSH: the block comes up before the
+  passphrase prompt and freezes the session) before you enable the unit on
+  a headless host (deploy/GUIDE.md §7i).
 - **Traffic-analysis limits.** DSM's tier shaper sends packets at a steady
   rate that only changes in a few fixed steps, so a watcher sees which step
   you are on, not your real traffic. It does not hide everything: the step
@@ -188,7 +237,8 @@ closed as known:
   seconds get in as fast as the TPM signs. Beyond that, some attempts lose
   their slot to a newer one right after the server signed for them: that
   signature is wasted, and the device tries again later (about 18 s, plus
-  its own reconnect wait of up to 30 s). In a model with 8 handshake slots,
+  its own reconnect wait of up to about 37 s: 30 s, moved up to a quarter
+  either way at random). In a model with 8 handshake slots,
   100 devices were all back after about 33 s and 200 after about 5 minutes,
   where 10-40 s would be the TPM's own limit. Nobody is barred for it. There
   is no cap for this yet. If one server serves more than about 30 devices,

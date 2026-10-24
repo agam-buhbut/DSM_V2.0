@@ -19,16 +19,19 @@ server_ip = "203.0.113.1"                    # Server endpoint: literal IPv4 OR 
 # server_ip accepts EITHER:
 #   * a literal IPv4 — privacy-max: NO pre-tunnel DNS lookup happens; or
 #   * a DNS / DDNS hostname (e.g. "my-dsm.duckdns.org") for a home server on a
-#     dynamic IP. The client resolves it ONCE to a single IPv4 at startup,
-#     BEFORE the kill switch installs. That is one cleartext A-lookup that
+#     dynamic IP. The client looks it up at start, after its kill switch is
+#     up: DSM sends the A query itself from a marked socket, and the kill
+#     switch lets only that out, only while it runs. That is one cleartext
+#     A-lookup that
 #     reveals the hostname to the local network (the destination IP is exposed
 #     at the kill switch anyway). It is NOT a trust anchor: the server is
 #     authenticated by Noise + the cert/CN pin, so a spoofed DNS answer fails
 #     the handshake CLOSED rather than redirecting you to an attacker. IPv6
 #     literals are unsupported (AF_INET-only transport) — use an A-record
 #     hostname instead. See "Running over the internet" in deploy/GUIDE.md.
-#     While the client reconnects it keeps that first address and never
-#     looks the name up again; if the address changes, stop and start DSM.
+#     The address a handshake proved stays a second one to try. During an
+#     outage the client looks the name up again after 5 failed tries, at
+#     most every 5 minutes. A server does not use server_ip.
 server_port = 51820                          # Server's service port
 listen_port = 0                              # client: 0 = ephemeral; server: real bind port
 
@@ -78,7 +81,9 @@ attest_key_file = "/opt/mtun/attest.key"
 
 # Certificate revocation (CRL)
 # crl_strict is true BY DEFAULT and fail-closed: the daemon refuses to start
-# unless a crl_file is configured AND it is not past next_update. A fresh copy
+# unless a crl_file is configured. A CRL past its next_update is used, with a
+# WARNING, only when the clock is NTP-synchronized; otherwise a client waits
+# behind its kill switch and a server does not start. A fresh copy
 # of this example WITHOUT a crl_file would refuse to start, so this example
 # ships with crl_strict = false to be bootable out of the box.
 #
@@ -88,14 +93,20 @@ attest_key_file = "/opt/mtun/attest.key"
 # !! crl_strict line below (restoring the true default), uncomment crl_file, and
 # !! provision the CRL per deploy/GUIDE.md §2c/§2f. Enforcement then fails closed.
 crl_strict = false
-# crl_file = "/opt/mtun/dsm_ca.crl"          # DER or PEM; refresh monthly via walked-USB
+# A new CRL lasts 395 days, a month longer than a cert. Make one each time
+# you sign a cert, and carry it to every host before the old one runs out.
+# crl_file = "/opt/mtun/dsm_ca.crl"          # DER or PEM
 
 # Role-specific cert policy
 # Client only: subject CN we accept on the server cert.
 expected_server_cn = "dsm-1234abcd-server"
 
 # Server only: file with one allowed client subject CN per line. Mode 0600
-# (or 0400) — any group/world bits are rejected at startup.
+# (or 0400) — any group/world bits are rejected at startup. The n-th name
+# gets the n-th tunnel address (10.8.0.2, 10.8.0.3, ...; comment lines do
+# not count; at most 253 names get one). Add new devices at the end:
+# removing or moving a line moves the addresses below it at the next
+# restart. Every client can reach the server and the server's LAN.
 # allowed_cns_file = "/opt/mtun/allowed_cns.txt"
 
 # Server only: peak number of handshake attempts the server validates
@@ -138,7 +149,7 @@ expected_server_cn = "dsm-1234abcd-server"
 # run.
 transport = "udp"                            # "udp" | "tcp"
 tun_name = "mtun0"
-log_level = "warning"                        # "debug" | "info" | "warning" | "error"
+log_level = "info"                           # "debug" | "info" | "warning" | "error"
 
 # TUN MTU. Default 1360: the largest that fits in one DSM packet, so no
 # packet is split in two. It also leaves slack for VPN-in-VPN / PPPoE paths.
