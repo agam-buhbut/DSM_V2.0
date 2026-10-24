@@ -22,14 +22,14 @@ from collections.abc import Sequence
 from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 import dsm.client as client_mod
 from dsm.crypto.auth_loader import AuthMaterialsError, AuthMaterialsTimeError
 from dsm.net.ntp_opening import NtpOpening
-from tests.test_client_fail_closed import _config, _FakeStore, _Materials
+from tests.test_client_fail_closed import _config, _FakeStore, _Materials, _Run
 
 NAME = "vpn.example.org"
 NTP = NtpOpening(uid=991, servers=("192.0.2.123",))
@@ -50,10 +50,19 @@ class _Start:
         # The lookup opens port 53 first, as the real one does.
         self.open_lookup = False
         self.stop_in_lookup = False
+        # The user stops DSM just as the lookup returns its answer.
+        self.stop_as_lookup_ends = False
+        # The lookup hangs and sets ``in_lookup``, for a cancel from outside.
+        self.hang_in_lookup = False
+        self.in_lookup = asyncio.Event()
+        # The user stops DSM while the cert files load.
+        self.stop_in_load = False
         # The user stops DSM during this wait (1 = the first); None: never.
         self.stop_at_wait: int | None = None
         # A kill-switch apply with this label fails (an nft error).
         self.fail_apply_for: str | None = None
+        # The nth kill-switch apply (1 = the first) raises this error.
+        self.fail_nth_apply: tuple[int, Exception] | None = None
         self.ntp: NtpOpening | None = None
         self.synced: bool | None = True
 
@@ -84,6 +93,10 @@ class _Start:
                 start.events.append(f"block {self.label}")
                 if self.label == start.fail_apply_for:
                     raise RuntimeError("nft: device or resource busy")
+                if start.fail_nth_apply is not None:
+                    nth, error = start.fail_nth_apply
+                    if nth == sum(e.startswith("block ") for e in start.events):
+                        raise error
 
             def remove(self) -> None:
                 start.events.append(f"unblock {self.label}")
@@ -93,6 +106,8 @@ class _Start:
     def _load(self, _config: object, **kwargs: Any) -> _Materials:
         self.events.append("materials")
         self.load_kwargs.append(kwargs)
+        if self.stop_in_load:
+            self.stops[0].set()
         error = self.loads.pop(0) if self.loads else None
         if error is not None:
             raise error
@@ -105,9 +120,14 @@ class _Start:
         if self.stop_in_lookup:
             self.stops[0].set()
             await asyncio.Event().wait()
+        if self.hang_in_lookup:
+            self.in_lookup.set()
+            await asyncio.Event().wait()
         found = self.lookups.pop(0) if self.lookups else "10.0.0.1"
         if isinstance(found, Exception):
             raise found
+        if self.stop_as_lookup_ends:
+            self.stops[0].set()
         return found
 
     async def _wait(self, shutdown: asyncio.Event, delay: float) -> bool:
@@ -464,4 +484,157 @@ async def test_under_the_unit_a_mistake_after_a_date_wait_closes_ntp(
         "wait",
         "materials",
         "block 10.0.0.1",
+    ]
+
+
+LOOKUP_THEN_CLOSED = [
+    "block none",
+    "materials",
+    "block none +dns",
+    "lookup",
+    "block none",  # port 53 closed again
+]
+
+
+@pytest.mark.parametrize("stop_keeps_block", [False, True])
+async def test_a_lookup_that_fails_with_a_bug_closes_port_53(
+    start: _Start, stop_keeps_block: bool
+) -> None:
+    # Any error keeps the block, by hand too, so the kept table must not keep
+    # the lookup's port-53 line (D7).
+    start.open_lookup = True
+    start.lookups = [TypeError("bug in the lookup")]
+    with pytest.raises(TypeError, match="bug in the lookup"):
+        await start.run(stop_keeps_block=stop_keeps_block, server_ip=NAME)
+    assert start.events == LOOKUP_THEN_CLOSED
+
+
+@pytest.mark.parametrize("stop_keeps_block", [False, True])
+async def test_a_lookup_cancelled_from_outside_closes_port_53(
+    start: _Start, stop_keeps_block: bool
+) -> None:
+    start.open_lookup = True
+    start.hang_in_lookup = True
+    run = asyncio.ensure_future(
+        start.run(stop_keeps_block=stop_keeps_block, server_ip=NAME)
+    )
+    await start.in_lookup.wait()
+    run.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await run
+    assert start.events == LOOKUP_THEN_CLOSED
+
+
+async def test_a_failed_close_of_port_53_is_an_error_not_a_failed_lookup(
+    start: _Start,
+) -> None:
+    # Read as a failed lookup, it would wait with port 53 open.
+    start.open_lookup = True
+    start.lookups = [OSError("no address")]
+    start.fail_nth_apply = (3, OSError("nft: No such file or directory"))
+    with pytest.raises(RuntimeError, match="could not close the kill switch"):
+        await start.run(server_ip=NAME)
+    assert start.waits == []
+    assert start.events == [
+        "block none",
+        "materials",
+        "block none +dns",
+        "lookup",
+        "block none",  # this close fails
+        "block none",  # tried once more as DSM stops with the block kept
+    ]
+
+
+@pytest.mark.parametrize("stop_keeps_block", [False, True])
+async def test_an_error_while_ntp_is_open_keeps_no_ntp_line(
+    start: _Start, stop_keeps_block: bool
+) -> None:
+    # The cert files are read again on each try, and a read error is not an
+    # AuthMaterialsError: it goes up, and the block it keeps must not keep
+    # the time daemon's NTP line (D8).
+    start.loads = [STALE, OSError("cannot read /opt/mtun/dsm_ca.crl")]
+    start.ntp = NTP
+    with pytest.raises(OSError, match="cannot read"):
+        await start.run(stop_keeps_block=stop_keeps_block)
+    assert start.events == [
+        "block 10.0.0.1",
+        "materials",
+        "block 10.0.0.1 +ntp",
+        "wait",
+        "materials",
+        "block 10.0.0.1",  # NTP closed before the block is kept
+    ]
+
+
+@pytest.mark.parametrize(
+    ("synced", "expected"), [(True, True), (False, False), (None, False)]
+)
+def test_only_a_clear_yes_counts_as_a_synchronized_clock(
+    synced: bool | None, expected: bool
+) -> None:
+    # D9: a clock timedatectl cannot report on may be wrong, so a stale CRL
+    # is not used then.
+    with patch("dsm.client.ntp_synchronized", return_value=synced):
+        assert client_mod._clock_synced() is expected
+
+
+@pytest.mark.parametrize("lookup_error", [False, True])
+async def test_the_proven_address_is_not_written_again(
+    tmp_path: Path, lookup_error: bool
+) -> None:
+    # A good handshake with the address already saved for the name leaves
+    # the file as it is, whether the lookup gave that address or failed.
+    # The file is not in the layout DSM writes, so a rewrite would show.
+    saved = tmp_path / "server-endpoint.json"
+    saved.write_text(json.dumps({"ip": "10.0.0.9", "name": NAME}, indent=1))
+    saved.chmod(0o600)
+    before = saved.read_text()
+    run = _Run()
+    run.stop_in_session = [True]
+    lookup = AsyncMock(
+        side_effect=OSError("no address") if lookup_error else None,
+        return_value="10.0.0.9",
+    )
+    with (
+        patch("dsm.client._SERVER_ENDPOINT_FILE", saved),
+        patch("dsm.client._resolve_server_endpoint", lookup),
+    ):
+        rc = await run.run(_config(server_ip=NAME))
+    assert rc == 0
+    assert run.events.count("session") == 1
+    assert saved.read_text() == before
+
+
+@pytest.mark.parametrize(
+    ("stop_keeps_block", "end"), [(False, ["unblock 10.0.0.1"]), (True, [])]
+)
+async def test_a_stop_while_the_files_load_ends_the_start(
+    start: _Start, stop_keeps_block: bool, end: list[str]
+) -> None:
+    # No passphrase prompt after Ctrl-C.
+    start.stop_in_load = True
+    rc = await start.run(stop_keeps_block=stop_keeps_block)
+    assert rc == 0
+    assert start.events == ["block 10.0.0.1", "materials", *end]
+
+
+@pytest.mark.parametrize(
+    ("stop_keeps_block", "end"),
+    [(False, ["unblock none +dns"]), (True, ["block 10.0.0.1"])],
+)
+async def test_a_stop_as_the_lookup_ends_ends_the_start(
+    start: _Start, stop_keeps_block: bool, end: list[str]
+) -> None:
+    # By hand the lookup's table goes; under the unit the kept table has the
+    # server's address and no port-53 line.
+    start.open_lookup = True
+    start.stop_as_lookup_ends = True
+    rc = await start.run(stop_keeps_block=stop_keeps_block, server_ip=NAME)
+    assert rc == 0
+    assert start.events == [
+        "block none",
+        "materials",
+        "block none +dns",
+        "lookup",
+        *end,
     ]

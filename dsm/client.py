@@ -489,6 +489,7 @@ async def run_client(
             )
             return 1
         lookup_open = False
+        ntp_open = False
 
         def _swap(
             *, resolvers: Sequence[str] = (), ntp: NtpOpening | None = None
@@ -497,13 +498,14 @@ async def run_client(
             ``candidates`` and has these openings, in one nft commit. No
             try: an error goes up and the table up before stays (fail
             closed)."""
-            nonlocal pre_killswitch, lookup_open
+            nonlocal pre_killswitch, lookup_open, ntp_open
             table = PreHandshakeKillSwitch(
                 candidates, config.server_port, resolvers=resolvers, ntp=ntp
             )
             table.apply()
             pre_killswitch = table
             lookup_open = bool(resolvers)
+            ntp_open = ntp is not None
 
         def _release_kill_switch(
             exc_type: type[BaseException] | None,
@@ -517,14 +519,21 @@ async def run_client(
             # (dsm-client.service) every exit leaves it up, a setup error
             # too: nobody may be at the host, and the unit's ExecStopPost
             # takes it down only for `systemctl stop` (re-decision 3).
+            if exc_type is None and not stop_keeps_block:
+                pre_killswitch.remove()
+                return False
+            # The kept block never keeps the lookup's port-53 line (D7) or the
+            # time daemon's NTP line (D8): back to the plain start-up table
+            # first, in one nft commit. No try: if that fails, its error goes
+            # up and the table up before stays.
+            if lookup_open or ntp_open:
+                _swap()
             if exc_type is not None:
                 log.error(_KEPT_AFTER_ERROR)
-            elif stop_keeps_block and shutdown.is_set():
+            elif shutdown.is_set():
                 log.info(_KEPT_ON_STOP)
-            elif stop_keeps_block:
-                log.error(_KEPT_AFTER_START_ERROR)
             else:
-                pre_killswitch.remove()
+                log.error(_KEPT_AFTER_START_ERROR)
             return False
 
         stack.push(_release_kill_switch)
@@ -534,7 +543,9 @@ async def run_client(
             switch also lets out port 53 to the resolvers it asks, one nft
             commit each way (re-decision 1). Returns the address, or None if
             the user stopped DSM first. Raises OSError when the name does
-            not resolve; port 53 is closed again before that."""
+            not resolve; port 53 is closed again before that, and before any
+            other error or a cancel goes up. A working lookup leaves it open
+            for the one swap to the server's address after the start loop."""
             try:
                 return await _unless_stopped(
                     shutdown,
@@ -544,9 +555,16 @@ async def run_client(
                         before_lookup=lambda servers: _swap(resolvers=servers),
                     ),
                 )
-            except OSError:
+            except BaseException:
                 if lookup_open:
-                    _swap()
+                    try:
+                        _swap()
+                    except OSError as e:
+                        # Not a failed lookup: the caller must not wait it
+                        # out with port 53 open. Up as an error (fail closed).
+                        raise RuntimeError(
+                            f"could not close the kill switch after the lookup: {e}"
+                        ) from e
                 raise
 
         # Mistakes in the cert files or the config (a missing or bad file, a
@@ -561,7 +579,6 @@ async def run_client(
         loaded: CertAuthMaterials | None = None
         said: set[str] = set()
         waits = 0
-        ntp_open = False
         while True:
             problem: tuple[str, str] | None = None
             if loaded is None:
@@ -573,13 +590,10 @@ async def run_client(
                     problem = ("dates", _held_by_dates(e))
                 except AuthMaterialsError as e:
                     log.error("cert auth materials missing or invalid: %s", e)
-                    if stop_keeps_block and ntp_open:
-                        _swap()  # the block the unit keeps has no NTP line (D8)
                     return 1
                 else:
                     if ntp_open:
                         _swap()  # the dates are fine now: NTP closed again
-                        ntp_open = False
             if problem is None and not candidates:
                 try:
                     found = await _look_up()
@@ -594,8 +608,6 @@ async def run_client(
                         candidates = [proven]
                 else:
                     if found is None:
-                        if stop_keeps_block and lookup_open:
-                            _swap()  # the kept block has no port-53 line (D7)
                         return 0  # the user stopped DSM during the lookup
                     log.info(
                         "resolved server hostname %s -> %s", config.server_ip, found
@@ -611,15 +623,16 @@ async def run_client(
                 opening = time_daemon_opening()
                 if opening is not None:
                     _swap(ntp=opening)
-                    ntp_open = True
             if await _wait_or_stop(shutdown, _backoff_s(waits)):
-                if stop_keeps_block and ntp_open:
-                    _swap()  # the block the unit keeps has no NTP line (D8)
                 return 0
             waits += 1
         # The loop ends only with the materials and an address.
         assert loaded is not None and candidates
         materials = loaded
+        if shutdown.is_set():
+            # A stop that came as the lookup ended or while the cert files
+            # loaded: end here, with no passphrase prompt after Ctrl-C.
+            return 0
         if looked_up_name:
             # The address is known: the server's address only, in one nft
             # commit that also drops the lookup lines.
@@ -628,8 +641,9 @@ async def run_client(
         # Read the passphrase once and unlock both stores, now BEHIND the kill
         # switch. Identity (X25519 Noise static) and attest key (ECDSA P-256)
         # live behind the same passphrase by design — both are provisioned
-        # together by `dsm enroll`. On failure the AsyncExitStack unwinds,
-        # removing the kill switch and restoring the host.
+        # together by `dsm enroll`. On failure the AsyncExitStack unwinds:
+        # by hand that removes the kill switch; with --stop-keeps-block it
+        # stays up.
         from dsm.crypto._stores import load_daemon_stores
 
         keystore = KeyStore(config.key_file)
@@ -652,7 +666,8 @@ async def run_client(
         # THIS device's keys. Catches the cert_file substitution failure mode
         # at startup with a clear error, rather than at the server's
         # AttestBindingMismatchError much later in the handshake. On failure
-        # the stack unwinds (unloading the stores, removing the kill switch).
+        # the stack unwinds: it unloads the stores, and the kill switch goes
+        # or stays as for a passphrase that does not unlock.
         try:
             verify_cert_matches_identity(materials.cert_der, keystore, attest_store)
         except AuthMaterialsError as e:
