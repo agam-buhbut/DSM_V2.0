@@ -5,6 +5,8 @@ are faked, as in tests/test_init.py; files live in tmp_path."""
 from __future__ import annotations
 
 import contextlib
+import errno
+import os
 from collections.abc import Generator
 from pathlib import Path
 from typing import Any
@@ -319,3 +321,236 @@ def test_init_asks_for_the_new_passphrase_twice(cfg_dir: Path) -> None:
     assert seen["confirm"] is True
     gen.assert_not_called()
     assert not (cfg_dir / "config.toml").exists()
+
+
+def _fail_the_write(monkeypatch: pytest.MonkeyPatch) -> None:
+    real = os.write
+
+    def write(fd: int, data: Any) -> int:
+        if bytes(data).startswith(b"hunter2"):
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return real(fd, data)
+
+    monkeypatch.setattr(os, "write", write)
+
+
+def test_a_failed_write_leaves_no_passphrase_file(
+    cfg_dir: Path,
+    cred: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _fail_the_write(monkeypatch)
+    _resume(cfg_dir, unit=True)
+    captured = capsys.readouterr()
+    assert not cred.exists()
+    assert "put the passphrase there by hand" in captured.err
+    assert "Ready." not in captured.out
+    assert f"Put the key passphrase in {cred}" in captured.out
+
+
+def test_a_hard_linked_passphrase_file_is_refused(
+    cfg_dir: Path, cred: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cred.parent.mkdir(mode=0o700)
+    other = cred.parent / "other"
+    other.write_bytes(b"")
+    os.link(other, cred)
+    _resume(cfg_dir, unit=True)
+    assert "more than one name" in capsys.readouterr().err
+    assert other.read_bytes() == b""
+    assert cred.read_bytes() == b""
+
+
+def test_a_kept_hard_linked_file_is_warned_about(
+    cfg_dir: Path, cred: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cred.parent.mkdir(mode=0o700)
+    other = cred.parent / "other"
+    other.write_bytes(b"already here")
+    other.chmod(0o600)
+    os.link(other, cred)
+    _resume(cfg_dir, unit=True)
+    captured = capsys.readouterr()
+    assert "more than one name" in captured.out + captured.err
+    assert cred.read_bytes() == b"already here"
+
+
+def test_a_symlinked_passphrase_file_is_named_and_not_followed(
+    cfg_dir: Path, cred: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cred.parent.mkdir(mode=0o700)
+    target = tmp_path / "target"
+    target.write_bytes(b"already here")
+    target.chmod(0o644)
+    cred.symlink_to(target)
+    _resume(cfg_dir, unit=True)
+    captured = capsys.readouterr()
+    assert f"{cred} is a symlink; init did not check or change" in (
+        captured.out + captured.err
+    )
+    assert target.read_bytes() == b"already here"
+    assert target.stat().st_mode & 0o777 == 0o644
+
+
+def test_a_dangling_symlink_is_not_written_through(
+    cfg_dir: Path, cred: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cred.parent.mkdir(mode=0o700)
+    target = tmp_path / "nowhere"
+    cred.symlink_to(target)
+    _resume(cfg_dir, unit=True)
+    assert "is a symlink" in capsys.readouterr().err
+    assert not target.exists()
+
+
+def test_o_nofollow_stops_a_link_made_after_the_check(
+    cfg_dir: Path,
+    cred: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cred.parent.mkdir(mode=0o700)
+    target = tmp_path / "target"
+    target.write_bytes(b"")
+    cred.symlink_to(target)
+    monkeypatch.setattr(Path, "is_symlink", lambda _self: False)
+    _resume(cfg_dir, unit=True)
+    assert target.read_bytes() == b""
+    assert "is a symlink" in capsys.readouterr().err
+
+
+def test_an_empty_loose_passphrase_file_ends_0600_with_the_passphrase(
+    cfg_dir: Path, cred: Path
+) -> None:
+    cred.parent.mkdir(mode=0o700)
+    cred.write_bytes(b"")
+    cred.chmod(0o644)
+    _resume(cfg_dir, unit=True)
+    assert cred.read_bytes() == b"hunter2hunter2"
+    assert cred.stat().st_mode & 0o777 == 0o600
+
+
+def test_a_ca_root_already_in_place_ends_0600(cfg_dir: Path) -> None:
+    ca = cfg_dir / "dsm_ca_root.pem"
+    ca.chmod(0o644)
+    with _enrolls():
+        assert dsm_init.main(_server_flags(cfg_dir)) == 0
+    assert ca.stat().st_mode & 0o777 == 0o600
+
+
+def test_the_proven_passphrase_is_wiped(
+    cfg_dir: Path, cred: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[bytes] = []
+    real = dsm_init.wipe_passphrase
+
+    def record(buf: bytearray) -> None:
+        seen.append(bytes(buf))
+        real(buf)
+
+    monkeypatch.setattr(dsm_init, "wipe_passphrase", record)
+    _resume(cfg_dir, unit=True)
+    # Once for the new passphrase, once for the one that unlocked the keys.
+    assert seen.count(b"hunter2hunter2") == 2
+
+
+def test_a_soft_build_says_so_in_the_config_file(cfg_dir: Path) -> None:
+    with _enrolls(), mock.patch.object(dsm_init, "_backend_is_soft", return_value=True):
+        assert dsm_init.main(_server_flags(cfg_dir)) == 0
+    assert "# Evaluation build" in (cfg_dir / "config.toml").read_text()
+
+
+def test_an_attest_key_alone_also_means_enrolled(cfg_dir: Path) -> None:
+    (cfg_dir / "attest.key").write_bytes(b"old key")
+    with _enrolls() as gen, pytest.raises(SystemExit) as err:
+        dsm_init.main(_server_flags(cfg_dir))
+    assert err.value.code == 2
+    assert not (cfg_dir / "config.toml").exists()
+    gen.assert_not_called()
+
+
+def test_a_missing_ca_root_flag_is_named(
+    cfg_dir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with _enrolls(), pytest.raises(SystemExit):
+        dsm_init.main(_without(_server_flags(cfg_dir), "--ca-root"))
+    assert "--ca-root" in capsys.readouterr().err
+
+
+def _config_of(cfg_dir: Path, role: str = "server") -> Any:
+    flags = _server_flags(cfg_dir)
+    if role == "client":
+        flags = _without(_without(flags, "--dns-provider"), "--dns-pin")
+        flags[0] = "client"
+        flags += ["--expected-server-cn", "dsm-x-server"]
+    with _enrolls():
+        assert dsm_init.main(flags) == 0
+    return config_load(cfg_dir / "config.toml")
+
+
+def test_a_client_is_told_to_wait_for_the_server(
+    cfg_dir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cfg = _config_of(cfg_dir, "client")
+    capsys.readouterr()
+    dsm_init._print_next_steps("client", cfg, cfg_dir / "config.toml", False)
+    out = capsys.readouterr().out
+    assert "Still to do before you start DSM:" in out
+    assert "Wait until the server's allowlist has this client's CN" in out
+
+
+def _ready_server(cfg_dir: Path, cred: Path) -> Any:
+    cfg = _config_of(cfg_dir)
+    Path(cfg.crl_file).write_bytes(b"crl")
+    Path(cfg.allowed_cns_file).write_text("# none\ndsm-x-client\n")
+    cred.parent.mkdir()
+    cred.write_bytes(b"x")
+    return cfg
+
+
+def test_a_server_with_nothing_left_is_ready(
+    cfg_dir: Path, cred: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cfg = _ready_server(cfg_dir, cred)
+    (tmp_path / "units" / "dsm.service").write_text("unit\n")
+    capsys.readouterr()
+    dsm_init._print_next_steps("server", cfg, cfg_dir / "config.toml", True)
+    out = capsys.readouterr().out
+    assert "Ready. Start it: sudo systemctl start dsm" in out
+    assert "Still to do" not in out
+
+
+def test_a_missing_unit_is_never_ready(
+    cfg_dir: Path, cred: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cfg = _ready_server(cfg_dir, cred)
+    capsys.readouterr()
+    dsm_init._print_next_steps("server", cfg, cfg_dir / "config.toml", True)
+    out = capsys.readouterr().out
+    assert "Ready." not in out
+    assert "Copy deploy/dsm.service to /etc/systemd/system/" in out
+    assert "sudo systemctl daemon-reload && sudo systemctl enable dsm" in out
+
+
+def test_the_list_asks_for_a_missing_passphrase(
+    cfg_dir: Path, cred: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cfg = _config_of(cfg_dir)
+    capsys.readouterr()
+    dsm_init._print_next_steps("server", cfg, cfg_dir / "config.toml", True)
+    assert f"Put the key passphrase in {cred}" in capsys.readouterr().out
+
+
+def test_the_resume_hint_quotes_a_path_with_a_space(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    inst = tmp_path / "my dir"
+    inst.mkdir()
+    (inst / "dsm_ca_root.pem").write_bytes(b"-----BEGIN CERTIFICATE-----\n")
+    (inst / "pass").write_bytes(b"hunter2hunter2\n")
+    (inst / "pass").chmod(0o600)
+    with _enrolls():
+        assert dsm_init.main(_server_flags(inst)) == 0
+    assert f"--install-dir '{inst}'" in capsys.readouterr().out

@@ -8,11 +8,14 @@ installs the systemd unit.
 from __future__ import annotations
 
 import argparse
+import errno
 import grp
 import hashlib
 import json
 import os
+import shlex
 import shutil
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -332,10 +335,11 @@ def _phase_a(role: str, args: argparse.Namespace) -> int:
     new_config = install_dir / "config.toml.new"
     done = False
     try:
-        new_config.write_text(
-            _render_config(role, args, install_dir, soft=soft), encoding="utf-8"
+        atomic_write(
+            new_config,
+            _render_config(role, args, install_dir, soft=soft).encode("utf-8"),
+            mode=0o600,
         )
-        new_config.chmod(0o600)
         try:
             config_load(new_config)
         except (ConfigError, ValueError, TypeError) as e:
@@ -383,7 +387,7 @@ def _phase_a(role: str, args: argparse.Namespace) -> int:
     print(f"Wrote CSR to {csr_path} (cn={result.cn})")
     resume = f"sudo dsm init {role} --resume --signed-cert <signed.crt>"
     if install_dir != Path(_DEFAULT_INSTALL_DIR):
-        resume += f" --install-dir {install_dir}"
+        resume += f" --install-dir {shlex.quote(str(install_dir))}"
     print(
         "Walk the CSR to the offline CA (deploy/GUIDE.md §3c), sign it, then "
         f"run:\n  {resume}"
@@ -471,6 +475,7 @@ def _cred_file_ready() -> bool:
     try:
         return _CRED_FILE.is_file() and _CRED_FILE.stat().st_size > 0
     except OSError:
+        # Cannot tell: "not ready" only makes init ask for the file.
         return False
 
 
@@ -495,6 +500,21 @@ def _close_to_others(path: Path, mode: int) -> None:
         print(f"{path} was open to others (mode {old:o}); it is now {mode:o}.")
 
 
+def _warn_if_shared(path: Path) -> None:
+    """One line if the kept file is owned by someone else or has more than
+    one name. Reads no content."""
+    try:
+        st = path.stat()
+    except OSError:
+        return
+    if st.st_uid != os.geteuid() or st.st_nlink > 1:
+        print(
+            f"dsm init: {path} is owned by another user or has more than one "
+            "name; check who can change it.",
+            file=sys.stderr,
+        )
+
+
 def _write_unit_passphrase(passphrase: bytearray) -> None:
     """Give the systemd unit the passphrase that just unlocked the keys.
 
@@ -502,33 +522,66 @@ def _write_unit_passphrase(passphrase: bytearray) -> None:
     stops it with every start error, a missing one makes systemd refuse to
     start it (QA B2). A file with something in it is left alone and not
     read: reading it would copy a secret into memory that cannot be wiped.
+    A write that fails leaves no file, never a partial one.
     """
     path = _CRED_FILE
     # Under the unit DSM sees only systemd's 0400 copy, so nothing else would
     # notice a passphrase file or folder others can open: close them here.
     _close_to_others(path.parent, 0o700)
+    if path.is_symlink():
+        print(
+            f"{path} is a symlink; init did not check or change the file it "
+            "points to: make it mode 0600, owned by root.",
+            file=sys.stderr,
+        )
+        return
     if _cred_file_ready():
         _close_to_others(path, 0o600)
+        _warn_if_shared(path)
         print(f"Kept {path}; make sure it holds this passphrase.")
         return
     try:
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        # No O_TRUNC: the file is truncated only after the checks below, so a
+        # file with another name is never emptied.
         fd = os.open(
             path,
-            os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC,
+            os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
             0o600,
         )
         try:
-            os.fchmod(fd, 0o600)
-            with memoryview(passphrase) as view:
-                written = 0
-                while written < len(view):
-                    written += os.write(fd, view[written:])
+            st = os.fstat(fd)
+            if (
+                not stat.S_ISREG(st.st_mode)
+                or st.st_uid != os.geteuid()
+                or st.st_nlink != 1
+            ):
+                print(
+                    f"dsm init: {path} is not a plain file of yours, or has more "
+                    "than one name; not written: put the passphrase there by "
+                    "hand (deploy/GUIDE.md §3e)",
+                    file=sys.stderr,
+                )
+                return
+            try:
+                os.ftruncate(fd, 0)
+                os.fchmod(fd, 0o600)
+                with memoryview(passphrase) as view:
+                    written = 0
+                    while written < len(view):
+                        written += os.write(fd, view[written:])
+                os.fsync(fd)
+            except OSError:
+                # The file was missing or empty before, or we made it: remove
+                # it so no partial passphrase stays behind.
+                path.unlink(missing_ok=True)
+                raise
         finally:
             os.close(fd)
     except OSError as e:
+        why = "it is a symlink" if e.errno == errno.ELOOP else str(e)
         print(
-            f"dsm init: could not write {path}: {e}; put the passphrase there "
+            f"dsm init: could not write {path}: {why}; put the passphrase there "
             "by hand (deploy/GUIDE.md §3e)",
             file=sys.stderr,
         )
@@ -540,6 +593,7 @@ def _has_names(path: Path) -> bool:
     try:
         text = path.read_text(encoding="utf-8")
     except OSError:
+        # Cannot read it: "no names" only makes init ask for them.
         return False
     return any(
         line.strip() and not line.strip().startswith("#") for line in text.splitlines()
@@ -568,6 +622,12 @@ def _print_next_steps(role: str, cfg: Config, config_path: Path, unit: bool) -> 
         )
     if unit and not _cred_file_ready():
         steps.append(f"Put the key passphrase in {_CRED_FILE} (deploy/GUIDE.md §3e).")
+    name = _unit_name(role)
+    if unit and not (_SYSTEMD_DIR / f"{name}.service").is_file():
+        steps.append(
+            f"Copy deploy/{name}.service to /etc/systemd/system/, then: sudo "
+            f"systemctl daemon-reload && sudo systemctl enable {name}"
+        )
     if unit:
         start = f"sudo systemctl start {_unit_name(role)}"
     else:
@@ -705,10 +765,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--passphrase-fd",
         type=int,
+        metavar="N",
         help="read the key passphrase from file descriptor N",
     )
     p.add_argument(
         "--passphrase-env-file",
+        metavar="PATH",
         help=(
             "read the key passphrase from the file at PATH (mode 0600; only "
             "the passphrase)"
