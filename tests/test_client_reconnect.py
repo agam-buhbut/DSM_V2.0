@@ -83,7 +83,7 @@ def test_the_address_hint_comes_once_after_five_failed_tries_for_a_name(
         reconnect.failed()
     hints = _lines(caplog, _HINT)
     assert len(hints) == 1
-    assert "stop and start DSM" in hints[0]
+    assert "looks the name up again" in hints[0]
 
     reconnect.connected()  # a new outage may hint again
     for _ in range(5):

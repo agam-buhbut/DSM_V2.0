@@ -398,7 +398,10 @@ async def test_a_tcp_connect_error_is_retried_and_names_no_address(
     assert rc == 0
     assert run.blocked_during_waits == [True]
     messages = [r.getMessage() for r in caplog.records]
-    assert "cannot connect to the server: Connection refused" in messages
+    assert (
+        "cannot connect to the server: Connection refused. Check server_ip and "
+        "server_port, and that both ends set the same transport (udp or tcp)."
+    ) in messages
     assert not any("10.0.0.1" in m for m in messages)
 
 

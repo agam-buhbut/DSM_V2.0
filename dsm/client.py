@@ -25,6 +25,7 @@ from dsm.core.log import RepeatLog
 from dsm.core.path_security import check_user_file_permissions
 from dsm.core.preflight import check_clock_sync
 from dsm.core.protocol import WIRE_VERSION, ReassemblyBuffer
+from dsm.core.rand import csprng_float
 from dsm.crypto.attest_store import AttestStore
 from dsm.crypto.auth_loader import (
     AuthMaterialsError,
@@ -70,6 +71,12 @@ HOSTNAME_HINT_AFTER = 5
 # seconds, so a server that takes the session and drops it at once cannot
 # flood the log.
 OUTAGE_NOTICE_EVERY_S = 60.0
+# Every wait moves up to this share either way at random, so clients that
+# lost one server do not all come back in step (re-decision 6).
+_JITTER = 0.25
+# During an outage, a server name is looked up again after
+# HOSTNAME_HINT_AFTER failed tries, then at most this often (re-decision 5).
+RELOOKUP_EVERY_S = 300.0
 
 _OUTAGE_NOTICE = (
     "no tunnel: all traffic is blocked until DSM connects again; it keeps "
@@ -78,10 +85,10 @@ _OUTAGE_NOTICE = (
     "`sudo dsm cleanup`."
 )
 _HOSTNAME_HINT = (
-    "server IP may have changed since DSM looked up its name at start; DSM "
-    "does not look it up again while the tunnel is down. If this goes on, "
-    "stop and start DSM: a restart keeps the kill switch up, so the name "
-    "cannot be looked up and the old address is used again."
+    "server IP may have changed since DSM looked up its name; while the "
+    "tunnel is down DSM looks the name up again, at most every 5 minutes, "
+    "and tries a new address first. If this goes on, check that the name "
+    "points at the server."
 )
 _KEPT_AFTER_ERROR = (
     "DSM stopped on an error and left the kill switch up, so all traffic "
@@ -222,6 +229,16 @@ def _emit_handshake_failure(err: Exception) -> None:
     )
 
 
+def _backoff_s(waits_before: int) -> float:
+    """The wait after ``waits_before`` earlier waits: 1 s, doubling up to 30 s."""
+    return min(RETRY_FIRST_S * 2.0 ** min(waits_before, 5), RETRY_MAX_S)
+
+
+def _jittered(delay: float) -> float:
+    """``delay`` moved up to _JITTER either way at random."""
+    return delay * (1.0 - _JITTER + 2.0 * _JITTER * csprng_float())
+
+
 class _Reconnect:
     """The waits between tries, and the log lines about an outage.
 
@@ -251,6 +268,11 @@ class _Reconnect:
         self._noticed = False
         self._hinted = False
 
+    @property
+    def failures(self) -> int:
+        """Failed tries since the last session came up."""
+        return self._failures
+
     def failed(self) -> None:
         """A try got no session."""
         self._failures += 1
@@ -267,18 +289,19 @@ class _Reconnect:
         if not self._noticed:
             self._notice.log(_OUTAGE_NOTICE)
             self._noticed = True
-        delay = min(RETRY_FIRST_S * 2.0 ** min(self._waits, 5), RETRY_MAX_S)
+        delay = _backoff_s(self._waits)
         self._waits += 1
         return delay
 
 
 async def _wait_or_stop(shutdown: asyncio.Event, delay: float) -> bool:
-    """Wait ``delay`` seconds before the next try.
+    """Wait about ``delay`` seconds (moved up to 25% at random) before the
+    next try.
 
     Returns True as soon as the user stops DSM, False when the wait is over.
     """
     try:
-        await asyncio.wait_for(shutdown.wait(), timeout=delay)
+        await asyncio.wait_for(shutdown.wait(), timeout=_jittered(delay))
     except TimeoutError:
         return False
     return True
@@ -583,7 +606,12 @@ async def run_client(
                     except OSError as e:
                         # Not str(e): asyncio's connect error holds the address.
                         reason = os.strerror(e.errno) if e.errno else type(e).__name__
-                        log.error("cannot connect to the server: %s", reason)
+                        log.error(
+                            "cannot connect to the server: %s. Check server_ip "
+                            "and server_port, and that both ends set the same "
+                            "transport (udp or tcp).",
+                            reason,
+                        )
                         return _End.FAILED
                     if shutdown.is_set():
                         return _End.FAILED
