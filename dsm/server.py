@@ -15,7 +15,7 @@ from pathlib import Path
 from dsm.core.config import Config
 from dsm.core.fsm import ProtocolError, SessionFSM, State
 from dsm.core.log import SESSION_LABEL
-from dsm.core.preflight import check_clock_sync
+from dsm.core.preflight import check_clock_sync, ntp_synchronized
 from dsm.core.protocol import WIRE_VERSION, PacketType, ReassemblyBuffer
 from dsm.crypto.attest_store import AttestStore
 from dsm.crypto.auth_loader import (
@@ -547,7 +547,12 @@ async def run_server(
     # Cert auth materials must load BEFORE we touch any host state, so a
     # missing cert file aborts cleanly with no rules / no TUN created.
     try:
-        materials = load_cert_materials(config)
+        # A stale CRL is used, with a WARNING, only when timedatectl clearly
+        # says the clock is synchronized (re-decision 4(i)); else the server
+        # refuses it, as before.
+        materials = load_cert_materials(
+            config, clock_synced=lambda: ntp_synchronized() is True
+        )
     except AuthMaterialsError as e:
         log.error("cert auth materials missing or invalid: %s", e)
         return 1

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import datetime
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -28,7 +29,7 @@ from dsm.core.path_security import (
     check_user_file_permissions,
 )
 from dsm.crypto.attest_store import AttestStore
-from dsm.crypto.cert import CertError, DeviceCert, load_ca_root
+from dsm.crypto.cert import CertError, CertExpiredError, DeviceCert, load_ca_root
 from dsm.crypto.crl import CRL, CRLError, CRLRollbackError
 from dsm.crypto.keystore import KeyStore
 
@@ -37,6 +38,13 @@ log = logging.getLogger(__name__)
 
 class AuthMaterialsError(Exception):
     """A required auth material file is missing, malformed, or fails policy."""
+
+
+class AuthMaterialsTimeError(AuthMaterialsError):
+    """The materials are sound but their dates do not cover now: a CRL past
+    its next update, or a cert not yet valid or run out. A fresh file or a
+    right clock mends it, so the client keeps its block and tries again
+    (R1). The server catches the base class and exits 1, as before."""
 
 
 @dataclass(frozen=True)
@@ -72,10 +80,41 @@ def _load_cert_der(cert_file: Path) -> bytes:
     return cert.to_der()
 
 
-def load_cert_materials(config: Config) -> CertAuthMaterials:
+def _check_own_dates(cert_der: bytes) -> None:
+    """Raise AuthMaterialsTimeError if this host's own cert is not valid now."""
+    cert = DeviceCert.from_der(cert_der)
+    now = datetime.datetime.now(datetime.UTC)
+    if now < cert.not_before:
+        raise AuthMaterialsTimeError(
+            f"this host's cert is not valid before {cert.not_before.isoformat()}; "
+            "check the clock"
+        )
+    if now > cert.not_after:
+        raise AuthMaterialsTimeError(
+            f"this host's cert ran out on {cert.not_after.isoformat()}; enroll "
+            "this host again (deploy/GUIDE.md §3)"
+        )
+
+
+def load_cert_materials(
+    config: Config,
+    *,
+    check_own_dates: bool = False,
+    clock_synced: Callable[[], bool] | None = None,
+) -> CertAuthMaterials:
     """Load this device's cert + pinned CA root + optional CRL.
 
-    Raises ``AuthMaterialsError`` on any I/O or parse failure.
+    Raises ``AuthMaterialsError`` on any I/O or parse failure, and its
+    subclass ``AuthMaterialsTimeError`` when the problem is only a date: a
+    CRL past its next update (crl_strict), the CA cert outside its dates,
+    and, with ``check_own_dates`` (the client), this host's own cert.
+
+    ``clock_synced`` (both daemons pass it) is asked only when the CRL is
+    past its next update under crl_strict. When it says the clock is
+    synchronized, the CRL is used with a WARNING instead (re-decision
+    4(i)): it is still signed by the CA and not older than the last one
+    taken, so every revocation in it holds; only a newer CRL may exist
+    that nobody has carried here yet.
     """
     cert_file = Path(config.cert_file)
     ca_root_file = Path(config.ca_root_file)
@@ -113,22 +152,40 @@ def load_cert_materials(config: Config) -> CertAuthMaterials:
         ) from e
     try:
         ca_root = load_ca_root(ca_root_file, expected_sha256=expected_ca_sha256)
+    except CertExpiredError as e:
+        # A CA cert outside its dates may be a clock set wrong: a date
+        # problem, so the client waits instead of failing open (fix 2).
+        raise AuthMaterialsTimeError(
+            f"CA root at {ca_root_file} failed validation: {e}"
+        ) from e
     except CertError as e:
         raise AuthMaterialsError(
             f"CA root at {ca_root_file} failed validation: {e}"
         ) from e
 
-    crl = _load_crl(config, ca_root)
+    # Before the CRL, so a try that fails on these dates runs no CRL code and
+    # logs nothing; the client tries again. A CRL mistake then shows once the
+    # date problem is gone.
+    if check_own_dates:
+        _check_own_dates(cert_der)
+
+    crl = _load_crl(config, ca_root, clock_synced)
 
     return CertAuthMaterials(cert_der=cert_der, ca_root=ca_root, crl=crl)
 
 
-def _load_crl(config: Config, ca_root: x509.Certificate) -> CRL | None:
+def _load_crl(
+    config: Config,
+    ca_root: x509.Certificate,
+    clock_synced: Callable[[], bool] | None = None,
+) -> CRL | None:
     """Load + freshness/rollback-check the optional CRL per crl_strict policy.
 
     Returns the loaded CRL, or None when no crl_file is configured (permitted
     only under crl_strict=false). Raises ``AuthMaterialsError`` on a missing,
     invalid, rolled-back, or (under crl_strict) stale / no-nextUpdate CRL.
+    A stale CRL under crl_strict raises ``AuthMaterialsTimeError``, unless
+    ``clock_synced`` says the clock is synchronized (see ``load_cert_materials``).
     """
     crl: CRL | None = None
     if not config.crl_file:
@@ -163,7 +220,6 @@ def _load_crl(config: Config, ca_root: x509.Certificate) -> CRL | None:
             crl = CRL.load(crl_path, ca_root, now=None)
         except CRLError as e:
             raise AuthMaterialsError(f"CRL at {crl_path} failed validation: {e}") from e
-        log.info("loaded CRL crl_number=%s", crl.crl_number)
         # DSM-B1: reject a genuinely-signed but older CRL replayed to
         # un-revoke a cert. The last-accepted crl_number is persisted under
         # the config dir and must never regress.
@@ -203,36 +259,47 @@ def _load_crl(config: Config, ca_root: x509.Certificate) -> CRL | None:
             )
             netaudit.emit("crl_no_nextupdate", path=str(crl_path), action="warned")
         elif crl.is_stale(_now):
-            if config.crl_strict:
-                # Fail closed: refuse to start under a stale CRL. The
-                # daemon's revocation surface is incomplete and a
-                # security-paranoid operator opted into hard-fail.
+            next_update = crl.next_update.isoformat()
+            clock_ok = config.crl_strict and clock_synced is not None and clock_synced()
+            if config.crl_strict and not clock_ok:
+                # Fail closed. A CRL reaches a host only when someone carries
+                # it there, so the message says to do that, not to turn the
+                # check off (QA M8).
                 netaudit.emit(
                     "crl_stale",
                     path=str(crl_path),
-                    next_update=crl.next_update.isoformat(),
+                    next_update=next_update,
                     action="refused_start",
                 )
-                raise AuthMaterialsError(
-                    f"CRL at {crl_path} is stale (next_update="
-                    f"{crl.next_update.isoformat()}) and crl_strict=true; "
-                    "refusing to start. Refresh the CRL via the CA workflow "
-                    "or set crl_strict=false in config to fall back to a "
-                    "warning."
+                raise AuthMaterialsTimeError(
+                    f"CRL at {crl_path} is past its next update ({next_update}). "
+                    "Carry the CA's current CRL here (deploy/GUIDE.md §7e)"
                 )
-            log.warning(
-                "CRL at %s is stale (next_update=%s); revocation checks "
-                "will miss certs revoked since that date. Set crl_strict=true "
-                "in config to refuse to start under a stale CRL.",
-                crl_path,
-                crl.next_update.isoformat(),
-            )
+            if clock_ok:
+                log.warning(
+                    "CRL at %s is past its next update (%s); DSM uses it because "
+                    "the clock is synchronized. Carry the CA's current CRL here "
+                    "(deploy/GUIDE.md §7e).",
+                    crl_path,
+                    next_update,
+                )
+            else:
+                log.warning(
+                    "CRL at %s is stale (next_update=%s); revocation checks "
+                    "will miss certs revoked since that date. Set crl_strict=true "
+                    "in config to refuse to start under a stale CRL.",
+                    crl_path,
+                    next_update,
+                )
             netaudit.emit(
                 "crl_stale",
                 path=str(crl_path),
-                next_update=crl.next_update.isoformat(),
+                next_update=next_update,
                 action="warned",
             )
+        # After the date checks, so a stale CRL under crl_strict, which the
+        # client tries again, logs nothing on each try.
+        log.info("loaded CRL crl_number=%s", crl.crl_number)
     return crl
 
 
