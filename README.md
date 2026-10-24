@@ -19,44 +19,75 @@ your packets.
 > (`deploy/GUIDE.md` §1), then go on with steps 2 and 3.
 
 Setup has three steps: install, set up, start. Setting up writes the config,
-pins your CA (certificate authority) root and enrolls this device. Enrolling
-means your offline CA signs the device's certificate request.
+copies in your CA (certificate authority) root and enrolls this device.
+Enrolling means your offline CA signs the device's certificate request.
+
+Before you start:
+
+1. Make your offline CA once (`deploy/GUIDE.md` §2). It gives you the CA
+   root (`dsm_ca_root.pem`) and a CRL (`dsm_ca.crl`, a list of revoked
+   certs).
+2. Every host needs both: give the root to `--ca-root`, and put the CRL at
+   `/opt/mtun/dsm_ca.crl` (§2f). A host without a CRL does not start.
+   Carry a new CRL to every host before the old one runs out (§7e).
+3. Server: get your DNS provider's key pin for `--dns-pin` (§3a.1).
+4. Client: get the server's CN for `--expected-server-cn`. `dsm init server`
+   prints it (`cn=dsm-...-server`).
+5. The server starts only once its allowlist,
+   `/opt/mtun/allowed_cns.txt`, has at least one client CN (§4). `dsm init
+   client` prints the client's CN.
+6. Under systemd the key passphrase goes in `/etc/dsm/passphrase`. Give
+   `--install-unit` to the first `dsm init` command (as below): `--resume`
+   then writes that file, with the passphrase that has just unlocked the
+   keys. Without the file the unit does not start.
 
 ```sh
 # 1. Install (downloads + minisign-verifies the wheel, apt-installs the TPM
-#    runtime libs, creates /opt/dsm/venv, symlinks `dsm`). Add `--systemd`
-#    to also install the server unit (dsm.service) and the daily DNS block
-#    list download, and to fetch the default block list once. On a client,
-#    add `--systemd --client` instead: that installs the client unit
-#    (dsm-client.service) and no block list.
+#    runtime libs, creates /opt/dsm/venv, links /usr/local/bin/dsm). Add
+#    `--systemd` to also install the server unit (dsm.service) and the daily
+#    DNS block list download, and to fetch the default block list once. On
+#    a client, add `--systemd --client` instead: that installs the client
+#    unit (dsm-client.service) and no block list.
 curl -fsSL https://github.com/agam-buhbut/DSM_V2.0/releases/download/v0.1.0/install.sh | sudo sh -s -- --systemd
 
-# 2. Provision config + CA-pin + enroll (orchestrates config + TPM preflight +
-#    CSR emit). Pass the required flags up front; only the key passphrase is
-#    prompted. Server example (client: use `client` + --expected-server-cn and
-#    drop --dns-provider/--dns-pin):
-sudo dsm init server \
-    --server-ip <IP> --server-port <PORT> --ca-root <ca-root.pem> \
+# 2. Write the config, copy in the CA root, make the keys and a CSR. Only
+#    the key passphrase is asked (twice). Server example (client: use
+#    `client`, add --server-ip and --expected-server-cn, drop
+#    --dns-provider and --dns-pin):
+#    --install-unit (a client takes it too) makes --resume write
+#    /etc/dsm/passphrase, which the unit needs. A source install has no
+#    unit yet: init then prints how to copy it from deploy/.
+sudo dsm init server --install-unit \
+    --server-port <PORT> --ca-root <ca-root.pem> \
     --dns-provider <DoH-URL> --dns-pin <SPKI-SHA256>
-#   ...this writes a CSR and pauses for the offline-CA signing step. Walk the
-#   CSR to the CA, sign it, then resume with the returned cert:
+#   ...this writes a CSR and stops for the offline-CA signing step. Carry
+#   the CSR to the CA and sign it (deploy/GUIDE.md §3c; a client's CSR with
+#   -extensions dsm_client_leaf, §3f), then go on with the signed cert.
+#   init then lists what is still to do:
 sudo dsm init server --resume --signed-cert <signed.crt>
 
-# 3. Start it. Server:
-sudo systemctl enable --now dsm
+# 3. Start it. Server: enable it now, and start it once its allowlist
+#    (/opt/mtun/allowed_cns.txt) has a client's CN (item 5 above;
+#    deploy/GUIDE.md §4). Started before that, it refuses, and systemd
+#    gives up after 5 tries.
+sudo systemctl enable dsm
+sudo systemctl start dsm
 #    Client (never the server unit: it runs DSM as a server). Enable it now,
 #    but start it only after the server has the client's CN in its
 #    allowed_cns file (deploy/GUIDE.md §4). A client the server does not know
 #    blocks all traffic, SSH too, and keeps trying.
+#    On a headless client, keep console access first (deploy/GUIDE.md §3f).
 sudo systemctl enable dsm-client
 sudo systemctl start dsm-client
 ```
 
 **Trying DSM without a TPM:** releases will also carry a clearly named
 `+soft` evaluation wheel (a Python install package), installed with
-`install.sh --eval`. Flags can go in any order, for example
-`-s -- --eval --systemd`. This wheel has **no hardware binding**: its key is
-not held in a TPM. It is for evaluation only. Never deploy it in production.
+`install.sh --eval`. It installs no systemd unit, so `--eval --systemd`
+does not add one. Flags can go in any order, for example
+`-s -- --client --systemd`. This wheel has **no hardware binding**: its key
+is not held in a TPM. It is for evaluation only. Never deploy it in
+production.
 
 ## Goal
 
@@ -70,7 +101,7 @@ A VPN tunnel that stands up to:
 
 ## Non-Goals
 
-- Multiple endpoints
+- More than one server per client (one server serves many clients)
 - Server hopping
 - Switching between geographic locations
 - Large setups with many users
@@ -139,6 +170,7 @@ SESSION_CLOSE packet.
 
 Clients cannot reach each other through the tunnel, and cannot send with
 another client's tunnel address: the server drops such packets.
+Every client can reach the server itself (10.8.0.1, and its services) and the server's LAN.
 
 The server tells each client its address inside the tunnel, and its own
 (which is also the client's DNS server), in the last handshake message. The
@@ -200,7 +232,7 @@ the file is unchanged.
 
 The MTU is the largest packet a link can carry.
 
-- The TUN MTU can be set: default 1400, allowed 576-1500.
+- The TUN MTU can be set: default 1360, allowed 576-1500.
 - Optional: the kernel's Path MTU Discovery on the UDP socket
   (IP_PMTUDISC_DO). It sets the DF (don't fragment) bit and records ICMP
   "frag needed" replies.
@@ -533,17 +565,35 @@ defaults, and each end shapes only what it sends.
 ### Leak Prevention
 
 - An nftables kill switch blocks all traffic that does not go through the
-  VPN. On the client it stays up while the tunnel is down, too: when a
-  session drops, the client goes back to the start-up kill switch (it lets
-  through only the path to the server) in one step and reconnects.
-  `sudo systemctl restart dsm-client` keeps it up as well. It comes down
-  when you stop DSM: Ctrl-C on a run by hand,
-  `sudo systemctl stop dsm-client`, or `sudo dsm cleanup`. Two cases differ:
-  a setup error at the first try also removes it (DSM exits 1), and a
-  `systemctl stop` sent while DSM waits to restart (after a crash or a
-  signal sent straight to it) leaves it up; run `sudo dsm cleanup`. If DSM
-  stops on an error (a crash), the kill switch stays up; the next start
-  replaces it. While the tunnel is down you have no internet, and a hotel or
+  VPN. On the client it goes up first at start, before DSM reads its cert
+  files, looks up a server name or asks for the passphrase. It stays up
+  while the tunnel is down, too: when a session drops, the client goes
+  back to the start-up kill switch in one step and reconnects. The
+  start-up kill switch lets out only DSM's own packets to the server (from
+  sockets that carry DSM's mark) and the replies to them, plus DHCP. It
+  blocks the normal network traffic of other programs; a program with
+  raw-packet rights (CAP_NET_RAW) can still get around a firewall like
+  this one.
+  `sudo systemctl restart dsm-client` keeps it up as well. A start the
+  clock or the network holds up (a server name that does not resolve, a
+  CRL past its next update while the clock is not synchronized, a cert
+  outside its dates) keeps it, and DSM keeps trying. It comes down when
+  you stop DSM: Ctrl-C on a run by hand, `sudo systemctl stop dsm-client`,
+  or `sudo dsm cleanup`. On a run by hand, a setup error (a wrong or empty
+  passphrase, a missing or bad cert, CA or CRL file) also removes it (DSM
+  exits 1). Under `dsm-client.service` a setup error keeps it, because
+  nobody may be at the host: fix the problem, then `sudo systemctl
+  reset-failed dsm-client && sudo systemctl restart dsm-client`, or run
+  `sudo systemctl stop dsm-client` and `sudo dsm cleanup`. A few errors
+  come before the kill switch and so raise no block, also under the unit:
+  a missing `/etc/dsm/passphrase` (systemd does not start DSM), a
+  config.toml that does not load, an evaluation build without
+  `allow_soft_attest`, nft refusing the first table, and an install that
+  cannot run DSM at all (SECURITY.md, deploy/GUIDE.md §7i). A `systemctl
+  stop` sent while DSM waits to restart also leaves it up; run `sudo dsm
+  cleanup`. If DSM stops
+  on an error (a crash), the kill switch stays up; the next start replaces
+  it. While the tunnel is down you have no internet, and a hotel or
   airport Wi-Fi login page cannot load: stop DSM, log in, then start it
   again.
 - mDNS (5353) and LLMNR (5355) are blocked, so they cannot be used to map
@@ -553,7 +603,7 @@ defaults, and each end shapes only what it sends.
   server IP for cleartext DNS or DoT. The "except to the server IP"
   exception applies only to HTTPS/DoH and DoH3 (443/tcp+udp; DNS over
   HTTPS). So the encrypted tunnel itself can reach the server, while every
-  other DoH destination is dropped.
+  other DoH destination is dropped. Two exceptions come before a tunnel exists, each only while needed: DSM's own lookup of a server name (port 53 to the resolvers it chose, from DSM itself), and, while a date holds a start, NTP from the time daemon to servers its config names by IP address.
 - VPN sockets are marked with SO_MARK=0x1, so the ip rule skips the TUN
   routing table for them. This avoids routing loops.
 - Name lookups run on the server. A DNS proxy listens on UDP port 53 on the
@@ -701,12 +751,18 @@ The config file is TOML, at `/opt/mtun/config.toml`.
 
 - mode: client | server
 - server_ip: a literal IPv4 address, or a DNS hostname (for example a DDNS
-  name for a home server). The client looks the hostname up once at
-  startup, before the kill switch is installed. That one lookup is sent in
-  the clear; use a literal address to avoid it. While the client
-  reconnects it keeps that first address and does not look the name up
-  again; if the server's address changes, stop and start DSM. IPv6 is
-  rejected (the transport is AF_INET-only, that is, IPv4 only).
+  name for a home server). A server does not use it. The client looks the
+  hostname up at start, after its kill switch is up: DSM sends one A query
+  from a marked socket to the host's resolver, and the block lets out only
+  that. The query is sent in the clear; use a literal address to avoid it.
+  If it fails, DSM uses the address a handshake proved before, or keeps
+  the block and tries again. During an outage it looks the name up again
+  after 5 failed tries, at most every 5 minutes. If the host's DNS goes
+  through a local forwarder other than systemd-resolved (dnsmasq or
+  unbound on 127.0.0.1, or NetworkManager's 127.0.1.1), the lookup cannot
+  work behind the block: use a literal address there, or an address a
+  handshake has proved. IPv6 is rejected (the
+  transport is AF_INET-only, that is, IPv4 only).
 - server_port, listen_port
 - key_file: path to the Argon2id-wrapped X25519 Noise static key
 - cert_file: path to the device's CA-signed leaf certificate (PEM or DER)
@@ -728,14 +784,17 @@ The config file is TOML, at `/opt/mtun/config.toml`.
   backend ignores it.
 - crl_file: optional path to the CA's CRL (PEM or DER)
 - crl_strict: bool (default: true). When true, DSM refuses to start if
-  crl_file is missing or the loaded CRL is past its next_update. When false,
-  a missing or stale CRL only logs a WARNING, and revoked certificates are
-  accepted (meant for lab and dev use only).
+  crl_file is missing or the loaded CRL is past its next_update. A client
+  or a server whose clock is NTP-synchronized keeps going on a CRL past
+  its next update, with a WARNING. With a clock that is not synchronized,
+  a client keeps its kill switch up and waits, and a server does not
+  start. When false, a missing or stale CRL only logs a WARNING, and
+  revoked certificates are accepted (meant for lab and dev use only).
 - expected_server_cn: client only; the subject CN accepted on the server
   certificate
 - allowed_cns_file: server only; one allowed client subject CN per line. The
   file must have no group or world access bits and must be owned by the
-  daemon's uid. Otherwise startup refuses to load it.
+  daemon's uid. Otherwise startup refuses to load it. The n-th name gets the n-th tunnel address (comments do not count), so add new devices at the end; removing or moving a line moves the addresses below it. At most 253 names get an address.
 - max_inflight_handshakes: server only; how many handshake attempts the
   server checks at the same time, over UDP or TCP (default: 8, allowed
   1-4096, warns above 1024 and, at start, below 8). A stalled attempt cannot
@@ -755,7 +814,7 @@ The config file is TOML, at `/opt/mtun/config.toml`.
   table, so keep it last in config.toml and put all other settings above
   it. A setting below it stops startup with a message that names it.
 - tun_name: TUN device name (default: mtun0)
-- mtu: TUN interface MTU in bytes (default: 1400, allowed 576-1500)
+- mtu: TUN interface MTU in bytes (default: 1360, allowed 576-1500)
 - pmtu_discover: turn on kernel PMTUD (path MTU discovery) on the UDP socket
   (default: false). `auto_mtu` needs it, because the kernel only tracks each
   path's MTU when this is on.
