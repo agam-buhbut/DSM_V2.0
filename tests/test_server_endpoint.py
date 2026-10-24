@@ -1,5 +1,4 @@
 import asyncio
-import socket
 from unittest.mock import patch
 
 import pytest
@@ -30,13 +29,25 @@ class TestResolveServerEndpoint:
             gai.assert_not_called()
 
     def test_hostname_resolves_to_first_a_record(self):
-        fake = [(socket.AF_INET, socket.SOCK_DGRAM, 0, "", ("203.0.113.7", 51820))]
-        with patch("socket.getaddrinfo", return_value=fake) as gai:
+        # DSM's own marked lookup (dsm.net.server_lookup), not libc's.
+        with (
+            patch(
+                "dsm.net.server_lookup.system_nameservers", return_value=["192.0.2.53"]
+            ),
+            patch(
+                "dsm.net.server_lookup.lookup_a", return_value="203.0.113.7"
+            ) as lookup,
+        ):
             result = asyncio.run(_resolve_server_endpoint("home.duckdns.org", 51820))
             assert result == "203.0.113.7"
-            gai.assert_called_once()
+            lookup.assert_called_once_with("home.duckdns.org", ["192.0.2.53"])
 
     def test_unresolvable_hostname_raises_oserror(self):
-        with patch("socket.getaddrinfo", side_effect=socket.gaierror("nxdomain")):
+        with (
+            patch(
+                "dsm.net.server_lookup.system_nameservers", return_value=["192.0.2.53"]
+            ),
+            patch("dsm.net.server_lookup.lookup_a", side_effect=OSError("no address")),
+        ):
             with pytest.raises(OSError):
                 asyncio.run(_resolve_server_endpoint("nope.invalid", 51820))

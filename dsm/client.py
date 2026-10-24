@@ -7,7 +7,6 @@ import ipaddress
 import json
 import logging
 import os
-import socket
 import time
 from collections.abc import Callable, Coroutine
 from contextlib import AsyncExitStack
@@ -33,6 +32,7 @@ from dsm.crypto.auth_loader import (
     verify_cert_matches_identity,
 )
 from dsm.crypto.keystore import KeyStore
+from dsm.net import server_lookup
 from dsm.net.nftables import (
     NFTablesManager,
     PreHandshakeKillSwitch,
@@ -112,35 +112,49 @@ class _End(Enum):
     ENDED = auto()  # a session was up and has ended
 
 
-async def _resolve_server_endpoint(server_ip: str, server_port: int) -> str:
-    """Resolve the configured server endpoint to a single literal IPv4.
-
-    An IPv4 literal is returned unchanged with no network I/O. A hostname gets
-    one A-record lookup: the trailing dot stops ``resolv.conf`` search-domain
-    expansion (so only the hostname itself leaks), and the timeout keeps a
-    slow resolver from stalling startup or the SIGTERM handler. Raises
-    ``OSError`` if the name does not resolve in time.
-    """
+def _ipv4_literal(server_ip: str) -> str | None:
+    """``server_ip`` if it is an IPv4 address; None for a server name."""
     try:
         ipaddress.IPv4Address(server_ip)
-        return server_ip
     except ipaddress.AddressValueError:
-        pass
-    loop = asyncio.get_running_loop()
-    query = server_ip if server_ip.endswith(".") else server_ip + "."
-    try:
-        infos = await asyncio.wait_for(
-            loop.getaddrinfo(
-                query, server_port, family=socket.AF_INET, type=socket.SOCK_DGRAM
-            ),
-            timeout=10.0,
-        )
-    except TimeoutError as e:
-        raise OSError(f"timed out resolving server hostname {server_ip!r}") from e
-    if not infos:
-        raise OSError(f"could not resolve server hostname {server_ip!r}")
-    # An AF_INET sockaddr is (host, port); the host is already a str.
-    return str(infos[0][4][0])
+        return None
+    return server_ip
+
+
+async def _resolve_server_endpoint(
+    server_ip: str,
+    server_port: int,
+    *,
+    before_lookup: Callable[[list[str]], None] | None = None,
+) -> str:
+    """Resolve the configured server endpoint to a single literal IPv4.
+
+    An IPv4 literal is returned unchanged with no network I/O. A name gets
+    DSM's own A lookup from marked sockets (dsm.net.server_lookup), in a
+    thread, as dnspython's calls block. ``before_lookup`` first gets the
+    resolvers that will be asked: the client opens its kill switch to them
+    for the lookup. Raises ``OSError`` if the name does not resolve in
+    time; the text names neither the name nor an address.
+    """
+    del server_port  # only the address is looked up; the port stays
+    literal = _ipv4_literal(server_ip)
+    if literal is not None:
+        return literal
+    # Read once: the same list opens the kill switch and is then asked, so a
+    # DHCP change in between cannot send the query to a resolver it drops.
+    nameservers = server_lookup.system_nameservers()
+    if not nameservers:
+        raise OSError("no IPv4 nameserver found in /etc/resolv.conf")
+    if before_lookup is not None:
+        try:
+            before_lookup(nameservers)
+        except OSError as e:
+            # The kill switch could not open: not a failed lookup, so it
+            # must not be retried as one. Up as an error (fail closed).
+            raise RuntimeError(
+                f"could not open the kill switch for the lookup: {e}"
+            ) from e
+    return await asyncio.to_thread(server_lookup.lookup_a, server_ip, nameservers)
 
 
 def _save_server_endpoint(name: str, ip: str) -> None:

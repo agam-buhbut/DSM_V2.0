@@ -10,6 +10,7 @@ recorder.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import socket
 from collections.abc import Callable, Generator, Iterator
@@ -24,6 +25,7 @@ import dns.rcode
 import dns.rrset
 import pytest
 
+from dsm.client import _resolve_server_endpoint
 from dsm.net import server_lookup
 from dsm.net.resolv_conf import DSM_MARKER
 
@@ -381,3 +383,48 @@ def test_a_bad_name_is_an_oserror_without_the_name(marks: _Marks) -> None:
     with _Resolver(udp=[]).patched(), pytest.raises(OSError) as err:
         server_lookup.lookup_a(bad, ["192.0.2.53"])
     assert "xxx" not in str(err.value)
+
+
+def test_the_client_uses_its_own_lookup_not_libcs() -> None:
+    opened: list[list[str]] = []
+    with (
+        patch("socket.getaddrinfo", side_effect=AssertionError("libc lookup")),
+        patch.object(server_lookup, "system_nameservers", return_value=["192.0.2.53"]),
+        patch.object(server_lookup, "lookup_a", return_value="203.0.113.7") as lookup,
+    ):
+        found = asyncio.run(
+            _resolve_server_endpoint(
+                "home.duckdns.org", 51820, before_lookup=opened.append
+            )
+        )
+    assert found == "203.0.113.7"
+    # The kill switch opens for exactly the resolvers that are then asked.
+    assert opened == [["192.0.2.53"]]
+    lookup.assert_called_once_with("home.duckdns.org", ["192.0.2.53"])
+
+
+def test_a_literal_address_is_not_looked_up() -> None:
+    with patch.object(server_lookup, "lookup_a") as lookup:
+        assert asyncio.run(_resolve_server_endpoint("192.0.2.1", 51820)) == "192.0.2.1"
+    lookup.assert_not_called()
+
+
+def test_no_resolver_is_a_failed_lookup_and_opens_nothing() -> None:
+    opened: list[list[str]] = []
+    with (
+        patch.object(server_lookup, "system_nameservers", return_value=[]),
+        pytest.raises(OSError, match="no IPv4 nameserver"),
+    ):
+        asyncio.run(_resolve_server_endpoint(NAME, 51820, before_lookup=opened.append))
+    assert opened == []
+
+
+def test_a_kill_switch_that_cannot_open_is_not_a_failed_lookup() -> None:
+    def refuse(_servers: list[str]) -> None:
+        raise FileNotFoundError("nft")
+
+    with (
+        patch.object(server_lookup, "system_nameservers", return_value=["192.0.2.53"]),
+        pytest.raises(RuntimeError, match="could not open the kill switch"),
+    ):
+        asyncio.run(_resolve_server_endpoint(NAME, 51820, before_lookup=refuse))
