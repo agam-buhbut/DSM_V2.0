@@ -84,9 +84,6 @@ def lookup_a(name: str, nameservers: list[str] | None = None) -> str:
         nameservers = system_nameservers()
     if not nameservers:
         raise OSError("no IPv4 nameserver found in /etc/resolv.conf")
-    # The trailing dot stops search-domain expansion, so only the name
-    # itself leaves.
-    query = dns.message.make_query(name.rstrip(".") + ".", dns.rdatatype.A)
     deadline = time.monotonic() + LOOKUP_TIMEOUT_S
     asked = 0
     reason = "out of time"
@@ -96,6 +93,7 @@ def lookup_a(name: str, nameservers: list[str] | None = None) -> str:
             break
         asked += 1
         try:
+            query = dns.message.make_query(name, dns.rdatatype.A)
             reply = _ask(query, server, min(deadline, now + _PER_SERVER_S))
         # dnspython raises the builtin EOFError when the far end closes the
         # TCP connection, which anyone on the path can do.
@@ -105,7 +103,10 @@ def lookup_a(name: str, nameservers: list[str] | None = None) -> str:
         if reply.rcode() != dns.rcode.NOERROR:
             reason = dns.rcode.to_text(reply.rcode())
             continue
-        address = _first_a(reply)
+        try:
+            address = _first_a(reply)
+        except dns.exception.DNSException:
+            address = None
         if address is not None:
             return address
         reason = "no A record"
@@ -120,10 +121,22 @@ def _ask(
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
         apply_so_mark(udp)
         udp.setblocking(False)
-        reply = dns.query.udp(
-            query, server, timeout=_left(deadline), port=_DNS_PORT, sock=udp
-        )
-    if not reply.flags & dns.flags.TC:
+        try:
+            reply = dns.query.udp(
+                query,
+                server,
+                timeout=_left(deadline),
+                port=_DNS_PORT,
+                sock=udp,
+                # A cut reply may end mid-record: that is the same signal.
+                raise_on_truncation=True,
+                # A stray or forged reply must not end the wait for the
+                # real one.
+                ignore_errors=True,
+            )
+        except dns.message.Truncated:
+            reply = None
+    if reply is not None and not reply.flags & dns.flags.TC:
         return reply
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcp:
         apply_so_mark(tcp)
@@ -147,13 +160,15 @@ def _left(deadline: float) -> float:
 
 
 def _first_a(reply: dns.message.Message) -> str | None:
-    for rrset in reply.answer:
-        if rrset.rdtype != dns.rdatatype.A:
-            continue
-        # dnspython's Rdataset.__iter__ is untyped (as in dsm.net.dns).
-        for rdata in cast(Iterable[dns.rdata.Rdata], rrset):
-            if isinstance(rdata, dns.rdtypes.IN.A.A):
-                return str(rdata.address)
+    # Only the answer chain for the asked name counts, not any A record
+    # that came along.
+    rrset = cast(dns.message.QueryMessage, reply).resolve_chaining().answer
+    if rrset is None or rrset.rdtype != dns.rdatatype.A:
+        return None
+    # dnspython's Rdataset.__iter__ is untyped (as in dsm.net.dns).
+    for rdata in cast(Iterable[dns.rdata.Rdata], rrset):
+        if isinstance(rdata, dns.rdtypes.IN.A.A):
+            return str(rdata.address)
     return None
 
 

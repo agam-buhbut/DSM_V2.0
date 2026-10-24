@@ -116,6 +116,12 @@ class _Resolver:
         self._plans: dict[str, list[Any]] = {"udp": udp, "tcp": tcp or []}
         self.asked: list[tuple[str, str, str]] = []  # (proto, server, name)
         self.timeouts: list[float] = []
+        self.socks: list[socket.socket] = []
+
+    def assert_marked_and_closed(self, marked: list[socket.socket]) -> None:
+        # dnspython got the very sockets that were marked, and none leaks.
+        assert self.socks == marked
+        assert all(s.fileno() == -1 for s in marked)
 
     def _answer(self, proto: str, query: Any, where: str, timeout: float) -> Any:
         self.asked.append((proto, where, query.question[0].name.to_text()))
@@ -125,18 +131,30 @@ class _Resolver:
             raise step
         return step(query)
 
-    def udp(self, query: Any, where: str, timeout: float, port: int, sock: Any) -> Any:
+    def udp(
+        self, query: Any, where: str, timeout: float, port: int, sock: Any, **kw: Any
+    ) -> Any:
         assert sock is not None and port == 53
+        assert kw == {"raise_on_truncation": True, "ignore_errors": True}
+        assert sock.getblocking() is False  # the deadline is dnspython's
+        self.socks.append(sock)
         return self._answer("udp", query, where, timeout)
 
     def tcp(self, query: Any, where: str, timeout: float, port: int, sock: Any) -> Any:
         assert sock is not None and port == 53
+        assert sock.getblocking() is False
+        self.socks.append(sock)
         return self._answer("tcp", query, where, timeout)
 
     @contextlib.contextmanager
     def patched(self) -> Generator[None, None, None]:
         with patch("dns.query.udp", self.udp), patch("dns.query.tcp", self.tcp):
             yield
+
+
+def _on_the_wire(reply: dns.message.Message) -> dns.message.Message:
+    # A parsed reply, as dnspython hands it over (its rrset index is built).
+    return dns.message.from_wire(reply.to_wire())
 
 
 def _a(*addresses: str, tc: bool = False) -> Reply:
@@ -148,7 +166,7 @@ def _a(*addresses: str, tc: bool = False) -> Reply:
             )
         if tc:
             reply.flags |= dns.flags.TC
-        return reply
+        return _on_the_wire(reply)
 
     return build
 
@@ -157,27 +175,42 @@ def _rcode(rcode: dns.rcode.Rcode) -> Reply:
     def build(query: dns.message.Message) -> dns.message.Message:
         reply = dns.message.make_response(query)
         reply.set_rcode(rcode)
-        return reply
+        return _on_the_wire(reply)
 
     return build
 
 
+class _Marks(list[socket.SocketKind]):
+    def __init__(self) -> None:
+        super().__init__()
+        self.socks: list[socket.socket] = []
+
+
 @pytest.fixture
-def marks() -> Iterator[list[socket.SocketKind]]:
-    seen: list[socket.SocketKind] = []
-    with patch.object(server_lookup, "apply_so_mark", lambda s: seen.append(s.type)):
+def marks() -> Iterator[_Marks]:
+    seen = _Marks()
+
+    def record(sock: socket.socket) -> None:
+        seen.append(sock.type)
+        seen.socks.append(sock)
+
+    with patch.object(server_lookup, "apply_so_mark", record):
         yield seen
 
 
 def test_the_first_a_record_comes_back_over_marked_udp(
-    marks: list[socket.SocketKind],
+    marks: _Marks,
 ) -> None:
     resolver = _Resolver(udp=[_a("203.0.113.7", "203.0.113.8")])
     with resolver.patched():
-        assert server_lookup.lookup_a(NAME, ["192.0.2.53"]) == "203.0.113.7"
-    # The trailing dot: no search domain is added, only the name leaves.
+        # dnspython shuffles the addresses of a reply when it writes it.
+        assert server_lookup.lookup_a(NAME, ["192.0.2.53"]) in {
+            "203.0.113.7",
+            "203.0.113.8",
+        }
     assert resolver.asked == [("udp", "192.0.2.53", "vpn.example.org.")]
     assert marks == [socket.SOCK_DGRAM]
+    resolver.assert_marked_and_closed(marks.socks)
     assert resolver.timeouts[0] <= 3.0
 
 
@@ -186,15 +219,24 @@ def test_a_cut_short_answer_is_asked_again_over_marked_tcp() -> None:
     # before DSM connects it, so the SYN carries the mark (the start-up
     # table drops an unmarked one).
     steps: list[tuple[str, Any]] = []
+    marked: list[socket.socket] = []
     resolver = _Resolver(udp=[_a(tc=True)], tcp=[_a("203.0.113.7")])
+
+    def mark(sock: socket.socket) -> None:
+        steps.append(("mark", sock.type))
+        marked.append(sock)
+
+    def connect(sock: socket.socket, addr: Any) -> None:
+        # connect must be bounded by the time left (dnspython's own sends
+        # are non-blocking, but this one is not).
+        timeout = sock.gettimeout()
+        assert timeout is not None and 0 < timeout <= 3.0
+        steps.append(("connect", addr))
+
     with (
         resolver.patched(),
-        patch.object(
-            server_lookup, "apply_so_mark", lambda s: steps.append(("mark", s.type))
-        ),
-        patch.object(
-            socket.socket, "connect", lambda _s, addr: steps.append(("connect", addr))
-        ),
+        patch.object(server_lookup, "apply_so_mark", mark),
+        patch.object(socket.socket, "connect", connect),
     ):
         assert server_lookup.lookup_a(NAME, ["192.0.2.53"]) == "203.0.113.7"
     assert [proto for proto, _, _ in resolver.asked] == ["udp", "tcp"]
@@ -203,10 +245,11 @@ def test_a_cut_short_answer_is_asked_again_over_marked_tcp() -> None:
         ("mark", socket.SOCK_STREAM),
         ("connect", ("192.0.2.53", 53)),
     ]
+    resolver.assert_marked_and_closed(marked)
 
 
 def test_a_resolver_that_closes_the_tcp_retry_is_skipped(
-    marks: list[socket.SocketKind],
+    marks: _Marks,
 ) -> None:
     # dnspython raises the builtin EOFError, not an OSError, when the far end
     # closes the TCP connection. Plain DNS has no protection, so anyone on
@@ -225,7 +268,7 @@ def test_a_resolver_that_closes_the_tcp_retry_is_skipped(
     ]
 
 
-def test_the_tcp_retry_gets_only_the_time_left(marks: list[socket.SocketKind]) -> None:
+def test_the_tcp_retry_gets_only_the_time_left(marks: _Marks) -> None:
     clock = [100.0]
 
     def slow(query: dns.message.Message) -> dns.message.Message:
@@ -243,7 +286,7 @@ def test_the_tcp_retry_gets_only_the_time_left(marks: list[socket.SocketKind]) -
 
 
 def test_a_resolver_that_does_not_answer_is_skipped(
-    marks: list[socket.SocketKind],
+    marks: _Marks,
 ) -> None:
     resolver = _Resolver(udp=[dns.exception.Timeout(), _a("203.0.113.7")])
     with resolver.patched():
@@ -253,7 +296,7 @@ def test_a_resolver_that_does_not_answer_is_skipped(
     assert [server for _, server, _ in resolver.asked] == ["192.0.2.53", "192.0.2.54"]
 
 
-def test_a_cname_is_followed_to_its_a_record(marks: list[socket.SocketKind]) -> None:
+def test_a_cname_is_followed_to_its_a_record(marks: _Marks) -> None:
     def build(query: dns.message.Message) -> dns.message.Message:
         reply = dns.message.make_response(query)
         name = query.question[0].name
@@ -263,14 +306,14 @@ def test_a_cname_is_followed_to_its_a_record(marks: list[socket.SocketKind]) -> 
         reply.answer.append(
             dns.rrset.from_text("home.example.net.", 60, "IN", "A", "203.0.113.7")
         )
-        return reply
+        return _on_the_wire(reply)
 
     with _Resolver(udp=[build]).patched():
         assert server_lookup.lookup_a(NAME, ["192.0.2.53"]) == "203.0.113.7"
 
 
 def test_no_address_anywhere_is_an_oserror_that_names_no_server(
-    marks: list[socket.SocketKind],
+    marks: _Marks,
 ) -> None:
     resolver = _Resolver(udp=[_rcode(dns.rcode.NXDOMAIN), _rcode(dns.rcode.SERVFAIL)])
     with resolver.patched(), pytest.raises(OSError) as err:
@@ -292,7 +335,7 @@ def test_a_mark_the_host_refuses_is_an_oserror() -> None:
     assert resolver.asked == []
 
 
-def test_nothing_is_asked_once_the_time_is_up(marks: list[socket.SocketKind]) -> None:
+def test_nothing_is_asked_once_the_time_is_up(marks: _Marks) -> None:
     resolver = _Resolver(udp=[])
     with (
         patch.object(server_lookup, "LOOKUP_TIMEOUT_S", 0.0),
@@ -301,3 +344,40 @@ def test_nothing_is_asked_once_the_time_is_up(marks: list[socket.SocketKind]) ->
     ):
         server_lookup.lookup_a(NAME, ["192.0.2.53"])
     assert resolver.asked == []
+
+
+def test_a_reply_cut_in_the_middle_of_a_record_is_retried_over_tcp(
+    marks: _Marks,
+) -> None:
+    # With raise_on_truncation, dnspython raises Truncated for a TC reply
+    # whatever it holds; a plain parse of such a reply can fail instead.
+    resolver = _Resolver(
+        udp=[dns.message.Truncated(message=None)], tcp=[_a("203.0.113.7")]
+    )
+    with (
+        resolver.patched(),
+        patch.object(socket.socket, "connect", lambda _s, _addr: None),
+    ):
+        assert server_lookup.lookup_a(NAME, ["192.0.2.53"]) == "203.0.113.7"
+    assert [proto for proto, _, _ in resolver.asked] == ["udp", "tcp"]
+
+
+def test_an_unrelated_a_record_is_not_taken(marks: _Marks) -> None:
+    def build(query: dns.message.Message) -> dns.message.Message:
+        reply = dns.message.make_response(query)
+        reply.answer.append(
+            dns.rrset.from_text("unrelated.example.", 60, "IN", "A", "198.51.100.66")
+        )
+        return _on_the_wire(reply)
+
+    with _Resolver(udp=[build]).patched(), pytest.raises(OSError) as err:
+        server_lookup.lookup_a(NAME, ["192.0.2.53"])
+    assert "198.51.100.66" not in str(err.value)
+    assert "last: no A record" in str(err.value)
+
+
+def test_a_bad_name_is_an_oserror_without_the_name(marks: _Marks) -> None:
+    bad = "x" * 70 + ".example.org"  # a label over 63 bytes
+    with _Resolver(udp=[]).patched(), pytest.raises(OSError) as err:
+        server_lookup.lookup_a(bad, ["192.0.2.53"])
+    assert "xxx" not in str(err.value)
