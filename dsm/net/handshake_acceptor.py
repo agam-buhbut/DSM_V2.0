@@ -507,7 +507,7 @@ async def _run_attempt(
     ``record`` is the attempt's record. Over TCP it is marked as signing
     once the first frame passed, until msg2 has left (UDP's view does that
     for UDP), and it loses its ``proved`` bit when the shared limits refuse
-    the first frame, which is not the address's doing. Over both it loses
+    the first frame, which is not the address's doing. Over UDP it loses
     that bit when msg3 does not open (spec §3.7 E2).
     """
     from cryptography.x509.oid import ExtendedKeyUsageOID
@@ -608,9 +608,15 @@ async def _run_attempt(
             HandshakeError,
         ) as e:
             _note_trouble(gate)
-            if isinstance(e, BadMsg3Error) and record is not None:
+            if (
+                isinstance(e, BadMsg3Error)
+                and isinstance(conn, _PerPeerUDPView)
+                and record is not None
+            ):
                 # Over UDP a spoofed datagram in this attempt looks the same:
                 # no penalty, so it cannot bar a real client (spec §3.7 E2).
+                # Nobody off the path can slip a frame into a TCP connection,
+                # so there it pays like any failure (owner, 2026-10-24).
                 record.proved = False
             # Same opaque INFO/WARNING logging as before; detail at DEBUG.
             if isinstance(e, (CNNotAllowedError, CertRevokedError, CertAuthError)):

@@ -1,8 +1,9 @@
 """Who a failed or pushed-out start spares (multi-client spec §3.7 E2,
-§4.3; owner decisions 2026-10-23): a proved start whose msg3 does not open
-bars nothing, and a push-out victim whose msg2 left less than
-_REPLY_ALLOWANCE_S ago did not stall. On test_client_acceptor.py's harness:
-scripted handshakes, the real session table, limiter and gate, fake clocks.
+§4.3; owner decisions 2026-10-23, 2026-10-24): a proved UDP start whose
+msg3 does not open bars nothing (over TCP it bars like any failure), and a
+push-out victim whose msg2 left less than _REPLY_ALLOWANCE_S ago did not
+stall. On test_client_acceptor.py's harness: scripted handshakes, the real
+session table, limiter and gate, fake clocks.
 """
 
 from __future__ import annotations
@@ -84,12 +85,11 @@ async def test_a_proved_start_whose_msg3_does_not_open_bars_nothing(
     assert limiter.try_start(B[0]) is not barred
 
 
-@pytest.mark.parametrize(
-    ("bad_msg3", "barred"), [(True, False), (False, True)], ids=["bad-msg3", "other"]
-)
-async def test_a_tcp_start_whose_msg3_does_not_open_bars_nothing(
-    bad_msg3: bool, barred: bool
-) -> None:
+@pytest.mark.parametrize("bad_msg3", [True, False], ids=["bad-msg3", "other"])
+async def test_a_tcp_start_whose_msg3_does_not_open_is_barred(bad_msg3: bool) -> None:
+    # Owner decision 2026-10-24: the exemption is for UDP only. Nobody off
+    # the path can slip a frame into a TCP connection, so there it would
+    # only make an attack cheaper.
     limiter = SourceLimiter(clock=_Frozen())
     hs = _Hs()
     (hs.bad_msg3 if bad_msg3 else hs.fail).add(B)
@@ -97,7 +97,7 @@ async def test_a_tcp_start_whose_msg3_does_not_open_bars_nothing(
         conn = run.connect(B, [_msg1(1)])
         assert await _spin(lambda: conn.closed)
     assert conn.sent == [MSG2]  # it got as far as msg3
-    assert limiter.try_start(B[0], shared=False) is not barred
+    assert not limiter.try_start(B[0], shared=False)
 
 
 @pytest.mark.parametrize(

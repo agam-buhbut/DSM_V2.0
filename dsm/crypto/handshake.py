@@ -145,9 +145,9 @@ class ClientRefusedError(HandshakeError):
 
 
 class BadMsg3Error(HandshakeError):
-    """The client's msg3 did not open. A spoofed datagram in a real client's
-    attempt looks the same, so the acceptor does not bar the address for it
-    (multi-client spec §3.7 E2)."""
+    """The client's msg3 did not open. Over UDP a spoofed datagram in a real
+    client's attempt looks the same, so there the acceptor does not bar the
+    address for it (multi-client spec §3.7 E2)."""
 
 
 @dataclass(frozen=True, slots=True)

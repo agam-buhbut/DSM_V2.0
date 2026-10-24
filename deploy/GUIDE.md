@@ -2223,8 +2223,8 @@ every handshake slot. The limits are the same for UDP and TCP:
 - "that address's last handshake failed": an unknown address whose last
   handshake proved the address (a cookie over UDP, the connection over TCP)
   and then failed or stalled may not start another for 30 s. Two starts cost
-  nothing: one whose final handshake message does not open, and one pushed
-  out less than 1.29 s after the server's reply left.
+  nothing: one over UDP whose final handshake message does not open, and
+  one pushed out less than 1.29 s after the server's reply left.
 
 Over TCP, the overall limit and the limit for unknown addresses are checked
 when the connection's first handshake message arrives (after its mac1
@@ -2269,11 +2269,11 @@ addresses can still make new devices wait while it lasts. Over TCP with no
 key at all it takes about 170 addresses, since a failed start bars its
 address for 30 s. Over UDP with the CA certificate and the server's name, it
 takes about 4 addresses once a client has connected, and about 16 right
-after a restart, if each start ends with a bad final message (that costs its
-address nothing, as said above). An attacker who stalls instead needs about
-31 (once a client has connected) or about 125 (right after a restart). A
-device coming back from an address it connected from in this run is not held
-back.
+after a restart, if each start ends with a bad final message (over UDP that
+costs its address nothing, as said above). An attacker who stalls instead,
+or who uses TCP, needs about 31 (once a client has connected) or about 125
+(right after a restart). A device coming back from an address it connected
+from in this run is not held back.
 
 With `transport = "tcp"` the server keeps its one listening socket open for
 the whole run, so one silent connection does not hold up other clients and
