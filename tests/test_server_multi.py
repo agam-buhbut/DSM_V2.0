@@ -1226,6 +1226,63 @@ async def test_a_tcp_session_closes_its_connection_when_it_ends() -> None:
     assert conn.closed  # the session's stack closed it
 
 
+async def test_a_tcp_session_whose_setup_fails_early_still_closes_its_connection(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Spec §5: "its setup raises -> its stack unwinds". A raise before the
+    # session's stack exists leaves the close to the session's task.
+    caplog.set_level(logging.ERROR, logger="dsm")
+
+    class _BrokenFSM(SessionFSM):
+        def transition(self, target: State) -> None:
+            if target is State.ESTABLISHED:
+                raise RuntimeError("setup bug")
+            super().transition(target)
+
+    class _Proxy:
+        def __init__(self) -> None:
+            self.forgotten: list[str] = []
+
+        def forget(self, client_ip: str) -> None:
+            self.forgotten.append(client_ip)
+
+    table = SessionTable([A])
+    attempt = object()
+    client = VerifiedClient(cn=A, noise_static=b"\x01" * 32)
+    table.admit(attempt, client)
+    _, tunnel = table.confirm(attempt)
+    table.release(attempt)
+    conn = _Conn(PEER_A)
+    session = ServerSession(
+        number=1,
+        client=client,
+        tunnel=tunnel,
+        session_keys=_Keys(),  # type: ignore[arg-type]
+        transport=conn,
+        shutdown=asyncio.Event(),
+        tun_queue=asyncio.Queue(),
+        peer=PEER_A,
+    )
+    table.add(session)
+    proxy = _Proxy()
+    host = server._Host(tun=_FakeTun(), dns_proxy=proxy)  # type: ignore[arg-type]
+    with patch("dsm.server.SessionFSM", _BrokenFSM):
+        await server._serve_client(
+            replace(_server_config(), transport="tcp"),
+            _FakeStore(),  # type: ignore[arg-type]
+            table,
+            host,
+            session,
+        )
+    assert conn.closed
+    assert table.sessions() == []
+    assert proxy.forgotten == ["10.8.0.2"]
+    (error,) = _errors(caplog)
+    assert error.getMessage() == (
+        f"session 1 failed (client_cn={A}); other clients are not affected"
+    )
+
+
 async def test_each_session_task_carries_its_own_label() -> None:
     captured: dict[str, Any] = {}
     sessions = _Sessions()

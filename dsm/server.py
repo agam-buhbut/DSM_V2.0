@@ -518,6 +518,11 @@ async def _serve_client(
                 session.number,
                 session.tun_drops,
             )
+        if isinstance(session.transport, TCPTransport):
+            # Its session stack closes it, but a setup that raised before the
+            # stack existed did not (spec §5). A second close does nothing.
+            # Last, so a cancel here cannot skip the table's cleanup above.
+            await session.transport.aclose()
 
 
 async def run_server(
