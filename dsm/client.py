@@ -567,6 +567,14 @@ async def run_client(
                         ) from e
                 raise
 
+        def _with_proven(found: str) -> list[str]:
+            """The fresh answer first, then the proven address if it differs
+            (re-decision 5): a bad or stale answer then costs one try, not
+            the connection."""
+            if proven is None or proven == found:
+                return [found]
+            return [found, proven]
+
         # Mistakes in the cert files or the config (a missing or bad file, a
         # wrong pin) exit 1, as before (owner ruling Q1). A date problem or a
         # name that does not resolve can mend by itself (a fresh CRL copied
@@ -612,7 +620,7 @@ async def run_client(
                     log.info(
                         "resolved server hostname %s -> %s", config.server_ip, found
                     )
-                    candidates = [found]
+                    candidates = _with_proven(found)
             if problem is None:
                 break
             kind, text = problem
@@ -1051,11 +1059,31 @@ async def run_client(
                 )
             return _End.ENDED
 
+        async def _look_up_again() -> bool:
+            """During an outage the server's address may have changed: look
+            the name up again (re-decision 5). A new address goes first and
+            the proven one stays second. Returns True if the user stopped
+            DSM during the lookup (the kill switch is released on exit)."""
+            nonlocal candidates
+            try:
+                found = await _look_up()
+            except OSError as e:
+                log.warning("looked the server name up again: %s", e)
+                return False
+            if found is None:
+                return True
+            if found not in candidates:
+                log.info("the server name has a new address; DSM tries it first")
+            candidates = _with_proven(found)
+            _swap()  # the server addresses only, in one nft commit
+            return False
+
         # Connect, run the session, and connect again when it ends, until the
         # user stops DSM. Between tries only the pre-handshake table is up.
         # With two addresses for a name, the tries take turns.
         first = True
         tries = 0
+        last_lookup = time.monotonic()
         while not shutdown.is_set():
             end = await _connect_and_run(first, candidates[tries % len(candidates)])
             if end is _End.SETUP_ERROR:
@@ -1066,6 +1094,15 @@ async def run_client(
             tries += 1
             if end is _End.FAILED:
                 reconnect.failed()
+                if (
+                    looked_up_name
+                    and reconnect.failures >= HOSTNAME_HINT_AFTER
+                    and time.monotonic() - last_lookup >= RELOOKUP_EVERY_S
+                ):
+                    last_lookup = time.monotonic()
+                    if await _look_up_again():
+                        break
+                    tries = 0  # the fresh answer first
             if await _wait_or_stop(shutdown, reconnect.next_wait()):
                 break
 
