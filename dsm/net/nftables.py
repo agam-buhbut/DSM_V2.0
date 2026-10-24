@@ -29,8 +29,15 @@ def _ip_proto(server_ip: str) -> str:
     return "ip6" if ipaddress.ip_address(server_ip).version == 6 else "ip"
 
 
+def _check_address(address: str) -> None:
+    """Raise ValueError unless ``address`` is a plain IP (no ``%scope``)."""
+    if ipaddress.ip_address(address).version == 6 and "%" in address:
+        raise ValueError(f"scoped address not allowed: {address}")
+
+
 def _nft_set(addresses: Sequence[str]) -> str:
-    """One address as itself, more as an anonymous nft set."""
+    """One address as itself, more as an anonymous nft set (no repeats)."""
+    addresses = list(dict.fromkeys(addresses))
     if len(addresses) == 1:
         return addresses[0]
     return "{ " + ", ".join(addresses) + " }"
@@ -149,7 +156,7 @@ class PreHandshakeKillSwitch:
     ) -> None:
         ips = [server_ips] if isinstance(server_ips, str) else list(server_ips or ())
         for ip in ips:
-            ipaddress.ip_address(ip)  # raises on bad input
+            _check_address(ip)  # raises on bad input
         if len({_ip_proto(ip) for ip in ips}) > 1:
             raise ValueError("server addresses must all be IPv4 or all IPv6")
         for address in (*resolvers, *(ntp.servers if ntp is not None else ())):
@@ -211,7 +218,7 @@ class PreHandshakeKillSwitch:
         }
         lines: list[str] = []
         for line in _load_template("pre_handshake.conf").splitlines(keepends=True):
-            tag = next((t for t in keep if t in line), None)
+            tag = next((t for t in keep if line.lstrip().startswith(t)), None)
             if tag is None:
                 lines.append(line)
             elif keep[tag]:
@@ -290,13 +297,20 @@ class NFTablesManager:
         # the same port hit the chain's `policy drop`. Same logic mirrored for
         # IPv4 servers.
         ip_proto = _ip_proto(self._server_ip)
+        _check_address(self._server_ip)
         validate_tun_name(self._tun_name)
         template = _load_template("nftables.conf")
+        pmtu = (
+            "icmpv6 type packet-too-big"
+            if ip_proto == "ip6"
+            else "icmp type destination-unreachable icmp code frag-needed"
+        )
         return (
             template.replace("{SERVER_IP}", self._server_ip)
             .replace("{SERVER_PORT}", str(int(self._server_port)))
             .replace("{TUN_NAME}", self._tun_name)
             .replace("{IP_PROTO}", ip_proto)
+            .replace("{PMTU_ICMP}", pmtu)
             .replace("{FWMARK}", f"{int(FWMARK):#x}")
         )
 
