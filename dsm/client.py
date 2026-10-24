@@ -545,7 +545,7 @@ async def run_client(
             the user stopped DSM first. Raises OSError when the name does
             not resolve; port 53 is closed again before that, and before any
             other error or a cancel goes up. A working lookup leaves it open
-            for the one swap to the server's address after the start loop."""
+            for the caller's one swap to the server's address."""
             try:
                 return await _unless_stopped(
                     shutdown,

@@ -15,6 +15,7 @@ import json
 import logging
 from collections.abc import Sequence
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
@@ -129,9 +130,11 @@ async def test_a_new_lookup_that_fails_keeps_the_old_address(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     run = _Run()
-    run.stop_at_wait = 5
+    run.stop_at_wait = 6
     tried, handshake = _handshakes(run)
-    lookup = AsyncMock(side_effect=["10.0.0.1", OSError("no address")])
+    lookup = AsyncMock(
+        side_effect=["10.0.0.1", OSError("no address"), OSError("no address")]
+    )
     caplog.set_level(logging.WARNING, logger="dsm")
     with (
         patch.object(client_mod, "RELOOKUP_EVERY_S", 0.0),
@@ -139,13 +142,15 @@ async def test_a_new_lookup_that_fails_keeps_the_old_address(
         patch("dsm.client._resolve_server_endpoint", lookup),
     ):
         assert await run.run(_config(server_ip=NAME), handshake=handshake) == 0
-    assert tried == ["10.0.0.1"] * 5
+    assert tried == ["10.0.0.1"] * 6  # DSM went on trying after the failures
+    assert run.events.count("pre.remove") == 1
+    assert run.events[-1] == "pre.remove"
     again = [
         r
         for r in caplog.records
         if r.getMessage().startswith("looked the server name up again")
     ]
-    assert [r.levelno for r in again] == [logging.WARNING]
+    assert [r.levelno for r in again] == [logging.WARNING] * 2
 
 
 async def test_a_stop_during_the_new_lookup_ends_dsm(tmp_path: Path) -> None:
@@ -302,3 +307,44 @@ async def test_a_stop_during_a_new_lookup_with_the_flag_keeps_the_plain_block(
     assert len(calls) == 2
     assert "pre.remove" not in run.events
     assert run.tables[-2:] == ["10.0.0.1 +dns", "10.0.0.1"]  # 53 closed again
+
+
+async def test_a_new_lookup_keeps_the_proven_address_second(tmp_path: Path) -> None:
+    saved = tmp_path / "server-endpoint.json"
+    _save(saved, "10.0.0.9")
+    run = _TableRun()
+    run.stop_at_wait = 6
+    tried, handshake = _handshakes(run)
+    answers = ["10.0.0.1", "10.0.0.2", "10.0.0.2"]
+
+    async def lookup(_name: str, _port: int, **kwargs: Any) -> str:
+        kwargs["before_lookup"](["192.0.2.53"])
+        return answers.pop(0)
+
+    with (
+        patch.object(client_mod, "RELOOKUP_EVERY_S", 0.0),
+        patch("dsm.client._SERVER_ENDPOINT_FILE", saved),
+        patch("dsm.client._resolve_server_endpoint", lookup),
+    ):
+        assert await run.run(_config(server_ip=NAME), handshake=handshake) == 0
+    assert tried == ["10.0.0.1", "10.0.0.9"] * 2 + ["10.0.0.1", "10.0.0.2"]
+    assert "10.0.0.2,10.0.0.9" in run.tables
+
+
+async def test_new_lookups_are_spaced_by_the_time_since_the_last_one(
+    tmp_path: Path,
+) -> None:
+    run = _Run()
+    run.stop_at_wait = 9
+    _, handshake = _handshakes(run)
+    lookup = AsyncMock(return_value="10.0.0.1")
+    ticks = iter(range(0, 100000, 600))  # 600 s pass at every look at the clock
+    fake_time = SimpleNamespace(monotonic=lambda: float(next(ticks)))
+    with (
+        patch.object(client_mod, "RELOOKUP_EVERY_S", 1000.0),
+        patch.object(client_mod, "time", fake_time),
+        patch("dsm.client._SERVER_ENDPOINT_FILE", tmp_path / "server-endpoint.json"),
+        patch("dsm.client._resolve_server_endpoint", lookup),
+    ):
+        assert await run.run(_config(server_ip=NAME), handshake=handshake) == 0
+    assert lookup.await_count == 3
