@@ -38,7 +38,12 @@ RANDFILE         = $dir/private/.rand
 
 default_md       = sha384
 default_days     = 365
-default_crl_days = 31
+# A CRL reaches a host only when you carry it there, so a short life adds
+# outages, not safety. It lasts a month longer than a cert (default_days),
+# so a cert runs out a month before the CRL made with it and the two never
+# run out on the same day. To revoke a cert, make a new CRL and carry it
+# to every host at once (deploy/GUIDE.md §7e).
+default_crl_days = 395
 
 policy           = policy_strict
 unique_subject   = no

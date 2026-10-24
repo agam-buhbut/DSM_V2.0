@@ -1,9 +1,10 @@
 """Certificate Revocation List (CRL) handling for DSM auth.
 
 The CRL is produced by the offline CA (signed with the CA private key)
-and distributed to servers/clients via walked USB on the operator's
-chosen cadence (monthly per the plan). Both ends consult their local
-CRL on every handshake.
+and carried to servers and clients on a USB stick; a new one lasts 395
+days, a month longer than a cert (deploy/openssl-ca.cnf
+``default_crl_days``). Both ends consult their local CRL on every
+handshake.
 
 This module:
   * loads a CRL from disk in DER or PEM
