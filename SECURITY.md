@@ -73,29 +73,33 @@ closed as known:
   recognizable traffic pattern before cover traffic is active, allowing an
   observer to identify that DSM is in use. Masking pre-key traffic is
   post-v1 research.
-- **Client start-up openings.** The client's kill switch is up from the
-  first moment of a start, but it opens two narrow holes, each only while
-  needed. While DSM looks up a DDNS server name, DSM itself (root, a
+- **Client start-up openings.** The client's kill switch goes up before DSM
+  reads its cert files, looks up the server name or asks for the passphrase
+  (a few errors come earlier; see below). Besides DHCP, which it always lets
+  out, it opens two narrow holes, each only while needed. If DSM crashes
+  while one is open, the hole stays until the next start or `sudo dsm
+  cleanup`. While DSM looks up a DDNS server name, DSM itself (root, a
   socket with its mark) may send DNS on port 53 to the resolvers it chose,
   in the clear: the local network and the resolver see the name. This
-  happens at start, and during an outage after 5 failed tries, at most
-  every 5 minutes. A spoofed answer cannot redirect the client (the
-  handshake authenticates the server). Once a handshake has worked, the
-  address it proved stays a second one to try, so a hostile resolver then
-  gains at most a delay; before that (a first start, a new host), a
-  resolver that keeps lying keeps the client out, and sees its handshake
-  starts, for as long as it lies. If the host's DNS goes through a local
-  forwarder other than systemd-resolved (dnsmasq or unbound on 127.0.0.1,
-  or NetworkManager's 127.0.1.1), the name cannot be looked up behind the
-  block: only a proven address or a literal IP works there.
-  While a date problem holds a start, systemd-timesyncd may send NTP on
-  UDP port 123 to the servers its config or DHCP names by IP address, in
-  the clear, so the clock can heal. Only a program with CAP_NET_ADMIN or
-  CAP_NET_RAW can set DSM's mark, and the kill switch takes marked packets
-  to the server and the resolvers only from root. The start-up block stops
-  the normal network traffic of other programs; it does not promise more.
-  A program with raw-packet rights (CAP_NET_RAW) can get around any
-  firewall rule of this kind.
+  happens at start, and during an outage after 5 failed tries, at most every
+  5 minutes. A spoofed answer cannot redirect the client (the handshake
+  authenticates the server). Once a handshake has worked, the address it
+  proved stays a second one to try, so a hostile resolver then gains at most
+  a delay; before that (a first start, a new host), a resolver that keeps
+  lying keeps the client out, and sees its handshake starts, for as long as
+  it lies. If the host's DNS goes through a local forwarder other than
+  systemd-resolved (dnsmasq or unbound on 127.0.0.1, or NetworkManager's
+  127.0.1.1), the name cannot be looked up behind the block: set server_ip
+  to the server's IP address there. An address a handshake proved earlier,
+  when the host's DNS did not go through such a forwarder, also works, but
+  only until the server's IP changes. While a date problem holds a start,
+  systemd-timesyncd may send NTP on UDP port 123 to the servers its config
+  or DHCP names by IP address, in the clear, so the clock can heal. Only a
+  program with CAP_NET_ADMIN or CAP_NET_RAW can set DSM's mark, and the kill
+  switch takes marked packets to the server and the resolvers only from
+  root. The start-up block stops the normal network traffic of other
+  programs; it does not promise more. A program with raw-packet rights
+  (CAP_NET_RAW) can get around any firewall rule of this kind.
 - **A stale CRL on a synchronized host.** A client or a server whose clock
   is NTP-synchronized keeps going on a CRL past its next update, with a
   WARNING. Every revocation in that CRL still holds, and an older CRL than
@@ -103,7 +107,9 @@ closed as known:
   a newer CRL that nobody has carried to this host yet. A host whose clock
   is not synchronized refuses such a CRL (a client keeps its kill switch
   up and waits; a server does not start). CRLs reach hosts only when
-  someone carries them, so carry each new one to every host at once. A new
+  someone carries them. Carry each new one to the server at once. Clients
+  need it at once only when you revoke the server's cert; otherwise take
+  it to them on your next round, before their copy runs out. A new
   CRL lasts 395 days and a cert 365, so a cert runs out a month before the
   CRL made with it, and the two never run out on the same day.
 - **Client start errors before the kill switch.** Some errors stop the

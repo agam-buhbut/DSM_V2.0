@@ -7,16 +7,18 @@ your packets.
 
 ## Quickstart
 
-> **Supported systems:** Debian 12+ or Ubuntu 22.04+ on x86_64, with a TPM 2.0
-> (a security chip in the computer). On other distributions, build from
-> source (see `deploy/GUIDE.md` §1). DSM is not on PyPI; it is distributed
+> **Supported systems:** Debian 12+ or Ubuntu 24.04+ on x86_64 (Python 3.11
+> or newer), with a TPM 2.0 (a security chip in the computer). On other
+> distributions, build from source (see `deploy/GUIDE.md` §0-§1:
+> prerequisites, then the build). DSM is not on PyPI; it is distributed
 > through signed GitHub Releases.
 
 > **No release has been published yet.** There is no `v0.1.0` tag or GitHub
 > Release. `install.sh` still has a placeholder minisign public key (the key
 > that checks the download's signature). So step 1 below does not work yet.
 > Until the first signed release, build and install from source
-> (`deploy/GUIDE.md` §1), then go on with steps 2 and 3.
+> (`deploy/GUIDE.md` §0-§1: prerequisites, then the build), then go on with
+> steps 2 and 3.
 
 Setup has three steps: install, set up, start. Setting up writes the config,
 copies in your CA (certificate authority) root and enrolls this device.
@@ -55,13 +57,18 @@ curl -fsSL https://github.com/agam-buhbut/DSM_V2.0/releases/download/v0.1.0/inst
 #    `client`, add --server-ip and --expected-server-cn, drop
 #    --dns-provider and --dns-pin):
 #    --install-unit (a client takes it too) makes --resume write
-#    /etc/dsm/passphrase, which the unit needs. A source install has no
-#    unit yet: init then prints how to copy it from deploy/.
+#    /etc/dsm/passphrase, which the unit needs. init does not copy a unit
+#    from an installed DSM: after `install.sh --systemd` the unit is there
+#    already; otherwise init prints how to copy it from deploy/.
 sudo dsm init server --install-unit \
     --server-port <PORT> --ca-root <ca-root.pem> \
     --dns-provider <DoH-URL> --dns-pin <SPKI-SHA256>
-#   ...this writes a CSR and stops for the offline-CA signing step. Carry
-#   the CSR to the CA and sign it (deploy/GUIDE.md §3c; a client's CSR with
+#   ...this writes a CSR and stops for the offline-CA signing step. init
+#   wrote the CSR to /opt/mtun/server.csr (a client: client.csr), which only
+#   root can read. Copy it to the stick under the name §3c uses:
+#     sudo cp /opt/mtun/server.csr /mnt/transport/dsm-csr-server.der
+#   (a client: client.csr to dsm-csr-client.der). Carry the CSR to the CA
+#   and sign it (deploy/GUIDE.md §3c; a client's CSR with
 #   -extensions dsm_client_leaf, §3f), then go on with the signed cert.
 #   init then lists what is still to do:
 sudo dsm init server --resume --signed-cert <signed.crt>
@@ -304,8 +311,11 @@ The MTU is the largest packet a link can carry.
 - The server accepts only the client CNs (certificate names) listed in
   `allowed_cns_file`, one per line. The client checks the server
   certificate's CN against `expected_server_cn`.
-- An optional CRL (certificate revocation list) is carried from the offline
-  CA by USB stick, on the CA's regular schedule.
+- A CRL (certificate revocation list) is carried from the offline CA by USB
+  stick. Every host needs one while crl_strict is on (the default). A new
+  one goes to the server at once. The clients need it at once only when you
+  revoke the server's cert; otherwise on your next round, before their copy
+  runs out (deploy/GUIDE.md §7e).
 
 ### Key Rotation
 
@@ -569,8 +579,10 @@ defaults, and each end shapes only what it sends.
   files, looks up a server name or asks for the passphrase. It stays up
   while the tunnel is down, too: when a session drops, the client goes
   back to the start-up kill switch in one step and reconnects. The
-  start-up kill switch lets out only DSM's own packets to the server (from
-  sockets that carry DSM's mark) and the replies to them, plus DHCP. It
+  start-up kill switch lets out DSM's own packets to the server (from
+  sockets that carry DSM's mark) and the replies to them, DHCP, and two
+  short openings before a tunnel exists (DSM's own lookup of a server name,
+  and NTP while a date holds the start; see below). It
   blocks the normal network traffic of other programs; a program with
   raw-packet rights (CAP_NET_RAW) can still get around a firewall like
   this one.
@@ -603,7 +615,7 @@ defaults, and each end shapes only what it sends.
   server IP for cleartext DNS or DoT. The "except to the server IP"
   exception applies only to HTTPS/DoH and DoH3 (443/tcp+udp; DNS over
   HTTPS). So the encrypted tunnel itself can reach the server, while every
-  other DoH destination is dropped. Two exceptions come before a tunnel exists, each only while needed: DSM's own lookup of a server name (port 53 to the resolvers it chose, from DSM itself), and, while a date holds a start, NTP from the time daemon to servers its config names by IP address.
+  other DoH destination is dropped. Two exceptions come before a tunnel exists, each only while needed: DSM's own lookup of a server name (port 53 to the resolvers it chose, from DSM itself), and, while a date holds a start, NTP from the time daemon to servers its config or DHCP names by IP address. If DSM crashes while one is open, it stays open until the next start or `sudo dsm cleanup`.
 - VPN sockets are marked with SO_MARK=0x1, so the ip rule skips the TUN
   routing table for them. This avoids routing loops.
 - Name lookups run on the server. A DNS proxy listens on UDP port 53 on the
@@ -760,8 +772,10 @@ The config file is TOML, at `/opt/mtun/config.toml`.
   after 5 failed tries, at most every 5 minutes. If the host's DNS goes
   through a local forwarder other than systemd-resolved (dnsmasq or
   unbound on 127.0.0.1, or NetworkManager's 127.0.1.1), the lookup cannot
-  work behind the block: use a literal address there, or an address a
-  handshake has proved. IPv6 is rejected (the
+  work behind the block: use a literal address there. An address a
+  handshake proved earlier, when the host's DNS did not go through such a
+  forwarder, also works, but only until the server's IP changes. IPv6 is
+  rejected (the
   transport is AF_INET-only, that is, IPv4 only).
 - server_port, listen_port
 - key_file: path to the Argon2id-wrapped X25519 Noise static key
@@ -782,14 +796,19 @@ The config file is TOML, at `/opt/mtun/config.toml`.
   the TPM (for example "device:/dev/tpmrm0"). If it is not set, DSM uses the
   TCTI or TPM2TOOLS_TCTI environment variable, then /dev/tpmrm0. The soft
   backend ignores it.
-- crl_file: optional path to the CA's CRL (PEM or DER)
+- crl_file: path to the CA's CRL (PEM or DER). Needed while crl_strict is
+  true (the default). A crl_file that is set but missing always stops DSM.
 - crl_strict: bool (default: true). When true, DSM refuses to start if
   crl_file is missing or the loaded CRL is past its next_update. A client
   or a server whose clock is NTP-synchronized keeps going on a CRL past
   its next update, with a WARNING. With a clock that is not synchronized,
   a client keeps its kill switch up and waits, and a server does not
-  start. When false, a missing or stale CRL only logs a WARNING, and
-  revoked certificates are accepted (meant for lab and dev use only).
+  start. When false, no crl_file at all, a stale CRL, or a CRL with no
+  next update only logs a WARNING. A crl_file that is set but missing,
+  badly signed or older than the last one still stops DSM. A CRL that
+  loads still refuses the certs it lists; with no CRL at all, revoked
+  certificates are accepted. To run without a CRL (lab and dev use only),
+  set crl_strict = false and remove the crl_file line.
 - expected_server_cn: client only; the subject CN accepted on the server
   certificate
 - allowed_cns_file: server only; one allowed client subject CN per line. The
@@ -872,7 +891,9 @@ The config file is TOML, at `/opt/mtun/config.toml`.
 `deploy/GUIDE.md` walks an operator through setup, from prerequisites to
 checking that it works. It also covers routine tasks and debugging by
 symptom. The same directory holds `openssl-ca.cnf` (the OpenSSL config for
-the offline CA), `dsm.service` (the systemd unit), and
+the offline CA), `dsm.service` (the server's systemd unit),
+`dsm-client.service` (the client's unit; never put dsm.service on a
+client), and
 `dsm-blocklist-update.sh` with its `.service` and `.timer` (the daily DNS
 block list download).
 

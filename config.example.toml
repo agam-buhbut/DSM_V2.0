@@ -87,11 +87,13 @@ attest_key_file = "/opt/mtun/attest.key"
 # of this example WITHOUT a crl_file would refuse to start, so this example
 # ships with crl_strict = false to be bootable out of the box.
 #
-# !! SECURITY: crl_strict = false means revoked certs are accepted SILENTLY —
-# !! it disables revocation enforcement entirely. This is acceptable ONLY for a
-# !! dev/lab box that has no CA CRL workflow. FOR PRODUCTION: comment out the
-# !! crl_strict line below (restoring the true default), uncomment crl_file, and
-# !! provision the CRL per deploy/GUIDE.md §2c/§2f. Enforcement then fails closed.
+# !! SECURITY: crl_strict = false with no crl_file means revoked certs are
+# !! accepted (DSM says so in one WARNING at start): it turns revocation off.
+# !! A crl_file that is set but missing still stops DSM. This is acceptable
+# !! ONLY for a dev/lab box that has no CA CRL workflow. FOR PRODUCTION:
+# !! comment out the crl_strict line below (restoring the true default),
+# !! uncomment crl_file, and provision the CRL per deploy/GUIDE.md §2c/§2f.
+# !! Enforcement then fails closed.
 crl_strict = false
 # A new CRL lasts 395 days, a month longer than a cert. Make one each time
 # you sign a cert, and carry it to every host before the old one runs out.

@@ -11,17 +11,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `deploy/openssl-ca.cnf`: a new CRL lasts 395 days, not 31
   (`default_crl_days`). Revocation reaches a host only when you carry the
   new CRL there, so a short life added outages, not safety; to revoke a
-  cert, make and carry the new CRL at once. A cert still lasts 365 days, so
-  it runs out a month before the CRL made with it, and the two never run
-  out on the same day. A CA set up from an older copy keeps 31 days until
-  you change `default_crl_days` in your CA's copy (or pass `-crldays
-  395`).
+  cert, make the new CRL and carry it to the server at once. A cert still
+  lasts 365 days, so it runs out a month before the CRL made with it, and
+  the two never run out on the same day. A CA set up from an older copy
+  keeps 31 days until you change `default_crl_days` in your CA's copy (or
+  pass `-crldays 395`).
 - The systemd units run `/usr/local/bin/dsm`, the command both install
   paths make; they ran `/opt/dsm/venv/bin/dsm`, which only `install.sh`
   makes.
 - `dsm init server` no longer needs `--server-ip` (a server does not use
   it). `dsm init` copies the CA root into the install folder at 0600.
 - `config.example.toml` sets `log_level = "info"`.
+- Supported systems: Debian 12+ or Ubuntu 24.04+ (Python 3.11 or newer).
+  Ubuntu 22.04's python3 is 3.10, too old for DSM; `install.sh` now warns
+  below 24.04. On Debian 12 it installs the TPM runtime under that
+  release's package name (`libtss2-esys-3.0.2-0`).
+- `dsm init --force` removes the old keys only once the new passphrase is
+  in, so a typo in the second answer leaves them in place.
 - `--passphrase-env-file` that is missing, open to others or empty now
   stops with one line; it no longer falls back to the terminal.
 - **Breaking: wire v2.** Old and new builds do not talk to each other:
@@ -143,21 +149,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   up first; DSM logs the problem once and tries again (1 s doubling to
   30 s, each wait moved up to 25% at random) until it works or you stop
   DSM. While a date holds the start, the time daemon (systemd-timesyncd)
-  may reach the NTP servers its config names by IP address. The client
-  also checks its own cert's dates. A client or a server whose clock is
-  synchronized keeps going on a stale CRL, with a warning; with a clock
-  that is not synchronized, a server still refuses to start on it.
+  may reach the NTP servers its config or DHCP names by IP address. The
+  client also checks its own cert's dates. A client or a server whose
+  clock is synchronized keeps going on a stale CRL, with a warning; with a
+  clock that is not synchronized, a server still refuses to start on it.
 - Some client start errors still come before the kill switch is up, so
   DSM raises no block for them, also under the unit: a missing
   `/etc/dsm/passphrase`, a `config.toml` that does not load, an
   evaluation build without `allow_soft_attest`, nft refusing the first
   table, and an install that cannot run DSM at all. After a boot the host
   is then open; a block an earlier run kept stays (deploy/GUIDE.md §7i).
-- **Behavior change:** under `dsm-client.service` every start error now
-  keeps the kill switch up and exits 1: a wrong or empty passphrase, a
-  missing or bad cert, CA or CRL file, a read-only resolv.conf. Before,
-  they took the block down, and systemd's retries then left a headless
-  host open. A run by hand still takes it down on such an error.
+- **Behavior change:** under `dsm-client.service` every start error after
+  the block is up now keeps it up and exits 1: a wrong or empty passphrase,
+  a missing or bad cert, CA or CRL file, a read-only resolv.conf. Before,
+  they took the block down, and systemd's retries then left a headless host
+  open. A run by hand still takes it down on such an error.
 - The start-up kill switch takes only packets from DSM's own marked
   sockets to the server, and only replies to them back in (also in the
   full kill switch). Before, a spoofed packet from the server's address
@@ -172,8 +178,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The lookup is plain DNS, also where systemd-resolved would use
   DNS-over-TLS. Where the host's DNS goes through another local forwarder
   (dnsmasq or unbound on 127.0.0.1, NetworkManager's 127.0.1.1), the
-  lookup cannot work behind the block; use a literal IP or an address a
-  handshake has proved. The address a handshake proved is kept in
+  lookup cannot work behind the block; use a literal IP there (an address
+  a handshake proved earlier, when the host's DNS did not go through such a
+  forwarder, also works, but only until the server's IP changes). The
+  address a handshake proved is kept in
   `/var/lib/dsm/server-endpoint.json` (it was in `/run/dsm`, which a reboot
   clears) and stays a second address to try; during an outage the name is
   looked up again after 5 failed tries, at most every 5 minutes.
@@ -289,7 +297,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   repeated name; `dsm enroll --cn` refuses a name with a space; the DNS cap
   line names the client; the TUN-address advice is gone; the transport is
   named in the no-answer and refused-connect lines; the mtu warning says
-  1360; a leftover `hosts.txt` gets one warning.
+  1360; a leftover `hosts.txt` gets a warning at each start that says to
+  move it into `dns/block/`.
 - The server's systemd unit (`deploy/dsm.service`) had `ProcSubset=pid`,
   which hides `/proc/sys`. The server writes its network settings there
   when a client connects, so under that unit every client session failed
@@ -405,9 +414,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `systemctl restart dsm-client`, a signal sent straight to DSM and a
   shutdown or reboot keep it up (new flag `--stop-keeps-block`, which the
   unit passes).
-  `install.sh --systemd --client` and `dsm init client --install-unit`
-  install it; before, every install path put the server unit on a client,
-  where it could not start.
+  `install.sh --systemd --client` installs it; `dsm init client
+  --install-unit` copies it only from a source checkout, and otherwise says
+  how. Before, every install path put the server unit on a client, where
+  it could not start.
 - Server DNS blocklist, on by default (`dns_blocklist`). The server answers
   "no such name" (NXDOMAIN, which devices remember for 5 minutes) for every
   name on the lists in `/opt/mtun/dns/block/*.txt` and every name under
@@ -456,9 +466,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   headless-client warning (§3f); a start the clock or the network holds
   up, the marked DDNS lookup and the unit's kept block (§7i, §10f); the
   time daemon under the block (§0f); 395-day CRLs, a month longer than a
-  cert, carried to every host (§2c, §7e); the start errors that come
+  cert, carried to the server at once and to the clients on the next round
+  (§2c, §7e); the start errors that come
   before the client's block (§7i); revoking a device keeps its allowlist line
-  (§7b); new §11 entries for every new line. README: a quickstart with
+  (§7b); new §11 entries for the new lines. README: a quickstart with
   what must exist first. SECURITY.md: the client's start-up openings, a
   stale CRL on a synchronized host, and the start errors before the block.
 - Corrected the default CN format (12 hex characters, bound to the role),

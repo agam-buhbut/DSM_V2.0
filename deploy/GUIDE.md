@@ -58,6 +58,8 @@ reference are in the top-level `README.md`.
 
 ### 0a. Hardware / OS (every host)
 
+- Debian 12+ or Ubuntu 24.04+ on x86_64, with Python 3.11 or newer
+  (Ubuntu 22.04's python3 is 3.10: too old).
 - Linux kernel 5.x or newer with TUN/TAP support:
 
   ```sh
@@ -141,24 +143,18 @@ stack. (Only the dev-soft-attest test build skips this — see §1.)
 
   (On Debian 13 "trixie" and Ubuntu 24.04+ the packages use the `t64`
   suffix: `libtss2-esys-3.0.2-0t64` and `libtss2-tcti-device0t64`. On
-  older releases they may be named `libtss2-esys-3.0.2-0` and
-  `libtss2-tcti-device0` — try both if the `t64` names have no apt
-  candidate.
+  Debian 12 they are named `libtss2-esys-3.0.2-0` and
+  `libtss2-tcti-device0`.
   On some releases these are pulled in by `tpm2-tools`. The build host
   additionally needs `libtss2-dev` for headers + pkg-config — that is a
   BUILD dependency, added in §1 below, not a runtime one.)
 
 - Group access. /dev/tpmrm0 is owned tss:tss mode 0660. The shipped
   deploy/dsm.service runs as root and also sets SupplementaryGroups=tss,
-  so the daemon can open the TPM. When you run `dsm enroll` BY HAND, run
-  it as a user that is either root or in the `tss` group:
-
-  ```sh
-  $ sudo usermod -aG tss "$USER"   # then log out / back in
-  ```
-
-  or prefix the enroll commands in §3 with `sudo` (the guide
-  already does).
+  so the daemon can open the TPM. Run `dsm enroll` by hand with `sudo`, as
+  §3 does: this guide keeps the config and keys in /opt/mtun, which only
+  root can read. (Adding your user to the `tss` group helps only when the
+  config and keys live in a folder your user owns.)
 
 - Optional inspection tooling (not required by dsm):
 
@@ -230,7 +226,9 @@ not a venv and not a --user install. Every Python module dsm imports
 (tuncore, dns, cryptography) MUST be visible to /usr/bin/python3.
 
 The systemd units run `/usr/local/bin/dsm`. §1b puts the `dsm` command
-there; `install.sh` links the same path to its own venv.
+there; `install.sh` links the same path to its own venv. So the commands in
+this guide use `sudo dsm ...`, which works after either install (sudo's
+path on Debian and Ubuntu includes /usr/local/bin).
 
 If you previously created a .venv under the repo from an earlier
 attempt, delete it now so you don't get confused later:
@@ -302,8 +300,10 @@ the client, then `pip install` it there.
 On the BUILD host:
 
 ```sh
-# Build as above (§1a), then copy the wheel to the client:
+# Build as above (§1a), then copy the wheel to the client, and the
+# client unit with it (the wheel has no deploy/ folder; §3f installs it):
 $ scp rust/tuncore/target/wheels/dsm-0.1.0-*.whl user@client:/tmp/
+$ scp deploy/dsm-client.service user@client:/tmp/
 ```
 
 On the CLIENT (after copying the wheel):
@@ -316,7 +316,7 @@ $ sudo apt install -y \
       nftables iproute2
 # python3-pip: Debian's ensurepip is disabled; install python3-pip via apt.
 # libtss2-*t64: the t64-suffixed names are correct on Debian 13+ / Ubuntu 24.04+.
-# On older releases use libtss2-esys-3.0.2-0 and libtss2-tcti-device0 instead.
+# On Debian 12 use libtss2-esys-3.0.2-0 and libtss2-tcti-device0 instead.
 
 $ sudo /usr/bin/python3 -m pip install --break-system-packages \
       /tmp/dsm-0.1.0-*.whl
@@ -543,11 +543,13 @@ $ openssl ca -config openssl-ca.cnf -gencrl -out crl/dsm_ca.crl
 This writes an empty but valid CRL whose `next_update` is `default_crl_days`
 (395) out. That is a month longer than a cert lasts (365 days), so a cert
 runs out a month before the CRL made with it, and the two never run out on
-the same day. Re-run this command, and carry the CRL to every host (the
-server and each client), before it runs out and whenever you revoke a cert
-(§7e). A CA set up with an older copy of `openssl-ca.cnf` sets
-`default_crl_days` to 31: change it to 395 in your CA's copy, or add
-`-crldays 395` to the command.
+the same day. Re-run this command before the CRL runs out, and whenever
+you revoke a cert (§7e). Every host needs one in date: the server and each
+client. Carry each new CRL to the server at once. Clients need it at once
+only when you revoke the server's cert; otherwise take it to them on your
+next round, before their copy runs out. A CA set up with an older copy
+of `openssl-ca.cnf` sets `default_crl_days` to 31: change it to 395 in
+your CA's copy, or add `-crldays 395` to the command.
 
 ### 2d. Record the root cert fingerprint in your physical safe
 
@@ -590,7 +592,7 @@ $ sudo install -m 0600 -o root -g root /mnt/transport/dsm_ca_root.pem \
       /opt/mtun/dsm_ca_root.pem
 $ sudo install -m 0600 -o root -g root /mnt/transport/dsm_ca.crl \
       /opt/mtun/dsm_ca.crl
-$ sha256sum /opt/mtun/dsm_ca_root.pem | cut -d' ' -f1
+$ sudo sha256sum /opt/mtun/dsm_ca_root.pem | cut -d' ' -f1
       # cross-check this 64-hex value vs the safe printout (§2d),
       # then paste it into config.toml as ca_root_sha256 (§3a).
 ```
@@ -605,7 +607,7 @@ than silently trusting the new anchor.
 The CRL goes to /opt/mtun/dsm_ca.crl (the `crl_file` path in §3a). Because
 `crl_strict` defaults true, the daemon will not start without it. Every
 host needs it: the server and each client. Carry a new one before it runs
-out (§7e).
+out (§2c, §7e).
 
 Re-wipe Stick B (`shred -v`) before reusing it.
 
@@ -636,7 +638,7 @@ cert_file          = "/opt/mtun/device.crt"
 ca_root_file       = "/opt/mtun/dsm_ca_root.pem"
 # REQUIRED: 64-hex SHA-256 of ca_root_file (§2d / §2f). The daemon refuses
 # to start without it and rejects a swapped CA PEM. Compute with:
-#   sha256sum /opt/mtun/dsm_ca_root.pem | cut -d' ' -f1
+#   sudo sha256sum /opt/mtun/dsm_ca_root.pem | cut -d' ' -f1
 ca_root_sha256     = "REPLACE_WITH_64_HEX_SHA256_OF_dsm_ca_root.pem"
 attest_key_file    = "/opt/mtun/attest.key"
 crl_file           = "/opt/mtun/dsm_ca.crl"   # required by default (crl_strict=true);
@@ -676,11 +678,12 @@ every line below that header as a pin, so a setting added below it stops
 dsm at startup (`dns_provider_pins has entries that are not in
 dns_providers: ...`). Put new settings above the header.
 
-Validate the TOML before continuing — a missing quote produces a
-confusing stack trace later:
+Validate the TOML before continuing. A missing quote stops DSM at start
+with `config: malformed TOML: ...`; check it now (sudo: only root can read
+the file):
 
 ```sh
-$ python3 -c "import tomllib; tomllib.load(open('/opt/mtun/config.toml','rb')); print('ok')"
+$ sudo python3 -c "import tomllib; tomllib.load(open('/opt/mtun/config.toml','rb')); print('ok')"
 ```
 
 Must print "ok". If you instead see TOMLDecodeError, see §11's TOML
@@ -714,7 +717,7 @@ roughly yearly). Plan to re-fetch and re-deploy on a cadence.
 ### 3b. Server: generate keys + emit CSR
 
 ```sh
-$ sudo python3 -m dsm --config /opt/mtun/config.toml \
+$ sudo dsm --config /opt/mtun/config.toml \
       enroll --csr-out /tmp/dsm-csr-server.der --role server
 ```
 
@@ -809,7 +812,7 @@ the cert on the CA laptop's Stick B, not on the server):
 
 ```sh
 $ sudo cp /mnt/transport/dsm-cert-server.pem /tmp/dsm-cert-server.pem
-$ sudo python3 -m dsm --config /opt/mtun/config.toml \
+$ sudo dsm --config /opt/mtun/config.toml \
       enroll --import /tmp/dsm-cert-server.pem
 ```
 
@@ -826,15 +829,18 @@ dsm verifies:
   fix, instead of failing later at the server.
 
 On success, writes /opt/mtun/device.crt (mode 0o600) and prints
-cn / serial / not_after.
+cn / serial / not_after. That serial is in decimal; the CA names the cert's
+file by the serial in hex (§7e).
 
 ### 3e. Server: stash the passphrase for non-interactive restarts
 
 Pick ONE source:
 
-`sudo dsm init ... --install-unit` (§3f) writes `/etc/dsm/passphrase` for
-you, with the passphrase that has just unlocked the keys, when that file is
-missing or empty.
+If you set this host up with `sudo dsm init ... --install-unit` (the README
+Quickstart), `--resume` already wrote `/etc/dsm/passphrase`. If you enrolled
+with `dsm enroll` as above, pick (i) or (ii), and do not run `dsm init` now:
+it refuses on an enrolled host, and its `--force` deletes the keys, which
+means a new trip to the CA.
 
 (i) Plain file (0600, read once at startup):
 
@@ -849,7 +855,7 @@ $ unset DSM_PP
 You start it in §5, once the allowlist has a client CN (§4), with:
 
 ```sh
-sudo python3 -m dsm --mode server \
+sudo dsm --mode server \
     --passphrase-env-file /etc/dsm/passphrase
 ```
 
@@ -891,7 +897,7 @@ missing, systemd refuses to start the unit; if it is empty, DSM stops with
 ```sh
 # Run this in §5, once the allowlist has a client CN (§4):
 $ read -rs DSM_PASSPHRASE && export DSM_PASSPHRASE   # typed, not in shell history
-$ sudo -E python3 -m dsm --mode server
+$ sudo -E dsm --mode server
 $ unset DSM_PASSPHRASE
 ```
 
@@ -912,17 +918,20 @@ pmtu_discover      = true                       # required by auto_mtu
 Then:
 
 ```sh
-$ sudo python3 -m dsm --config /opt/mtun/config.toml \
+$ sudo dsm --config /opt/mtun/config.toml \
       enroll --csr-out /tmp/dsm-csr-client.der --role client
 ```
 
 Walk to CA, sign exactly as in §3c but with `-extensions dsm_client_leaf`
-(NOT dsm_server_leaf) and `-out certs/dsm-cert-client.pem` (keep `-notext`),
-copy it to Stick B, walk back, then bridge it off the stick and import:
+(NOT dsm_server_leaf) and `-out certs/<client CN>.pem` (keep `-notext`).
+Name the file after the CN that enroll printed, for example
+`certs/dsm-XXXXXXXX-client.pem`, so a second client's cert does not
+overwrite the first one's. Copy it to Stick B, walk back, then bridge it off
+the stick and import:
 
 ```sh
-$ sudo cp /mnt/transport/dsm-cert-client.pem /tmp/dsm-cert-client.pem
-$ sudo python3 -m dsm --config /opt/mtun/config.toml \
+$ sudo cp /mnt/transport/<client CN>.pem /tmp/dsm-cert-client.pem
+$ sudo dsm --config /opt/mtun/config.toml \
       enroll --import /tmp/dsm-cert-client.pem
 ```
 
@@ -933,6 +942,14 @@ unit, never `deploy/dsm.service` (that one runs DSM as a server):
 $ sudo cp deploy/dsm-client.service /etc/systemd/system/dsm-client.service
 $ sudo systemctl daemon-reload
 $ sudo systemctl enable dsm-client
+```
+
+On a client set up from the wheel alone (§1a.1) there is no deploy/
+folder: install the copy you brought from the build host instead of the
+`cp` line:
+
+```sh
+$ sudo install -m 0644 /tmp/dsm-client.service /etc/systemd/system/dsm-client.service
 ```
 
 Do not start it yet: the server must know this client first (§4), and
@@ -956,11 +973,14 @@ Before you enable the unit, make sure you can reach the console (a screen
 and keyboard, a serial line, or the hypervisor's console). Keep the CRL
 fresh and the clock right.
 
-`sudo dsm init client --install-unit` and `install.sh --systemd --client`
-install the same unit. `dsm init ... --install-unit` also writes
-`/etc/dsm/passphrase` when it is missing or empty. Unlike the server's, the
-client unit takes the kill switch down only after a stop you ask for
-(`systemctl stop`); see §7i.
+`install.sh --systemd --client` installs this unit. `sudo dsm init client
+--install-unit` does not copy a unit from an installed DSM (the wheel has
+no deploy/ folder): after install.sh it says the unit is already there;
+otherwise it tells you to copy `deploy/dsm-client.service` yourself, as
+above. Either way, its `--resume` writes `/etc/dsm/passphrase` when that
+file is missing or empty. Unlike the server's, the client unit takes the
+kill switch down only after a stop you ask for (`systemctl stop`); see
+§7i.
 
 Record the client's CN — you need it for §4.
 
@@ -1041,7 +1061,7 @@ Start the server once its allowlist has at least one client CN (§4).
 ```sh
 $ sudo systemctl start dsm                   # if you installed the unit
 # or
-$ sudo python3 -m dsm --mode server \
+$ sudo dsm --mode server \
       --passphrase-env-file /etc/dsm/passphrase
 ```
 
@@ -1050,7 +1070,7 @@ Client:
 ```sh
 $ sudo systemctl start dsm-client            # if you installed the client unit (§3f)
 # or
-$ sudo python3 -m dsm --mode client \
+$ sudo dsm --mode client \
       --passphrase-env-file /etc/dsm/passphrase
 ```
 
@@ -1178,17 +1198,24 @@ static rotates — see §7c), push the new value to every client's
 
 ### 7b. Revoke a client (retire a device)
 
-1. On the CA laptop, revoke its certificate and make a new CRL (§7e).
-2. Carry the new CRL to the server, put it at `/opt/mtun/dsm_ca.crl`
-   (mode 0600), then `sudo systemctl restart dsm`. The server now logs
-   `client_cn=... refused: revoked` for that device.
+1. On the CA laptop, find the cert's serial in hex, then revoke the cert
+   and make a new CRL (§7e shows both; for a retired device use
+   `-crl_reason cessationOfOperation`).
+2. Carry the new CRL to the server at once, put it at
+   `/opt/mtun/dsm_ca.crl` (mode 0600), then `sudo systemctl restart dsm`.
+   The server now logs `client_cn=... refused: revoked` for that device.
 3. Keep the device's line in `/opt/mtun/allowed_cns.txt` as it is. Do not
    delete it, and do not put a `#` in front of it: either way every device
    listed below it gets a new tunnel address at the restart, and its open
    connections are cut (§4).
+4. If you still have the retired device, stop DSM there for good: `sudo
+   systemctl disable --now dsm-client`, then remove DSM and its keys as in
+   §12. Left enabled, it keeps its kill switch up and keeps trying, so the
+   machine has no internet.
 
-The clients need the new CRL only to refuse a revoked server; take it to
-them on your next round (§7e).
+The clients need the new CRL at once only when you revoke the server's
+cert. For a client's cert, take it to them on your next round, before
+their copy runs out (§7e).
 
 To revoke the server's own cert: revoke it the same way, then carry the new
 CRL to every client while the old CRL is still in date. A client refuses a
@@ -1200,19 +1227,27 @@ Fresh enrollment generates a new Noise static, so the CN derivation
 `dsm-<sha256(noise_static ‖ role)[:6 bytes / 12 hex]>-server` ALWAYS produces
 a new CN. Plan accordingly.
 
+First, the clients. Once the server stops, every client goes back to its
+start-up kill switch, which blocks SSH too, and a client that does not know
+the new CN never connects again. So before you stop the server, on each
+client you reach only over SSH, run `sudo systemctl stop dsm-client`, or
+make sure you have its console. The stop cuts an SSH session that runs
+through the tunnel: connect again on the client's LAN address.
+
 ```sh
 $ sudo systemctl stop dsm
 $ sudo rm /opt/mtun/identity.key /opt/mtun/attest.key /opt/mtun/device.crt
-$ sudo python3 -m dsm --config /opt/mtun/config.toml \
+$ sudo dsm --config /opt/mtun/config.toml \
       enroll --csr-out /tmp/dsm-csr-server.der --role server
 # Note the printed CN. Walk CSR to CA, sign with dsm_server_leaf,
 # walk back:
-$ sudo python3 -m dsm --config /opt/mtun/config.toml \
+$ sudo dsm --config /opt/mtun/config.toml \
       enroll --import /tmp/dsm-cert-server.pem
 $ sudo systemctl start dsm
 ```
 
-Push the new CN to every client's `expected_server_cn`. Until then a client
+Then put the new CN in each client's `expected_server_cn` and start it
+(`sudo systemctl start dsm-client`). A client that still has the old name
 gets no answer (`handshake failed: no answer after 3 tries`): the server
 stays silent to a client that does not know its name.
 
@@ -1234,12 +1269,19 @@ On the CA laptop:
 ```sh
 $ cd ca
 
-# If revoking a cert:
+# If revoking a cert: find its serial in hex. index.txt has one line per
+# cert, with tabs between the fields; the 4th field is the serial:
+$ grep 'CN=dsm-XXXXXXXX-client' index.txt | cut -f4       # e.g. 1001
+# (Or on the device itself:
+#   sudo openssl x509 -inform DER -in /opt/mtun/device.crt -noout -serial)
+# The serial `dsm enroll --import` printed is in decimal (4097 for 1001),
+# so it is not the file name. Then revoke newcerts/<hex serial>.pem:
 $ openssl ca -config openssl-ca.cnf \
-      -revoke newcerts/<serial>.pem -crl_reason <reason>
+      -revoke newcerts/<hex serial>.pem -crl_reason <reason>
 # Valid reasons (RFC 5280):
 #   keyCompromise, affiliationChanged, superseded,
 #   cessationOfOperation, certificateHold, removeFromCRL
+# A retired device: cessationOfOperation.
 # DO NOT USE cACompromise — it would invalidate the entire fleet.
 
 # Always (revocation or just freshness refresh):
@@ -1247,11 +1289,11 @@ $ openssl ca -config openssl-ca.cnf -gencrl -out crl/dsm_ca.crl
 ```
 
 The CRL number goes up by one each time (ca/crlnumber). Carry
-crl/dsm_ca.crl on a freshly wiped stick to every host: the server and each
-client (`dsm init` gives every client a `crl_file`). Put it at
-/opt/mtun/dsm_ca.crl. Restart the server to pick it up (no SIGHUP reload
-yet). A client that waits on a stale CRL reads the new one by itself; a
-running client takes it at its next start.
+crl/dsm_ca.crl on a freshly wiped stick to the hosts (when: below), and put
+it at /opt/mtun/dsm_ca.crl. Every host needs one: the server and each client
+(`dsm init` gives every client a `crl_file`). Restart the server to pick it
+up (no SIGHUP reload yet). A client that waits on a stale CRL reads the
+new one by itself; a running client takes it at its next start.
 
 Default validity:
 
@@ -1264,9 +1306,10 @@ Put both dates in your calendar, each a few weeks early. A CRL made
 before a cert was signed can run out first: make a fresh CRL each time you
 sign a cert (§3c), and carry it with the cert.
 
-A CRL reaches a host only when you carry it there, so each round goes to
-every host: the server and each client. To revoke a cert, make the new CRL
-and carry it at once; do not wait for the old one to run out.
+A CRL reaches a host only when you carry it there. Carry each new CRL to
+the server at once; to revoke a cert, do not wait for the old one to run
+out. Clients need it at once only when you revoke the server's cert;
+otherwise take it to them on your next round, before their copy runs out.
 
 When a CRL is past its next update (with `crl_strict`, the default):
 
@@ -1289,10 +1332,12 @@ When a CRL is past its next update (with `crl_strict`, the default):
 In both cases carry the new CRL soon: a cert revoked after the old CRL was
 made is not in it.
 
-A missing CRL, one your CA did not sign, or one older than the last one a
-host took is always refused. To run without a CRL (lab or dev only: it
-accepts revoked certs without a word), set `crl_strict = false` in
-config.toml.
+A CRL your CA did not sign, or one older than the last one a host took, is
+always refused, and so is a `crl_file` that is set but missing: that always
+stops DSM, whatever `crl_strict` says. To run without a CRL (lab or dev
+only), set `crl_strict = false` and remove the `crl_file` line from
+config.toml. DSM then accepts revoked certs, and says so in one WARNING at
+start.
 
 ### 7f. Disaster recovery — CA private key lost
 
@@ -1337,8 +1382,9 @@ Lines that start with `#` or `!` are comments. Rules to know:
 
 - A hosts line blocks its names whatever address is in front of them. DSM
   never answers with that address. So an old hosts file of fixed answers,
-  copied into `block/`, blocks its names; it does not redirect them. DSM no
-  longer reads such a file by itself.
+  moved into `block/`, blocks its names; it does not redirect them. DSM no
+  longer reads `/opt/mtun/hosts.txt` by itself, and warns at each start
+  while it is there (§11 has the commands to move it).
 - A list can block a shared suffix such as `co.uk`, and with it every name
   under it. Only bare one-word names such as `localhost` are refused. Read a
   list before you add it.
@@ -1423,7 +1469,8 @@ skip the list. Pi-hole has the same limit.
 
 The client's kill switch is up whenever DSM runs, from the very start
 (before it reads its cert files, looks up a server name or asks for the
-passphrase), and also while there is no tunnel. It comes down when you stop
+passphrase; a few errors come earlier, below), and also while there is no
+tunnel. It comes down when you stop
 DSM. Two cases differ: on a run by hand a setup error also removes it (DSM
 exits 1), and a `systemctl stop` sent while DSM waits to restart (after a
 crash, a start error or a signal sent straight to it) leaves it up; run
@@ -1516,7 +1563,7 @@ crash, a start error or a signal sent straight to it) leaves it up; run
   time. DSM has no block of its own for these cases. They are setup
   mistakes, and each shows on the first start, so check them before you
   enable the unit on a headless host: `sudo dsm init ... --install-unit`
-  writes the passphrase file, and one run by hand at the console (§3)
+  writes the passphrase file, and one run by hand at the console (§5)
   shows the others. Not over SSH: DSM raises its block before it asks for
   the passphrase, so the SSH session freezes. §11 has each line.
 - **A start the clock or the network holds up:** a CRL past its next
@@ -1552,21 +1599,24 @@ crash, a start error or a signal sent straight to it) leaves it up; run
   (dnsmasq or unbound on 127.0.0.1, or NetworkManager's 127.0.1.1), DSM
   cannot look the name up behind the block: the forwarder's own questions
   to its upstream are not DSM's marked packets, so the block drops them.
-  Only a saved address helps there. Set `server_ip` to the server's IP
-  address, or let the client connect once so that its address is saved.
-  Once a handshake with a looked-up address works, DSM saves the name and
-  that address in `/var/lib/dsm/server-endpoint.json` (root only; kept
-  across reboots; `dsm cleanup` leaves it). A run whose handshake never
-  works leaves the file as it was. A later start tries the fresh answer
-  first and the saved address second, taking turns. If the lookup fails,
-  DSM uses the saved address and logs `could not look up the server name;
-  using the last address it had`. With no saved address for that name, it
-  logs `could not look up the server name: ...` once and tries again, with
-  the block up. During an outage, after 5 failed tries the client logs
-  `server IP may have changed ...` and looks the name up again, at most
-  every 5 minutes; a new address goes first. If DSM dies while the query
-  runs (a crash, a SIGKILL), the start-up table and its port-53 opening
-  stay until the next start or `sudo dsm cleanup`. Only a program with
+  Set `server_ip` to the server's IP address there. An address saved
+  earlier, when this host's DNS did not go through such a forwarder, also
+  works, but only until the server's IP changes. Once a handshake with a
+  looked-up address works, DSM saves the name and that address in
+  `/var/lib/dsm/server-endpoint.json` (root only; kept across reboots; `dsm
+  cleanup` leaves it). A run whose handshake never works leaves the file as
+  it was. A later start tries the fresh answer first and the saved address
+  second, taking turns. If the lookup fails, DSM uses the saved address and
+  logs `could not look up the server name; using the last address it had`.
+  With no saved address for that name, it logs `could not look up the server
+  name: ...` once and tries again, with the block up. During an outage,
+  after 5 failed tries the client logs `server IP may have changed ...` and
+  looks the name up again, at most every 5 minutes; a new address goes first
+  (`the server name has a new address; DSM tries it first`, INFO). If that
+  lookup fails, it logs `looked the server name up again: ...` (a WARNING)
+  and keeps trying the addresses it has (§11). If DSM dies while the query
+  runs (a crash, a SIGKILL), the start-up table and its port-53 opening stay
+  until the next start or `sudo dsm cleanup`. Only a program with
   CAP_NET_ADMIN or CAP_NET_RAW can mark its socket.
 - **`systemctl restart dsm-client`** keeps the kill switch up: the old run
   leaves the start-up kill switch in place and the new start replaces it
@@ -1586,12 +1636,22 @@ crash, a start error or a signal sent straight to it) leaves it up; run
 Wire v2 changes the packet format and the handshake. Old and new builds do
 not talk to each other, so this is one switch for every box.
 
-1. On a machine with enough memory (not a small laptop), build the new wheel
-   (§1) and copy it to every box (§1a.1).
-2. Upgrade the server and restart it: `sudo systemctl restart dsm`. Its log
+1. First, the clients you reach only over SSH. Once the server is
+   upgraded, a client not yet upgraded is blocked, SSH too, so you cannot
+   reach it to upgrade it. On each such client run `sudo systemctl stop
+   dsm-client` now (the stop cuts an SSH session that runs through the
+   tunnel: connect again on its LAN address); you upgrade it in step 4,
+   while it is stopped. Or make sure you have its console.
+2. On a machine with enough memory (not a small laptop), build the new wheel
+   (§1) and copy it to every box (§1a.1). A client set up from the wheel
+   alone also needs the new `deploy/dsm-client.service` from the build host
+   (§1a.1, §3f). A host set up with `install.sh` upgrades by running the
+   new release's `install.sh` instead.
+3. Upgrade the server and restart it: `sudo systemctl restart dsm`. Its log
    must show `server listening on UDP port 51820 (wire v2)` (with your port;
    `TCP` if you set `transport = "tcp"`).
-3. Upgrade each client and restart it: `sudo systemctl restart dsm-client`.
+4. Upgrade each client and restart it: `sudo systemctl restart dsm-client`
+   (a client you stopped in step 1: `sudo systemctl start dsm-client`).
    Its log must show `client starting (wire v2)`, then `handshake complete`.
 
 In between:
@@ -1659,16 +1719,16 @@ EOF
 
 Place /opt/mtun/dsm_ca_root.pem per §2f. Cross-check its SHA-256
 against the safe printout, and set ca_root_sha256 to that 64-hex
-value (`sha256sum /opt/mtun/dsm_ca_root.pem | cut -d' ' -f1`) — the
+value (`sudo sha256sum /opt/mtun/dsm_ca_root.pem | cut -d' ' -f1`) — the
 daemon refuses to start without it.
 
 ### 8c. Enroll the server (§3b–§3d)
 
 ```sh
-$ sudo python3 -m dsm --config /opt/mtun/config.toml \
+$ sudo dsm --config /opt/mtun/config.toml \
       enroll --csr-out /tmp/dsm-csr-server.der --role server
 # Walk to CA, sign with dsm_server_leaf, walk back, then:
-$ sudo python3 -m dsm --config /opt/mtun/config.toml \
+$ sudo dsm --config /opt/mtun/config.toml \
       enroll --import /tmp/dsm-cert-server.pem
 ```
 
@@ -1732,8 +1792,8 @@ $ sudo pkill -9 -f 'dsm --mode client'
 #   - mtun0 is gone (kernel reaps the TUN when the owning fd closes)
 #   - the kill switch tables are STILL PRESENT, on purpose: all traffic
 #     stays blocked (fail closed). Starting DSM again replaces them.
-#   - resolv.conf still points at 10.8.0.1; the pre-VPN contents
-#     were captured only in process memory and are lost
+#   - resolv.conf still points at 10.8.0.1; the original is saved in
+#     /var/lib/dsm/resolv.conf.orig, and `sudo dsm cleanup` puts it back
 #   - /run/dsm/ipv6_state.json remains (next clean dsm start restores)
 # To get the host back without DSM:
 $ sudo dsm cleanup
@@ -1741,7 +1801,13 @@ $ sudo dsm cleanup
 $ for t in dsm_killswitch_pre dsm_killswitch dsm_dns_leak dsm_server_ratelimit dsm_server_nat; do
       sudo nft delete table inet "$t" 2>/dev/null
   done
-$ sudo $EDITOR /etc/resolv.conf            # restore pre-VPN nameserver by hand
+$ sudo head -1 /var/lib/dsm/resolv.conf.orig
+# If that prints "# dsm-resolv-symlink -> X", the original was a link to X:
+$ sudo ln -sfn X /etc/resolv.conf
+# Otherwise the file is the original itself:
+$ sudo cp /var/lib/dsm/resolv.conf.orig /etc/resolv.conf
+# Either way, then:
+$ sudo rm /var/lib/dsm/resolv.conf.orig
 $ for iface in $(ls /sys/class/net); do
       sudo sysctl -w "net.ipv6.conf.$iface.disable_ipv6=0" 2>/dev/null
   done
@@ -1913,7 +1979,7 @@ unblocks SystemCallFilter + RestrictNamespaces.
 9e.7 — Auto-MTU adaptation
 
 ```sh
-$ sudo journalctl -u dsm | grep -E "auto_mtu|kernel path MTU"
+$ sudo journalctl -u dsm-client | grep -E "auto_mtu|kernel path MTU"
 ```
 
 PASS: at least one "auto_mtu: lowered tun mtu N -> M (kernel
@@ -1941,7 +2007,7 @@ $ sudo systemctl stop dsm
 #    sockopts) only fire on real paths.
 $ sudo strace -f -e trace=%file,%network,%process \
       -o /tmp/dsm-strace.log \
-      timeout 60 python3 -m dsm --mode server \
+      timeout 60 dsm --mode server \
       --passphrase-env-file /etc/dsm/passphrase
 
 # 3. Pull the unique syscall names actually used.
@@ -1965,14 +2031,16 @@ unit.
 
 ### 9g. What to capture and ship back from each demo run
 
-- journalctl -u dsm  (server + client, full session)
+- journalctl -u dsm on the server and journalctl -u dsm-client on the
+  client (full session)
 - sudo nft list ruleset           (after established)
 - ip rule + ip route show table 100   (both boxes)
 - The Cloudflare trace output from §9e.2
 - sudo systemd-analyze security dsm
 - /tmp/dsm-strace.log and /tmp/dsm-syscalls.txt from §9f
 - With --debug-net enabled: the JSON event stream from
-  `sudo journalctl -u dsm -o cat | grep dsm.netaudit > /tmp/demo.jsonl`
+  `sudo journalctl -u dsm -o cat | grep dsm.netaudit > /tmp/demo.jsonl` on
+  the server, and the same with `-u dsm-client` on the client
 
 ## 10. Running Over the Internet (Remote Client)
 
@@ -2128,10 +2196,13 @@ _deconfigure, rekey_epoch, liveness_fire, shutdown_signal,
 auto_mtu_change, auto_cap_change, crl_missing/stale). Capture with:
 
 ```sh
-$ sudo journalctl -u dsm -o cat | grep dsm.netaudit > /tmp/audit.jsonl
+$ sudo journalctl -u dsm -o cat | grep dsm.netaudit > /tmp/audit.jsonl          # server
+$ sudo journalctl -u dsm-client -o cat | grep dsm.netaudit > /tmp/audit.jsonl   # client
 ```
 
-### TOML triage: `python3 -c "import tomllib; ..."` raised TOMLDecodeError
+A client run by hand prints the events in its terminal instead.
+
+### TOML triage: "config: malformed TOML: ...", or TOMLDecodeError from `sudo python3 -c "import tomllib; ..."`
 
 (1) Missing quotes around a STRING value:
 
@@ -2276,7 +2347,7 @@ network could send a wrong cert). Stop it, fix the config, start it again.
 
 - "chain ..." → the pinned ca_root_file does not match the CA that
   issued this side's cert. Cross-check
-  `sha256sum /opt/mtun/dsm_ca_root.pem` against the value recorded in
+  `sudo sha256sum /opt/mtun/dsm_ca_root.pem` against the value recorded in
   your safe (§2d).
 - "binding ..." → the cert's noiseStaticBinding extension does not
   match the local Noise static. The cert was issued for a different
@@ -2340,6 +2411,21 @@ the file (§3e), then `sudo systemctl reset-failed dsm-client && sudo
 systemctl start dsm-client` (or `dsm`). `sudo dsm init ... --install-unit`
 writes it for you.
 
+### systemd: "status=203/EXEC"
+
+systemd could not run `/usr/local/bin/dsm`: it is missing, or it points
+into a broken venv. DSM did not run, so it raised no block (§7i). Check
+`ls -l /usr/local/bin/dsm` (§1c), then install again: §1b, or run
+`install.sh` again on a host set up with it. Then `sudo systemctl
+reset-failed dsm-client && sudo systemctl start dsm-client` (or `dsm`).
+
+### "tuncore is missing ATTEST_BACKEND_IS_SOFTWARE: the extension predates the Phase-0 attestation gate. ..."
+
+The installed tuncore is from an old build. DSM stops before its kill
+switch is up, so it raises no block (§7i). Build the wheel again from the
+repo root (§1a) and install it with `--force-reinstall` (as in the
+TypeError entry below), or run `install.sh` again on a host set up with it.
+
 ### "DSM could not start (see the error above), and the kill switch stays up ..."
 
 Under `dsm-client.service` a start error keeps the block (§7i). The line
@@ -2369,8 +2455,24 @@ saved from an earlier good handshake. Check the name and the resolvers in
 goes through a local forwarder other than systemd-resolved (dnsmasq or
 unbound on 127.0.0.1, or NetworkManager's 127.0.1.1), the lookup cannot
 work behind the block, and waiting does not help: set `server_ip` to the
-server's IP address, or let the client connect once so that its address is
-saved (§7i).
+server's IP address. An address saved earlier, when this host's DNS did not
+go through such a forwarder, also works, but only until the server's IP
+changes (§7i).
+
+### Client log: "looked the server name up again: no address (asked N nameservers, last: ...)"
+
+A WARNING during an outage, at most every 5 minutes: after 5 failed tries
+the client looked the DDNS name up again, and that lookup failed. The block
+stays, and DSM keeps trying the addresses it has. Check the name and the
+resolvers as for `could not look up the server name` (above), and see the
+local forwarder note there.
+
+### Client log: "the server name has a new address; DSM tries it first"
+
+INFO, during an outage: the client looked the name up again and got a new
+address. It tries that one first, and the address a handshake proved
+before second. Nothing to do. If the server did not move, check that the
+name points at it.
 
 ### "CRL at ... is past its next update (...); DSM uses it because the clock is synchronized. ..."
 
@@ -2391,6 +2493,28 @@ server opens no TCP port.
 
 config.toml has a key DSM does not know, often a typo. Fix the spelling or
 remove the line; `config.example.toml` lists every setting.
+
+### Server log: "CN allowlist load failed: ... not found: create it with one client CN per line ..." (or "... put a comment on a line of its own ...")
+
+The server does not start (exit 1). With `not found`, the allowlist file is
+not there: make it as in §4 and put one client CN on each line. With `put a
+comment on a line of its own (a CN has no '#')`, one line holds a CN and a
+`#` comment: move the comment to a line of its own. Then start the server
+again.
+
+### Server log: "... hosts.txt is no longer read: DSM gives no fixed answers now. To block those names, move the file into ... (deploy/GUIDE.md §7h); otherwise delete it."
+
+A WARNING at each start while `/opt/mtun/hosts.txt` is there. DSM no
+longer reads that file. The lines in it block their names; they do not
+redirect them (§7h). To block those names, move the file:
+
+```sh
+$ sudo install -d -m 0700 /opt/mtun/dns /opt/mtun/dns/block
+$ sudo install -m 0600 /opt/mtun/hosts.txt /opt/mtun/dns/block/hosts.txt
+$ sudo rm /opt/mtun/hosts.txt
+```
+
+Otherwise delete it. The warning stops once the old file is gone.
 
 ### Tunnel up but `curl` through it is very slow or hangs
 
@@ -2420,7 +2544,8 @@ At the default top tier (800 packets/s) DSM sends up to about 11 Mbit/s in
 each direction. On a slower link it floods the link: packets are lost, key
 changes can be lost too, and the tunnel stalls or drops, mostly during big
 downloads. DSM now lowers its own top tier when that happens. Look for
-`auto cap:` lines in the log (`journalctl -u dsm | grep 'auto cap'`). A
+`auto cap:` lines in the log (`journalctl -u dsm | grep 'auto cap'` on
+the server, `-u dsm-client` on a client). A
 line like this means it worked:
 `auto cap: lost 12% at tier 3 (800/s); top tier now 2 (200/s), next try in 5 min`.
 It tries the higher tier again after 5 minutes, and waits longer (up to an
@@ -2905,6 +3030,8 @@ $ for t in dsm_killswitch_pre dsm_killswitch dsm_dns_leak dsm_server_ratelimit d
 - Did you create a venv and install there instead? `sudo python3`
   can't see venv packages. Re-run §1c verification; if any import
   fails, redo §1b.
+- On a host set up with `install.sh`, run `install.sh` again instead of
+  §1b.
 
 ### TypeError or AttributeError mentioning a tuncore object
 
@@ -2962,7 +3089,8 @@ $ for iface in $(ls /sys/class/net); do
                                       # P-256 key (dev-soft-attest build)
 /opt/mtun/device.crt                  # CA-signed leaf cert (mode 0o600)
 /opt/mtun/dsm_ca_root.pem             # pinned CA root cert (mode 0o600)
-/opt/mtun/dsm_ca.crl                  # optional CRL (walked-USB cadence)
+/opt/mtun/dsm_ca.crl                  # the CA's CRL: every host needs it (crl_strict);
+                                      # carry a new one before it runs out (§7e)
 /opt/mtun/allowed_cns.txt             # server only: one CN per line (0o600)
 /etc/dsm/passphrase                   # non-interactive passphrase source (0o600)
 /run/dsm/ipv6_state.json              # per-iface IPv6 state snapshot
@@ -2981,44 +3109,48 @@ $ for iface in $(ls /sys/class/net); do
 
 ## 14. CLI Reference
 
+Put `sudo` in front: the files in /opt/mtun belong to root, and DSM and
+`dsm cleanup` refuse to run without it. Only `dsm --version` and `--help`
+need no root.
+
 ```
-python3 -m dsm --mode {client,server}            Run the VPN
-python3 -m dsm --config PATH                     Override config file path
-python3 -m dsm --debug-net                       Emit JSON audit events on
-                                                 the dsm.netaudit logger
-python3 -m dsm --passphrase-fd N                 Read passphrase from FD N
-python3 -m dsm --passphrase-env-file PATH        Read the passphrase from the
-                                                 0600-mode file at PATH; the
-                                                 file holds only the
-                                                 passphrase, not KEY=VALUE
-python3 -m dsm --version                         Print the version and the
-                                                 wire version
-python3 -m dsm --stop-keeps-block                Client: Ctrl-C, SIGTERM or
-                                                 a start error leaves the
-                                                 start-up kill switch up
-                                                 (dsm-client.service passes
-                                                 it)
+dsm --mode {client,server}            Run the VPN
+dsm --config PATH                     Override config file path
+dsm --debug-net                       Emit JSON audit events on
+                                      the dsm.netaudit logger
+dsm --passphrase-fd N                 Read passphrase from FD N
+dsm --passphrase-env-file PATH        Read the passphrase from the
+                                      0600-mode file at PATH; the
+                                      file holds only the
+                                      passphrase, not KEY=VALUE
+dsm --version                         Print the version and the
+                                      wire version
+dsm --stop-keeps-block                Client: Ctrl-C, SIGTERM or
+                                      a start error leaves the
+                                      start-up kill switch up
+                                      (dsm-client.service passes
+                                      it)
 
-python3 -m dsm enroll --csr-out PATH             Provision identity +
-                                                 attest key, write a CSR
-python3 -m dsm enroll --import CERT_PATH         Verify + persist a
-                                                 CA-signed cert
-python3 -m dsm enroll --cn CN [--role ROLE]      Override the derived CN
-                                                 (default: dsm-<12 hex>-<role>)
-python3 -m dsm enroll --role {client,server}     Set the role suffix when
-                                                 --cn is not given
+dsm enroll --csr-out PATH             Provision identity +
+                                      attest key, write a CSR
+dsm enroll --import CERT_PATH         Verify + persist a
+                                      CA-signed cert
+dsm enroll --cn CN [--role ROLE]      Override the derived CN
+                                      (default: dsm-<12 hex>-<role>)
+dsm enroll --role {client,server}     Set the role suffix when
+                                      --cn is not given
 
-python3 -m dsm show-pubkey                       Print the local identity's
-                                                 Noise static pubkey (hex)
+dsm show-pubkey                       Print the local identity's
+                                      Noise static pubkey (hex)
 
-python3 -m dsm cleanup                           Remove every DSM table, rule
-                                                 and setting (gets the host
-                                                 back after a crash)
+dsm cleanup                           Remove every DSM table, rule
+                                      and setting (gets the host
+                                      back after a crash)
 
-python3 -m dsm init {server,client} ...          Set up this host: config,
-                                                 CA copy, keys, CSR
-                                                 (`dsm init --help` lists
-                                                 every option)
-python3 -m dsm init {server,client} --resume     Import the signed cert;
-      --signed-cert PATH                         print what is left to do
+dsm init {server,client} ...          Set up this host: config,
+                                      CA copy, keys, CSR
+                                      (`dsm init --help` lists
+                                      every option)
+dsm init {server,client} --resume     Import the signed cert;
+      --signed-cert PATH              print what is left to do
 ```

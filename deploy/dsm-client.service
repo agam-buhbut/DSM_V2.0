@@ -8,9 +8,10 @@ After=network-online.target
 Wants=network-online.target
 
 # StartLimit* is only honored in [Unit]. If DSM keeps failing at start,
-# systemd stops trying after 5 starts in 10 minutes. After a crash or a
-# start error the kill switch stays up even then (see ExecStopPost), so the
-# host stays blocked, not open.
+# systemd stops trying after 5 starts in 10 minutes. After a crash, or a
+# start error once the block is up, the kill switch stays up even then (see
+# ExecStopPost), so the host stays blocked, not open. A few errors come
+# before the block (deploy/GUIDE.md §7i): after a boot the host is then open.
 StartLimitIntervalSec=10min
 StartLimitBurst=5
 
