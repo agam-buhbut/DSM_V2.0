@@ -92,6 +92,9 @@ async def test_a_leftover_hosts_file_gets_one_warning(
     lines = [r.getMessage() for r in caplog.records if "hosts.txt" in r.getMessage()]
     assert len(lines) == 1
     assert "is no longer read" in lines[0]
+    # A copy leaves the old file, so the warning would come back each start.
+    assert f"move the file into {tmp_path / 'dns' / 'block'}" in lines[0]
+    assert "copy" not in lines[0]
 
 
 async def test_the_fatal_line_gives_no_tun_address_advice(

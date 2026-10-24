@@ -555,7 +555,7 @@ async def run_server(
     if old_hosts.exists():
         log.warning(
             "%s is no longer read: DSM gives no fixed answers now. To block "
-            "those names, copy the file into %s (deploy/GUIDE.md §7h); "
+            "those names, move the file into %s (deploy/GUIDE.md §7h); "
             "otherwise delete it.",
             old_hosts,
             config.config_dir / "dns" / "block",
