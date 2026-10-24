@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import difflib
 import ipaddress
 import logging
 import os
 import re
 import tomllib
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Literal, cast
 from urllib.parse import urlparse
@@ -296,10 +297,11 @@ def _validate_mode(c: Config) -> None:
 
 def _validate_server_ip(c: Config) -> None:
     # A literal IPv4, or a hostname (e.g. DDNS for a home server on a dynamic
-    # IP) that the client resolves once, before the kill switch is installed
-    # (client._resolve_server_endpoint). That lookup leaves in the clear and is
-    # not a trust anchor: the server is authenticated by Noise + cert/CN, so a
-    # spoofed answer fails the handshake instead of redirecting the client.
+    # IP) that the client looks up at start, behind its kill switch, from a
+    # marked socket (client._resolve_server_endpoint, net.server_lookup). That
+    # lookup leaves in the clear and is not a trust anchor: the server is
+    # authenticated by Noise + cert/CN, so a spoofed answer fails the
+    # handshake instead of redirecting the client. A server ignores it.
     try:
         addr = ipaddress.ip_address(c.server_ip)
     except ValueError:
@@ -637,8 +639,8 @@ def _validate_mtu(c: Config) -> None:
         log.warning(
             "configured tun mtu=%d is above 1400; "
             "wire packets will be ~%d B which may exceed link MTU on "
-            "PPPoE/tunnel-in-tunnel paths. Lower to 1380 if ping works "
-            "but throughput stalls.",
+            "PPPoE/tunnel-in-tunnel paths. Use 1360, the default: above it "
+            "every full-size packet is split in two.",
             c.mtu,
             c.mtu + 68,
         )
@@ -746,6 +748,22 @@ def _reject_removed_keys(raw: dict[str, object]) -> None:
         )
 
 
+def _reject_unknown_keys(raw: dict[str, object]) -> None:
+    """Stop with one line for a setting DSM does not know, and the nearest
+    one it does (QA Minor 5). Config(**raw) would fail with Python's own
+    "unexpected keyword argument" text instead."""
+    known = [f.name for f in fields(Config)]
+    unknown = sorted(key for key in raw if key not in known)
+    if not unknown:
+        return
+    named: list[str] = []
+    for key in unknown:
+        close = difflib.get_close_matches(key, known, n=1)
+        named.append(f"{key!r} (did you mean {close[0]!r}?)" if close else repr(key))
+    word = "setting" if len(unknown) == 1 else "settings"
+    raise ConfigError(f"unknown {word} {', '.join(named)}; see config.example.toml")
+
+
 def load(path: Path | None = None) -> Config:
     """Load and validate config from TOML file.
 
@@ -763,9 +781,9 @@ def load(path: Path | None = None) -> Config:
     try:
         check_user_file_permissions(p)
     except InsecureFilePermissionsError as e:
+        # The check's own text already says how to fix it (one chmod).
         raise ConfigError(
-            f"refusing to load config with insecure permissions: {e}. "
-            f"config.toml pins the CA root + crl_strict; run: chmod 600 {p}"
+            f"refusing to load config with insecure permissions: {e}"
         ) from e
     if dsm_config_dir := os.getenv("DSM_CONFIG_DIR"):
         config_dir = Path(dsm_config_dir)
@@ -774,5 +792,6 @@ def load(path: Path | None = None) -> Config:
     with open(p, "rb") as f:
         raw = tomllib.load(f)
     _reject_removed_keys(raw)
+    _reject_unknown_keys(raw)
     raw.setdefault("config_dir", config_dir)
     return Config(**raw)
