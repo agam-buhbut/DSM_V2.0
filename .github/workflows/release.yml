@@ -155,7 +155,7 @@ jobs:
         run: |
           cd dist
           # Covers every wheel (DSM tpm + DSM +soft + all vendored dep wheels),
-          # the sdist, and install.sh — the signed list is the single trust
+          # the sdist, install.sh and the systemd units — the signed list is the single trust
           # anchor the installer verifies the entire local wheelhouse against.
           sha256sum * > SHA256SUMS
       - name: Sign SHA256SUMS with minisign

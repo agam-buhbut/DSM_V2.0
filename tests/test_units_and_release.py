@@ -4,7 +4,13 @@ as the other unit and install.sh tests do."""
 
 from __future__ import annotations
 
+import hashlib
+import os
+import subprocess
+from collections.abc import Callable
 from pathlib import Path
+
+import pytest
 
 from tests.test_client_unit import _code
 
@@ -38,8 +44,12 @@ def test_the_units_run_usr_local_bin_dsm() -> None:
 def test_the_release_ships_the_units() -> None:
     for name in SHIPPED:
         assert f"deploy/{name}" in RELEASE, name
+    files_block = RELEASE.split("files: |", 1)[1].split("\n\n", 1)[0]
     for pattern in ("dist/*.service", "dist/*.timer", "dist/dsm-blocklist-update.sh"):
-        assert pattern in RELEASE, pattern
+        assert pattern in files_block, pattern
+    cp_line = RELEASE[RELEASE.index("cp deploy/dsm.service") :].split("dist/\n", 1)[0]
+    for name in SHIPPED:
+        assert f"deploy/{name}" in cp_line, name
     # Staged before the checksums are made, so the signed list covers them.
     assert RELEASE.index("deploy/dsm.service") < RELEASE.index(
         "sha256sum * > SHA256SUMS"
@@ -68,3 +78,145 @@ def test_install_sh_fetches_and_checks_the_units_before_installing() -> None:
     # branches name --install-unit (QA M1).
     assert 'enable --now dsm"' not in INSTALL
     assert INSTALL.count("Give --install-unit to the first dsm init command") == 2
+
+
+def test_install_sh_guards_the_fetch_and_checks_inside_deploy() -> None:
+    assert 'if [ "$SYSTEMD" = 1 ] && [ "$EVAL" = 0 ]; then' in INSTALL
+    assert '( cd "$WORK/deploy" && sha256sum -c "$WORK/expected.sha256" )' in INSTALL
+
+
+# --- run install.sh against fakes -------------------------------------------
+
+_FAKE_CURL = """#!/bin/sh
+# fake curl: copy $SERVED/<name> to the -o file; fail for names in $CURL_FAIL.
+out=""; url=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) out="$2"; shift ;;
+    http*) url="$1" ;;
+  esac
+  shift
+done
+name="${url##*/}"
+echo "$name" >> "$FAKE_LOG_DIR/curl.log"
+case " $CURL_FAIL " in *" $name "*) exit 22 ;; esac
+cp "$SERVED/$name" "$out"
+"""
+_RECORDER = """#!/bin/sh
+echo "$0 $*" >> "$FAKE_LOG_DIR/calls.log"
+"""
+_WHEEL = "dsm-0.1.0-cp311-abi3-linux_x86_64.whl"
+_UNIT_FILES = [n for n in SHIPPED if n != "dsm-client.service"]
+
+Install = Callable[..., "tuple[subprocess.CompletedProcess[str], Path]"]
+
+
+def _sums(served: Path, names: list[str]) -> None:
+    lines = [
+        f"{hashlib.sha256((served / n).read_bytes()).hexdigest()}  {n}\n" for n in names
+    ]
+    (served / "SHA256SUMS").write_text("".join(lines))
+
+
+@pytest.fixture(name="install")
+def _install(tmp_path: Path) -> Install:
+    fakebin = tmp_path / "fakebin"
+    fakebin.mkdir()
+    for name, body in (
+        ("curl", _FAKE_CURL),
+        ("minisign", "#!/bin/sh\nexit 0\n"),
+        ("id", "#!/bin/sh\necho 0\n"),
+        ("uname", "#!/bin/sh\necho x86_64\n"),
+        ("apt-get", _RECORDER),
+        ("install", _RECORDER),
+        ("pip", _RECORDER),
+        ("python3", _RECORDER),
+        ("systemctl", _RECORDER),
+    ):
+        (fakebin / name).write_text(body)
+        (fakebin / name).chmod(0o755)
+    tpm = tmp_path / "tpmrm0"
+    tpm.write_text("")
+    # The copy looks for a stand-in TPM node, so nothing on the host is read.
+    script = tmp_path / "install.sh"
+    script.write_text(INSTALL.replace("/dev/tpmrm0", str(tpm)))
+    tmp = tmp_path / "tmp"
+    tmp.mkdir()
+
+    def run(
+        *args: str,
+        tamper: str | None = None,
+        drop: str | None = None,
+        curl_fail: str = "",
+    ) -> tuple[subprocess.CompletedProcess[str], Path]:
+        served = tmp_path / "served"
+        served.mkdir(exist_ok=True)
+        for name in (_WHEEL, *SHIPPED):
+            (served / name).write_text(f"content of {name}\n")
+        names = [_WHEEL, *(n for n in SHIPPED if n != drop)]
+        _sums(served, names)
+        (served / "SHA256SUMS.minisig").write_text("sig\n")
+        if tamper:
+            (served / tamper).write_text("tampered\n")
+        logs = tmp_path / "logs"
+        logs.mkdir(exist_ok=True)
+        env = {
+            "PATH": f"{fakebin}:{os.environ['PATH']}",
+            "TMPDIR": str(tmp),
+            "SERVED": str(served),
+            "CURL_FAIL": curl_fail,
+            "FAKE_LOG_DIR": str(logs),
+            "DSM_RELEASE_BASE_URL": "https://example.invalid/rel",
+        }
+        done = subprocess.run(
+            ["/bin/sh", str(script), *args],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+        return done, logs
+
+    return run
+
+
+def _calls(logs: Path) -> str:
+    path = logs / "calls.log"
+    return path.read_text() if path.exists() else ""
+
+
+def test_a_unit_file_that_does_not_match_the_signed_sums_stops_the_install(
+    install: Install,
+) -> None:
+    done, logs = install("--systemd", tamper="dsm.service")
+    assert done.returncode != 0, done.stderr
+    assert "checksum mismatch for dsm.service" in done.stderr
+    assert _calls(logs) == ""
+
+
+def test_sums_without_the_unit_line_stop_the_install(install: Install) -> None:
+    done, logs = install("--systemd", drop="dsm.service")
+    assert done.returncode != 0, done.stderr
+    assert "no single entry for dsm.service" in done.stderr
+    assert _calls(logs) == ""
+
+
+def test_a_failed_unit_download_stops_the_install(install: Install) -> None:
+    done, logs = install("--systemd", curl_fail="dsm.service")
+    assert done.returncode != 0, done.stderr
+    assert "cannot fetch dsm.service" in done.stderr
+    assert _calls(logs) == ""
+
+
+def test_the_client_install_checks_its_unit_too(install: Install) -> None:
+    done, logs = install("--systemd", "--client", tamper="dsm-client.service")
+    assert done.returncode != 0, done.stderr
+    assert "checksum mismatch for dsm-client.service" in done.stderr
+    assert _calls(logs) == ""
+
+
+def test_eval_fetches_no_unit_file(install: Install) -> None:
+    _, logs = install("--eval", "--systemd")
+    fetched = (logs / "curl.log").read_text().split()
+    assert not [n for n in fetched if n in SHIPPED], fetched
