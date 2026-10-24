@@ -150,8 +150,10 @@ def test_dsm_init_client_installs_the_client_unit(
     assert (units / "dsm-client.service").read_text() == "client unit\n"
     assert not (units / "dsm.service").exists()
     assert runs == [["systemctl", "daemon-reload"]]
-    assert (tmp_path / "etc-dsm" / "passphrase").stat().st_mode & 0o777 == 0o600
+    # No empty passphrase file (QA B2): init says to fill it instead.
+    assert not (tmp_path / "etc-dsm" / "passphrase").exists()
     out = capsys.readouterr().out
+    assert f"Put the key passphrase in {tmp_path / 'etc-dsm' / 'passphrase'}" in out
     assert "sudo systemctl enable dsm-client" in out
     assert "enable --now" not in out
     assert "sudo systemctl start dsm-client" in out

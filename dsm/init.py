@@ -16,9 +16,10 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import NoReturn
+from typing import Literal, NoReturn
 
-from dsm.core.config import ConfigError
+from dsm.core.atomic_io import atomic_write
+from dsm.core.config import Config, ConfigError
 from dsm.core.config import load as config_load
 from dsm.core.passphrase import read_passphrase, wipe_passphrase
 from dsm.crypto._stores import loaded_stores_cli
@@ -39,6 +40,7 @@ _STATE_SCHEMA = 1
 _DEPLOY_DIR = Path(__file__).resolve().parent.parent / "deploy"
 _SYSTEMD_DIR = Path("/etc/systemd/system")
 _CRED_FILE = Path("/etc/dsm/passphrase")
+_DEFAULT_INSTALL_DIR = "/opt/mtun"
 
 # A client the server does not know yet blocks all traffic, SSH too, and
 # keeps trying. So the client unit is enabled now and started later.
@@ -106,9 +108,16 @@ def _check_preconditions(tcti: str | None) -> None:
         _fail(str(e))
 
 
-def _render_config(role: str, args: argparse.Namespace, install_dir: Path) -> str:
-    """Render config.toml text from config.example.toml-shaped fields."""
-    ca_root = Path(args.ca_root)
+def _render_config(
+    role: str, args: argparse.Namespace, install_dir: Path, *, soft: bool = False
+) -> str:
+    """Render config.toml text from config.example.toml-shaped fields.
+
+    The CA root must already be at ``install_dir/dsm_ca_root.pem``
+    (``_install_ca_root``). With ``soft`` (an evaluation build) the config
+    acknowledges the software attest key (QA Minor 13).
+    """
+    ca_root = install_dir / "dsm_ca_root.pem"
     if not ca_root.is_file():
         _fail(f"ca-root not found: {ca_root}")
     ca_sha = hashlib.sha256(ca_root.read_bytes()).hexdigest()
@@ -116,9 +125,15 @@ def _render_config(role: str, args: argparse.Namespace, install_dir: Path) -> st
     crl_file = install_dir / "dsm_ca.crl"
     print(
         f"dsm init: crl_strict is on (fail-closed); the daemon will NOT start "
-        f"until you place a current CRL at {crl_file} — see deploy/GUIDE.md §7e.",
+        f"until a current CRL is at {crl_file}: copy the CA's CRL there "
+        "(deploy/GUIDE.md §2c, §2f).",
         file=sys.stderr,
     )
+    # A server does not use server_ip (QA Minor 16), but the config check
+    # wants an address there.
+    server_ip_line = f"server_ip = {json.dumps(args.server_ip or '0.0.0.0')}"
+    if role == "server":
+        server_ip_line += "  # not used by a server"
     # Every dynamic/operator-supplied value is rendered with json.dumps so it
     # cannot break out of the TOML string and inject config keys (e.g. a
     # --dns-provider or --expected-server-cn containing a quote/newline that
@@ -126,7 +141,7 @@ def _render_config(role: str, args: argparse.Namespace, install_dir: Path) -> st
     # valid subset of TOML basic-string escaping. config_load re-validates after.
     lines = [
         f"mode = {json.dumps(role)}",
-        f"server_ip = {json.dumps(args.server_ip)}",
+        server_ip_line,
         f"server_port = {args.server_port}",
         f"listen_port = {0 if role == 'client' else args.server_port}",
         f"key_file = {json.dumps(str(install_dir / 'identity.key'))}",
@@ -137,11 +152,17 @@ def _render_config(role: str, args: argparse.Namespace, install_dir: Path) -> st
         # Fail-closed by default: crl_strict=true with a configured crl_file
         # makes the daemon refuse to start on a MISSING/stale CRL with a clear
         # message, rather than silently skipping revocation. The operator must
-        # place a current CRL at crl_file before starting (deploy/GUIDE.md §7e).
+        # place a current CRL at crl_file before starting (deploy/GUIDE.md §2f).
         "crl_strict = true",
         f"crl_file = {json.dumps(str(crl_file))}",
         'transport = "udp"',
     ]
+    if soft:
+        lines += [
+            "# Evaluation build: the attest key is a software key, not held in",
+            "# a TPM. Never use this host in production.",
+            "allow_soft_attest = true",
+        ]
     if role == "client":
         lines.append(f"expected_server_cn = {json.dumps(args.expected_server_cn)}")
     else:
@@ -154,12 +175,31 @@ def _render_config(role: str, args: argparse.Namespace, install_dir: Path) -> st
     return "\n".join(lines) + "\n"
 
 
+def _install_ca_root(src: Path, install_dir: Path) -> Path:
+    """Copy the CA root into the install dir at 0600, as GUIDE §2f does by
+    hand, so the config never points at a USB stick or a download folder
+    (QA M7). A relative ``src`` is taken from the current folder."""
+    src = src.absolute()
+    if not src.is_file():
+        _fail(f"ca-root not found: {src}")
+    target = install_dir / "dsm_ca_root.pem"
+    if target.exists() and os.path.samefile(src, target):
+        # Already in place. The folder is init's own (0700), so it may set
+        # the mode the daemon wants.
+        target.chmod(0o600)
+        return target
+    atomic_write(target, src.read_bytes(), mode=0o600)
+    print(f"Copied the CA root to {target} (mode 0600).")
+    return target
+
+
 def _write_state(
     install_dir: Path,
     role: str,
     args: argparse.Namespace,
     csr_path: Path,
     cn: str,
+    ca_root: Path,
 ) -> None:
     state = {
         "schema": _STATE_SCHEMA,
@@ -168,7 +208,7 @@ def _write_state(
         "config_path": str(install_dir / "config.toml"),
         "csr_path": str(csr_path),
         "cn": cn,
-        "ca_root_file": str(Path(args.ca_root)),
+        "ca_root_file": str(ca_root),
         "install_unit": bool(getattr(args, "install_unit", False)),
     }
     path = install_dir / _STATE_NAME
@@ -178,7 +218,8 @@ def _write_state(
 
 def _require_server_args(role: str, args: argparse.Namespace) -> None:
     missing: list[str] = []
-    if not args.server_ip:
+    if role == "client" and not args.server_ip:
+        # A server does not use it (QA Minor 16).
         missing.append("--server-ip")
     if args.server_port is None:
         missing.append("--server-port")
@@ -255,7 +296,7 @@ def _force_remove_enrollment(install_dir: Path, state_path: Path) -> None:
 def _phase_a(role: str, args: argparse.Namespace) -> int:
     _require_server_args(role, args)
     _check_preconditions(getattr(args, "tcti", None))
-    install_dir = Path(args.install_dir)
+    install_dir = Path(args.install_dir).absolute()
     _ensure_secret_dir(install_dir)
 
     state_path = install_dir / _STATE_NAME
@@ -266,64 +307,98 @@ def _phase_a(role: str, args: argparse.Namespace) -> int:
         )
     if args.force:
         _force_remove_enrollment(install_dir, state_path)
+    else:
+        # Refuse before anything is written, so a re-run on an enrolled host
+        # leaves its config as it is (QA M6).
+        for key in (install_dir / "identity.key", install_dir / "attest.key"):
+            if key.exists():
+                _fail(
+                    f"{key} already exists: this host is already enrolled, and "
+                    "its config.toml was not changed. To enroll it again, "
+                    "re-run with --force (it removes the keys)."
+                )
 
-    config_path = install_dir / "config.toml"
-    config_path.write_text(_render_config(role, args, install_dir), encoding="utf-8")
-    config_path.chmod(0o600)
-    try:
-        config_load(config_path)
-    except (ConfigError, ValueError, TypeError) as e:
-        _fail(f"generated config did not validate: {e}")
-
-    keystore = KeyStore(str(install_dir / "identity.key"))
-    attest_store = AttestStore(str(install_dir / "attest.key"))
-    try:
-        passphrase = read_passphrase(
-            passphrase_fd=getattr(args, "passphrase_fd", None),
-            passphrase_env_file=getattr(args, "passphrase_env_file", None),
-            prompt="New passphrase (protects the identity key): ",
+    ca_root = _install_ca_root(Path(args.ca_root), install_dir)
+    soft = _backend_is_soft()
+    if soft:
+        print(
+            "dsm init: evaluation build: writing allow_soft_attest = true "
+            "(never in production).",
+            file=sys.stderr,
         )
-    except ValueError as e:
-        # read_passphrase fails closed on an empty passphrase from any source
-        # (it would otherwise enroll an unprotected empty-auth TPM key). Surface
-        # it cleanly, mirroring the `dsm enroll` handler — no traceback, exit 2.
-        _fail(str(e))
+    config_path = install_dir / "config.toml"
+    # Written aside and checked first; it replaces config.toml only once the
+    # enrollment worked, so a failure leaves the old config as it was (M6, M7).
+    new_config = install_dir / "config.toml.new"
+    done = False
     try:
+        new_config.write_text(
+            _render_config(role, args, install_dir, soft=soft), encoding="utf-8"
+        )
+        new_config.chmod(0o600)
         try:
-            result = generate_enrollment(
-                keystore=keystore,
-                attest_store=attest_store,
-                passphrase=passphrase,
-                role=role,
-                cn=None,
+            config_load(new_config)
+        except (ConfigError, ValueError, TypeError) as e:
+            _fail(f"generated config did not validate: {e}")
+
+        keystore = KeyStore(str(install_dir / "identity.key"))
+        attest_store = AttestStore(str(install_dir / "attest.key"))
+        try:
+            passphrase = read_passphrase(
+                passphrase_fd=getattr(args, "passphrase_fd", None),
+                passphrase_env_file=getattr(args, "passphrase_env_file", None),
+                prompt="New passphrase (protects the identity key): ",
+                confirm=True,
             )
-        except EnrollError as e:
-            # generate_enrollment refuses to clobber existing keys; surface its
-            # actionable "remove the file by hand" message rather than a trace.
+        except ValueError as e:
+            # read_passphrase fails closed on an empty passphrase from any
+            # source (it would otherwise enroll an unprotected empty-auth TPM
+            # key), and on two answers that differ. Surface it cleanly.
             _fail(str(e))
+        try:
+            try:
+                result = generate_enrollment(
+                    keystore=keystore,
+                    attest_store=attest_store,
+                    passphrase=passphrase,
+                    role=role,
+                    cn=None,
+                )
+            except EnrollError as e:
+                _fail(str(e))
+        finally:
+            wipe_passphrase(passphrase)
+        new_config.replace(config_path)
+        done = True
     finally:
-        wipe_passphrase(passphrase)
+        if not done:
+            new_config.unlink(missing_ok=True)
 
     csr_path = install_dir / f"{role}.csr"
     csr_path.write_bytes(result.csr_der)
     # A CSR is not secret, but write it 0o600 for consistency with the rest of
     # the install dir (config, state, keys) and to avoid an umask-dependent mode.
     csr_path.chmod(0o600)
-    _write_state(install_dir, role, args, csr_path, result.cn)
+    _write_state(install_dir, role, args, csr_path, result.cn, ca_root)
     print(f"Wrote CSR to {csr_path} (cn={result.cn})")
+    resume = f"sudo dsm init {role} --resume --signed-cert <signed.crt>"
+    if install_dir != Path(_DEFAULT_INSTALL_DIR):
+        resume += f" --install-dir {install_dir}"
     print(
         "Walk the CSR to the offline CA (deploy/GUIDE.md §3c), sign it, then "
-        "run:\n"
-        f"  sudo dsm init {role} --resume --signed-cert <signed.crt>"
+        f"run:\n  {resume}"
     )
     return 0
 
 
-def _phase_b(role: str, args: argparse.Namespace) -> int:
-    install_dir = Path(args.install_dir)
+def _phase_b(role: Literal["client", "server"], args: argparse.Namespace) -> int:
+    install_dir = Path(args.install_dir).absolute()
     state_path = install_dir / _STATE_NAME
     if not state_path.is_file():
-        _fail(f"no init state at {state_path}; run Phase A first (without --resume)")
+        _fail(
+            f"no init state at {state_path}: run `dsm init {role}` without "
+            "--resume first, with the same --install-dir"
+        )
     state = json.loads(state_path.read_text(encoding="utf-8"))
     if state.get("schema") != _STATE_SCHEMA:
         _fail(
@@ -337,48 +412,173 @@ def _phase_b(role: str, args: argparse.Namespace) -> int:
         )
     if not args.signed_cert:
         _fail("--signed-cert <path> is required to resume (import the CA cert)")
-    cfg = config_load(Path(state["config_path"]))
+    config_path = Path(state["config_path"])
+    cfg = config_load(config_path)
+    # --install-unit counts at either step: the README gives it to the first
+    # one, and a user may add it to --resume.
+    unit = bool(state.get("install_unit")) or bool(getattr(args, "install_unit", False))
 
     keystore = KeyStore(cfg.key_file)
     attest_store = AttestStore(cfg.attest_key_file)
     signed = Path(args.signed_cert)
-    with loaded_stores_cli(
-        keystore,
-        attest_store,
-        passphrase_fd=getattr(args, "passphrase_fd", None),
-        passphrase_env_file=getattr(args, "passphrase_env_file", None),
-        key_file_label=cfg.key_file,
-        attest_key_file_label=cfg.attest_key_file,
-    ):
-        try:
-            import_signed_cert(
-                cert_input_path=signed,
-                cert_output_path=Path(cfg.cert_file),
-                ca_root_path=Path(cfg.ca_root_file),
-                keystore=keystore,
-                attest_store=attest_store,
+    # The passphrase that unlocks both stores, kept (wipeable) for the unit's
+    # passphrase file, written only once the import worked (QA B2).
+    proven = bytearray()
+    try:
+        with loaded_stores_cli(
+            keystore,
+            attest_store,
+            passphrase_fd=getattr(args, "passphrase_fd", None),
+            passphrase_env_file=getattr(args, "passphrase_env_file", None),
+            key_file_label=cfg.key_file,
+            attest_key_file_label=cfg.attest_key_file,
+            on_unlocked=proven.extend if unit else None,
+        ):
+            try:
+                import_signed_cert(
+                    cert_input_path=signed,
+                    cert_output_path=Path(cfg.cert_file),
+                    ca_root_path=Path(cfg.ca_root_file),
+                    keystore=keystore,
+                    attest_store=attest_store,
+                    role=role,
+                )
+            except EnrollError as e:
+                _fail(str(e))
+
+        if role == "server" and cfg.allowed_cns_file:
+            allow = Path(cfg.allowed_cns_file)
+            allow.touch(mode=0o600, exist_ok=True)
+            print(f"Created the allowlist {allow}; add the client CNs there.")
+        else:
+            print(
+                "Give this CN to the server operator for its allowlist: "
+                f"{state['cn']}"
             )
-        except EnrollError as e:
-            _fail(str(e))
 
-    if role == "server" and cfg.allowed_cns_file:
-        allow = Path(cfg.allowed_cns_file)
-        allow.touch(mode=0o600, exist_ok=True)
-        print(f"Created empty allowlist {allow}; add the client CN there.")
-    else:
-        print(
-            "Give this CN to the server operator for its allowlist: " f"{state['cn']}"
-        )
-
-    if state.get("install_unit"):
-        _install_unit(role)
+        if unit:
+            _write_unit_passphrase(proven)
+            _install_unit(role)
+    finally:
+        wipe_passphrase(proven)
 
     state_path.unlink()
-    print(
-        f"Done. Verify with: systemctl status {_unit_name(role)}  "
-        "(deploy/GUIDE.md §6)"
-    )
+    _print_next_steps(role, cfg, config_path, unit)
     return 0
+
+
+def _cred_file_ready() -> bool:
+    try:
+        return _CRED_FILE.is_file() and _CRED_FILE.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def _close_to_others(path: Path, mode: int) -> None:
+    """Set ``path`` to ``mode`` if group or others may use it. Never reads
+    the file. A missing path is left for the caller to make; a symlink is
+    left alone."""
+    try:
+        if path.is_symlink() or not path.exists():
+            return
+        old = path.stat().st_mode & 0o777
+        if not old & 0o077:
+            return
+        path.chmod(mode)
+    except OSError as e:
+        print(
+            f"dsm init: could not set {path} to mode {mode:o}: {e}; run: "
+            f"sudo chmod {mode:o} {path}",
+            file=sys.stderr,
+        )
+    else:
+        print(f"{path} was open to others (mode {old:o}); it is now {mode:o}.")
+
+
+def _write_unit_passphrase(passphrase: bytearray) -> None:
+    """Give the systemd unit the passphrase that just unlocked the keys.
+
+    The unit reads /etc/dsm/passphrase (LoadCredential=); an empty file
+    stops it with every start error, a missing one makes systemd refuse to
+    start it (QA B2). A file with something in it is left alone and not
+    read: reading it would copy a secret into memory that cannot be wiped.
+    """
+    path = _CRED_FILE
+    # Under the unit DSM sees only systemd's 0400 copy, so nothing else would
+    # notice a passphrase file or folder others can open: close them here.
+    _close_to_others(path.parent, 0o700)
+    if _cred_file_ready():
+        _close_to_others(path, 0o600)
+        print(f"Kept {path}; make sure it holds this passphrase.")
+        return
+    try:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+        )
+        try:
+            os.fchmod(fd, 0o600)
+            with memoryview(passphrase) as view:
+                written = 0
+                while written < len(view):
+                    written += os.write(fd, view[written:])
+        finally:
+            os.close(fd)
+    except OSError as e:
+        print(
+            f"dsm init: could not write {path}: {e}; put the passphrase there "
+            "by hand (deploy/GUIDE.md §3e)",
+            file=sys.stderr,
+        )
+        return
+    print(f"Wrote the key passphrase to {path} (mode 0600) for the systemd unit.")
+
+
+def _has_names(path: Path) -> bool:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return any(
+        line.strip() and not line.strip().startswith("#") for line in text.splitlines()
+    )
+
+
+def _print_next_steps(role: str, cfg: Config, config_path: Path, unit: bool) -> None:
+    """What is left before DSM can start (QA M1), instead of "Done"."""
+    steps: list[str] = []
+    if cfg.crl_file and not Path(cfg.crl_file).is_file():
+        steps.append(
+            f"Copy the CA's current CRL to {cfg.crl_file}, mode 0600 "
+            "(deploy/GUIDE.md §2f)."
+        )
+    if role == "server":
+        if cfg.allowed_cns_file and not _has_names(Path(cfg.allowed_cns_file)):
+            steps.append(
+                f"Add each client's CN to {cfg.allowed_cns_file}, one per line "
+                "(deploy/GUIDE.md §4)."
+            )
+    else:
+        steps.append(
+            "Wait until the server's allowlist has this client's CN "
+            "(deploy/GUIDE.md §4): until then this client blocks all traffic, "
+            "SSH too."
+        )
+    if unit and not _cred_file_ready():
+        steps.append(f"Put the key passphrase in {_CRED_FILE} (deploy/GUIDE.md §3e).")
+    if unit:
+        start = f"sudo systemctl start {_unit_name(role)}"
+    else:
+        start = f"sudo dsm --config {config_path}"
+    if not steps:
+        print(f"Ready. Start it: {start}  (check: deploy/GUIDE.md §6)")
+        return
+    print("Still to do before you start DSM:")
+    for number, step in enumerate(steps, start=1):
+        print(f"  {number}. {step}")
+    print(f"Then start it: {start}  (check: deploy/GUIDE.md §6)")
 
 
 def _unit_name(role: str) -> str:
@@ -393,57 +593,127 @@ def _install_unit(role: str = "server") -> None:
     name = _unit_name(role)
     src = _DEPLOY_DIR / f"{name}.service"
     client = role == "client"
+    # Never an empty passphrase file (QA B2): it would stop the unit.
+    fill = (
+        ""
+        if _cred_file_ready()
+        else f"\nPut the key passphrase in {_CRED_FILE} before you start it "
+        "(deploy/GUIDE.md §3e)."
+    )
+    # Enabled now, started later: a server needs a client CN in its
+    # allowlist first, and a client must be known to the server (QA M2).
+    # _print_next_steps gives the start command.
+    note = f"\n{_CLIENT_START_NOTE}" if client else ""
     if not src.is_file():
-        enable = f"enable {name}" if client else f"enable --now {name}"
+        if (_SYSTEMD_DIR / f"{name}.service").is_file():
+            # install.sh --systemd put it there; a wheel has no deploy/.
+            print(
+                f"{name}.service is already installed. Enable it with: "
+                f"sudo systemctl enable {name}" + note + fill
+            )
+            return
         print(
             f"{name}.service not found at the expected location.\n"
-            "Copy it manually from the DSM release tarball to "
+            f"Copy deploy/{name}.service from the DSM source or release to "
             f"/etc/systemd/system/{name}.service, then run:\n"
-            f"  sudo systemctl daemon-reload && sudo systemctl {enable}"
-            + (f"\n{_CLIENT_START_NOTE}" if client else ""),
+            f"  sudo systemctl daemon-reload && sudo systemctl enable {name}"
+            + note
+            + fill,
             file=sys.stderr,
         )
         return
     shutil.copyfile(src, _SYSTEMD_DIR / f"{name}.service")
-    _CRED_FILE.parent.mkdir(parents=True, exist_ok=True)
-    if not _CRED_FILE.exists():
-        _CRED_FILE.touch(mode=0o600)
     subprocess.run(["systemctl", "daemon-reload"], check=True)
     if client:
         print(
             f"Installed {name}.service. Enable it with: sudo systemctl enable {name}\n"
             f"{_CLIENT_START_NOTE}\n"
-            f"Then start it with: sudo systemctl start {name}"
+            f"Then start it with: sudo systemctl start {name}" + fill
         )
     else:
         print(
-            f"Installed {name}.service. Start with: sudo systemctl enable --now {name}"
+            f"Installed {name}.service. Enable it with: sudo systemctl enable {name}"
+            + fill
         )
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="dsm init")
-    p.add_argument("role", choices=["server", "client"])
-    p.add_argument("--resume", action="store_true")
-    p.add_argument("--force", action="store_true")
-    p.add_argument("--install-dir", default="/opt/mtun")
+    p = argparse.ArgumentParser(
+        prog="dsm init",
+        description=(
+            "Set up this host: write config.toml, pin the CA root, make the "
+            "keys and a CSR. Then, with --resume, import the cert the CA "
+            "signed (deploy/GUIDE.md §3)."
+        ),
+    )
+    p.add_argument("role", choices=["server", "client"], help="what this host is")
+    p.add_argument(
+        "--resume",
+        action="store_true",
+        help="second step: import the cert the CA signed (needs --signed-cert)",
+    )
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="start again: remove this host's keys and the saved init state",
+    )
+    p.add_argument(
+        "--install-dir",
+        default=_DEFAULT_INSTALL_DIR,
+        help="folder for the config, keys and certs (default: %(default)s)",
+    )
     p.add_argument(
         "--server-ip",
         help=(
-            "server endpoint: a literal IPv4 address, or a DDNS hostname for a "
-            "home server on a dynamic IP (resolved once at client startup)"
+            "client: the server's address, a literal IPv4 address or a DDNS "
+            "name for a home server on a dynamic IP (looked up at start). A "
+            "server does not use it (default there: 0.0.0.0)"
         ),
     )
-    p.add_argument("--server-port", type=int)
-    p.add_argument("--ca-root")
-    p.add_argument("--dns-provider")
-    p.add_argument("--dns-pin")
-    p.add_argument("--expected-server-cn")
-    p.add_argument("--signed-cert")
-    p.add_argument("--install-unit", action="store_true")
-    p.add_argument("--tcti")
-    p.add_argument("--passphrase-fd", type=int)
-    p.add_argument("--passphrase-env-file")
+    p.add_argument("--server-port", type=int, help="the server's port, e.g. 51820")
+    p.add_argument(
+        "--ca-root",
+        help="your CA's root certificate (PEM); init copies it into --install-dir",
+    )
+    p.add_argument(
+        "--dns-provider",
+        help="server: a DoH URL whose host is an IP address, e.g. https://1.1.1.1/dns-query",
+    )
+    p.add_argument(
+        "--dns-pin",
+        help=(
+            "server: the provider's key pin, 64 hex characters "
+            "(deploy/GUIDE.md §3a.1)"
+        ),
+    )
+    p.add_argument(
+        "--expected-server-cn",
+        help="client: the server's CN, as `dsm init server` printed it",
+    )
+    p.add_argument("--signed-cert", help="with --resume: the cert the CA signed")
+    p.add_argument(
+        "--install-unit",
+        action="store_true",
+        help=(
+            "also install the systemd unit and put the key passphrase in "
+            "/etc/dsm/passphrase"
+        ),
+    )
+    p.add_argument(
+        "--tcti", help="the TPM to use, as a TSS2 TCTI string (default /dev/tpmrm0)"
+    )
+    p.add_argument(
+        "--passphrase-fd",
+        type=int,
+        help="read the key passphrase from file descriptor N",
+    )
+    p.add_argument(
+        "--passphrase-env-file",
+        help=(
+            "read the key passphrase from the file at PATH (mode 0600; only "
+            "the passphrase)"
+        ),
+    )
     return p
 
 
