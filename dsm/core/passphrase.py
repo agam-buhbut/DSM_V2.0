@@ -12,6 +12,7 @@ they're no longer needed.
 from __future__ import annotations
 
 import ctypes
+import hmac
 import logging
 import os
 import sys
@@ -22,6 +23,11 @@ from pathlib import Path
 from dsm.core.path_security import check_user_file_permissions
 
 log = logging.getLogger(__name__)
+
+
+class PassphraseError(ValueError):
+    """The key passphrase could not be read, or is empty. ``str()`` is one
+    line for the user."""
 
 
 def wipe_passphrase(buf: bytearray) -> None:
@@ -117,6 +123,26 @@ def _read_from_file(path: str | Path) -> bytearray:
     return buf
 
 
+def _read_named_file(path: str) -> bytearray:
+    """Read the passphrase file the user named (``--passphrase-env-file``).
+
+    Any problem stops here with one line. It never falls back to the
+    terminal: under systemd stdin is /dev/null, so a prompt would read
+    nothing and hide the real cause (QA B2).
+    """
+    # os.path.lexists: a dangling symlink is "there" (the permission check
+    # then refuses it); Path.exists(follow_symlinks=False) needs 3.12.
+    if not os.path.lexists(path):
+        raise PassphraseError(f"passphrase file {path} not found")
+    try:
+        buf = _read_from_file(path)
+    except OSError as e:
+        raise PassphraseError(f"cannot read the passphrase file {path}: {e}") from e
+    if not buf:
+        raise PassphraseError(f"passphrase must not be empty: {path} is empty")
+    return buf
+
+
 def _try_source(
     fn: Callable[[], bytearray],
     warn_msg: str,
@@ -153,11 +179,7 @@ def _read_noninteractive(
         )
 
     if passphrase_env_file is not None:
-        return _try_source(
-            lambda: _read_from_file(passphrase_env_file),
-            "failed to read passphrase from %s",
-            passphrase_env_file,
-        )
+        return _read_named_file(passphrase_env_file)
 
     env_file = os.environ.get("DSM_PASSPHRASE_FILE")
     if env_file:
@@ -212,16 +234,34 @@ def read_passphrase(
     passphrase_env_file: str | None = None,
     *,
     prompt: str = "Key passphrase: ",
+    confirm: bool = False,
 ) -> bytearray:
     """Read a passphrase into a wipeable ``bytearray``.
 
     Tries non-interactive sources in order; falls back to an interactive
-    tty prompt with ECHO disabled. The caller owns the returned buffer
-    and MUST call ``wipe_passphrase`` on it after use.
+    tty prompt with ECHO disabled. With ``confirm`` (a new passphrase), a
+    passphrase typed at a terminal is asked twice, so one typo cannot seal
+    the keys under a passphrase nobody knows. The caller owns the returned
+    buffer and MUST call ``wipe_passphrase`` on it after use.
+
+    Raises:
+        PassphraseError: a named file is missing, unsafe or empty, the two
+            answers differ, or the passphrase is empty.
     """
     p = _read_noninteractive(passphrase_fd, passphrase_env_file)
     if p is None:
         p = _read_from_tty(prompt)
+        if confirm and p and sys.stdin.isatty():
+            again = _read_from_tty("Type it again: ")
+            try:
+                same = hmac.compare_digest(p, again)
+            finally:
+                wipe_passphrase(again)
+            if not same:
+                wipe_passphrase(p)
+                raise PassphraseError(
+                    "the two passphrases do not match; nothing was changed"
+                )
     # Fail closed on an empty passphrase from ANY source (empty fd, empty
     # file, or a bare Enter at the tty). The soft backend's
     # seal/open already reject empty (passphrase_store.rs), but the TPM
@@ -231,5 +271,5 @@ def read_passphrase(
     # buffer first to keep the wipeable-bytearray discipline intact.
     if len(p) == 0:
         wipe_passphrase(p)
-        raise ValueError("passphrase must not be empty") from None
+        raise PassphraseError("passphrase must not be empty") from None
     return p
