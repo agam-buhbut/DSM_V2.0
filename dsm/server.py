@@ -528,8 +528,9 @@ async def run_server(
     """Run DSM in server mode using transactional resource management.
 
     Returns:
-        0 after a signal, 1 when the start fails or when the TUN or packet
-        routing fails. ``main()`` ``sys.exit``s this so a misconfigured
+        0 after a signal, 1 when the start fails, when the TUN or packet
+        routing fails, or when the accept loop ends by itself (a bug).
+        ``main()`` ``sys.exit``s this so a misconfigured
         server is a nonzero exit and ``Restart=on-failure`` behaves
         correctly.
     """
@@ -844,11 +845,18 @@ async def run_server(
         # Routing failures already logged, so the stop does not log them again.
         reported: set[asyncio.Task[None]] = set()
         try:
-            # Until a signal, or until the TUN or packet routing fails. A
-            # routing bug fails closed: its state may be wrong.
+            # Until a signal, until the TUN or packet routing fails, or until
+            # the accept loop ends by itself. A routing bug fails closed: its
+            # state may be wrong.
             await asyncio.wait(
-                [signalled, *routing], return_when=asyncio.FIRST_COMPLETED
+                [signalled, accepting, *routing], return_when=asyncio.FIRST_COMPLETED
             )
+            if accepting.done() and not process_shutdown.is_set():
+                # Only a bug ends it without a stop. The sessions would go on,
+                # but nobody new could connect.
+                rc = 1
+                err = None if accepting.cancelled() else accepting.exception()
+                log.error("handshake accept ended unexpectedly; stopping", exc_info=err)
             for task in routing:
                 if not task.done():
                     continue

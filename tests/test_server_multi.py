@@ -845,6 +845,48 @@ async def test_a_dispatcher_bug_stops_the_run_with_exit_1(
     assert error.exc_info is not None
 
 
+@pytest.mark.parametrize("raises", [False, True], ids=["returns", "raises"])
+async def test_an_accept_loop_that_ends_by_itself_stops_the_run_with_exit_1(
+    raises: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Only a bug ends the accept loop without a stop. The sessions would go
+    # on, but nobody new could connect, and nothing would say so.
+    caplog.set_level(logging.ERROR, logger="dsm")
+    captured: dict[str, Any] = {}
+    events: list[str] = captured.setdefault("events", [])
+    sessions = _Sessions(events)
+    end = asyncio.Event()
+    bug = RuntimeError("accept loop bug")
+
+    async def _ends_early(acceptor: _Acceptor, _shutdown: asyncio.Event) -> None:
+        acceptor.runs += 1  # what _start waits for
+        await end.wait()
+        if raises:
+            raise bug
+
+    with _multi(captured, sessions), patch("dsm.server._run_acceptor", _ends_early):
+        run = await _start()
+        acceptor = _Acceptor.made[0]
+        acceptor.admit(A, PEER_A)
+        acceptor.admit(B, PEER_B)
+        assert await _spin(lambda: len(sessions.started) == 2)
+        end.set()
+        rc = await asyncio.wait_for(run, 5.0)
+    assert rc == 1
+    (error,) = _errors(caplog)
+    assert error.getMessage() == "handshake accept ended unexpectedly; stopping"
+    if raises:
+        assert error.exc_info is not None and error.exc_info[1] is bug
+    else:
+        assert error.exc_info is None
+    # The stop a signal gets: the acceptor, every session, the routing, then
+    # the host state (spec §2.2).
+    assert acceptor.stops == 1
+    assert acceptor.live_at_stop == [False, False]
+    assert sorted(events[-4:-2]) == sorted([f"{A} ended", f"{B} ended"])
+    assert events[-2:] == ["routing stopped", "host down"]
+
+
 async def test_a_host_setup_failure_at_start_exits_1_before_any_client(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

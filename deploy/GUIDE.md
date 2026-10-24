@@ -2387,6 +2387,13 @@ sessions are not touched, and new clients wait for the restart. At a stop,
 the same kind of bug logs `handshake accept failed while stopping`, and the
 stop goes on. Report it.
 
+### Server log: "handshake accept ended unexpectedly; stopping"
+
+An ERROR, with a traceback when there is one: a bug ended the part that
+accepts handshakes, so no new client could connect. The server stops (exit
+code 1) rather than run on that way; systemd restarts it, and every client
+reconnects by itself. Report it.
+
 ### Server log: "could not set up the tunnel at start: ...; exiting"
 
 An ERROR at start: the server could not set up its TUN device, its NAT
