@@ -15,8 +15,10 @@ import ctypes
 import hmac
 import logging
 import os
+import signal
 import sys
 import termios
+import threading
 from collections.abc import Callable
 from pathlib import Path
 
@@ -53,6 +55,17 @@ def _read_from_tty(prompt: str) -> bytearray:
     sys.stderr.flush()
 
     old_attrs = termios.tcgetattr(fd)
+    # While the read runs, Ctrl-C raises KeyboardInterrupt and ends it at
+    # once: a handler that only notes the signal (the client's asyncio one)
+    # would leave the prompt waiting. The loop's wakeup fd still gets this
+    # SIGINT, so it may set its stop event later; fine, DSM is stopping.
+    # signal.signal works only in the main thread: elsewhere (and for a
+    # handler Python cannot put back) the read keeps the handler in place.
+    old_sigint = (
+        signal.getsignal(signal.SIGINT)
+        if threading.current_thread() is threading.main_thread()
+        else None
+    )
     buf = bytearray()
     try:
         # The bytes-collection loop is the ONLY region where ``buf`` can
@@ -63,6 +76,8 @@ def _read_from_tty(prompt: str) -> bytearray:
         new_attrs = termios.tcgetattr(fd)
         new_attrs[3] = new_attrs[3] & ~termios.ECHO
         termios.tcsetattr(fd, termios.TCSADRAIN, new_attrs)
+        if old_sigint is not None:
+            signal.signal(signal.SIGINT, signal.default_int_handler)
 
         try:
             while True:
@@ -71,7 +86,7 @@ def _read_from_tty(prompt: str) -> bytearray:
                     break
                 if ch in (b"\n", b"\r"):
                     break
-                if ch == b"\x03":
+                if ch == b"\x03":  # Ctrl-C as a byte: ISIG is off (stty -isig)
                     raise KeyboardInterrupt
                 if ch == b"\x04" and not buf:
                     break
@@ -80,9 +95,13 @@ def _read_from_tty(prompt: str) -> bytearray:
             wipe_passphrase(buf)
             raise
     finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
-        sys.stderr.write("\n")
-        sys.stderr.flush()
+        try:
+            if old_sigint is not None:
+                signal.signal(signal.SIGINT, old_sigint)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+            sys.stderr.write("\n")
+            sys.stderr.flush()
 
     return buf
 

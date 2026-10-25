@@ -4,14 +4,21 @@ A passphrase file named with --passphrase-env-file is the only source DSM
 tries: a missing, unsafe or empty file stops with one clear line and never
 falls back to the terminal (under systemd stdin is /dev/null, so a prompt
 reads nothing and hides the cause). A new passphrase typed at a terminal is
-asked twice. No real terminal is read: the tty reader is faked.
+asked twice. No real terminal is read: the tty reader is faked, and its own
+tests fake termios and os.read. Ctrl-C at the prompt stops the read at once.
 """
 
 from __future__ import annotations
 
+import contextlib
 import os
-from collections.abc import Iterator
+import signal
+import termios
+import threading
+from collections.abc import Callable, Generator, Iterator
 from pathlib import Path
+from types import FrameType, SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -183,3 +190,130 @@ def test_piped_input_is_not_asked_twice() -> None:
     ):
         wipe_passphrase(read_passphrase(confirm=True))
     assert tty.call_count == 1
+
+
+# --- the terminal read itself -------------------------------------------------
+
+_ATTRS: list[Any] = [0, 0, 0, termios.ECHO | termios.ICANON | termios.ISIG, 0, 0, []]
+
+
+def _noted(_signum: int, _frame: FrameType | None) -> None:
+    """A SIGINT handler that only notes the signal, as the client's asyncio
+    handler does."""
+
+
+@pytest.fixture
+def loop_sigint() -> Iterator[None]:
+    old = signal.signal(signal.SIGINT, _noted)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGINT, old)
+
+
+class _Terminal:
+    """termios and os.read for _read_from_tty. Each read returns the next
+    typed byte, or runs the next callable (a Ctrl-C), and notes the SIGINT
+    handler in place."""
+
+    def __init__(self, *typed: bytes | Callable[[], bytes]) -> None:
+        self.typed = list(typed)
+        self.attrs_set: list[list[Any]] = []
+        self.handlers: list[object] = []
+
+    def tcgetattr(self, _fd: int) -> list[Any]:
+        return [*_ATTRS[:6], []]
+
+    def tcsetattr(self, _fd: int, _when: int, attrs: list[Any]) -> None:
+        self.attrs_set.append(list(attrs))
+
+    def read(self, _fd: int, _n: int) -> bytes:
+        self.handlers.append(signal.getsignal(signal.SIGINT))
+        step = self.typed.pop(0)
+        return step() if callable(step) else step
+
+
+@contextlib.contextmanager
+def _at(term: _Terminal) -> Generator[list[tuple[bytes, bytearray]], None, None]:
+    """Run _read_from_tty on ``term``; yields each buffer it wiped, with
+    what it held first."""
+    wiped: list[tuple[bytes, bytearray]] = []
+
+    def wipe(buf: bytearray) -> None:
+        wiped.append((bytes(buf), buf))
+        wipe_passphrase(buf)
+
+    fake_termios = SimpleNamespace(
+        ECHO=termios.ECHO,
+        TCSADRAIN=termios.TCSADRAIN,
+        tcgetattr=term.tcgetattr,
+        tcsetattr=term.tcsetattr,
+    )
+    stdin = _stdin(tty=True)
+    stdin.fileno.return_value = 0
+    with (
+        patch.object(passphrase, "termios", fake_termios),
+        patch.object(passphrase, "os", SimpleNamespace(read=term.read)),
+        patch.object(passphrase, "wipe_passphrase", wipe),
+        patch.object(passphrase.sys, "stdin", stdin),
+    ):
+        yield wiped
+
+
+def _ctrl_c() -> bytes:
+    signal.raise_signal(signal.SIGINT)  # what the terminal sends
+    return b"x"  # reached only if the handler in place did not raise
+
+
+@pytest.mark.usefixtures("loop_sigint")
+@pytest.mark.parametrize(
+    "ctrl_c",
+    # As the terminal sends it, and as a byte (with `stty -isig`).
+    [_ctrl_c, lambda: b"\x03"],
+    ids=["signal", "byte"],
+)
+def test_ctrl_c_at_the_prompt_stops_the_read_at_once(
+    ctrl_c: Callable[[], bytes],
+) -> None:
+    term = _Terminal(b"a", b"b", ctrl_c, b"c", b"\n")
+    with _at(term) as wiped, pytest.raises(KeyboardInterrupt):
+        passphrase._read_from_tty("Key passphrase: ")
+    assert term.typed == [b"c", b"\n"]  # no read after the Ctrl-C
+    assert wiped == [(b"ab", bytearray(2))]
+    assert signal.getsignal(signal.SIGINT) is _noted
+    assert term.attrs_set[-1] == _ATTRS
+
+
+@pytest.mark.usefixtures("loop_sigint")
+def test_the_read_sets_the_default_ctrl_c_handler_only_while_it_runs() -> None:
+    term = _Terminal(b"s", b"e", b"\n")
+    with _at(term) as wiped:
+        buf = passphrase._read_from_tty("Key passphrase: ")
+    assert buf == bytearray(b"se")
+    assert term.handlers == [signal.default_int_handler] * 3
+    assert signal.getsignal(signal.SIGINT) is _noted
+    # Only echo goes off: the terminal still edits the line.
+    no_echo = [*_ATTRS[:3], _ATTRS[3] & ~termios.ECHO, *_ATTRS[4:]]
+    assert term.attrs_set == [no_echo, _ATTRS]
+    assert wiped == []
+    wipe_passphrase(buf)
+
+
+@pytest.mark.usefixtures("loop_sigint")
+def test_off_the_main_thread_the_ctrl_c_handler_is_left_alone() -> None:
+    term = _Terminal(b"s", b"\n")
+    out: list[bytearray | ValueError] = []
+
+    def read() -> None:
+        try:
+            out.append(passphrase._read_from_tty("Key passphrase: "))
+        except ValueError as e:  # signal.signal off the main thread
+            out.append(e)
+
+    with _at(term):
+        worker = threading.Thread(target=read)
+        worker.start()
+        worker.join(timeout=10)
+    assert out == [bytearray(b"s")]
+    assert term.handlers == [_noted, _noted]
+    assert term.attrs_set[-1] == _ATTRS
