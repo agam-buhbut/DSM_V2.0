@@ -112,18 +112,26 @@ def _check_preconditions(tcti: str | None) -> None:
 
 
 def _render_config(
-    role: str, args: argparse.Namespace, install_dir: Path, *, soft: bool = False
+    role: str,
+    args: argparse.Namespace,
+    install_dir: Path,
+    *,
+    soft: bool = False,
+    ca_sha: str | None = None,
 ) -> str:
     """Render config.toml text from config.example.toml-shaped fields.
 
-    The CA root must already be at ``install_dir/dsm_ca_root.pem``
-    (``_install_ca_root``). With ``soft`` (an evaluation build) the config
-    acknowledges the software attest key (QA Minor 13).
+    The config names ``install_dir/dsm_ca_root.pem`` and pins ``ca_sha``,
+    the sha256 of the CA root that will be copied there. Without it the
+    copy must already be there and its sha256 is pinned. With ``soft`` (an
+    evaluation build) the config acknowledges the software attest key (QA
+    Minor 13).
     """
     ca_root = install_dir / "dsm_ca_root.pem"
-    if not ca_root.is_file():
-        _fail(f"ca-root not found: {ca_root}")
-    ca_sha = hashlib.sha256(ca_root.read_bytes()).hexdigest()
+    if ca_sha is None:
+        if not ca_root.is_file():
+            _fail(f"ca-root not found: {ca_root}")
+        ca_sha = hashlib.sha256(ca_root.read_bytes()).hexdigest()
     print(f"ca_root_sha256 = {ca_sha}", file=sys.stderr)
     crl_file = install_dir / "dsm_ca.crl"
     print(
@@ -178,20 +186,29 @@ def _render_config(
     return "\n".join(lines) + "\n"
 
 
-def _install_ca_root(src: Path, install_dir: Path) -> Path:
-    """Copy the CA root into the install dir at 0600, as GUIDE §2f does by
-    hand, so the config never points at a USB stick or a download folder
-    (QA M7). A relative ``src`` is taken from the current folder."""
+def _read_ca_root(src: Path, install_dir: Path) -> tuple[bytes, bool]:
+    """Check the CA root given by --ca-root and read it once. Returns its
+    bytes, and True when it is already the install dir's copy. A relative
+    ``src`` is taken from the current folder."""
     src = src.absolute()
     if not src.is_file():
         _fail(f"ca-root not found: {src}")
     target = install_dir / "dsm_ca_root.pem"
-    if target.exists() and os.path.samefile(src, target):
-        # Already in place. The folder is init's own (0700), so it may set
-        # the mode the daemon wants.
+    in_place = target.exists() and os.path.samefile(src, target)
+    return src.read_bytes(), in_place
+
+
+def _install_ca_root(data: bytes, in_place: bool, install_dir: Path) -> Path:
+    """Copy the CA root into the install dir at 0600, as GUIDE §2f does by
+    hand, so the config never points at a USB stick or a download folder
+    (QA M7)."""
+    target = install_dir / "dsm_ca_root.pem"
+    if in_place:
+        # The folder is init's own (0700), so it may set the mode the
+        # daemon wants.
         target.chmod(0o600)
         return target
-    atomic_write(target, src.read_bytes(), mode=0o600)
+    atomic_write(target, data, mode=0o600)
     print(f"Copied the CA root to {target} (mode 0600).")
     return target
 
@@ -319,7 +336,7 @@ def _phase_a(role: str, args: argparse.Namespace) -> int:
                     "re-run with --force (it removes the keys)."
                 )
 
-    ca_root = _install_ca_root(Path(args.ca_root), install_dir)
+    ca_bytes, ca_in_place = _read_ca_root(Path(args.ca_root), install_dir)
     soft = _backend_is_soft()
     if soft:
         print(
@@ -335,7 +352,13 @@ def _phase_a(role: str, args: argparse.Namespace) -> int:
     try:
         atomic_write(
             new_config,
-            _render_config(role, args, install_dir, soft=soft).encode("utf-8"),
+            _render_config(
+                role,
+                args,
+                install_dir,
+                soft=soft,
+                ca_sha=hashlib.sha256(ca_bytes).hexdigest(),
+            ).encode("utf-8"),
             mode=0o600,
         )
         try:
@@ -373,6 +396,9 @@ def _phase_a(role: str, args: argparse.Namespace) -> int:
                 _fail(str(e))
         finally:
             wipe_passphrase(passphrase)
+        # Only now: until the enrollment worked, the old config.toml stays,
+        # and it pins the old CA copy (final review F1).
+        ca_root = _install_ca_root(ca_bytes, ca_in_place, install_dir)
         new_config.replace(config_path)
         done = True
     finally:

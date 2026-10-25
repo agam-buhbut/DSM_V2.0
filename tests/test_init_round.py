@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import hashlib
 import os
 from collections.abc import Generator
 from pathlib import Path
@@ -588,3 +589,80 @@ def test_force_with_two_different_answers_keeps_the_old_keys(
     stderr = capsys.readouterr().err
     assert "the two passphrases do not match; nothing was changed" in stderr
     assert "removing existing enrollment keys" not in stderr
+
+
+def _enrolled_under_ca_a(cfg_dir: Path) -> dict[str, bytes]:
+    """An install dir init enrolled under the fixture's CA, with its keys.
+    Returns the bytes of each file a failed --force run must keep."""
+    with _enrolls():
+        assert dsm_init.main(_server_flags(cfg_dir)) == 0
+    for name in ("identity.key", "attest.key"):
+        (cfg_dir / name).write_bytes(b"old")
+    kept = (
+        "dsm_ca_root.pem",
+        "config.toml",
+        "identity.key",
+        "attest.key",
+        ".dsm-init-state.json",
+    )
+    return {name: (cfg_dir / name).read_bytes() for name in kept}
+
+
+@pytest.mark.parametrize(
+    "how",
+    ["two different answers", "an empty passphrase file", "a config that fails"],
+)
+def test_a_failed_force_run_keeps_the_old_ca_copy(
+    cfg_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, how: str
+) -> None:
+    # The kept config pins the old CA, so the kept copy must still be it.
+    before = _enrolled_under_ca_a(cfg_dir)
+    flags = _set(_server_flags(cfg_dir), "--ca-root", str(_usb_ca(tmp_path)))
+    flags.append("--force")
+    if how == "two different answers":
+        flags = _without(flags, "--passphrase-env-file")
+    elif how == "an empty passphrase file":
+        empty = tmp_path / "empty"
+        empty.write_bytes(b"")
+        empty.chmod(0o600)
+        flags = _set(flags, "--passphrase-env-file", str(empty))
+    else:
+        flags = _set(flags, "--dns-provider", "https://dns.example/dns-query")
+    monkeypatch.delenv("DSM_PASSPHRASE_FILE", raising=False)
+    monkeypatch.delenv("DSM_PASSPHRASE", raising=False)
+    stdin = mock.MagicMock()
+    stdin.isatty.return_value = True
+    tty = mock.MagicMock(
+        side_effect=[bytearray(b"one secret"), bytearray(b"one secrte")]
+    )
+    with (
+        _enrolls() as gen,
+        mock.patch.object(passphrase, "_read_from_tty", tty),
+        mock.patch.object(passphrase.sys, "stdin", stdin),
+        pytest.raises(SystemExit) as err,
+    ):
+        dsm_init.main(flags)
+    assert err.value.code == 2
+    gen.assert_not_called()
+    for name, data in before.items():
+        assert (cfg_dir / name).read_bytes() == data, name
+    copy = (cfg_dir / "dsm_ca_root.pem").read_bytes()
+    pin = config_load(cfg_dir / "config.toml").ca_root_sha256
+    assert pin == hashlib.sha256(copy).hexdigest()
+    assert not list(cfg_dir.glob("*.new"))
+
+
+def test_a_good_force_run_copies_the_new_ca_and_pins_it(
+    cfg_dir: Path, tmp_path: Path
+) -> None:
+    _enrolled_under_ca_a(cfg_dir)
+    ca = _usb_ca(tmp_path)
+    flags = _set(_server_flags(cfg_dir), "--ca-root", str(ca)) + ["--force"]
+    with _enrolls():
+        assert dsm_init.main(flags) == 0
+    copy = cfg_dir / "dsm_ca_root.pem"
+    assert copy.read_bytes() == ca.read_bytes()
+    assert copy.stat().st_mode & 0o777 == 0o600
+    cfg = config_load(cfg_dir / "config.toml")
+    assert cfg.ca_root_file == str(copy)
+    assert cfg.ca_root_sha256 == hashlib.sha256(ca.read_bytes()).hexdigest()
