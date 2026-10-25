@@ -28,6 +28,7 @@ from dsm.crypto.handshake import (
     CertAuthError,
     CertRevokedError,
     CNNotAllowedError,
+    HandshakeError,
     WrongCertTypeError,
     client_handshake,
     server_handshake,
@@ -277,3 +278,32 @@ def test_enroll_import_refuses_a_mistyped_role(tmp_path: Path, role: str) -> Non
             attest_store=MagicMock(),
             role=role,  # type: ignore[arg-type]
         )
+
+
+@pytest.mark.parametrize(
+    ("error", "line"),
+    [
+        (HandshakeError("lost"), "handshake failed (HandshakeError)"),
+        (TimeoutError(), "a handshake attempt exceeded 12s deadline; slot reclaimed"),
+    ],
+)
+async def test_a_failed_or_slow_handshake_has_no_address_at_info(
+    error: BaseException, line: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="dsm")
+    with patch("dsm.crypto.handshake.server_handshake", AsyncMock(side_effect=error)):
+        await _run_attempt(
+            MagicMock(),
+            MagicMock(),
+            MagicMock(),
+            MagicMock(),
+            MagicMock(),
+            MagicMock(),
+            ("203.0.113.5", 40112),
+            MagicMock(),
+            who="('203.0.113.5', 40112)",
+            table=MagicMock(),
+        )
+    lines = [r.getMessage() for r in caplog.records]
+    assert line in lines
+    assert not any("203.0.113.5" in text for text in lines)

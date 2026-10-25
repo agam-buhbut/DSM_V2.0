@@ -552,7 +552,11 @@ async def run_server(
     # DSM no longer reads hosts.txt (fixed answers; see CHANGELOG). Say so
     # once, so a user whose names stopped working knows why (QA Minor 19).
     old_hosts = config.config_dir / "hosts.txt"
-    if old_hosts.exists():
+    try:
+        present = old_hosts.exists()
+    except OSError:
+        present = False  # a notice must never stop the start
+    if present:
         log.warning(
             "%s is no longer read: DSM gives no fixed answers now. To block "
             "those names, move the file into %s (deploy/GUIDE.md §7h); "

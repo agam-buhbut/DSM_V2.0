@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 import pytest
@@ -46,3 +47,20 @@ def test_a_repeated_name_is_warned_about(
     assert [r.getMessage() for r in caplog.records] == [
         f"{path}:3: dsm-aaaa-client is already on line 1; this line does not count"
     ]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can search any folder")
+def test_a_file_in_a_folder_that_cannot_be_searched_is_not_called_missing(
+    tmp_path: Path,
+) -> None:
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    path = _write(locked, "dsm-aaaa-client\n")
+    locked.chmod(0o000)
+    try:
+        with pytest.raises(CNAllowlistError) as err:
+            CNAllowlist.from_file(path)
+    finally:
+        locked.chmod(0o700)
+    assert "not found" not in str(err.value)
+    assert "Permission denied" in str(err.value)

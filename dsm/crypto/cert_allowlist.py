@@ -53,13 +53,18 @@ class CNAllowlist:
             check_user_file_permissions(path)
         except Exception as e:
             # Chained either way (tests/test_cert_allowlist_io.py wants the
-            # OS error kept). os.path.lexists: a dangling symlink is "there"
-            # and gets the permission check's own text.
-            if not os.path.lexists(path):
+            # OS error kept). Only a missing file is "not found": a dangling
+            # symlink is there, and a folder that cannot be searched is not
+            # missing, so both get the permission check's own text.
+            try:
+                os.lstat(path)
+            except FileNotFoundError:
                 raise CNAllowlistError(
                     f"{path} not found: create it with one client CN per line "
                     "(deploy/GUIDE.md §4)"
                 ) from e
+            except OSError:
+                pass  # the permission check's text below says what failed
             raise CNAllowlistError(
                 f"refusing to load CN allowlist with insecure permissions: {e}"
             ) from e

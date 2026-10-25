@@ -622,11 +622,12 @@ async def _run_attempt(
                 )
         except TimeoutError:
             _note_trouble(gate)
+            # No address above DEBUG (QA M3).
             log.info(
-                "handshake attempt from %s exceeded %.0fs deadline — slot reclaimed",
-                who,
+                "a handshake attempt exceeded %.0fs deadline; slot reclaimed",
                 _HANDSHAKE_ATTEMPT_DEADLINE,
             )
+            log.debug("handshake attempt deadline detail (%s)", who)
             return
         except ClientRefusedError as e:
             _note_trouble(gate)
@@ -658,7 +659,7 @@ async def _run_attempt(
             if isinstance(e, CertAuthError):
                 _log_cert_refusal(e)
             else:
-                log.info("handshake failed from %s", who)
+                log.info("handshake failed (%s)", type(e).__name__)
             log.debug("handshake failure detail (%s): %s", who, e)
             _emit_handshake_failure(e)
             return

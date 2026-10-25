@@ -115,3 +115,21 @@ async def test_the_fatal_line_gives_no_tun_address_advice(
         assert await asyncio.wait_for(run_server(_server_config()), 5.0) == 1
     errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
     assert errors == [f"FATAL: DNS proxy port conflict — {text} Then restart DSM."]
+
+
+async def test_a_hosts_file_check_that_fails_does_not_stop_the_start(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    config = replace(_server_config(), config_dir=tmp_path, dns_blocklist=False)
+    real_exists = Path.exists
+
+    def exists(self: Path, *args: Any, **kwargs: Any) -> bool:
+        if self.name == "hosts.txt":  # as in a folder it cannot search
+            raise PermissionError(errno.EACCES, "Permission denied", str(self))
+        return real_exists(self, *args, **kwargs)
+
+    caplog.set_level(logging.WARNING, logger="dsm.server")
+    captured: dict[str, Any] = {}
+    with _base_patches(captured), patch.object(Path, "exists", exists):
+        assert await _run_until(config, captured) == 0
+    assert not any("hosts.txt" in r.getMessage() for r in caplog.records)
