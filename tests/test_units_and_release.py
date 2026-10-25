@@ -106,6 +106,7 @@ _RECORDER = """#!/bin/sh
 echo "$0 $*" >> "$FAKE_LOG_DIR/calls.log"
 """
 _WHEEL = "dsm-0.1.0-cp311-abi3-linux_x86_64.whl"
+_SOFT_WHEEL = "dsm-0.1.0+soft-cp311-abi3-linux_x86_64.whl"
 _UNIT_FILES = [n for n in SHIPPED if n != "dsm-client.service"]
 
 Install = Callable[..., "tuple[subprocess.CompletedProcess[str], Path]"]
@@ -148,12 +149,18 @@ def _install(tmp_path: Path) -> Install:
         tamper: str | None = None,
         drop: str | None = None,
         curl_fail: str = "",
+        wheel: str = _WHEEL,
+        apt_fails: bool = False,
     ) -> tuple[subprocess.CompletedProcess[str], Path]:
         served = tmp_path / "served"
         served.mkdir(exist_ok=True)
-        for name in (_WHEEL, *SHIPPED):
+        for name in (wheel, *SHIPPED):
             (served / name).write_text(f"content of {name}\n")
-        names = [_WHEEL, *(n for n in SHIPPED if n != drop)]
+        names = [wheel, *(n for n in SHIPPED if n != drop)]
+        if apt_fails:
+            # The first step past the gate fails: the run stops there,
+            # before anything is installed.
+            (fakebin / "apt-get").write_text("#!/bin/sh\nexit 1\n")
         _sums(served, names)
         (served / "SHA256SUMS.minisig").write_text("sig\n")
         if tamper:
@@ -217,8 +224,10 @@ def test_the_client_install_checks_its_unit_too(install: Install) -> None:
 
 
 def test_eval_fetches_no_unit_file(install: Install) -> None:
-    _, logs = install("--eval", "--systemd")
+    done, logs = install("--eval", "--systemd", wheel=_SOFT_WHEEL, apt_fails=True)
+    assert "apt-get update failed" in done.stderr  # the gate was passed
     fetched = (logs / "curl.log").read_text().split()
+    assert _SOFT_WHEEL in fetched
     assert not [n for n in fetched if n in SHIPPED], fetched
 
 

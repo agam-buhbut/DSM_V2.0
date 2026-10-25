@@ -104,22 +104,46 @@ def test_a_mode_the_config_does_not_fit_is_one_config_line(
     assert text.rstrip().endswith("(with --mode server)")
 
 
-def test_enroll_refuses_a_cn_with_a_space(
-    client_config: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+@pytest.mark.parametrize("cn", ["my laptop", "", "a\tb", "lap#top"])
+def test_enroll_refuses_a_cn_that_is_not_one_word(
+    client_config: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str], cn: str
 ) -> None:
     with pytest.raises(SystemExit) as err:
         entry._run_enroll(
             client_config,
             csr_out=tmp_path / "x.csr",
             import_cert=None,
-            cn="my laptop",
+            cn=cn,
             role="client",
             passphrase_fd=None,
             passphrase_env_file=None,
         )
     assert err.value.code == 2
-    assert "enroll: --cn must be one word" in capsys.readouterr().err
+    assert (
+        "enroll: --cn must be one word, with no spaces and no '#'\n"
+        in capsys.readouterr().err
+    )
     assert not (tmp_path / "identity.key").exists()
+
+
+@pytest.mark.parametrize(
+    ("argv", "runner"),
+    [
+        (["enroll", "--csr-out", "x"], "_run_enroll"),
+        (["show-pubkey"], "_run_show_pubkey"),
+    ],
+)
+def test_enroll_and_show_pubkey_need_no_root(
+    argv: list[str], runner: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with (
+        patch.object(entry, runner) as recorder,
+        patch.object(entry.sys, "argv", ["dsm", *argv]),
+        patch.object(entry.os, "geteuid", return_value=1000),
+    ):
+        entry.main()
+    recorder.assert_called_once()
+    assert "must run as root" not in capsys.readouterr().err
 
 
 def test_enroll_asks_for_a_new_passphrase_twice(
