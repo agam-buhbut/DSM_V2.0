@@ -348,3 +348,65 @@ async def test_new_lookups_are_spaced_by_the_time_since_the_last_one(
     ):
         assert await run.run(_config(server_ip=NAME), handshake=handshake) == 0
     assert lookup.await_count == 3
+
+
+class _CloseFailsRun(_TableRun):
+    """_TableRun whose start-up table apply number ``fail_at`` (1 = the
+    first) fails, as nft would."""
+
+    def __init__(self, fail_at: int) -> None:
+        super().__init__()
+        self.fail_at = fail_at
+
+    def _recorder(self, name: str) -> type:
+        base = super()._recorder(name)
+        if name != "pre":
+            return base
+        tables, fail_at = self.tables, self.fail_at
+
+        class _Pre(base):
+            def apply(self) -> None:
+                super().apply()
+                if len(tables) == fail_at:
+                    raise OSError("nft: No such file or directory")
+
+        return _Pre
+
+
+async def test_a_failed_close_after_a_new_lookup_is_an_error_not_a_failed_lookup(
+    tmp_path: Path,
+) -> None:
+    # Read as a failed lookup, DSM would go on with port 53 open.
+    run = _CloseFailsRun(fail_at=5)  # the close after the new lookup
+    run.stop_at_wait = 6  # reached only if DSM went on
+    tried, handshake = _handshakes(run)
+    calls: list[int] = []
+
+    async def lookup(_name: str, _port: int, **kwargs: Any) -> str:
+        calls.append(1)
+        kwargs["before_lookup"](["192.0.2.53"])
+        if len(calls) == 1:
+            return "10.0.0.1"
+        raise OSError("no address")
+
+    with (
+        patch.object(client_mod, "RELOOKUP_EVERY_S", 0.0),
+        patch("dsm.client._SERVER_ENDPOINT_FILE", tmp_path / "server-endpoint.json"),
+        patch("dsm.client._resolve_server_endpoint", lookup),
+        pytest.raises(
+            RuntimeError, match="could not close the kill switch after the lookup"
+        ),
+    ):
+        await run.run(_config(server_ip=NAME), handshake=handshake)
+    assert len(calls) == 2
+    assert tried == ["10.0.0.1"] * 5  # no try after it
+    assert len(run.waits) == 4  # and no wait
+    assert "pre.remove" not in run.events
+    assert run.tables == [
+        "none",
+        "none +dns",
+        "10.0.0.1",
+        "10.0.0.1 +dns",  # the new lookup, after the 5th failed try
+        "10.0.0.1",  # this close fails
+        "10.0.0.1",  # tried once more as DSM stops with the block kept
+    ]

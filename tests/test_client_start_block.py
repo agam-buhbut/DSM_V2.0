@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import subprocess
 from collections.abc import Sequence
 from contextlib import ExitStack
 from pathlib import Path
@@ -637,4 +638,38 @@ async def test_a_stop_as_the_lookup_ends_ends_the_start(
         "block none +dns",
         "lookup",
         *end,
+    ]
+
+
+@pytest.mark.parametrize("stop_keeps_block", [False, True])
+async def test_an_nft_timeout_on_the_lookup_opening_still_closes_port_53(
+    start: _Start, stop_keeps_block: bool
+) -> None:
+    # nft may take the table and then time out: the opening counts as up.
+    start.open_lookup = True
+    start.fail_nth_apply = (2, subprocess.TimeoutExpired(["nft"], 5))
+    with pytest.raises(subprocess.TimeoutExpired):
+        await start.run(stop_keeps_block=stop_keeps_block, server_ip=NAME)
+    assert start.events == [
+        "block none",
+        "materials",
+        "block none +dns",  # nft took it, then timed out
+        "block none",  # port 53 closed again
+    ]
+
+
+@pytest.mark.parametrize("stop_keeps_block", [False, True])
+async def test_an_nft_timeout_on_the_ntp_opening_still_closes_it(
+    start: _Start, stop_keeps_block: bool
+) -> None:
+    start.loads = [STALE]
+    start.ntp = NTP
+    start.fail_nth_apply = (2, subprocess.TimeoutExpired(["nft"], 5))
+    with pytest.raises(subprocess.TimeoutExpired):
+        await start.run(stop_keeps_block=stop_keeps_block)
+    assert start.events == [
+        "block 10.0.0.1",
+        "materials",
+        "block 10.0.0.1 +ntp",  # nft took it, then timed out
+        "block 10.0.0.1",  # NTP closed again
     ]

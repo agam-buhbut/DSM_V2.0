@@ -17,7 +17,9 @@ def ntp_synchronized() -> bool | None:
         out = subprocess.run(
             ["timedatectl", "show", "-p", "NTPSynchronized", "--value"],
             capture_output=True,
-            text=True,
+            # Odd bytes must give "cannot tell", not a decode error.
+            encoding="utf-8",
+            errors="replace",
             timeout=3,
             check=False,
         )

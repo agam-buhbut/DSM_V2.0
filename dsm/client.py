@@ -502,6 +502,11 @@ async def run_client(
             table = PreHandshakeKillSwitch(
                 candidates, config.server_port, resolvers=resolvers, ntp=ntp
             )
+            # An opening counts as open before the apply that opens it, and
+            # as closed only once the apply that closes it worked: nft may
+            # take the table and then time out. An extra close is harmless.
+            lookup_open = lookup_open or bool(resolvers)
+            ntp_open = ntp_open or ntp is not None
             table.apply()
             pre_killswitch = table
             lookup_open = bool(resolvers)
