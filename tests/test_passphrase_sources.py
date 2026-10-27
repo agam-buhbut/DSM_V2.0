@@ -317,3 +317,48 @@ def test_off_the_main_thread_the_ctrl_c_handler_is_left_alone() -> None:
     assert out == [bytearray(b"s")]
     assert term.handlers == [_noted, _noted]
     assert term.attrs_set[-1] == _ATTRS
+
+
+@pytest.mark.usefixtures("loop_sigint")
+def test_a_ctrl_c_as_the_handler_goes_back_still_wipes_the_passphrase() -> None:
+    # The read ended with Enter, then a Ctrl-C lands before the old handler
+    # is back: the default one raises there.
+    real_set = signal.signal
+    handlers: list[object] = []
+
+    def set_handler(signum: int, handler: Any) -> Any:
+        handlers.append(handler)
+        if len(handlers) == 2:  # putting the old handler back
+            raise KeyboardInterrupt
+        return real_set(signum, handler)
+
+    term = _Terminal(b"s", b"e", b"\n")
+    with (
+        _at(term) as wiped,
+        patch.object(passphrase.signal, "signal", set_handler),
+        pytest.raises(KeyboardInterrupt),
+    ):
+        passphrase._read_from_tty("Key passphrase: ")
+    assert wiped == [(b"se", bytearray(2))]
+    assert term.attrs_set[-1] == _ATTRS  # the terminal is still restored
+
+
+@pytest.fixture
+def ignored_sigint() -> Iterator[None]:
+    old = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGINT, old)
+
+
+@pytest.mark.usefixtures("ignored_sigint")
+def test_an_ignored_ctrl_c_stays_ignored() -> None:
+    # nohup, or a parent that chose to ignore it.
+    term = _Terminal(b"s", b"\n")
+    with _at(term):
+        buf = passphrase._read_from_tty("Key passphrase: ")
+    assert buf == bytearray(b"s")
+    assert term.handlers == [signal.SIG_IGN, signal.SIG_IGN]
+    assert signal.getsignal(signal.SIGINT) == signal.SIG_IGN
+    wipe_passphrase(buf)

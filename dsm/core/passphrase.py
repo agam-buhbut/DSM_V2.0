@@ -66,20 +66,16 @@ def _read_from_tty(prompt: str) -> bytearray:
         if threading.current_thread() is threading.main_thread()
         else None
     )
+    if old_sigint == signal.SIG_IGN:
+        old_sigint = None  # ignored on purpose (nohup): it stays ignored
     buf = bytearray()
     try:
-        # The bytes-collection loop is the ONLY region where ``buf`` can
-        # grow past empty, so it's the only region whose exception path
-        # needs to wipe. tcsetattr/tcgetattr around it cannot leak the
-        # passphrase even on failure, but the surrounding ``finally``
-        # still restores terminal state.
-        new_attrs = termios.tcgetattr(fd)
-        new_attrs[3] = new_attrs[3] & ~termios.ECHO
-        termios.tcsetattr(fd, termios.TCSADRAIN, new_attrs)
-        if old_sigint is not None:
-            signal.signal(signal.SIGINT, signal.default_int_handler)
-
         try:
+            new_attrs = termios.tcgetattr(fd)
+            new_attrs[3] = new_attrs[3] & ~termios.ECHO
+            termios.tcsetattr(fd, termios.TCSADRAIN, new_attrs)
+            if old_sigint is not None:
+                signal.signal(signal.SIGINT, signal.default_int_handler)
             while True:
                 ch = os.read(fd, 1)
                 if not ch:
@@ -91,17 +87,19 @@ def _read_from_tty(prompt: str) -> bytearray:
                 if ch == b"\x04" and not buf:
                     break
                 buf.extend(ch)
-        except BaseException:
-            wipe_passphrase(buf)
-            raise
-    finally:
-        try:
-            if old_sigint is not None:
-                signal.signal(signal.SIGINT, old_sigint)
         finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
-            sys.stderr.write("\n")
-            sys.stderr.flush()
+            try:
+                if old_sigint is not None:
+                    signal.signal(signal.SIGINT, old_sigint)
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+                sys.stderr.write("\n")
+                sys.stderr.flush()
+    except BaseException:
+        # Any way out but the return wipes what was typed, also a Ctrl-C that
+        # lands after Enter, before the old handler is back.
+        wipe_passphrase(buf)
+        raise
 
     return buf
 

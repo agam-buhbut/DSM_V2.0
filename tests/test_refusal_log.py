@@ -10,6 +10,7 @@ Real handshakes over loopback UDP, as in tests/test_handshake_admit_hook.py.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from collections.abc import Iterator
 from pathlib import Path
@@ -25,6 +26,7 @@ from dsm.crypto.cert import DeviceCert
 from dsm.crypto.cert_allowlist import CNAllowlist
 from dsm.crypto.enroll import EnrollError, import_signed_cert
 from dsm.crypto.handshake import (
+    HANDSHAKE_FRAME_SIZE,
     CertAuthError,
     CertRevokedError,
     CNNotAllowedError,
@@ -33,6 +35,7 @@ from dsm.crypto.handshake import (
     client_handshake,
     server_handshake,
 )
+from dsm.net import handshake_acceptor as hsa
 from dsm.net.handshake_acceptor import _log_cert_refusal, _run_attempt
 from tests.cert_helpers import SERVER_AUTH_OID, make_enrolled_device, make_test_ca
 from tests.test_handshake_admit_hook import _udp_pair
@@ -307,3 +310,56 @@ async def test_a_failed_or_slow_handshake_has_no_address_at_info(
     lines = [r.getMessage() for r in caplog.records]
     assert line in lines
     assert not any("203.0.113.5" in text for text in lines)
+
+
+class _OneFrame:
+    """A UDP socket that brings one full handshake frame, then waits."""
+
+    def __init__(self, addr: tuple[str, int]) -> None:
+        self.addr = addr
+        self.given = False
+        self.waiting = asyncio.Event()
+
+    async def recv(self) -> tuple[bytes, tuple[str, int]]:
+        if not self.given:
+            self.given = True
+            return b"\x00" * HANDSHAKE_FRAME_SIZE, self.addr
+        self.waiting.set()
+        await asyncio.Event().wait()
+        raise AssertionError("not reached")
+
+
+async def test_the_inbox_cap_line_has_no_address_above_debug(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG, logger="dsm")
+    sock = _OneFrame(("203.0.113.5", 40112))
+    with patch.object(hsa, "_MAX_INBOXES", 0):  # every new source is past it
+        task = asyncio.ensure_future(
+            hsa._demux(
+                MagicMock(),
+                MagicMock(),
+                MagicMock(),
+                MagicMock(),
+                MagicMock(),
+                sock,  # type: ignore[arg-type]
+                MagicMock(),
+                MagicMock(),
+                set(),
+                asyncio.Semaphore(1),
+                {},
+                MagicMock(),
+            )
+        )
+        try:
+            await asyncio.wait_for(sock.waiting.wait(), 5.0)
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+    above = [(r.levelno, r.getMessage()) for r in caplog.records if r.levelno > 10]
+    assert above == [
+        (logging.WARNING, "handshake inbox cap (0) reached — dropping new-source frame")
+    ]
+    debug = [r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG]
+    assert any("203.0.113.5" in text for text in debug)

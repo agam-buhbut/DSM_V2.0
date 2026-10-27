@@ -524,7 +524,10 @@ async def run_client(
             # (dsm-client.service) every exit leaves it up, a setup error
             # too: nobody may be at the host, and the unit's ExecStopPost
             # takes it down only for `systemctl stop` (re-decision 3).
-            if exc_type is None and not stop_keeps_block:
+            # Ctrl-C at the passphrase prompt comes as a KeyboardInterrupt:
+            # a stop too. It goes on up, and main() says "aborted".
+            stopped = exc_type is not None and issubclass(exc_type, KeyboardInterrupt)
+            if (exc_type is None or stopped) and not stop_keeps_block:
                 pre_killswitch.remove()
                 return False
             # The kept block never keeps the lookup's port-53 line (D7) or the
@@ -533,10 +536,10 @@ async def run_client(
             # up and the table up before stays.
             if lookup_open or ntp_open:
                 _swap()
-            if exc_type is not None:
-                log.error(_KEPT_AFTER_ERROR)
-            elif shutdown.is_set():
+            if stopped or (exc_type is None and shutdown.is_set()):
                 log.info(_KEPT_ON_STOP)
+            elif exc_type is not None:
+                log.error(_KEPT_AFTER_ERROR)
             else:
                 log.error(_KEPT_AFTER_START_ERROR)
             return False

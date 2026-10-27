@@ -917,12 +917,12 @@ async def _demux(
             _note_trouble(gate)
             continue
         if len(inboxes) >= _MAX_INBOXES:
+            # No address above DEBUG (QA M3).
             log.warning(
-                "handshake inbox cap (%d) reached — dropping new-source frame "
-                "from %s",
+                "handshake inbox cap (%d) reached — dropping new-source frame",
                 _MAX_INBOXES,
-                addr,
             )
+            log.debug("handshake inbox cap: dropped the frame from %s", addr)
             _note_trouble(gate)
             continue
         # Never waits: the pool has a free slot (checked above).

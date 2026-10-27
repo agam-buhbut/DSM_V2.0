@@ -66,6 +66,10 @@ class _Start:
         self.fail_nth_apply: tuple[int, Exception] | None = None
         self.ntp: NtpOpening | None = None
         self.synced: bool | None = True
+        # None: run_client runs in the test's own task. Python 3.11's
+        # wait_for runs it as a task of its own, and a KeyboardInterrupt
+        # there would stop the event loop, not reach the test.
+        self.timeout: float | None = 10
 
     def _block(self) -> type:
         start = self
@@ -168,7 +172,7 @@ class _Start:
                 client_mod.run_client(
                     _config(**config), stop_keeps_block=stop_keeps_block
                 ),
-                timeout=10,
+                timeout=self.timeout,
             )
 
 
@@ -673,3 +677,42 @@ async def test_an_nft_timeout_on_the_ntp_opening_still_closes_it(
         "block 10.0.0.1 +ntp",  # nft took it, then timed out
         "block 10.0.0.1",  # NTP closed again
     ]
+
+
+class _CtrlCAtThePrompt(_Start):
+    """Ctrl-C at the passphrase prompt: the read raises KeyboardInterrupt."""
+
+    def __init__(self, endpoint_file: Path) -> None:
+        super().__init__(endpoint_file)
+        self.timeout = None
+
+    def _stores(self, *_a: object, **_k: object) -> bool:
+        self.events.append("stores")
+        raise KeyboardInterrupt
+
+
+@pytest.mark.parametrize(
+    ("stop_keeps_block", "end", "line"),
+    [
+        # By hand a Ctrl-C takes the block down (owner ruling Q1).
+        (False, ["unblock 10.0.0.1"], None),
+        (True, [], client_mod._KEPT_ON_STOP),
+    ],
+    ids=["by hand", "under the unit"],
+)
+async def test_ctrl_c_at_the_passphrase_prompt_is_a_stop_not_an_error(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    stop_keeps_block: bool,
+    end: list[str],
+    line: str | None,
+) -> None:
+    start = _CtrlCAtThePrompt(tmp_path / "server-endpoint.json")
+    caplog.set_level(logging.INFO, logger="dsm")
+    with pytest.raises(KeyboardInterrupt):  # main() then says "aborted"
+        await start.run(stop_keeps_block=stop_keeps_block)
+    assert start.events == ["block 10.0.0.1", "materials", "stores", *end]
+    messages = [r.getMessage() for r in caplog.records]
+    assert client_mod._KEPT_AFTER_ERROR not in messages
+    if line is not None:
+        assert line in messages
