@@ -2276,3 +2276,38 @@ def test_a_config_warning_before_logging_is_up_has_the_normal_format(
     ), err
     # Only for the load: configure() adds the daemon's handler later.
     assert logging.getLogger("dsm").handlers == handlers
+
+
+# --- final box check: the wheel check's message (Nit 2) --------------------------
+
+
+@pytest.mark.parametrize(
+    ("wheels", "found"),
+    [
+        ([_TPM_WHEEL], "(none)"),
+        (
+            [_TPM_WHEEL, "dsm-0.1.0-cp311-abi3-manylinux_2_38_x86_64.whl", _SOFT],
+            f"dist/{_TPM_WHEEL} dist/dsm-0.1.0-cp311-abi3-manylinux_2_38_x86_64.whl",
+        ),
+    ],
+)
+def test_the_wheel_check_names_what_it_found(
+    tmp_path: Path, wheels: list[str], found: str
+) -> None:
+    (tmp_path / "install.sh").write_text('DSM_VERSION="0.1.0"\n')
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    for name in wheels:
+        (dist / name).write_text("wheel\n")
+
+    done = subprocess.run(
+        ["/bin/bash", "-e", "-c", _check_wheels_script()],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+
+    assert done.returncode == 1
+    assert done.stdout.splitlines()[-1].endswith(f"; found: {found}"), done.stdout

@@ -199,8 +199,9 @@ jobs:
           [ -n "$v" ] || { echo "no DSM_VERSION in install.sh"; exit 1; }
           for prefix in "dsm-${v}-cp311-abi3-" "dsm-${v}+soft-cp311-abi3-"; do
             set -- dist/"${prefix}"*_x86_64.whl
-            if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
-              echo "dist/ must hold exactly one ${prefix}*_x86_64.whl; found: $*"
+            [ -e "$1" ] || set --  # no match: the glob is left as it is
+            if [ "$#" -ne 1 ]; then
+              echo "dist/ must hold exactly one ${prefix}*_x86_64.whl; found: ${*:-(none)}"
               exit 1
             fi
           done
