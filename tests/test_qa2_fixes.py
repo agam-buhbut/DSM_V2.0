@@ -1785,9 +1785,14 @@ def _config_in_closed_folder(
 @pytest.mark.parametrize("there", [True, False])
 @pytest.mark.parametrize("command", ["show-pubkey", "enroll"])
 def test_a_config_in_a_folder_the_user_cannot_search_says_use_sudo(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str], there: bool, command: str
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    there: bool,
+    command: str,
 ) -> None:
     folder, config = _config_in_closed_folder(tmp_path, there=there)
+    _fake_owner(monkeypatch, folder, 0)  # root's 0700 folder, as GUIDE §2f makes
     with _closed(folder), pytest.raises(SystemExit) as err:
         if command == "show-pubkey":
             entry._run_show_pubkey(config, passphrase_fd=None, passphrase_env_file=None)
@@ -2380,3 +2385,31 @@ def test_a_failed_passphrase_write_ends_at_the_cause_and_asks_once(
     )
     assert "by hand" not in text
     assert text.count("Put the key passphrase in") == 1
+
+
+# --- review: sudo advice only for root's file or folder (config) ----------------
+
+
+@_ROOT_SKIP
+def test_a_config_folder_of_the_users_own_it_cannot_search_is_a_plain_line(
+    tmp_path: Path,
+) -> None:
+    folder, config = _config_in_closed_folder(tmp_path)
+    with _closed(folder), pytest.raises(ConfigError) as err:
+        load(config)
+    assert str(err.value) == f"cannot reach {config}: Permission denied"
+
+
+@_ROOT_SKIP
+def test_the_users_own_config_without_a_read_bit_is_a_plain_line(
+    tmp_path: Path,
+) -> None:
+    # Sudo would not help: as root, DSM refuses a file owned by uid 1000.
+    path = _write_config(tmp_path, _GOOD_CLIENT)
+    path.chmod(0o200)
+    try:
+        with pytest.raises(ConfigError) as err:
+            load(path)
+    finally:
+        path.chmod(0o600)
+    assert str(err.value) == f"cannot read {path}: Permission denied"

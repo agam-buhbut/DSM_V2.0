@@ -783,11 +783,25 @@ def _reject_missing_keys(raw: dict[str, object]) -> None:
     raise ConfigError(text)
 
 
-def _cannot_reach(p: Path, e: PermissionError) -> str:
-    """GUIDE §2f makes /opt/mtun root's, 0700: a normal user cannot even
-    look for the file in it. Sudo, not a traceback (QA2 final check)."""
-    text = f"cannot reach {p}: {e.strerror or e}"
-    return text if os.geteuid() == 0 else text + ": run it with sudo"
+def _root_owns(p: Path) -> bool:
+    """Root owns the file, or, when the file cannot be looked at, its folder."""
+    for candidate in (p, p.parent):
+        try:
+            return candidate.stat().st_uid == 0
+        except OSError:
+            continue
+    return False
+
+
+def _cannot(what: str, p: Path, e: PermissionError) -> str:
+    """One line, not a traceback, for a config DSM cannot reach or read. GUIDE
+    §2f makes /opt/mtun root's, 0700: there a normal user is told to use sudo
+    (QA2 final check). Not for a user's own file: as root, DSM would then
+    refuse it as owned by another user."""
+    text = f"cannot {what} {p}: {e.strerror or e}"
+    if os.geteuid() != 0 and _root_owns(p):
+        text += ": run it with sudo"
+    return text
 
 
 def _owned_by_root(p: Path) -> bool:
@@ -813,7 +827,7 @@ def load(path: Path | None = None) -> Config:
     try:
         found = p.exists()
     except PermissionError as e:
-        raise ConfigError(_cannot_reach(p, e)) from e
+        raise ConfigError(_cannot("reach", p, e)) from e
     if not found:
         raise ConfigError(f"config file not found: {p}")
     try:
@@ -835,7 +849,7 @@ def load(path: Path | None = None) -> Config:
         with open(p, "rb") as f:
             raw = tomllib.load(f)
     except PermissionError as e:
-        raise ConfigError(_cannot_reach(p, e)) from e
+        raise ConfigError(_cannot("read", p, e)) from e
     _reject_removed_keys(raw)
     _reject_unknown_keys(raw)
     _reject_missing_keys(raw)
