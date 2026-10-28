@@ -290,7 +290,7 @@ def test_the_server_unit_is_enabled_not_started(
     # QA M2: the server starts only once its allowlist has a client CN.
     _resume(cfg_dir, unit=True)  # no unit file anywhere: the manual steps
     captured = capsys.readouterr()
-    assert "sudo systemctl enable dsm" in captured.err
+    assert "sudo systemctl enable dsm" in captured.out
     assert "enable --now" not in captured.out + captured.err
     assert "release tarball" not in captured.err
 

@@ -153,11 +153,11 @@ def test_dsm_init_client_installs_the_client_unit(
     # No empty passphrase file (QA B2): init says to fill it instead.
     assert not (tmp_path / "etc-dsm" / "passphrase").exists()
     out = capsys.readouterr().out
-    assert f"Put the key passphrase in {tmp_path / 'etc-dsm' / 'passphrase'}" in out
+    assert f"Put the key passphrase in {tmp_path / 'etc-dsm' / 'passphrase'}" not in out
     assert "sudo systemctl enable dsm-client" in out
     assert "enable --now" not in out
     assert "sudo systemctl start dsm-client" not in out
-    assert "the server has this client's CN" in out
+    assert "the server has this client's CN" not in out
 
 
 def test_dsm_init_client_without_the_unit_file_says_enable_only(
@@ -170,10 +170,10 @@ def test_dsm_init_client_without_the_unit_file_says_enable_only(
 
     init._install_unit("client")
 
-    err = capsys.readouterr().err
-    assert "sudo systemctl enable dsm-client" in err
+    err = capsys.readouterr().out
+    assert "dsm-client.service is not in this install" in err
     assert "enable --now" not in err
-    assert "the server has this client's CN" in err
+    assert "the server has this client's CN" not in err
 
 
 def test_dsm_init_server_still_installs_the_server_unit(

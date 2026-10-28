@@ -1975,3 +1975,71 @@ def test_the_rollback_refusal_gives_the_numbers_in_hex(
     with pytest.raises(CRLRollbackError) as err:
         crl.reject_if_rolled_back(store)
     assert str(err.value) == text
+
+
+# --- final check: each next step once (Nit 4) -----------------------------------
+
+
+def _unit_resume_output(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    unit_in_deploy: bool,
+    write_passphrase: bool = True,
+) -> str:
+    deploy = tmp_path / "deploy"
+    deploy.mkdir()
+    if unit_in_deploy:
+        (deploy / "dsm-client.service").write_text("client unit\n")
+    (tmp_path / "units").mkdir()
+    monkeypatch.setattr(dsm_init, "_DEPLOY_DIR", deploy)
+    monkeypatch.setattr(dsm_init, "_SYSTEMD_DIR", tmp_path / "units")
+    monkeypatch.setattr(dsm_init, "_CRED_FILE", tmp_path / "etc-dsm" / "passphrase")
+    monkeypatch.setattr(dsm_init, "_is_root", lambda: True)
+    monkeypatch.setattr(dsm_init.subprocess, "run", mock.MagicMock())
+    if not write_passphrase:
+        monkeypatch.setattr(dsm_init, "_write_unit_passphrase", lambda _p: None)
+    inst = tmp_path / "inst"
+    with _enrolls():
+        assert dsm_init.main([*_client_flags(tmp_path, inst), "--install-unit"]) == 0
+    capsys.readouterr()
+    with (
+        mock.patch.object(dsm_init, "loaded_stores_cli", _unlocked),
+        mock.patch.object(dsm_init, "import_signed_cert"),
+    ):
+        assert dsm_init.main(_resume_argv("client", inst, tmp_path)) == 0
+    captured = capsys.readouterr()
+    return captured.out + captured.err
+
+
+@pytest.mark.parametrize("unit_in_deploy", [True, False])
+def test_a_client_unit_resume_says_to_wait_for_the_server_once(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    unit_in_deploy: bool,
+) -> None:
+    text = _unit_resume_output(
+        tmp_path, capsys, monkeypatch, unit_in_deploy=unit_in_deploy
+    )
+    assert text.count("this client's CN") == 1, text
+    assert "Wait until the server's allowlist has this client's CN" in text
+
+
+def test_a_wheel_install_gives_the_unit_copy_step_once(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    text = _unit_resume_output(tmp_path, capsys, monkeypatch, unit_in_deploy=False)
+    enable = "sudo systemctl daemon-reload && sudo systemctl enable dsm-client"
+    assert text.count(enable) == 1, text
+    assert "Copy deploy/dsm-client.service to /etc/systemd/system/" in text
+
+
+def test_a_missing_passphrase_file_is_asked_for_once(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    text = _unit_resume_output(
+        tmp_path, capsys, monkeypatch, unit_in_deploy=True, write_passphrase=False
+    )
+    assert text.count("Put the key passphrase in") == 1, text

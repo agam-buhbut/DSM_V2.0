@@ -53,13 +53,6 @@ _SYSTEMD_DIR = Path("/etc/systemd/system")
 _CRED_FILE = Path("/etc/dsm/passphrase")
 _DEFAULT_INSTALL_DIR = "/opt/mtun"
 
-# A client the server does not know yet blocks all traffic, SSH too, and
-# keeps trying. So the client unit is enabled now and started later.
-_CLIENT_START_NOTE = (
-    "Start it only after the server has this client's CN (deploy/GUIDE.md "
-    "§4). Until then it blocks all traffic, SSH too."
-)
-
 
 def _fail(msg: str) -> NoReturn:
     print(f"dsm init: {msg}", file=sys.stderr)
@@ -761,41 +754,28 @@ def _unit_name(role: str) -> str:
 
 
 def _install_unit(role: str = "server") -> None:
-    # deploy/ exists only in a source checkout; a wheel-only install gets
-    # instructions instead of a FileNotFoundError.
+    """Install the unit, and say only what was done. Each step that is left
+    (the passphrase file, copying a unit a wheel lacks, waiting for the
+    server, the start) is said once, in _print_next_steps' list (QA2)."""
     name = _unit_name(role)
     src = _DEPLOY_DIR / f"{name}.service"
-    client = role == "client"
-    # Never an empty passphrase file (QA B2): it would stop the unit.
-    fill = (
-        ""
-        if _cred_file_ready()
-        else f"\nPut the key passphrase in {_CRED_FILE} before you start it "
-        "(deploy/GUIDE.md §3e)."
-    )
+    dst = _SYSTEMD_DIR / f"{name}.service"
     # Enabled now, started later: a server needs a client CN in its
     # allowlist first, and a client must be known to the server (QA M2).
-    # _print_next_steps gives the start command.
-    note = f"\n{_CLIENT_START_NOTE}" if client else ""
     if not src.is_file():
-        if (_SYSTEMD_DIR / f"{name}.service").is_file():
-            # install.sh --systemd put it there; a wheel has no deploy/.
+        # deploy/ exists only in a source checkout.
+        if dst.is_file():
+            # install.sh --systemd put it there.
             print(
                 f"{name}.service is already installed. Enable it with: "
-                f"sudo systemctl enable {name}" + note + fill
+                f"sudo systemctl enable {name}"
             )
-            return
-        print(
-            f"{name}.service not found at the expected location.\n"
-            f"Copy deploy/{name}.service from the DSM source or release to "
-            f"/etc/systemd/system/{name}.service, then run:\n"
-            f"  sudo systemctl daemon-reload && sudo systemctl enable {name}"
-            + note
-            + fill,
-            file=sys.stderr,
-        )
+        else:
+            print(
+                f"{name}.service is not in this install (an installed wheel "
+                "has no deploy/ folder): the list below says how to add it."
+            )
         return
-    dst = _SYSTEMD_DIR / f"{name}.service"
     try:
         shutil.copyfile(src, dst)
     except OSError as e:
@@ -803,17 +783,7 @@ def _install_unit(role: str = "server") -> None:
         print(f"dsm init: could not install {dst}: {e.strerror or e}", file=sys.stderr)
         sys.exit(1)
     subprocess.run(["systemctl", "daemon-reload"], check=True)
-    if client:
-        # No start line here: the "Still to do" list ends with it (QA2 Nit 2).
-        print(
-            f"Installed {name}.service. Enable it with: sudo systemctl enable {name}\n"
-            f"{_CLIENT_START_NOTE}" + fill
-        )
-    else:
-        print(
-            f"Installed {name}.service. Enable it with: sudo systemctl enable {name}"
-            + fill
-        )
+    print(f"Installed {name}.service. Enable it with: sudo systemctl enable {name}")
 
 
 def _build_parser() -> argparse.ArgumentParser:
