@@ -43,8 +43,9 @@ def _nft_set(addresses: Sequence[str]) -> str:
     return "{ " + ", ".join(addresses) + " }"
 
 
-def apply_ruleset(rules: str, *, log_label: str) -> None:
-    """Load a rendered nftables ruleset via ``nft -f -``.
+def apply_ruleset(rules: str, *, log_label: str, level: int = logging.INFO) -> None:
+    """Load a rendered nftables ruleset via ``nft -f -``; log ``<log_label>
+    applied`` at ``level``.
 
     Raises ``RuntimeError`` on ``nft`` failure and re-raises
     ``FileNotFoundError`` when ``nft`` is not installed.
@@ -57,7 +58,7 @@ def apply_ruleset(rules: str, *, log_label: str) -> None:
             capture_output=True,
             timeout=5,
         )
-        log.info("%s applied", log_label)
+        log.log(level, "%s applied", log_label)
     except subprocess.CalledProcessError as e:
         stderr = e.stderr.decode(errors="replace").strip()
         raise RuntimeError(f"{log_label} apply failed: {stderr}")
@@ -171,9 +172,13 @@ class PreHandshakeKillSwitch:
         self._applied = False
 
     def apply(self) -> None:
+        # DEBUG: the client swaps this table for each opening and closing
+        # (a lookup: three in one second, QA2 N-b3) and says once, at INFO,
+        # that the first one is up.
         apply_ruleset(
             self._ruleset(),
             log_label="pre-handshake kill switch",
+            level=logging.DEBUG,
         )
         self._applied = True
         netaudit.emit(

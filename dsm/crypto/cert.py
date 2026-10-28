@@ -257,6 +257,13 @@ class DeviceCert:
         return self.cert.serial_number
 
 
+def serial_hex(serial: int) -> str:
+    """A cert serial as openssl writes it (index.txt, newcerts/<serial>.pem,
+    `openssl x509 -serial`): upper-case hex, an even number of digits."""
+    text = f"{serial:X}"
+    return "0" * (len(text) % 2) + text
+
+
 def load_ca_root(
     path: Path,
     *,

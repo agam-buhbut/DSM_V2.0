@@ -297,6 +297,7 @@ def _run_enroll(
 ) -> None:
     from dsm.core.passphrase import read_passphrase, wipe_passphrase
     from dsm.crypto.attest_store import AttestStore
+    from dsm.crypto.cert import serial_hex
     from dsm.crypto.enroll import EnrollError, generate_enrollment, import_signed_cert
     from dsm.crypto.keystore import KeyStore
 
@@ -453,7 +454,7 @@ def _run_enroll(
 
         print(f"Imported cert into {config.cert_file}")
         print(f"  cn = {leaf.subject_cn}")
-        print(f"  serial = {leaf.serial_number}")
+        print(f"  serial = {serial_hex(leaf.serial_number)} (hex)")
         print(f"  not_after = {leaf.not_after.isoformat()}")
         return
 

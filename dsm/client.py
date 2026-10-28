@@ -488,6 +488,7 @@ async def run_client(
                 e,
             )
             return 1
+        log.info("pre-handshake kill switch applied")
         lookup_open = False
         ntp_open = False
 

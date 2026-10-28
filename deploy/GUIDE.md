@@ -856,8 +856,9 @@ dsm verifies:
   fix, instead of failing later at the server.
 
 On success, writes /opt/mtun/device.crt (mode 0o600) and prints
-cn / serial / not_after. That serial is in decimal; the CA names the cert's
-file by the serial in hex (§7e).
+cn / serial / not_after. The serial is in hex, as openssl writes it
+(`serial = 1000 (hex)`): the CA's newcerts/1000.pem and index.txt name the
+cert by it (§7e).
 
 ### 3e. Server: stash the passphrase for non-interactive restarts
 
@@ -1308,8 +1309,9 @@ $ cd ca
 $ grep 'CN=dsm-XXXXXXXX-client' index.txt | cut -f4       # e.g. 1001
 # (Or on the device itself:
 #   sudo openssl x509 -inform DER -in /opt/mtun/device.crt -noout -serial)
-# The serial `dsm enroll --import` printed is in decimal (4097 for 1001),
-# so it is not the file name. Then revoke newcerts/<hex serial>.pem:
+# `dsm enroll --import` printed the same hex serial (`serial = 1001 (hex)`),
+# and a revoked cert is named by it in DSM's log too. Then revoke
+# newcerts/<hex serial>.pem:
 $ openssl ca -config openssl-ca.cnf \
       -revoke newcerts/<hex serial>.pem -crl_reason <reason>
 # Valid reasons (RFC 5280):
@@ -2648,9 +2650,12 @@ processed the INIT (network drop). If present, the ACK was dropped in
 the reverse direction. The session ends on purpose; a client keeps the
 kill switch up and makes a new handshake by itself (§7i).
 
-### "DNS resolve failed for qname-tag=<hex>"
+### "all DNS providers failed for qname-tag=<hex>" (or "DNS resolve failed for qname-tag=<hex>")
 
-Server's upstream DoH/DoT provider failed or pin mismatch.
+Server's upstream DoH/DoT provider failed or pin mismatch. The first line is
+an ERROR, at most one every 10 s: a slow or down upstream fails every query,
+so a later line ends `(N more in the last <seconds> s)`, the count of the
+ones not shown. The second line is a WARNING for a single query.
 Temporarily set `debug_dns = true` to log the plaintext qname (then
 flip it off). Re-check the SPKI pin against the provider's live cert
 (§3a.1).

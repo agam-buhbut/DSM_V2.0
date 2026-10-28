@@ -51,7 +51,7 @@ from dsm.crypto.attest import (
     build_attest_payload,
     verify_attest_payload,
 )
-from dsm.crypto.cert import CertError
+from dsm.crypto.cert import CertError, serial_hex
 from dsm.crypto.cert_allowlist import CNAllowlist
 from dsm.crypto.crl import CRL, CRLError
 from dsm.net._addresses import SINGLE_CLIENT_TUNNEL, TunnelAssignment
@@ -498,7 +498,8 @@ async def client_handshake(
         try:
             if crl.is_revoked(server_cert.serial_number):
                 raise CertRevokedError(
-                    f"server cert serial {server_cert.serial_number} " "is revoked"
+                    f"server cert serial {serial_hex(server_cert.serial_number)} "
+                    "(hex) is revoked"
                 )
         except CRLError as e:
             raise CertAuthError(f"CRL check failed: {e}") from e
@@ -729,7 +730,8 @@ async def server_handshake(
         try:
             if crl.is_revoked(client_cert.serial_number):
                 raise CertRevokedError(
-                    f"client cert serial {client_cert.serial_number} is revoked",
+                    f"client cert serial {serial_hex(client_cert.serial_number)} "
+                    "(hex) is revoked",
                     cn=cn,
                 )
         except CRLError as e:

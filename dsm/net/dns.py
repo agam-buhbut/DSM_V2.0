@@ -24,9 +24,14 @@ import dns.rdata
 import dns.rdatatype
 import dns.rdtypes.IN.A
 
+from dsm.core.log import RepeatLog
 from dsm.net.transport._fwmark import apply_so_mark
 
 log = logging.getLogger(__name__)
+
+# A slow or down upstream fails every query: one line per 10 s, with a count
+# of the others, not one per query (QA2 N-b1: 919 lines in 10 s).
+_all_failed_log = RepeatLog(log, logging.ERROR)
 
 MAX_CACHE_ENTRIES = 2_000
 MIN_TTL = 60
@@ -204,7 +209,7 @@ class DNSResolver:
                 continue
 
         redacted = redact(hostname, self._debug_dns)
-        log.error("all DNS providers failed for %s", redacted)
+        _all_failed_log.log("all DNS providers failed for %s", redacted)
         # Transport failure across every provider — non-authoritative so the
         # proxy returns SERVFAIL, not NXDOMAIN.
         return DnsResult(addresses=[], ttl=MIN_TTL, rcode=-1, authoritative=False)

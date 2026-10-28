@@ -30,21 +30,31 @@ from dsm import init as dsm_init
 from dsm.core import config as dsm_config
 from dsm.core import passphrase
 from dsm.core.config import ConfigError, load
+from dsm.core.log import RepeatLog
 from dsm.core.passphrase import PassphraseError, read_passphrase
 from dsm.crypto._stores import load_daemon_stores, loaded_stores_cli
 from dsm.crypto.attest_store import AttestStore
 from dsm.crypto.auth_loader import AuthMaterialsError, load_cert_materials
+from dsm.crypto.cert_allowlist import CNAllowlist
 from dsm.crypto.enroll import EnrollError, generate_enrollment, import_signed_cert
+from dsm.crypto.handshake import CertRevokedError, client_handshake, server_handshake
 from dsm.crypto.keystore import KeyStore
+from dsm.net import dns as dsm_dns
+from dsm.net.dns import DNSResolver
+from dsm.net.nftables import PreHandshakeKillSwitch
 from dsm.server import run_server
 from tests.cert_helpers import (
+    CLIENT_AUTH_OID,
+    SERVER_AUTH_OID,
     IssuingCA,
+    make_enrolled_device,
     make_leaf_cert,
     make_test_ca,
     public_spki_der_from_priv,
 )
 from tests.test_client_fail_closed import _config as _client_config
 from tests.test_client_start_block import _Start
+from tests.test_handshake_integration import _build_crl_with_revoked
 from tests.test_init import _fake_enrollment, _server_flags
 from tests.test_server_dns_fatal import _base_patches, _run_until, _server_config
 from tests.test_units_and_release import _FAKE_CURL, _RECORDER, INSTALL, RELEASE, _sums
@@ -1572,3 +1582,167 @@ def test_the_release_stops_unless_dist_has_one_dsm_wheel_of_each_kind(
     )
 
     assert (done.returncode == 0) is ok, done.stdout + done.stderr
+
+
+# --- follow-up 2, commit C: server and client lines (N-b1, N-b2, N-b3) ----------
+
+_PROVIDER = "https://10.0.0.53/dns-query"
+
+
+def _failing_resolver(monkeypatch: pytest.MonkeyPatch) -> DNSResolver:
+    resolver = DNSResolver([_PROVIDER], {_PROVIDER: ["aa" * 32]})
+
+    async def fail(*_a: object) -> Any:
+        raise OSError("timed out")
+
+    monkeypatch.setattr(resolver, "_resolve_doh", fail)
+    return resolver
+
+
+async def test_a_dns_upstream_outage_is_one_line_per_10_s_not_one_per_query(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = [100.0]
+    monkeypatch.setattr(
+        dsm_dns,
+        "_all_failed_log",
+        RepeatLog(dsm_dns.log, logging.ERROR, clock=lambda: now[0]),
+        raising=False,
+    )
+    caplog.set_level(logging.ERROR, logger="dsm.net.dns")
+    resolver = _failing_resolver(monkeypatch)
+
+    for i in range(50):
+        await resolver.resolve_detailed(f"n{i}.example")
+    now[0] += 11
+    await resolver.resolve_detailed("late.example")
+
+    lines = [r.getMessage() for r in caplog.records]
+    assert len(lines) == 2, lines
+    assert lines[0].startswith("all DNS providers failed for qname-tag=")
+    assert lines[1].endswith(" (49 more in the last 11 s)")
+
+
+@pytest.mark.parametrize(
+    ("serial", "text"), [(4096, "1000"), (4097, "1001"), (0xABC, "0ABC")]
+)
+def test_a_serial_is_written_as_openssl_writes_it(serial: int, text: str) -> None:
+    from dsm.crypto.cert import serial_hex  # new in this commit
+
+    assert serial_hex(serial) == text
+
+
+def test_enroll_import_prints_the_serial_in_hex(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config = _write_config(tmp_path, _GOOD_CLIENT)
+    leaf = mock.MagicMock(subject_cn="dsm-x-client", serial_number=4097)
+    with (
+        mock.patch("dsm.crypto._stores.loaded_stores_cli", _unlocked),
+        mock.patch("dsm.crypto.enroll.import_signed_cert", return_value=leaf),
+    ):
+        entry._run_enroll(
+            config,
+            csr_out=None,
+            import_cert=tmp_path / "signed.pem",
+            cn=None,
+            role=None,
+            passphrase_fd=None,
+            passphrase_env_file=None,
+        )
+    assert "  serial = 1001 (hex)\n" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("revoked", ["server", "client"])
+async def test_a_revoked_cert_line_gives_its_serial_in_hex(revoked: str) -> None:
+    from dsm.net.transport.udp import UDPTransport
+
+    ca = make_test_ca()
+    client = make_enrolled_device(ca, subject_cn="dsm-hex-client", eku=CLIENT_AUTH_OID)
+    server = make_enrolled_device(ca, subject_cn="dsm-hex-server", eku=SERVER_AUTH_OID)
+    device = server if revoked == "server" else client
+    crl = _build_crl_with_revoked(ca, [device.cert.serial_number])
+    with mock.patch("dsm.net.transport.udp.apply_so_mark", lambda _sock: None):
+        server_t = UDPTransport()
+        port = await server_t.bind("127.0.0.1", 0)
+        client_t = UDPTransport()
+        await client_t.bind("127.0.0.1", 0)
+        tasks: list[asyncio.Future[Any]] = [
+            asyncio.ensure_future(
+                client_handshake(
+                    client_t,
+                    client.identity,
+                    ("127.0.0.1", port),
+                    attest_key=client.attest_key,
+                    cert_der=client.cert_der,
+                    ca_root=ca.certificate,
+                    expected_server_cn="dsm-hex-server",
+                    crl=crl,
+                )
+            ),
+            asyncio.ensure_future(
+                server_handshake(
+                    server_t,
+                    server.identity,
+                    attest_key=server.attest_key,
+                    cert_der=server.cert_der,
+                    ca_root=ca.certificate,
+                    cn_allowlist=CNAllowlist(cns=frozenset({"dsm-hex-client"})),
+                    crl=crl,
+                )
+            ),
+        ]
+        try:
+            # The side that checks the revoked cert fails at once; the other
+            # would wait for its timeout, so it is cancelled.
+            done, pending = await asyncio.wait(
+                tasks, timeout=30.0, return_when=asyncio.FIRST_EXCEPTION
+            )
+            for task in pending:
+                task.cancel()
+            for task in pending:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+        finally:
+            await client_t.aclose()
+            await server_t.aclose()
+    results = [task.exception() for task in done]
+
+    revoked_lines = [str(r) for r in results if isinstance(r, CertRevokedError)]
+    hex_serial = f"{device.cert.serial_number:X}"
+    hex_serial = "0" * (len(hex_serial) % 2) + hex_serial
+    assert revoked_lines == [f"{revoked} cert serial {hex_serial} (hex) is revoked"]
+
+
+def test_the_pre_handshake_table_itself_logs_at_debug(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG, logger="dsm.net.nftables")
+    with mock.patch("dsm.net.nftables.subprocess.run"):
+        PreHandshakeKillSwitch("10.0.0.1", 51820, resolvers=["192.0.2.53"]).apply()
+    levels = [
+        r.levelno
+        for r in caplog.records
+        if r.getMessage() == "pre-handshake kill switch applied"
+    ]
+    assert levels == [logging.DEBUG]
+
+
+async def test_a_start_with_a_lookup_says_the_kill_switch_is_up_once(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="dsm")
+    start = _Start(tmp_path / "server-endpoint.json")
+    start.open_lookup = True
+
+    assert await start.run(server_ip="vpn.example.org") == 1
+
+    # The table, then port 53 opened for the lookup, then closed.
+    blocks = [e for e in start.events if e.startswith("block ")]
+    assert blocks[:3] == ["block none", "block none +dns", "block 10.0.0.1"]
+    applied = [
+        r
+        for r in caplog.records
+        if r.getMessage() == "pre-handshake kill switch applied"
+    ]
+    assert [r.levelno for r in applied] == [logging.INFO]

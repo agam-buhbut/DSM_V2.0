@@ -46,6 +46,7 @@ from dsm.crypto.cert import (
     CertExpiredError,
     DeviceCert,
     load_ca_root,
+    serial_hex,
     validate_chain,
 )
 from dsm.crypto.keystore import KeyStore
@@ -391,9 +392,9 @@ def import_signed_cert(
     except OSError as e:
         log.warning("could not chmod %s to 0o600: %s", cert_output_path, e)
     log.info(
-        "imported cert cn=%s serial=%s into %s",
+        "imported cert cn=%s serial=%s (hex) into %s",
         leaf.subject_cn,
-        leaf.serial_number,
+        serial_hex(leaf.serial_number),
         cert_output_path,
     )
     return leaf

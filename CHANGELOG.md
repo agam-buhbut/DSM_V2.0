@@ -318,6 +318,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   signed SHA256SUMS by its start (`dsm-<version>-cp311-abi3-`, or
   `dsm-<version>+soft-cp311-abi3-` with `--eval`) and its end
   (`_x86_64.whl`), so the `manylinux_2_<n>` names maturin makes match.
+- A slow or down DNS upstream logged one ERROR `all DNS providers failed
+  for qname-tag=...` per query (919 in 10 s from one client's burst). It is
+  now at most one line every 10 s, with a count of the others, and GUIDE §11
+  names it.
+- Cert serials are printed in hex, as openssl writes them (`serial = 1000
+  (hex)` at `dsm enroll --import`, `server cert serial 1000 (hex) is
+  revoked`), so they match index.txt and newcerts/<serial>.pem.
+- "pre-handshake kill switch applied" is said once, at INFO, when the
+  client's start-up block goes up; the swaps for a lookup or the time
+  daemon's NTP (three in one second for a name) are DEBUG.
 - Under the systemd units, a cert, CA root, CRL or key path DSM cannot read
   (a home folder, for example: the units drop CAP_DAC_OVERRIDE) is one line
   that says to keep DSM's files in /opt/mtun, owned by root; before, it was
