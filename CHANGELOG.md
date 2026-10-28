@@ -312,6 +312,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `install.sh --systemd` run through `curl | sudo sh` never found the
   units; a release now ships them, and install.sh fetches them and checks
   them against the signed SHA256SUMS.
+- install.sh no longer upgrades pip in its venv: that came from PyPI, as
+  root, outside the signature check, and failed on a host that reaches
+  GitHub but not PyPI. The venv's own pip installs the signed wheelhouse.
 - install.sh's signature check could never pass with the real minisign: it
   wrote the key alone into a file, which minisign refuses. It now gives the
   key on the command line (`minisign -V -P`).

@@ -253,7 +253,8 @@ fi
 
 # Dedicated venv keeps the wheel out of system Python.
 python3 -m venv "$VENV" || die "could not create the venv at $VENV"
-"$VENV/bin/pip" install --upgrade pip || die "could not upgrade pip in the venv"
+# No pip upgrade: it would come from PyPI, outside the signature check. The
+# venv's own pip installs the local wheelhouse (checked on 3.11, 3.12, 3.13).
 # --no-index + --find-links restricts the install to the local wheelhouse: the
 # verified DSM wheel PLUS the dependency wheels downloaded and checksum-verified
 # above (cryptography/dnspython + cffi/pycparser). pip resolves every

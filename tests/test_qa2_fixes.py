@@ -11,6 +11,7 @@ import dataclasses
 import datetime
 import logging
 import os
+import re
 import shutil
 import subprocess
 from collections.abc import Generator
@@ -2139,3 +2140,20 @@ def test_resume_on_an_enrolled_host_says_there_is_nothing_to_resume(
         f"dsm init: this host looks enrolled already ({inst / 'identity.key'} "
         f"and {inst / 'device.crt'} are there): nothing to resume\n"
     )
+
+
+# --- final box check: no PyPI at install time (F2) ------------------------------
+
+
+def test_install_sh_never_runs_pip_without_no_index() -> None:
+    # Everything past the gate comes from the signed release: pip must never
+    # reach PyPI, not even to upgrade itself (QA2 box F2).
+    from tests.test_install_sh import _code_lines
+
+    pip_lines = [
+        code for _, code in _code_lines() if re.search(r"pip['\"]?\s+install\b", code)
+    ]
+    assert pip_lines, "install.sh installs nothing with pip"
+    for code in pip_lines:
+        assert "--no-index" in code, code
+    assert "--upgrade pip" not in INSTALL

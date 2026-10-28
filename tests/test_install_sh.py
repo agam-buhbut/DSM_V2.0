@@ -429,8 +429,7 @@ class TestDependencyWheelhouse(unittest.TestCase):
 
         # Anchors. The minisign signature check; the dep selection/loop; the
         # dep download; the dep checksum check; and the FINAL wheel install
-        # (anchored on the unambiguous `--no-index --find-links` line rather
-        # than the first `pip install`, which is `pip install --upgrade pip`).
+        # (anchored on the unambiguous `--no-index --find-links` line).
         self.minisign_verify_ln = _first_lineno(r"\bminisign\s+-V\b")
         # awk selecting `.whl` entries that are NOT the dsm wheel(s).
         self.dep_select_ln = _first_lineno(
