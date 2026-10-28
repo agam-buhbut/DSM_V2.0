@@ -1119,3 +1119,95 @@ def test_a_key_dsm_cannot_read_is_one_line(
     assert [r.getMessage() for r in caplog.records] == [
         f"identity store: cannot read {key}: Permission denied {_UNIT_HINT}"
     ]
+
+
+# --- follow-up: dsm init without sudo on root's install dir ---------------------
+
+
+def _sudo_line(what: str, path: Path) -> str:
+    return f"dsm init: cannot {what} {path}: Permission denied: run it with sudo"
+
+
+@_ROOT_SKIP
+@pytest.mark.parametrize("closed", ["the folder", "the state file"])
+def test_resume_without_sudo_on_roots_install_dir_says_use_sudo(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    closed: str,
+) -> None:
+    inst = tmp_path / "inst"
+    with _enrolls():
+        assert dsm_init.main(_phase_a_flags(tmp_path, inst)) == 0
+    capsys.readouterr()
+    state = inst / ".dsm-init-state.json"
+    monkeypatch.setattr(dsm_init, "_is_root", lambda: False)
+    shut = inst if closed == "the folder" else state
+
+    shut.chmod(0o000)
+    try:
+        with pytest.raises(SystemExit) as err:
+            dsm_init.main(_resume_argv("server", inst, tmp_path))
+    finally:
+        shut.chmod(0o700 if closed == "the folder" else 0o600)
+
+    assert err.value.code == 1
+    assert capsys.readouterr().err == _sudo_line("read", state) + "\n"
+
+
+def test_init_without_sudo_on_a_root_owned_install_dir_says_use_sudo(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inst = tmp_path / "inst"
+    inst.mkdir(mode=0o700)
+    flags = _phase_a_flags(tmp_path, inst)
+    _looks_owned_by(monkeypatch, inst, 0)
+    monkeypatch.setattr(dsm_init, "_is_root", lambda: False)
+
+    with _enrolls() as gen, pytest.raises(SystemExit) as err:
+        dsm_init.main(flags)
+
+    assert err.value.code == 1
+    assert capsys.readouterr().err.splitlines()[-1] == (
+        f"dsm init: {inst} belongs to root: run it with sudo"
+    )
+    gen.assert_not_called()
+    assert not list(inst.iterdir())
+
+
+def test_init_on_another_users_install_dir_keeps_the_owner_text(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inst = tmp_path / "inst"
+    inst.mkdir(mode=0o700)
+    flags = _phase_a_flags(tmp_path, inst)
+    _looks_owned_by(monkeypatch, inst, 4242)
+    monkeypatch.setattr(dsm_init, "_is_root", lambda: False)
+
+    with _enrolls(), pytest.raises(SystemExit) as err:
+        dsm_init.main(flags)
+
+    assert err.value.code == 2
+    assert "is owned by uid 4242" in capsys.readouterr().err.splitlines()[-1]
+
+
+@_ROOT_SKIP
+def test_init_without_sudo_that_cannot_make_the_install_dir_says_use_sudo(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = tmp_path / "opt"
+    parent.mkdir()
+    inst = parent / "mtun"
+    flags = _phase_a_flags(tmp_path, inst)
+    monkeypatch.setattr(dsm_init, "_is_root", lambda: False)
+
+    parent.chmod(0o500)
+    try:
+        with _enrolls() as gen, pytest.raises(SystemExit) as err:
+            dsm_init.main(flags)
+    finally:
+        parent.chmod(0o700)
+
+    assert err.value.code == 1
+    assert capsys.readouterr().err.splitlines()[-1] == _sudo_line("create", inst)
+    gen.assert_not_called()

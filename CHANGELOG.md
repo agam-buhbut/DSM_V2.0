@@ -26,6 +26,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Ubuntu 22.04's python3 is 3.10, too old for DSM; `install.sh` now warns
   below 24.04. On Debian 12 it installs the TPM runtime under that
   release's package name (`libtss2-esys-3.0.2-0`).
+- Release wheels are built on Ubuntu 22.04 (glibc 2.35), so they install on
+  Debian 12 (glibc 2.36). That is only the build host: DSM itself still needs
+  Debian 12+ or Ubuntu 24.04+.
 - `dsm init --force` removes the old keys only once the new passphrase is
   in, so a typo in the second answer leaves them in place.
 - `--passphrase-env-file` that is missing, open to others or empty now
@@ -102,7 +105,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that uses it, no longer loads without the built extension.
 - The default `mtu` is now 1360 (was 1400). One DSM packet carries at most
   1360 bytes, so at 1400 every full-size packet was split in two, which
-  halved top speed. Configs that set `mtu = 1400` keep the old behavior.
+  halved top speed. Configs that set `mtu = 1400` keep the old behavior, and
+  get a warning at start: it now comes for any `mtu` above 1360 (it came
+  only above 1400).
 - A second DSM on a UDP port that is already in use now fails at start with
   a clear error. Before, both could share the port and each got only some
   of the packets, so sessions broke with no error.
@@ -279,11 +284,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A re-run of `dsm init` on an enrolled host overwrote config.toml before
   it refused; now it refuses first, and a new config replaces the old one
   only once the enrollment worked. A relative `--ca-root` works.
+- `dsm init --ca-root` takes only a CA certificate (PEM). The CRL or a
+  passphrase file given by mistake is refused at once, before anything is
+  written; before, it showed only after the trip to the CA, as a traceback.
+  A bad CA copy at `dsm init --resume` or `dsm enroll --import` is one line.
 - `dsm init` ends with a list of what is still to do (the CRL, the
   allowlist, the passphrase file) instead of "Done".
 - Starting DSM or `dsm cleanup` without root says "use sudo" at once;
   `dsm cleanup` no longer says "complete" after every step failed. An nft
   error on the client's first block is one line, not a traceback.
+- The same for the other commands that need root: `dsm init
+  --install-unit`, `dsm init` on root's install folder, and `dsm
+  show-pubkey` or `dsm enroll` with a config owned by root. Run without sudo,
+  each says "run it with sudo" in one line, before it writes anything,
+  instead of a traceback or "owned by uid 0".
 - Ctrl-C at a prompt of the installed `dsm` command prints "aborted", not a
   traceback; `--mode` that does not fit the config is one config line.
 - `dsm enroll --import` refuses a cert of the wrong type for the host's
@@ -291,6 +305,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `install.sh --systemd` run through `curl | sudo sh` never found the
   units; a release now ships them, and install.sh fetches them and checks
   them against the signed SHA256SUMS.
+- install.sh's signature check could never pass with the real minisign: it
+  wrote the key alone into a file, which minisign refuses. It now gives the
+  key on the command line (`minisign -V -P`).
+- The release's dependency wheels were for Python 3.11 only, and cffi has a
+  wheel per Python, so install.sh (which installs with `--no-index`) failed
+  on Debian 13 (3.13) and Ubuntu 24.04 (3.12). The release now ships them
+  for 3.11, 3.12 and 3.13.
+- Both DSM wheels got the same file name, and neither matched the name
+  install.sh looked for. The evaluation wheel is now
+  `dsm-<version>+soft-...`, and install.sh takes each wheel's name from the
+  signed SHA256SUMS by its start (`dsm-<version>-cp311-abi3-`, or
+  `dsm-<version>+soft-cp311-abi3-` with `--eval`) and its end
+  (`_x86_64.whl`), so the `manylinux_2_<n>` names maturin makes match.
+- Under the systemd units, a cert, CA root, CRL or key path DSM cannot read
+  (a home folder, for example: the units drop CAP_DAC_OVERRIDE) is one line
+  that says to keep DSM's files in /opt/mtun, owned by root; before, it was
+  a traceback.
 - A new passphrase typed at a terminal is asked twice.
 - Plainer messages: an unknown config key names the setting it may mean;
   the allowlist says "not found", where comments go, and warns about a
@@ -298,7 +329,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   line names the client; the TUN-address advice is gone; the transport is
   named in the no-answer and refused-connect lines; the mtu warning says
   1360; a leftover `hosts.txt` gets a warning at each start that says to
-  move it into `dns/block/`.
+  move it into `dns/block/`. A missing setting is named (`missing setting
+  'server_ip'`; a server is told any IPv4 address will do), not Python's
+  argument text. No passphrase source and no terminal says so, not "must
+  not be empty". Unlock errors name no Python class; `dsm enroll` ends with
+  the whole `sudo dsm --config ... enroll --import` command and names the
+  three files to remove on an enrolled host; a cert made for another device
+  says so in plain words. `CN allowlist loaded (1 entry)`. `dsm init` tells
+  a client started by hand to do it at the console, not over SSH.
 - The server's systemd unit (`deploy/dsm.service`) had `ProcSubset=pid`,
   which hides `/proc/sys`. The server writes its network settings there
   when a client connects, so under that unit every client session failed
@@ -478,6 +516,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Documented build and runtime packages (patchelf, t64 TSS2 names), NTP,
   and installing a prebuilt wheel on a constrained client.
 - The README Quickstart states that no release has been published yet.
+- To install a new build over an installed DSM of the same version (every
+  build is 0.1.0 so far), add `--force-reinstall --no-deps` to the wheel
+  install, after the plain install has brought the dependencies up
+  (deploy/GUIDE.md §1b, §7j); without it pip keeps the old code. The guide
+  also says where Stick B is mounted, copies the new CRL in §3d, and names
+  the server-only keys a client config leaves out (§3f).
 
 ## [0.1.0] - not released yet
 

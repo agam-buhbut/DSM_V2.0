@@ -64,6 +64,18 @@ def _is_root() -> bool:
     return os.geteuid() == 0
 
 
+def _need_sudo(what: str, path: Path, e: PermissionError) -> NoReturn:
+    """A normal user met root's install dir: say sudo, not chmod (QA2).
+    Root itself gets the error as it is."""
+    if _is_root():
+        raise e
+    print(
+        f"dsm init: cannot {what} {path}: Permission denied: run it with sudo",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
 def _need_root_for_unit() -> None:
     """--install-unit writes /etc/dsm/passphrase and the unit: refuse a
     normal user at the start, before anything is written (QA2 Minor 1)."""
@@ -294,18 +306,32 @@ def _ensure_secret_dir(install_dir: Path) -> None:
     (e.g. a pre-provisioned ``/opt/mtun`` owned by a service account), we fail
     closed when the dir already exists and is not owner-owned.
     """
-    if install_dir.exists():
+    try:
+        exists = install_dir.exists()
+    except PermissionError as e:
+        _need_sudo("read", install_dir, e)
+    if exists:
         try:
             st = install_dir.stat()
         except OSError as e:
             _fail(f"cannot stat install dir {install_dir}: {e}")
+        if st.st_uid == 0 and not _is_root():
+            # Sudo, not a chown to this user (as config.load says).
+            print(
+                f"dsm init: {install_dir} belongs to root: run it with sudo",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         if st.st_uid != os.geteuid():
             _fail(
                 f"install dir {install_dir} is owned by uid {st.st_uid}, not "
                 f"the current uid {os.geteuid()}; refusing to chmod a dir owned "
                 "by another user (provision it yourself at mode 0700)"
             )
-    install_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        install_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    except PermissionError as e:
+        _need_sudo("create", install_dir, e)
     try:
         install_dir.chmod(0o700)
     except OSError as e:
@@ -454,12 +480,15 @@ def _phase_a(role: str, args: argparse.Namespace) -> int:
 def _phase_b(role: Literal["client", "server"], args: argparse.Namespace) -> int:
     install_dir = Path(args.install_dir).absolute()
     state_path = install_dir / _STATE_NAME
-    if not state_path.is_file():
-        _fail(
-            f"no init state at {state_path}: run `dsm init {role}` without "
-            "--resume first, with the same --install-dir"
-        )
-    state = json.loads(state_path.read_text(encoding="utf-8"))
+    try:
+        if not state_path.is_file():
+            _fail(
+                f"no init state at {state_path}: run `dsm init {role}` without "
+                "--resume first, with the same --install-dir"
+            )
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except PermissionError as e:
+        _need_sudo("read", state_path, e)
     if state.get("schema") != _STATE_SCHEMA:
         _fail(
             f"unrecognized init-state schema {state.get('schema')!r} in "
