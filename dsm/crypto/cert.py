@@ -337,14 +337,15 @@ def check_ca_key(ca_root: x509.Certificate) -> EllipticCurvePublicKey:
     ``validate_chain`` and ``dsm init`` both use this one rule."""
     ca_pub = ca_root.public_key()
     if not isinstance(ca_pub, EllipticCurvePublicKey):
+        # RSAPublicKey -> "RSA": the kind of key, not a Python class name.
+        kind = type(ca_pub).__name__.removesuffix("PublicKey")
         raise CertChainError(
-            f"unsupported CA pubkey type {type(ca_pub).__name__}; "
-            "only EC CAs are supported"
+            f"the CA's key is {kind}; DSM needs a P-384 (secp384r1) EC key"
         )
     if not isinstance(ca_pub.curve, ec.SECP384R1):
         raise CertChainError(
-            f"CA public key is on curve {ca_pub.curve.name!r}; "
-            "only secp384r1 (P-384) CAs are accepted"
+            f"the CA's key is on curve {ca_pub.curve.name}; DSM needs secp384r1 "
+            "(P-384)"
         )
     return ca_pub
 

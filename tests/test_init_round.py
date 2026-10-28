@@ -523,8 +523,11 @@ def test_a_server_with_nothing_left_is_ready(
     capsys.readouterr()
     dsm_init._print_next_steps("server", cfg, cfg_dir / "config.toml", True)
     out = capsys.readouterr().out
-    assert "Ready. Start it: sudo systemctl start dsm" in out
-    assert "Still to do" not in out
+    assert (
+        "  1. Enable it: sudo systemctl enable dsm\n"
+        "Then start it: sudo systemctl start dsm" in out
+    )
+    assert "  2." not in out
 
 
 def test_a_missing_unit_is_never_ready(

@@ -25,6 +25,7 @@ from dsm.core.atomic_io import atomic_write
 from dsm.core.config import Config, ConfigError
 from dsm.core.config import load as config_load
 from dsm.core.passphrase import read_passphrase, wipe_passphrase
+from dsm.core.path_security import root_owns
 from dsm.crypto._stores import loaded_stores_cli
 from dsm.crypto.attest_store import AttestStore
 from dsm.crypto.cert import (
@@ -64,9 +65,13 @@ def _is_root() -> bool:
 
 
 def _need_sudo(what: str, path: Path, e: PermissionError) -> NoReturn:
-    """A normal user met a folder or file of root's: say sudo, not chmod
-    (QA2). Root gets the same one line without the sudo advice."""
-    tail = "" if _is_root() else ": run it with sudo"
+    """One line for a file or folder init may not use. Sudo only when root
+    owns it (or its folder) and init runs as a normal user, as for the
+    config (QA2); a user's own file needs a chmod, not sudo."""
+    if not _is_root() and root_owns(path):
+        tail = ": run it with sudo"
+    else:
+        tail = "; check its permissions"
     print(f"dsm init: cannot {what} {path}: {e.strerror or e}{tail}", file=sys.stderr)
     sys.exit(1)
 
@@ -564,9 +569,10 @@ def _phase_b(role: Literal["client", "server"], args: argparse.Namespace) -> int
 
         if role == "server" and cfg.allowed_cns_file:
             allow = Path(cfg.allowed_cns_file)
+            kept = allow.exists()
             allow.touch(mode=0o600, exist_ok=True)
             # The list below says to add the client CNs.
-            print(f"Created the allowlist {allow}.")
+            print(f"{'Kept' if kept else 'Created'} the allowlist {allow}.")
         else:
             print(
                 "Give this CN to the server operator for its allowlist: "
@@ -692,7 +698,7 @@ def _write_unit_passphrase(passphrase: bytearray) -> None:
         finally:
             os.close(fd)
     except OSError as e:
-        why = "it is a symlink" if e.errno == errno.ELOOP else str(e)
+        why = "it is a symlink" if e.errno == errno.ELOOP else (e.strerror or str(e))
         # The cause only: the list below says to put the passphrase there.
         print(f"dsm init: could not write {path}: {why}", file=sys.stderr)
         return
@@ -712,6 +718,8 @@ def _has_names(path: Path) -> bool:
 
 def _print_next_steps(role: str, cfg: Config, config_path: Path, unit: bool) -> None:
     """What is left before DSM can start (QA M1), instead of "Done"."""
+    # This host's own steps first, each once; a client's wait for the
+    # server last, as it cannot do that itself (QA2 re-check).
     steps: list[str] = []
     if cfg.crl_file and not Path(cfg.crl_file).is_file():
         steps.append(
@@ -724,12 +732,6 @@ def _print_next_steps(role: str, cfg: Config, config_path: Path, unit: bool) -> 
                 f"Add each client's CN to {cfg.allowed_cns_file}, one per line "
                 "(deploy/GUIDE.md §4)."
             )
-    else:
-        steps.append(
-            "Wait until the server's allowlist has this client's CN "
-            "(deploy/GUIDE.md §4): until then this client blocks all traffic, "
-            "SSH too."
-        )
     if unit and not _cred_file_ready():
         steps.append(f"Put the key passphrase in {_CRED_FILE} (deploy/GUIDE.md §3e).")
     name = _unit_name(role)
@@ -741,6 +743,14 @@ def _print_next_steps(role: str, cfg: Config, config_path: Path, unit: bool) -> 
             f"deploy/{name}.service in the DSM source or release (install.sh "
             f"{fetch} puts it there). Then: sudo systemctl daemon-reload && "
             f"sudo systemctl enable {name}"
+        )
+    elif unit:
+        steps.append(f"Enable it: sudo systemctl enable {name}")
+    if role == "client":
+        steps.append(
+            "Wait until the server's allowlist has this client's CN "
+            "(deploy/GUIDE.md §4): until then this client blocks all traffic, "
+            "SSH too."
         )
     if unit:
         start = f"sudo systemctl start {_unit_name(role)}"
@@ -781,10 +791,7 @@ def _install_unit(role: str = "server") -> None:
         # deploy/ exists only in a source checkout.
         if dst.is_file():
             # install.sh --systemd put it there.
-            print(
-                f"{name}.service is already installed. Enable it with: "
-                f"sudo systemctl enable {name}"
-            )
+            print(f"{name}.service is already installed.")
         else:
             print(
                 f"{name}.service is not in this install (an installed wheel "
@@ -798,7 +805,7 @@ def _install_unit(role: str = "server") -> None:
         print(f"dsm init: could not install {dst}: {e.strerror or e}", file=sys.stderr)
         sys.exit(1)
     subprocess.run(["systemctl", "daemon-reload"], check=True)
-    print(f"Installed {name}.service. Enable it with: sudo systemctl enable {name}")
+    print(f"Installed {name}.service.")
 
 
 def _build_parser() -> argparse.ArgumentParser:

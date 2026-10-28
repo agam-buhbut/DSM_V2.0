@@ -1181,6 +1181,7 @@ def test_resume_without_sudo_on_roots_install_dir_says_use_sudo(
     state = inst / ".dsm-init-state.json"
     monkeypatch.setattr(dsm_init, "_is_root", lambda: False)
     shut = inst if closed == "the folder" else state
+    _fake_owner(monkeypatch, shut, 0)  # root's, as `sudo dsm init` makes it
 
     shut.chmod(0o000)
     try:
@@ -1238,6 +1239,7 @@ def test_init_without_sudo_that_cannot_make_the_install_dir_says_use_sudo(
     inst = parent / "mtun"
     flags = _phase_a_flags(tmp_path, inst)
     monkeypatch.setattr(dsm_init, "_is_root", lambda: False)
+    _fake_owner(monkeypatch, parent, 0)  # root's /opt
 
     parent.chmod(0o500)
     try:
@@ -1834,6 +1836,7 @@ def test_a_ca_root_in_a_folder_the_user_cannot_search_says_use_sudo(
     inst = tmp_path / "inst"
     flags = _set(_phase_a_flags(tmp_path, inst), "--ca-root", str(ca))
     monkeypatch.setattr(dsm_init, "_is_root", lambda: False)
+    _fake_owner(monkeypatch, folder, 0)  # root's /opt/mtun (GUIDE §2f)
 
     with _closed(folder), _enrolls() as gen, pytest.raises(SystemExit) as err:
         dsm_init.main(flags)
@@ -1860,7 +1863,7 @@ def test_root_that_cannot_reach_the_ca_root_gets_the_plain_line(
 
     assert err.value.code == 1
     assert capsys.readouterr().err.splitlines()[-1] == (
-        f"dsm init: cannot read {ca}: Permission denied"
+        f"dsm init: cannot read {ca}: Permission denied; check its permissions"
     )
 
 
@@ -1872,10 +1875,9 @@ def test_root_that_cannot_reach_the_ca_root_gets_the_plain_line(
     [
         (
             "P-256",
-            "CA public key is on curve 'secp256r1'; only secp384r1 (P-384) CAs "
-            "are accepted",
+            "the CA's key is on curve secp256r1; DSM needs secp384r1 (P-384)",
         ),
-        ("RSA", "unsupported CA pubkey type RSAPublicKey; only EC CAs are supported"),
+        ("RSA", "the CA's key is RSA; DSM needs a P-384 (secp384r1) EC key"),
     ],
 )
 def test_init_refuses_a_ca_root_that_is_not_p384_before_writing(
@@ -2379,10 +2381,7 @@ def test_a_failed_passphrase_write_ends_at_the_cause_and_asks_once(
     monkeypatch.setattr(os, "write", write)
     text = _unit_resume_output(tmp_path, capsys, monkeypatch, unit_in_deploy=True)
 
-    assert (
-        f"dsm init: could not write {cred}: [Errno 28] No space left on device\n"
-        in (text)
-    )
+    assert f"dsm init: could not write {cred}: No space left on device\n" in text
     assert "by hand" not in text
     assert text.count("Put the key passphrase in") == 1
 
@@ -2413,3 +2412,134 @@ def test_the_users_own_config_without_a_read_bit_is_a_plain_line(
     finally:
         path.chmod(0o600)
     assert str(err.value) == f"cannot read {path}: Permission denied"
+
+
+# --- laptop re-check: the list has every step once, in order ---------------------
+
+
+def _list_and_above(out: str) -> tuple[list[str], str]:
+    lines = out.splitlines()
+    at = lines.index("Still to do before you start DSM:")
+    steps: list[str] = []
+    for line in lines[at + 1 :]:
+        found = re.match(r"  \d+\. (.*)", line)
+        if found is None:
+            assert line.startswith("Then start it: "), line
+            break
+        steps.append(found.group(1))
+    return steps, "\n".join(lines[:at])
+
+
+@pytest.mark.parametrize("role", ["server", "client"])
+@pytest.mark.parametrize("unit_file", ["from the source", "already there", "missing"])
+def test_the_unit_resume_list_has_each_step_once_enable_before_start(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    role: str,
+    unit_file: str,
+) -> None:
+    name = "dsm-client" if role == "client" else "dsm"
+    deploy = tmp_path / "deploy"
+    deploy.mkdir()
+    units = tmp_path / "units"
+    units.mkdir()
+    if unit_file == "from the source":
+        (deploy / f"{name}.service").write_text("unit\n")
+    elif unit_file == "already there":
+        (units / f"{name}.service").write_text("unit\n")
+    monkeypatch.setattr(dsm_init, "_DEPLOY_DIR", deploy)
+    monkeypatch.setattr(dsm_init, "_SYSTEMD_DIR", units)
+    monkeypatch.setattr(dsm_init, "_CRED_FILE", tmp_path / "etc-dsm" / "passphrase")
+    monkeypatch.setattr(dsm_init, "_is_root", lambda: True)
+    monkeypatch.setattr(dsm_init.subprocess, "run", mock.MagicMock())
+    inst = tmp_path / "inst"
+    first = (
+        _client_flags(tmp_path, inst)
+        if role == "client"
+        else _phase_a_flags(tmp_path, inst)
+    )
+    with _enrolls():
+        assert dsm_init.main([*first, "--install-unit"]) == 0
+    capsys.readouterr()
+    with (
+        mock.patch.object(dsm_init, "loaded_stores_cli", _unlocked),
+        mock.patch.object(dsm_init, "import_signed_cert"),
+    ):
+        assert dsm_init.main(_resume_argv(role, inst, tmp_path)) == 0
+    captured = capsys.readouterr()
+    out = captured.out + captured.err
+
+    steps, above = _list_and_above(captured.out)
+    assert len(steps) == len(set(steps)), steps
+    enable = f"sudo systemctl enable {name}"
+    assert out.count(enable) == 1, out
+    assert any(enable in step for step in steps), steps
+    assert out.count(f"sudo systemctl start {name}") == 1, out
+    said = {
+        "from the source": f"Installed {name}.service.",
+        "already there": f"{name}.service is already installed.",
+        "missing": f"{name}.service is not in this install",
+    }[unit_file]
+    assert said in above
+    # The client's own steps first; the one it cannot do itself last.
+    waits = [i for i, s in enumerate(steps) if s.startswith("Wait until the server")]
+    assert waits == ([len(steps) - 1] if role == "client" else []), steps
+
+
+def test_a_kept_allowlist_is_not_called_created(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    inst = tmp_path / "inst"
+    with _enrolls():
+        assert dsm_init.main(_phase_a_flags(tmp_path, inst)) == 0
+    allow = inst / "allowed_cns.txt"
+    allow.write_text("dsm-x-client\n")
+    allow.chmod(0o600)
+    capsys.readouterr()
+    with (
+        mock.patch.object(dsm_init, "loaded_stores_cli", _unlocked),
+        mock.patch.object(dsm_init, "import_signed_cert"),
+    ):
+        assert dsm_init.main(_resume_argv("server", inst, tmp_path)) == 0
+    out = capsys.readouterr().out
+    assert f"Kept the allowlist {allow}.\n" in out
+    assert "Created the allowlist" not in out
+    assert allow.read_text() == "dsm-x-client\n"
+
+
+@_ROOT_SKIP
+def test_the_users_own_unreadable_ca_root_is_a_plain_line(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ca = tmp_path / "ca200.pem"
+    ca.write_bytes(make_test_ca().pem)
+    ca.chmod(0o200)
+    flags = _set(_phase_a_flags(tmp_path, tmp_path / "inst"), "--ca-root", str(ca))
+    monkeypatch.setattr(dsm_init, "_is_root", lambda: False)
+    try:
+        with _enrolls(), pytest.raises(SystemExit) as err:
+            dsm_init.main(flags)
+    finally:
+        ca.chmod(0o600)
+    assert err.value.code == 1
+    assert capsys.readouterr().err.splitlines()[-1] == (
+        f"dsm init: cannot read {ca}: Permission denied; check its permissions"
+    )
+
+
+@_ROOT_SKIP
+def test_an_install_dir_in_the_users_own_closed_folder_is_a_plain_line(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    inst = locked / "x"
+    flags = _phase_a_flags(tmp_path, inst)
+    monkeypatch.setattr(dsm_init, "_is_root", lambda: False)
+    with _closed(locked), _enrolls(), pytest.raises(SystemExit) as err:
+        dsm_init.main(flags)
+    assert err.value.code == 1
+    assert capsys.readouterr().err.splitlines()[-1] == (
+        f"dsm init: cannot read {inst}: Permission denied; check its permissions"
+    )

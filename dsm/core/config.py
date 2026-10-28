@@ -17,6 +17,7 @@ from dsm.core._validators import DSM_TUN_NAME_RE as _TUN_NAME_PATTERN
 from dsm.core.path_security import (
     InsecureFilePermissionsError,
     check_user_file_permissions,
+    root_owns,
 )
 
 log = logging.getLogger(__name__)
@@ -783,23 +784,13 @@ def _reject_missing_keys(raw: dict[str, object]) -> None:
     raise ConfigError(text)
 
 
-def _root_owns(p: Path) -> bool:
-    """Root owns the file, or, when the file cannot be looked at, its folder."""
-    for candidate in (p, p.parent):
-        try:
-            return candidate.stat().st_uid == 0
-        except OSError:
-            continue
-    return False
-
-
 def _cannot(what: str, p: Path, e: PermissionError) -> str:
     """One line, not a traceback, for a config DSM cannot reach or read. GUIDE
     §2f makes /opt/mtun root's, 0700: there a normal user is told to use sudo
     (QA2 final check). Not for a user's own file: as root, DSM would then
     refuse it as owned by another user."""
     text = f"cannot {what} {p}: {e.strerror or e}"
-    if os.geteuid() != 0 and _root_owns(p):
+    if os.geteuid() != 0 and root_owns(p):
         text += ": run it with sudo"
     return text
 

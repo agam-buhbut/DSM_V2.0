@@ -25,6 +25,17 @@ def cannot_read(path: Path | str, e: OSError) -> str:
     return text
 
 
+def root_owns(path: Path) -> bool:
+    """Root owns ``path``, or, when it cannot be looked at (or is not
+    there yet), its folder. Decides whether "run it with sudo" can help."""
+    for candidate in (path, path.parent):
+        try:
+            return candidate.stat().st_uid == 0
+        except OSError:
+            continue
+    return False
+
+
 def cannot_write_in(folder: Path | str, e: OSError) -> str:
     """One line for a folder DSM cannot write in (QA2 box F1). Under the
     units root has no CAP_DAC_OVERRIDE, so a config folder owned by another
