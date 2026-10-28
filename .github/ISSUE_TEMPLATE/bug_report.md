@@ -25,7 +25,7 @@ A clear, one-or-two-sentence description of the bug.
 
 - DSM version / commit:
 - Role: server / client
-- OS + version (e.g. Debian 12, Ubuntu 22.04):
+- OS + version (e.g. Debian 13, Ubuntu 26.04):
 - Arch (`uname -m`):
 - Build flavor: TPM (`tpm-attest`) / eval (`dev-soft-attest`)
 - TPM present: yes / no (swtpm / hardware / none)

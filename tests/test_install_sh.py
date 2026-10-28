@@ -369,23 +369,14 @@ class TestPlaceholdersAndHygiene(unittest.TestCase):
     def setUp(self) -> None:
         self.text = _INSTALL_SH.read_text(encoding="utf-8")
 
-    def test_owner_placeholders_present(self) -> None:
-        # The repo-URL placeholder has been filled with the real release URL
-        # (github.com/agam-buhbut/DSM_V2.0); only the minisign-pubkey
-        # TODO(owner) legitimately remains a placeholder until release.
-        for token in ("TODO(owner)",):
-            self.assertIn(
-                token,
-                self.text,
-                f"owner placeholder {token!r} must remain literal until release",
-            )
+    def test_no_owner_placeholder_is_left(self) -> None:
+        for token in ("TODO(owner)", "PLACEHOLDER"):
+            self.assertNotIn(token, self.text)
 
-    def test_minisign_pubkey_is_a_placeholder(self) -> None:
-        self.assertRegex(
-            self.text,
-            r'MINISIGN_PUBKEY="[^"]*PLACEHOLDER[^"]*"',
-            "MINISIGN_PUBKEY must remain a literal placeholder until release",
-        )
+    def test_minisign_pubkey_is_a_real_key(self) -> None:
+        # A minisign public key: "RW" (Ed25519) + base64 of key ID and key,
+        # 56 characters in all.
+        self.assertRegex(self.text, r'\nMINISIGN_PUBKEY="RW[A-Za-z0-9+/]{54}"\n')
 
     def test_uses_mktemp_not_predictable_tmp(self) -> None:
         self.assertRegex(

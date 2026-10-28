@@ -1,6 +1,6 @@
 #!/bin/sh
 # DSM installer — verify-before-execute bootstrap for the supported target
-# (Debian 12+ / Ubuntu 24.04+ / x86_64 / TPM 2.0). Downloads the wheel +
+# (Debian 13+ / Ubuntu 25.04+ / x86_64 / TPM 2.0). Downloads the wheel +
 # SHA256SUMS + minisign signature, VERIFIES the minisign signature and the
 # checksum BEFORE installing anything (apt/pip/venv), then installs into a
 # dedicated venv.
@@ -39,9 +39,9 @@ set -eu
 DSM_VERSION="0.1.0"
 BASE="${DSM_RELEASE_BASE_URL:-https://github.com/agam-buhbut/DSM_V2.0/releases/download/v${DSM_VERSION}}"
 
-# TODO(owner): paste the real minisign PUBLIC key (one base64 line) before
-# release. The matching PRIVATE key is OWNER-ONLY and lives in a CI secret.
-MINISIGN_PUBKEY="RWQUNRELEASED_PLACEHOLDER_minisign_public_key_REPLACE_BEFORE_RELEASE"
+# The release signing key's PUBLIC half (minisign key ID DF98FF5321B786A3).
+# The matching PRIVATE key is OWNER-ONLY and lives in a CI secret.
+MINISIGN_PUBKEY="RWSjhrchU/+Y31PirEAjfoNQ0ktYgR0ovHTLL7CykL22+hSoRfvHgUsi"
 
 VENV="/opt/dsm/venv"
 
@@ -67,10 +67,11 @@ done
 
 [ "$(id -u)" = "0" ] || die "must run as root (sudo)"
 [ "$(uname -m)" = "x86_64" ] || die "unsupported arch $(uname -m); build from source (deploy/GUIDE.md §1)"
-command -v apt-get >/dev/null 2>&1 || die "no apt-get; supported targets are Debian 12+/Ubuntu 24.04+. Build from source for others."
+command -v apt-get >/dev/null 2>&1 || die "no apt-get; supported targets are Debian 13+/Ubuntu 25.04+. Build from source for others."
 
-# Supported-distro warning (warn+continue: Debian 12+ / Ubuntu 24.04+; DSM
-# needs Python 3.11 or newer, and an older Ubuntu's python3 is too old).
+# Supported-distro warning (warn+continue: Debian 13+ / Ubuntu 25.04+; the
+# release's wheels are built on Debian 13, and an older glibc may be too old
+# for them).
 # /etc/os-release is sourced in a subshell so its variables (VERSION_ID,
 # VERSION, ID, …) cannot leak into and shadow our own state.
 if [ -r /etc/os-release ]; then
@@ -80,18 +81,18 @@ if [ -r /etc/os-release ]; then
     case "${ID:-}" in
       debian)
         case "${VERSION_ID:-0}" in
-          1[2-9]|[2-9][0-9]) : ;;
-          *) echo "WARNING — Debian ${VERSION_ID:-?} is below the supported Debian 12+ baseline; continuing." ;;
+          1[3-9]|[2-9][0-9]) : ;;
+          *) echo "WARNING — Debian ${VERSION_ID:-?} is below the supported Debian 13+ baseline; continuing." ;;
         esac
         ;;
       ubuntu)
         _major="${VERSION_ID:-0}"; _major="${_major%%.*}"
-        if [ "${_major:-0}" -lt 24 ] 2>/dev/null; then
-          echo "WARNING — Ubuntu ${VERSION_ID:-?} is below the supported Ubuntu 24.04+ baseline; continuing."
+        if [ "${_major:-0}" -lt 25 ] 2>/dev/null; then
+          echo "WARNING — Ubuntu ${VERSION_ID:-?} is below the supported Ubuntu 25.04+ baseline; continuing."
         fi
         ;;
       *)
-        echo "WARNING — ${PRETTY_NAME:-unknown distro} is not a declared supported target (Debian 12+/Ubuntu 24.04+); continuing."
+        echo "WARNING — ${PRETTY_NAME:-unknown distro} is not a declared supported target (Debian 13+/Ubuntu 25.04+); continuing."
         ;;
     esac
   )"
@@ -242,8 +243,7 @@ apt-get install -y nftables iproute2 ca-certificates python3-venv \
   || die "could not install base runtime dependencies"
 if [ "$EVAL" = 0 ]; then
   # TPM 2.0 runtime stack: the .so.0 provider + the device TCTI. No vendoring.
-  apt-get install -y libtss2-esys-3.0.2-0t64 libtss2-tcti-device0 \
-    || apt-get install -y libtss2-esys-3.0.2-0 libtss2-tcti-device0 \
+  apt-get install -y libtss2-esys-3.0.2-0t64 libtss2-tcti-device0t64 \
     || die "could not install the libtss2 TPM runtime stack"
 else
   # Eval allows swtpm for software-TPM testing (still NO hardware binding).
@@ -254,7 +254,7 @@ fi
 # Dedicated venv keeps the wheel out of system Python.
 python3 -m venv "$VENV" || die "could not create the venv at $VENV"
 # No pip upgrade: it would come from PyPI, outside the signature check. The
-# venv's own pip installs the local wheelhouse (checked on 3.11, 3.12, 3.13).
+# venv's own pip installs the local wheelhouse (checked on 3.13 and 3.14).
 # --no-index + --find-links restricts the install to the local wheelhouse: the
 # verified DSM wheel PLUS the dependency wheels downloaded and checksum-verified
 # above (cryptography/dnspython + cffi/pycparser). pip resolves every

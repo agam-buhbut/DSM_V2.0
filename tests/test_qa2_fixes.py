@@ -1014,9 +1014,9 @@ def _job(name: str) -> str:
     return RELEASE[start : end if end != -1 else len(RELEASE)]
 
 
-@pytest.mark.parametrize("job", ["build-tpm-wheel", "build-soft-wheel", "build-sdist"])
-def test_the_build_jobs_run_on_the_oldest_glibc_runner(job: str) -> None:
-    assert "    runs-on: ubuntu-22.04" in _job(job)
+@pytest.mark.parametrize("job", ["build-tpm-wheel", "build-soft-wheel"])
+def test_the_wheel_jobs_build_on_debian_13(job: str) -> None:
+    assert re.search(r"\n    container: debian:13@sha256:[0-9a-f]{64}\n", _job(job))
 
 
 def test_the_soft_job_names_its_wheel_plus_soft() -> None:
@@ -1038,7 +1038,7 @@ _PLATFORMS = (
 
 def test_the_dependency_wheels_come_for_every_supported_python() -> None:
     publish = _job("sign-and-publish")
-    for version in ("311", "312", "313"):
+    for version in ("313", "314"):
         block = (
             "pip download \\\n"
             "            --require-hashes \\\n"
@@ -1050,10 +1050,10 @@ def test_the_dependency_wheels_come_for_every_supported_python() -> None:
         )
         assert block in publish, version
     # Every download carries the tags: glibc 2.34 or older, whatever the runner.
-    assert publish.count("pip download") == 3
+    assert publish.count("pip download") == 2
     for tag in _PLATFORMS:
-        assert publish.count(f"--platform {tag} ") == 3, tag
-    assert publish.index("--python-version 313") < publish.index(
+        assert publish.count(f"--platform {tag} ") == 2, tag
+    assert publish.index("--python-version 314") < publish.index(
         "sha256sum * > SHA256SUMS"
     )
 
@@ -1546,9 +1546,7 @@ def test_a_missing_cert_file_names_the_real_step(
 def test_the_tpm_job_installs_patchelf_for_maturins_repair() -> None:
     # maturin's repair step vendors libtss2 and needs patchelf (GUIDE §0b);
     # the soft wheel links nothing to vendor.
-    assert "sudo apt-get install -y libtss2-dev libtss2-tcti-device0 patchelf" in (
-        _job("build-tpm-wheel")
-    )
+    assert "libtss2-dev libtss2-tcti-device0t64 patchelf" in _job("build-tpm-wheel")
 
 
 def test_sign_and_publish_runs_on_ubuntu_latest_for_a_current_minisign() -> None:

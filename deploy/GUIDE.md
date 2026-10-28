@@ -58,8 +58,9 @@ reference are in the top-level `README.md`.
 
 ### 0a. Hardware / OS (every host)
 
-- Debian 12+ or Ubuntu 24.04+ on x86_64, with Python 3.11 or newer
-  (Ubuntu 22.04's python3 is 3.10: too old).
+- Debian 13+ or Ubuntu 25.04+ on x86_64, with Python 3.11 or newer
+  (the release's wheels are built on Debian 13: an older system builds
+  from source, §1).
 - Linux kernel 5.x or newer with TUN/TAP support:
 
   ```sh
@@ -141,11 +142,9 @@ stack. (Only the dev-soft-attest test build skips this — see §1.)
   $ sudo apt install -y libtss2-esys-3.0.2-0t64 libtss2-tcti-device0t64
   ```
 
-  (On Debian 13 "trixie" and Ubuntu 24.04+ the packages use the `t64`
-  suffix: `libtss2-esys-3.0.2-0t64` and `libtss2-tcti-device0t64`. On
-  Debian 12 they are named `libtss2-esys-3.0.2-0` and
-  `libtss2-tcti-device0`.
-  On some releases these are pulled in by `tpm2-tools`. The build host
+  (On Debian 12 the names have no `t64` suffix: `libtss2-esys-3.0.2-0`
+  and `libtss2-tcti-device0`. On some releases these are pulled in by
+  `tpm2-tools`. The build host
   additionally needs `libtss2-dev` for headers + pkg-config — that is a
   BUILD dependency, added in §1 below, not a runtime one.)
 
@@ -315,8 +314,7 @@ $ sudo apt install -y \
       libtss2-esys-3.0.2-0t64 libtss2-tcti-device0t64 \
       nftables iproute2
 # python3-pip: Debian's ensurepip is disabled; install python3-pip via apt.
-# libtss2-*t64: the t64-suffixed names are correct on Debian 13+ / Ubuntu 24.04+.
-# On Debian 12 use libtss2-esys-3.0.2-0 and libtss2-tcti-device0 instead.
+# On Debian 12 drop the t64 suffix from the two libtss2 names.
 
 $ sudo /usr/bin/python3 -m pip install --break-system-packages \
       /tmp/dsm-0.1.0-*.whl
@@ -324,8 +322,8 @@ $ sudo /usr/bin/python3 -m pip install --break-system-packages \
 
 Important caveats:
 - The wheel MUST be built on the SAME distro + arch + Python minor version
-  as the client. A wheel built on Debian 12 (Python 3.11, amd64) will
-  NOT install cleanly on Ubuntu 22.04 (Python 3.10) or on arm64.
+  as the client. A wheel built on Debian 13 (amd64) will NOT install on
+  an older system such as Debian 12, or on arm64.
 - A wheel built with the plain `maturin build --release` command above has
   its `libtss2` libraries vendored in (RPATH-rewritten) by maturin's repair
   step. The client still needs the runtime TSS2 packages above regardless,

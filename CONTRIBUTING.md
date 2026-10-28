@@ -11,10 +11,11 @@ ship as signed GitHub Release artifacts. For operating a deployed instance, see
 
 ## Supported target
 
-The production wheel dynamically links the host TPM 2.0 stack
-(`libtss2-esys.so.0`) and is built for Debian 12+ / Ubuntu 22.04+ / x86_64 with
-a TPM 2.0. A portable manylinux wheel is not possible. Other distros can
-build from source, but development and CI target the above.
+The production wheel is built on Debian 13 for Debian 13+ / Ubuntu 25.04+ /
+x86_64 with a TPM 2.0. maturin's repair step copies the TPM 2.0 libraries
+(`libtss2-esys` and the rest) into the manylinux wheel; the device TCTI
+still comes from the host. Other distros can build from source, but
+development and CI target the above.
 
 ## Prerequisites
 

@@ -31,29 +31,37 @@ jobs:
 
   build-tpm-wheel:
     needs: gate
-    # The oldest glibc here (2.35): the wheel then installs on Debian 12 (2.36).
-    runs-on: ubuntu-22.04
+    # Built on Debian 13, the oldest supported system, so the wheel needs no
+    # newer glibc than every supported system has.
+    runs-on: ubuntu-latest
+    # Pinned to a digest, as the actions are pinned to a SHA.
+    container: debian:13@sha256:8c4733a92aacd0bcff3779eadc35a4a5147f36cb20a5fcb56504cbc740212259
     steps:
+      # The image has no build tools: git for the checkout, curl for the Rust
+      # toolchain, python3-venv for maturin. TPM lane build deps mirror ci.yml's
+      # tpm-attest job: the tss2-esys headers (libtss2-dev) for the build/link,
+      # plus the device TCTI runtime object. patchelf: maturin's repair step,
+      # which copies libtss2 into the wheel, needs it (deploy/GUIDE.md §0b).
+      # The soft wheel links nothing to copy.
+      - name: Install the build tools and the TSS2 build stack
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates curl \
+            build-essential pkg-config python3 python3-venv \
+            libtss2-dev libtss2-tcti-device0t64 patchelf
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
-      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b  # v5.3.0
-        with:
-          python-version: "3.12"
       # dtolnay/rust-toolchain@stable is a moving alias by design; pinned to the
-      # commit SHA the `stable` branch pointed at, per supply-chain policy.
+      # commit SHA the `stable` branch pointed at, per supply-chain policy. It
+      # installs rustup first, as the image has none.
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable branch
         with:
           components: rustfmt, clippy
-      # TPM lane build deps mirror ci.yml's tpm-attest job: the tss2-esys headers
-      # (libtss2-dev) for the build/link, plus the device TCTI runtime object.
-      # patchelf: maturin's repair step, which copies libtss2 into the wheel,
-      # needs it (deploy/GUIDE.md §0b). The soft wheel links nothing to copy.
-      - name: Install TSS2 build stack
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libtss2-dev libtss2-tcti-device0 patchelf
       - name: Build TPM (production) wheel
         run: |
-          python -m pip install --upgrade pip
+          python3 -m venv /opt/build
+          . /opt/build/bin/activate
           pip install maturin
           # maturin's repair step copies the libtss2 libraries into the wheel
           # and tags it manylinux_2_<glibc>_x86_64 (deploy/GUIDE.md §1a.1);
@@ -66,19 +74,25 @@ jobs:
 
   build-soft-wheel:
     needs: gate
-    # The oldest glibc here (2.35): the wheel then installs on Debian 12 (2.36).
-    runs-on: ubuntu-22.04
+    # Built on Debian 13, as the TPM wheel is.
+    runs-on: ubuntu-latest
+    container: debian:13@sha256:8c4733a92aacd0bcff3779eadc35a4a5147f36cb20a5fcb56504cbc740212259
     steps:
+      - name: Install the build tools
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates curl \
+            build-essential python3 python3-venv
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
-      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b  # v5.3.0
-        with:
-          python-version: "3.12"
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable branch
         with:
           components: rustfmt, clippy
       - name: Build +soft (evaluation) wheel
         run: |
-          python -m pip install --upgrade pip
+          python3 -m venv /opt/build
+          . /opt/build/bin/activate
           pip install maturin
           # The +soft EVALUATION wheel: software attest backend, extractable key,
           # NO hardware binding; it must never be deployed in production.
@@ -96,8 +110,8 @@ jobs:
 
   build-sdist:
     needs: gate
-    # Pinned with the wheel jobs (glibc 2.35, below Debian 12's 2.36).
-    runs-on: ubuntu-22.04
+    # Source only: the runner's glibc does not matter here.
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
       - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b  # v5.3.0
@@ -151,13 +165,13 @@ jobs:
       # generated with --generate-hashes): the vendored wheelhouse is EXACTLY the
       # locked runtime closure (cryptography -> cffi -> pycparser; dnspython is
       # pure-Python), so a compromised index cannot substitute an unpinned dep.
-      # One download per supported Python (3.11 on Debian 12, 3.12 on Ubuntu
-      # 24.04, 3.13 on Debian 13): cffi is not abi3, so each Python needs its
-      # own cffi wheel, and install.sh's venv install is --no-index. The
-      # abi3 and pure wheels come once ("already downloaded" after that).
-      # requirements.lock holds the hashes of every version's wheels.
-      # --platform: wheels for glibc 2.34 or older, whatever the runner (pip
-      # needs the older tags named too; Debian 12 has glibc 2.36).
+      # One download per python3 a supported system ships: 3.13 (Debian 13,
+      # Ubuntu 25.04 and 25.10) and 3.14 (Ubuntu 26.04). cffi is not abi3, so
+      # each Python needs its own cffi wheel, and install.sh's venv install is
+      # --no-index. The abi3 and pure wheels come once ("already downloaded"
+      # after that). requirements.lock holds the hashes of every version's
+      # wheels. --platform: wheels for glibc 2.34 or older, whatever the
+      # runner (pip needs the older tags named too).
       - name: Vendor runtime dependency wheels into the wheelhouse
         run: |
           python -m pip install --upgrade pip
@@ -169,27 +183,17 @@ jobs:
             --platform manylinux_2_28_x86_64 \
             --platform manylinux_2_17_x86_64 \
             --platform manylinux2014_x86_64 \
-            --python-version 311 \
-            --dest dist
-          pip download \
-            --require-hashes \
-            -r requirements.lock \
-            --only-binary=:all: \
-            --platform manylinux_2_34_x86_64 \
-            --platform manylinux_2_28_x86_64 \
-            --platform manylinux_2_17_x86_64 \
-            --platform manylinux2014_x86_64 \
-            --python-version 312 \
-            --dest dist
-          pip download \
-            --require-hashes \
-            -r requirements.lock \
-            --only-binary=:all: \
-            --platform manylinux_2_34_x86_64 \
-            --platform manylinux_2_28_x86_64 \
-            --platform manylinux_2_17_x86_64 \
-            --platform manylinux2014_x86_64 \
             --python-version 313 \
+            --dest dist
+          pip download \
+            --require-hashes \
+            -r requirements.lock \
+            --only-binary=:all: \
+            --platform manylinux_2_34_x86_64 \
+            --platform manylinux_2_28_x86_64 \
+            --platform manylinux_2_17_x86_64 \
+            --platform manylinux2014_x86_64 \
+            --python-version 314 \
             --dest dist
       # Exactly one DSM wheel of each kind, under the names install.sh picks:
       # a second one, or none, stops the release before anything is signed.

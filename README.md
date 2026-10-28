@@ -7,15 +7,14 @@ your packets.
 
 ## Quickstart
 
-> **Supported systems:** Debian 12+ or Ubuntu 24.04+ on x86_64 (Python 3.11
+> **Supported systems:** Debian 13+ or Ubuntu 25.04+ on x86_64 (Python 3.11
 > or newer), with a TPM 2.0 (a security chip in the computer). On other
 > distributions, build from source (see `deploy/GUIDE.md` §0-§1:
 > prerequisites, then the build). DSM is not on PyPI; it is distributed
 > through signed GitHub Releases.
 
 > **No release has been published yet.** There is no `v0.1.0` tag or GitHub
-> Release. `install.sh` still has a placeholder minisign public key (the key
-> that checks the download's signature). So step 1 below does not work yet.
+> Release, so step 1 below does not work yet.
 > Until the first signed release, build and install from source
 > (`deploy/GUIDE.md` §0-§1: prerequisites, then the build), then go on with
 > steps 2 and 3.

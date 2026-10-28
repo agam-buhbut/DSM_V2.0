@@ -22,15 +22,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `dsm init server` no longer needs `--server-ip` (a server does not use
   it). `dsm init` copies the CA root into the install folder at 0600.
 - `config.example.toml` sets `log_level = "info"`.
-- Supported systems: Debian 12+ or Ubuntu 24.04+ (Python 3.11 or newer).
-  Ubuntu 22.04's python3 is 3.10, too old for DSM; `install.sh` now warns
-  below 24.04. On Debian 12 it installs the TPM runtime under that
-  release's package name (`libtss2-esys-3.0.2-0`).
-- The release's DSM wheels are built on Ubuntu 22.04 (glibc 2.35), so they
-  install on Debian 12 (glibc 2.36); only the build jobs run there, and
-  signing runs on a current runner. The dependency wheels are taken for
-  glibc 2.34 or older, whatever the runner. DSM itself still needs Debian
-  12+ or Ubuntu 24.04+.
+- Supported systems: Debian 13+ or Ubuntu 25.04+. The release's DSM wheels
+  are built in a Debian 13 container, so an older glibc may be too old for
+  them; an older system builds from source. `install.sh` warns below
+  those versions and installs the TPM runtime under its `t64` package
+  names. Signing runs on a current runner. The dependency wheels are
+  taken for glibc 2.34 or older, whatever the runner.
+- `install.sh` carries the real minisign public key (key ID
+  DF98FF5321B786A3).
 - `dsm init --force` removes the old keys only once the new passphrase is
   in, so a typo in the second answer leaves them in place.
 - `--passphrase-env-file` that is missing, open to others or empty now
@@ -321,8 +320,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   key on the command line (`minisign -V -P`).
 - The release's dependency wheels were for Python 3.11 only, and cffi has a
   wheel per Python, so install.sh (which installs with `--no-index`) failed
-  on Debian 13 (3.13) and Ubuntu 24.04 (3.12). The release now ships them
-  for 3.11, 3.12 and 3.13.
+  on Debian 13 (3.13) and Ubuntu 26.04 (3.14). The release now ships them
+  for 3.13 and 3.14, the python3 of every supported system.
 - Both DSM wheels got the same file name, and neither matched the name
   install.sh looked for. The evaluation wheel is now
   `dsm-<version>+soft-...`, and install.sh takes each wheel's name from the
