@@ -27,8 +27,10 @@ from dsm.core.config import load as config_load
 from dsm.core.passphrase import read_passphrase, wipe_passphrase
 from dsm.crypto._stores import loaded_stores_cli
 from dsm.crypto.attest_store import AttestStore
+from dsm.crypto.cert import CertError, load_ca_root
 from dsm.crypto.enroll import (
     EnrollError,
+    ca_root_reason,
     generate_enrollment,
     import_signed_cert,
 )
@@ -195,7 +197,17 @@ def _read_ca_root(src: Path, install_dir: Path) -> tuple[bytes, bool]:
         _fail(f"ca-root not found: {src}")
     target = install_dir / "dsm_ca_root.pem"
     in_place = target.exists() and os.path.samefile(src, target)
-    return src.read_bytes(), in_place
+    try:
+        data = src.read_bytes()
+        # The daemon's own CA loader, before anything is written: the CRL or
+        # the passphrase file given by mistake would otherwise show only
+        # after the CA trip (QA2 Major 1). The pin makes it check these bytes.
+        load_ca_root(src, expected_sha256=hashlib.sha256(data).digest())
+    except OSError as e:
+        _fail(f"cannot read --ca-root {src}: {e}")
+    except (CertError, ValueError) as e:
+        _fail(f"--ca-root {src} is not a CA certificate (PEM): {ca_root_reason(e)}")
+    return data, in_place
 
 
 def _install_ca_root(data: bytes, in_place: bool, install_dir: Path) -> Path:

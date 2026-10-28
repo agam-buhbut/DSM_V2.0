@@ -19,12 +19,13 @@ from dsm import init as dsm_init
 from dsm.core import passphrase
 from dsm.core.config import load as config_load
 from dsm.crypto.enroll import EnrollError
+from tests.cert_helpers import make_test_ca
 from tests.test_init import _fake_enrollment, _server_flags
 
 
 @pytest.fixture
 def cfg_dir(tmp_path: Path) -> Path:
-    (tmp_path / "dsm_ca_root.pem").write_bytes(b"-----BEGIN CERTIFICATE-----\n")
+    (tmp_path / "dsm_ca_root.pem").write_bytes(make_test_ca().pem)
     passphrase = tmp_path / "pass"
     passphrase.write_bytes(b"hunter2hunter2\n")
     passphrase.chmod(0o600)
@@ -94,7 +95,7 @@ def _usb_ca(tmp_path: Path) -> Path:
     usb = tmp_path / "usb"
     usb.mkdir()
     ca = usb / "dsm_ca_root.pem"
-    ca.write_bytes(b"-----BEGIN CERTIFICATE-----\nfrom the stick\n")
+    ca.write_bytes(make_test_ca("CA on the stick").pem)
     ca.chmod(0o664)  # as `openssl req` leaves it
     return ca
 
@@ -550,7 +551,7 @@ def test_the_resume_hint_quotes_a_path_with_a_space(
 ) -> None:
     inst = tmp_path / "my dir"
     inst.mkdir()
-    (inst / "dsm_ca_root.pem").write_bytes(b"-----BEGIN CERTIFICATE-----\n")
+    (inst / "dsm_ca_root.pem").write_bytes(make_test_ca().pem)
     (inst / "pass").write_bytes(b"hunter2hunter2\n")
     (inst / "pass").chmod(0o600)
     with _enrolls():

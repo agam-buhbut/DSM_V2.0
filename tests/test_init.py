@@ -19,6 +19,7 @@ import pytest
 from dsm import init as dsm_init
 from dsm.core.config import load as config_load
 from dsm.crypto.enroll import EnrollError, EnrollmentResult
+from tests.cert_helpers import make_test_ca
 
 
 def _server_flags(cfg_dir: Path) -> list[str]:
@@ -43,7 +44,7 @@ def _server_flags(cfg_dir: Path) -> list[str]:
 
 @pytest.fixture
 def cfg_dir(tmp_path: Path) -> Path:
-    (tmp_path / "dsm_ca_root.pem").write_bytes(b"-----BEGIN CERTIFICATE-----\n")
+    (tmp_path / "dsm_ca_root.pem").write_bytes(make_test_ca().pem)
     p = tmp_path / "pass"
     p.write_bytes(b"hunter2hunter2\n")
     p.chmod(0o600)

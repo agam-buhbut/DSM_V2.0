@@ -59,6 +59,14 @@ class EnrollError(Exception):
     """Enrollment-time error (CSR build / cert import)."""
 
 
+def ca_root_reason(e: Exception) -> str:
+    """One short reason for a CA root that ``load_ca_root`` refused. A parse
+    error is cryptography's long text, which names the file again."""
+    if isinstance(e.__cause__, ValueError):
+        return "no PEM certificate in it"
+    return str(e)
+
+
 def derive_default_cn(noise_static_pub: bytes, role: str) -> str:
     """Derive the default device CN from the Noise static pubkey + role.
 
@@ -308,7 +316,15 @@ def import_signed_cert(
         leaf = DeviceCert.from_pem_or_der(cert_input_path.read_bytes())
     except CertError as e:
         raise EnrollError(f"failed to parse cert: {e}") from e
-    ca_root = load_ca_root(ca_root_path)
+    try:
+        ca_root = load_ca_root(ca_root_path)
+    except (CertError, ValueError) as e:
+        # One line at `dsm enroll --import` and `dsm init --resume`, never a
+        # traceback (QA2 Major 1).
+        raise EnrollError(
+            f"the CA root {ca_root_path} is not a CA certificate (PEM): "
+            f"{ca_root_reason(e)}"
+        ) from e
 
     try:
         validate_chain(leaf, ca_root, now=now)
