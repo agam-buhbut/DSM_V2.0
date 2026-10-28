@@ -115,8 +115,9 @@ jobs:
 
   sign-and-publish:
     needs: [ build-tpm-wheel, build-soft-wheel, build-sdist ]
-    # The oldest glibc here (2.35): pip picks the dependency wheels' tags from it.
-    runs-on: ubuntu-22.04
+    # A current runner, for a current minisign to sign with. The dependency
+    # wheels do not depend on its glibc (the --platform flags below).
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
       - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b  # v5.3.0
@@ -155,6 +156,8 @@ jobs:
       # own cffi wheel, and install.sh's venv install is --no-index. The
       # abi3 and pure wheels come once ("already downloaded" after that).
       # requirements.lock holds the hashes of every version's wheels.
+      # --platform: wheels for glibc 2.34 or older, whatever the runner (pip
+      # needs the older tags named too; Debian 12 has glibc 2.36).
       - name: Vendor runtime dependency wheels into the wheelhouse
         run: |
           python -m pip install --upgrade pip
@@ -162,18 +165,30 @@ jobs:
             --require-hashes \
             -r requirements.lock \
             --only-binary=:all: \
+            --platform manylinux_2_34_x86_64 \
+            --platform manylinux_2_28_x86_64 \
+            --platform manylinux_2_17_x86_64 \
+            --platform manylinux2014_x86_64 \
             --python-version 311 \
             --dest dist
           pip download \
             --require-hashes \
             -r requirements.lock \
             --only-binary=:all: \
+            --platform manylinux_2_34_x86_64 \
+            --platform manylinux_2_28_x86_64 \
+            --platform manylinux_2_17_x86_64 \
+            --platform manylinux2014_x86_64 \
             --python-version 312 \
             --dest dist
           pip download \
             --require-hashes \
             -r requirements.lock \
             --only-binary=:all: \
+            --platform manylinux_2_34_x86_64 \
+            --platform manylinux_2_28_x86_64 \
+            --platform manylinux_2_17_x86_64 \
+            --platform manylinux2014_x86_64 \
             --python-version 313 \
             --dest dist
       # Exactly one DSM wheel of each kind, under the names install.sh picks:

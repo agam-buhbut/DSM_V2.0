@@ -1027,6 +1027,14 @@ def test_the_soft_job_names_its_wheel_plus_soft() -> None:
     assert "+soft" not in _job("build-tpm-wheel").split("run: |", 1)[1]
 
 
+_PLATFORMS = (
+    "manylinux_2_34_x86_64",
+    "manylinux_2_28_x86_64",
+    "manylinux_2_17_x86_64",
+    "manylinux2014_x86_64",
+)
+
+
 def test_the_dependency_wheels_come_for_every_supported_python() -> None:
     publish = _job("sign-and-publish")
     for version in ("311", "312", "313"):
@@ -1035,10 +1043,15 @@ def test_the_dependency_wheels_come_for_every_supported_python() -> None:
             "            --require-hashes \\\n"
             "            -r requirements.lock \\\n"
             "            --only-binary=:all: \\\n"
-            f"            --python-version {version} \\\n"
+            + "".join(f"            --platform {tag} \\\n" for tag in _PLATFORMS)
+            + f"            --python-version {version} \\\n"
             "            --dest dist"
         )
         assert block in publish, version
+    # Every download carries the tags: glibc 2.34 or older, whatever the runner.
+    assert publish.count("pip download") == 3
+    for tag in _PLATFORMS:
+        assert publish.count(f"--platform {tag} ") == 3, tag
     assert publish.index("--python-version 313") < publish.index(
         "sha256sum * > SHA256SUMS"
     )
@@ -1532,9 +1545,10 @@ def test_the_tpm_job_installs_patchelf_for_maturins_repair() -> None:
     )
 
 
-def test_sign_and_publish_runs_on_the_oldest_glibc_runner_too() -> None:
-    # Its pip downloads pick each wheel's platform tag from the runner's glibc.
-    assert "    runs-on: ubuntu-22.04" in _job("sign-and-publish")
+def test_sign_and_publish_runs_on_ubuntu_latest_for_a_current_minisign() -> None:
+    # The signature comes from that runner's minisign; the dependency wheels'
+    # tags do not depend on it (the --platform flags below).
+    assert "    runs-on: ubuntu-latest" in _job("sign-and-publish")
 
 
 def _check_wheels_script() -> str:

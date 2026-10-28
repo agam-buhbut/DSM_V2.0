@@ -26,9 +26,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Ubuntu 22.04's python3 is 3.10, too old for DSM; `install.sh` now warns
   below 24.04. On Debian 12 it installs the TPM runtime under that
   release's package name (`libtss2-esys-3.0.2-0`).
-- Release wheels are built on Ubuntu 22.04 (glibc 2.35), so they install on
-  Debian 12 (glibc 2.36). That is only the build host: DSM itself still needs
-  Debian 12+ or Ubuntu 24.04+.
+- The release's DSM wheels are built on Ubuntu 22.04 (glibc 2.35), so they
+  install on Debian 12 (glibc 2.36); only the build jobs run there, and
+  signing runs on a current runner. The dependency wheels are taken for
+  glibc 2.34 or older, whatever the runner. DSM itself still needs Debian
+  12+ or Ubuntu 24.04+.
 - `dsm init --force` removes the old keys only once the new passphrase is
   in, so a typo in the second answer leaves them in place.
 - `--passphrase-env-file` that is missing, open to others or empty now
