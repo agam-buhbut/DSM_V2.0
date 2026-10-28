@@ -8,7 +8,7 @@ import contextvars
 import logging
 import sys
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator
 
 _configured = (
     False  # pylint: disable=invalid-name  # module-private flag, not a constant
@@ -115,7 +115,7 @@ def configure(level: str = "warning") -> None:
 
 
 @contextlib.contextmanager
-def until_configured() -> Iterator[None]:
+def until_configured() -> Generator[None, None, None]:
     """Inside, a line logged before :func:`configure` (a warning about the
     config that holds ``log_level``, while it loads) goes to stderr in the
     normal format, not as Python's bare last-resort line (QA2 box Nit 1).
