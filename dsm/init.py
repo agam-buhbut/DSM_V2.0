@@ -65,14 +65,10 @@ def _is_root() -> bool:
 
 
 def _need_sudo(what: str, path: Path, e: PermissionError) -> NoReturn:
-    """A normal user met root's install dir: say sudo, not chmod (QA2).
-    Root itself gets the error as it is."""
-    if _is_root():
-        raise e
-    print(
-        f"dsm init: cannot {what} {path}: Permission denied: run it with sudo",
-        file=sys.stderr,
-    )
+    """A normal user met a folder or file of root's: say sudo, not chmod
+    (QA2). Root gets the same one line without the sudo advice."""
+    tail = "" if _is_root() else ": run it with sudo"
+    print(f"dsm init: cannot {what} {path}: {e.strerror or e}{tail}", file=sys.stderr)
     sys.exit(1)
 
 
@@ -220,7 +216,11 @@ def _read_ca_root(src: Path, install_dir: Path) -> tuple[bytes, bool]:
     bytes, and True when it is already the install dir's copy. A relative
     ``src`` is taken from the current folder."""
     src = src.absolute()
-    if not src.is_file():
+    try:
+        found = src.is_file()
+    except PermissionError as e:
+        _need_sudo("read", src, e)
+    if not found:
         _fail(f"ca-root not found: {src}")
     target = install_dir / "dsm_ca_root.pem"
     in_place = target.exists() and os.path.samefile(src, target)
@@ -230,6 +230,8 @@ def _read_ca_root(src: Path, install_dir: Path) -> tuple[bytes, bool]:
         # the passphrase file given by mistake would otherwise show only
         # after the CA trip (QA2 Major 1). The pin makes it check these bytes.
         load_ca_root(src, expected_sha256=hashlib.sha256(data).digest())
+    except PermissionError as e:
+        _need_sudo("read", src, e)
     except OSError as e:
         _fail(f"cannot read --ca-root {src}: {e}")
     except CertExpiredError as e:

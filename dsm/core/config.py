@@ -783,6 +783,13 @@ def _reject_missing_keys(raw: dict[str, object]) -> None:
     raise ConfigError(text)
 
 
+def _cannot_reach(p: Path, e: PermissionError) -> str:
+    """GUIDE §2f makes /opt/mtun root's, 0700: a normal user cannot even
+    look for the file in it. Sudo, not a traceback (QA2 final check)."""
+    text = f"cannot reach {p}: {e.strerror or e}"
+    return text if os.geteuid() == 0 else text + ": run it with sudo"
+
+
 def _owned_by_root(p: Path) -> bool:
     try:
         st = p.lstat()
@@ -803,7 +810,11 @@ def load(path: Path | None = None) -> Config:
     # Probe existence first so a missing config produces a clear "not found"
     # rather than the permission check's "cannot lstat ... chmod 600"
     # message, which would send the operator chasing a permissions ghost.
-    if not p.exists():
+    try:
+        found = p.exists()
+    except PermissionError as e:
+        raise ConfigError(_cannot_reach(p, e)) from e
+    if not found:
         raise ConfigError(f"config file not found: {p}")
     try:
         check_user_file_permissions(p)
@@ -820,8 +831,11 @@ def load(path: Path | None = None) -> Config:
         config_dir = Path(dsm_config_dir)
     else:
         config_dir = Path(p).parent
-    with open(p, "rb") as f:
-        raw = tomllib.load(f)
+    try:
+        with open(p, "rb") as f:
+            raw = tomllib.load(f)
+    except PermissionError as e:
+        raise ConfigError(_cannot_reach(p, e)) from e
     _reject_removed_keys(raw)
     _reject_unknown_keys(raw)
     _reject_missing_keys(raw)

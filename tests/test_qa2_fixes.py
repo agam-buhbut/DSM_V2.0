@@ -1760,3 +1760,96 @@ async def test_a_start_with_a_lookup_says_the_kill_switch_is_up_once(
         if r.getMessage() == "pre-handshake kill switch applied"
     ]
     assert [r.levelno for r in applied] == [logging.INFO]
+
+
+# --- final check: root-only folders (Minor 4 FAIL, Nit 2) ------------------------
+
+
+def _config_in_closed_folder(
+    tmp_path: Path, *, there: bool = True
+) -> tuple[Path, Path]:
+    folder = tmp_path / "mtun"
+    folder.mkdir(mode=0o700)
+    config = folder / "config.toml"
+    if there:
+        config.write_text(_GOOD_CLIENT)
+        config.chmod(0o600)
+    return folder, config
+
+
+@_ROOT_SKIP
+@pytest.mark.parametrize("there", [True, False])
+@pytest.mark.parametrize("command", ["show-pubkey", "enroll"])
+def test_a_config_in_a_folder_the_user_cannot_search_says_use_sudo(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], there: bool, command: str
+) -> None:
+    folder, config = _config_in_closed_folder(tmp_path, there=there)
+    with _closed(folder), pytest.raises(SystemExit) as err:
+        if command == "show-pubkey":
+            entry._run_show_pubkey(config, passphrase_fd=None, passphrase_env_file=None)
+        else:
+            entry._run_enroll(
+                config,
+                csr_out=tmp_path / "x.csr",
+                import_cert=None,
+                cn=None,
+                role="client",
+                passphrase_fd=None,
+                passphrase_env_file=None,
+            )
+    assert err.value.code == 2
+    assert capsys.readouterr().err == (
+        f"config: cannot reach {config}: Permission denied: run it with sudo\n"
+    )
+
+
+@_ROOT_SKIP
+def test_root_that_cannot_reach_the_config_gets_the_plain_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    folder, config = _config_in_closed_folder(tmp_path)
+    monkeypatch.setattr(dsm_config.os, "geteuid", lambda: 0)
+    with _closed(folder), pytest.raises(ConfigError) as err:
+        load(config)
+    assert str(err.value) == f"cannot reach {config}: Permission denied"
+
+
+@_ROOT_SKIP
+def test_a_ca_root_in_a_folder_the_user_cannot_search_says_use_sudo(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    folder = tmp_path / "opt-mtun"
+    folder.mkdir(mode=0o700)
+    ca = folder / "dsm_ca_root.pem"
+    ca.write_bytes(make_test_ca().pem)
+    inst = tmp_path / "inst"
+    flags = _set(_phase_a_flags(tmp_path, inst), "--ca-root", str(ca))
+    monkeypatch.setattr(dsm_init, "_is_root", lambda: False)
+
+    with _closed(folder), _enrolls() as gen, pytest.raises(SystemExit) as err:
+        dsm_init.main(flags)
+
+    assert err.value.code == 1
+    assert capsys.readouterr().err.splitlines()[-1] == _sudo_line("read", ca)
+    gen.assert_not_called()
+
+
+@_ROOT_SKIP
+def test_root_that_cannot_reach_the_ca_root_gets_the_plain_line(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    folder = tmp_path / "opt-mtun"
+    folder.mkdir(mode=0o700)
+    ca = folder / "dsm_ca_root.pem"
+    ca.write_bytes(make_test_ca().pem)
+    inst = tmp_path / "inst"
+    flags = _set(_phase_a_flags(tmp_path, inst), "--ca-root", str(ca))
+    monkeypatch.setattr(dsm_init, "_is_root", lambda: True)
+
+    with _closed(folder), _enrolls(), pytest.raises(SystemExit) as err:
+        dsm_init.main(flags)
+
+    assert err.value.code == 1
+    assert capsys.readouterr().err.splitlines()[-1] == (
+        f"dsm init: cannot read {ca}: Permission denied"
+    )
