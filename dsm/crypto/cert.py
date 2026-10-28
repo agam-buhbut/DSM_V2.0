@@ -331,6 +331,24 @@ def load_ca_root(
     return ca
 
 
+def check_ca_key(ca_root: x509.Certificate) -> EllipticCurvePublicKey:
+    """The CA's public key, if it is the P-384 key the offline CA makes
+    (deploy/openssl-ca.cnf). Raises ``CertChainError`` for any other key.
+    ``validate_chain`` and ``dsm init`` both use this one rule."""
+    ca_pub = ca_root.public_key()
+    if not isinstance(ca_pub, EllipticCurvePublicKey):
+        raise CertChainError(
+            f"unsupported CA pubkey type {type(ca_pub).__name__}; "
+            "only EC CAs are supported"
+        )
+    if not isinstance(ca_pub.curve, ec.SECP384R1):
+        raise CertChainError(
+            f"CA public key is on curve {ca_pub.curve.name!r}; "
+            "only secp384r1 (P-384) CAs are accepted"
+        )
+    return ca_pub
+
+
 def validate_chain(
     leaf: DeviceCert,
     ca_root: x509.Certificate,
@@ -359,18 +377,7 @@ def validate_chain(
 
     # cryptography's verify is constant-time on the MAC comparison; the
     # chain-walk shape (single hop) is fixed here.
-    ca_pub = ca_root.public_key()
-    if not isinstance(ca_pub, EllipticCurvePublicKey):
-        raise CertChainError(
-            f"unsupported CA pubkey type {type(ca_pub).__name__}; "
-            "only EC CAs are supported"
-        )
-    # The offline CA (deploy/openssl-ca.cnf) is P-384; refuse any other curve.
-    if not isinstance(ca_pub.curve, ec.SECP384R1):
-        raise CertChainError(
-            f"CA public key is on curve {ca_pub.curve.name!r}; "
-            "only secp384r1 (P-384) CAs are accepted"
-        )
+    ca_pub = check_ca_key(ca_root)
     sig_alg = leaf.cert.signature_hash_algorithm
     if sig_alg is None:
         raise CertChainError("leaf cert has no signature hash algorithm")

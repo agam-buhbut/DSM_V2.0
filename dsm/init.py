@@ -27,7 +27,13 @@ from dsm.core.config import load as config_load
 from dsm.core.passphrase import read_passphrase, wipe_passphrase
 from dsm.crypto._stores import loaded_stores_cli
 from dsm.crypto.attest_store import AttestStore
-from dsm.crypto.cert import CertError, CertExpiredError, load_ca_root
+from dsm.crypto.cert import (
+    CertChainError,
+    CertError,
+    CertExpiredError,
+    check_ca_key,
+    load_ca_root,
+)
 from dsm.crypto.enroll import (
     EnrollError,
     ca_root_reason,
@@ -229,7 +235,7 @@ def _read_ca_root(src: Path, install_dir: Path) -> tuple[bytes, bool]:
         # The daemon's own CA loader, before anything is written: the CRL or
         # the passphrase file given by mistake would otherwise show only
         # after the CA trip (QA2 Major 1). The pin makes it check these bytes.
-        load_ca_root(src, expected_sha256=hashlib.sha256(data).digest())
+        ca = load_ca_root(src, expected_sha256=hashlib.sha256(data).digest())
     except PermissionError as e:
         _need_sudo("read", src, e)
     except OSError as e:
@@ -239,6 +245,11 @@ def _read_ca_root(src: Path, install_dir: Path) -> tuple[bytes, bool]:
         _fail(f"--ca-root {src} is outside its dates: {e} (check this host's clock)")
     except (CertError, ValueError) as e:
         _fail(f"--ca-root {src} is not a CA certificate (PEM): {ca_root_reason(e)}")
+    try:
+        # The rule validate_chain applies at --resume, after the CA trip.
+        check_ca_key(ca)
+    except CertChainError as e:
+        _fail(f"--ca-root {src} is not a P-384 CA certificate: {e}")
     return data, in_place
 
 

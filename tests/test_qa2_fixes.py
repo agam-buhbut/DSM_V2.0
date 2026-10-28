@@ -21,7 +21,7 @@ from unittest import mock
 import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.asymmetric import ec, rsa
 from cryptography.hazmat.primitives.serialization import Encoding
 from cryptography.x509.oid import NameOID
 
@@ -1300,10 +1300,13 @@ def test_root_with_a_root_owned_loose_config_keeps_the_chmod_text(
     )
 
 
-def _ca_pem_with_dates(not_before: datetime.datetime, days: int) -> bytes:
-    """A P-384 CA root, as make_test_ca makes one, valid from ``not_before``
-    for ``days`` days."""
-    priv = ec.generate_private_key(ec.SECP384R1())
+def _ca_pem_with_dates(
+    not_before: datetime.datetime, days: int, priv: Any = None
+) -> bytes:
+    """A CA root, as make_test_ca makes one, valid from ``not_before`` for
+    ``days`` days; P-384 unless ``priv`` gives another key."""
+    if priv is None:
+        priv = ec.generate_private_key(ec.SECP384R1())
     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Dated CA")])
     cert = (
         x509.CertificateBuilder()
@@ -1853,3 +1856,55 @@ def test_root_that_cannot_reach_the_ca_root_gets_the_plain_line(
     assert capsys.readouterr().err.splitlines()[-1] == (
         f"dsm init: cannot read {ca}: Permission denied"
     )
+
+
+# --- final check: a CA root that is not P-384 (Minor 1) --------------------------
+
+
+@pytest.mark.parametrize(
+    ("key", "reason"),
+    [
+        (
+            "P-256",
+            "CA public key is on curve 'secp256r1'; only secp384r1 (P-384) CAs "
+            "are accepted",
+        ),
+        ("RSA", "unsupported CA pubkey type RSAPublicKey; only EC CAs are supported"),
+    ],
+)
+def test_init_refuses_a_ca_root_that_is_not_p384_before_writing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], key: str, reason: str
+) -> None:
+    priv = (
+        ec.generate_private_key(ec.SECP256R1())
+        if key == "P-256"
+        else rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    )
+    ca = tmp_path / "other_ca.pem"
+    ca.write_bytes(_ca_pem_with_dates(_NOW - datetime.timedelta(days=1), 365, priv))
+    inst = tmp_path / "inst"
+    flags = _set(_phase_a_flags(tmp_path, inst), "--ca-root", str(ca))
+
+    with _enrolls() as gen, pytest.raises(SystemExit) as err:
+        dsm_init.main(flags)
+
+    assert err.value.code == 2
+    assert capsys.readouterr().err.splitlines()[-1] == (
+        f"dsm init: --ca-root {ca} is not a P-384 CA certificate: {reason}"
+    )
+    gen.assert_not_called()
+    assert not inst.exists() or not list(inst.iterdir())
+
+
+def test_the_ca_key_rule_is_one_helper_that_validate_chain_uses() -> None:
+    from dsm.crypto import cert as dsm_cert
+
+    ca = make_test_ca()
+    assert dsm_cert.check_ca_key(ca.certificate) == ca.certificate.public_key()
+    with mock.patch.object(
+        dsm_cert, "check_ca_key", side_effect=dsm_cert.CertChainError("stop")
+    ) as check:
+        leaf = dsm_cert.DeviceCert.from_pem(_leaf_pem(ca))
+        with pytest.raises(dsm_cert.CertChainError, match="stop"):
+            dsm_cert.validate_chain(leaf, ca.certificate)
+    check.assert_called_once_with(ca.certificate)
