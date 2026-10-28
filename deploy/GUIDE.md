@@ -583,6 +583,15 @@ USB RW, sign, unmount, return to safe.
 
 ### 2f. Distribute the root cert + CRL to every dsm host (via Stick B)
 
+This guide mounts Stick B at /mnt/transport, on the CA laptop and on each
+host. Find the stick's partition with `lsblk` (`sdb1` below), then:
+
+```sh
+$ sudo mkdir -p /mnt/transport
+$ sudo mount /dev/sdb1 /mnt/transport
+# when you are done with the stick: sudo umount /mnt/transport
+```
+
 On Stick B, place a copy of BOTH dsm_ca_root.pem and the initial CRL
 crl/dsm_ca.crl from §2c (both public, safe to walk). On each dsm host:
 
@@ -808,10 +817,13 @@ $ cp certs/dsm-cert-server.pem crl/dsm_ca.crl /mnt/transport/
 
 Walk Stick B back to the server and copy the signed cert off it to the
 import path BEFORE importing (this is the cross-machine bridge — §3c wrote
-the cert on the CA laptop's Stick B, not on the server):
+the cert on the CA laptop's Stick B, not on the server). Copy the new CRL
+from §3c step 3 into place too, mode 0600, as in §2f:
 
 ```sh
 $ sudo cp /mnt/transport/dsm-cert-server.pem /tmp/dsm-cert-server.pem
+$ sudo install -m 0600 -o root -g root /mnt/transport/dsm_ca.crl \
+      /opt/mtun/dsm_ca.crl
 $ sudo dsm --config /opt/mtun/config.toml \
       enroll --import /tmp/dsm-cert-server.pem
 ```
@@ -903,7 +915,8 @@ $ unset DSM_PASSPHRASE
 
 ### 3f. Client: mirror 3a – 3e
 
-On the client host, mirror the server steps with:
+On the client host, write /opt/mtun/config.toml as in §3a, with these
+lines changed or added:
 
 ```toml
 mode               = "client"
@@ -914,6 +927,12 @@ expected_server_cn = "<server CN from §3b>"
 auto_mtu           = true                       # cellular benefit
 pmtu_discover      = true                       # required by auto_mtu
 ```
+
+Leave out §3a's server-only keys: `allowed_cns_file`, `dns_providers` and
+the whole `[dns_provider_pins]` table. A client does not use them, and DSM
+says nothing if they stay. Keep the rest of §3a as it is (`key_file`,
+`cert_file`, `ca_root_file`, `ca_root_sha256`, `attest_key_file`,
+`crl_file`, `transport`, `mtu`, `log_level`).
 
 Then:
 

@@ -73,18 +73,20 @@ sudo dsm init server --install-unit \
 #   init then lists what is still to do:
 sudo dsm init server --resume --signed-cert <signed.crt>
 
-# 3. Start it. Server: enable it now, and start it once its allowlist
-#    (/opt/mtun/allowed_cns.txt) has a client's CN (item 5 above;
-#    deploy/GUIDE.md §4). Started before that, it refuses, and systemd
-#    gives up after 5 tries.
+# 3. Start it. Server: enable it now.
 sudo systemctl enable dsm
+#    Start it only once its allowlist (/opt/mtun/allowed_cns.txt) has a
+#    client's CN (item 5 above; deploy/GUIDE.md §4). Started before that, it
+#    refuses, and systemd gives up after 5 tries; if so, run
+#    `sudo systemctl reset-failed dsm` before you start it again.
 sudo systemctl start dsm
-#    Client (never the server unit: it runs DSM as a server). Enable it now,
-#    but start it only after the server has the client's CN in its
-#    allowed_cns file (deploy/GUIDE.md §4). A client the server does not know
-#    blocks all traffic, SSH too, and keeps trying.
-#    On a headless client, keep console access first (deploy/GUIDE.md §3f).
+#    Client (never the server unit: it runs DSM as a server). Enable it now.
 sudo systemctl enable dsm-client
+#    Start it only after the server has the client's CN in its allowed_cns
+#    file (deploy/GUIDE.md §4). A client the server does not know blocks all
+#    traffic, SSH too, and keeps trying.
+#    On a headless client, keep console access first (deploy/GUIDE.md §3f).
+#    Once the server has the CN:
 sudo systemctl start dsm-client
 ```
 
