@@ -116,12 +116,15 @@ WORK="$(mktemp -d)" || die "could not create a temporary working directory"
 trap 'rm -rf "$WORK"' EXIT
 cd "$WORK" || die "could not enter working directory"
 
+# The DSM wheel's name up to its platform tag. maturin picks the tag from the
+# build host's glibc (manylinux_2_<n>_x86_64), so the name is taken from the
+# signed list below.
 if [ "$EVAL" = 1 ]; then
   echo "install.sh: EVALUATION INSTALL — soft wheel, no hardware binding." >&2
   echo "install.sh: EVALUATION ONLY — never use this build in production." >&2
-  WHEEL="dsm-${DSM_VERSION}+soft-cp311-abi3-linux_x86_64.whl"
+  WHEEL_PREFIX="dsm-${DSM_VERSION}+soft-cp311-abi3-"
 else
-  WHEEL="dsm-${DSM_VERSION}-cp311-abi3-linux_x86_64.whl"
+  WHEEL_PREFIX="dsm-${DSM_VERSION}-cp311-abi3-"
 fi
 
 # Download checksum file + signature; the wheel is NOT fetched yet.
@@ -131,12 +134,21 @@ curl -fsSL --proto '=https' --tlsv1.3 "$BASE/SHA256SUMS.minisig" \
   -o "$WORK/SHA256SUMS.minisig"  || die "cannot fetch signature"
 
 # VERIFY the minisign signature over SHA256SUMS BEFORE touching any artifact.
-# The exit code is checked explicitly (|| die); nothing is downstream of a pipe
-# that could swallow a failure.
-printf '%s\n' "$MINISIGN_PUBKEY" > "$WORK/pubkey.pub" \
-  || die "could not stage the minisign public key"
-minisign -V -p "$WORK/pubkey.pub" -m "$WORK/SHA256SUMS" \
+# The key goes on the command line (-P): minisign reads a key FILE only with
+# its "untrusted comment:" line first, and refuses a file that holds just the
+# key. The exit code is checked explicitly (|| die); nothing is downstream of
+# a pipe that could swallow a failure.
+minisign -V -P "$MINISIGN_PUBKEY" -m "$WORK/SHA256SUMS" \
   || die "minisign verification FAILED — refusing to continue"
+
+# Pick the DSM wheel from the signed list: the one entry whose name starts
+# with exactly $WHEEL_PREFIX and ends with exactly _x86_64.whl. index() and
+# substr() compare plain text, so the '+' in '+soft' is no regex character;
+# the production prefix never matches the +soft wheel, nor the other way
+# round. Two entries that match, or none, fail closed.
+WHEEL="$(awk -v p="$WHEEL_PREFIX" -v s="_x86_64.whl" 'index($2, p) == 1 && length($2) > length(p) + length(s) && substr($2, length($2) - length(s) + 1) == s && index($2, "/") == 0 {n++; w=$2} END {if (n == 1) print w}' "$WORK/SHA256SUMS")"
+[ -n "$WHEEL" ] \
+  || die "signed SHA256SUMS has no single entry for ${WHEEL_PREFIX}*_x86_64.whl — refusing (wrong/rolled-back release, unsupported variant, or malformed list)"
 
 # Anti-rollback / version pin: the signed list MUST contain a line for the
 # EXACT wheel this script installs. We select that line by an exact FIELD match

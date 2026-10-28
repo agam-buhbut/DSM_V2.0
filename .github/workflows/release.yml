@@ -31,7 +31,8 @@ jobs:
 
   build-tpm-wheel:
     needs: gate
-    runs-on: ubuntu-latest
+    # The oldest glibc here (2.35): the wheel then installs on Debian 12 (2.36).
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
       - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b  # v5.3.0
@@ -52,8 +53,9 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install maturin
-          # NB: the production wheel links the host libtss2-esys on purpose, so
-          # do NOT auditwheel-repair/vendor it; tag plain linux_x86_64.
+          # maturin's repair step copies the libtss2 libraries into the wheel
+          # and tags it manylinux_2_<glibc>_x86_64 (deploy/GUIDE.md §1a.1);
+          # install.sh finds it by its name's start and end.
           maturin build --release --no-default-features --features tpm-attest --out dist
       - uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08  # v4.6.0
         with:
@@ -62,7 +64,8 @@ jobs:
 
   build-soft-wheel:
     needs: gate
-    runs-on: ubuntu-latest
+    # The oldest glibc here (2.35): the wheel then installs on Debian 12 (2.36).
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
       - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b  # v5.3.0
@@ -76,8 +79,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install maturin
           # The +soft EVALUATION wheel: software attest backend, extractable key,
-          # NO hardware binding. The +soft local-version segment comes from the
-          # crate metadata; it must never be deployed in production.
+          # NO hardware binding; it must never be deployed in production.
+          # maturin names the wheel after pyproject.toml's version, so this
+          # checkout's copy gets a +soft local version: the wheel is then
+          # dsm-<version>+soft-cp311-abi3-*.whl, the name install.sh --eval
+          # looks for, and never the TPM wheel's name in dist/.
+          sed -i 's/^version = "\([^"+]*\)"$/version = "\1+soft"/' pyproject.toml
+          grep -q '^version = "[^"]*+soft"$' pyproject.toml
           maturin build --release --no-default-features --features dev-soft-attest --out dist
       - uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08  # v4.6.0
         with:
@@ -86,7 +94,8 @@ jobs:
 
   build-sdist:
     needs: gate
-    runs-on: ubuntu-latest
+    # Pinned with the wheel jobs (glibc 2.35, below Debian 12's 2.36).
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
       - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b  # v5.3.0
@@ -109,10 +118,8 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
       - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b  # v5.3.0
         with:
-          # The installer's pinned wheel is cp311/abi3 (see install.sh $WHEEL),
-          # and the supported runtime floor is requires-python>=3.11. Resolve the
-          # dependency wheelhouse against 3.11 so abi3/manylinux wheels picked
-          # here are exactly those a fresh 3.11 venv on the target will load.
+          # The supported runtime floor is requires-python>=3.11; the step
+          # below downloads the dependency wheels for each supported Python.
           python-version: "3.11"
       - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16  # v4.1.8
         with:
@@ -140,8 +147,11 @@ jobs:
       # generated with --generate-hashes): the vendored wheelhouse is EXACTLY the
       # locked runtime closure (cryptography -> cffi -> pycparser; dnspython is
       # pure-Python), so a compromised index cannot substitute an unpinned dep.
-      # --python-version 311 keeps the abi3/manylinux wheels aligned with the
-      # cp311-abi3 DSM wheel install.sh $WHEEL loads on the target.
+      # One download per supported Python (3.11 on Debian 12, 3.12 on Ubuntu
+      # 24.04, 3.13 on Debian 13): cffi is not abi3, so each Python needs its
+      # own cffi wheel, and install.sh's venv install is --no-index. The
+      # abi3 and pure wheels come once ("already downloaded" after that).
+      # requirements.lock holds the hashes of every version's wheels.
       - name: Vendor runtime dependency wheels into the wheelhouse
         run: |
           python -m pip install --upgrade pip
@@ -150,6 +160,18 @@ jobs:
             -r requirements.lock \
             --only-binary=:all: \
             --python-version 311 \
+            --dest dist
+          pip download \
+            --require-hashes \
+            -r requirements.lock \
+            --only-binary=:all: \
+            --python-version 312 \
+            --dest dist
+          pip download \
+            --require-hashes \
+            -r requirements.lock \
+            --only-binary=:all: \
+            --python-version 313 \
             --dest dist
       - name: Generate SHA256SUMS over all artifacts
         run: |

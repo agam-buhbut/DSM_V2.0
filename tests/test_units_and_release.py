@@ -59,7 +59,7 @@ def test_the_release_ships_the_units() -> None:
 def test_install_sh_fetches_and_checks_the_units_before_installing() -> None:
     block_start = INSTALL.index('mkdir -p "$WORK/deploy"')
     gate = INSTALL.index("VERIFIED-ARTIFACT GATE PASSED")
-    verify = INSTALL.index('minisign -V -p "$WORK/pubkey.pub"')
+    verify = INSTALL.index('minisign -V -P "$MINISIGN_PUBKEY" -m "$WORK/SHA256SUMS"')
     assert verify < block_start < gate
     block = INSTALL[block_start:gate]
     assert '"$BASE/$f" -o "$WORK/deploy/$f"' in block
@@ -105,8 +105,8 @@ cp "$SERVED/$name" "$out"
 _RECORDER = """#!/bin/sh
 echo "$0 $*" >> "$FAKE_LOG_DIR/calls.log"
 """
-_WHEEL = "dsm-0.1.0-cp311-abi3-linux_x86_64.whl"
-_SOFT_WHEEL = "dsm-0.1.0+soft-cp311-abi3-linux_x86_64.whl"
+_WHEEL = "dsm-0.1.0-cp311-abi3-manylinux_2_35_x86_64.whl"
+_SOFT_WHEEL = "dsm-0.1.0+soft-cp311-abi3-manylinux_2_35_x86_64.whl"
 _UNIT_FILES = [n for n in SHIPPED if n != "dsm-client.service"]
 
 Install = Callable[..., "tuple[subprocess.CompletedProcess[str], Path]"]

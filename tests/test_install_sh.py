@@ -344,7 +344,7 @@ class TestVersionPin(unittest.TestCase):
     def test_wheel_name_embeds_pinned_version(self) -> None:
         self.assertRegex(
             self.code,
-            r'WHEEL="dsm-\$\{DSM_VERSION\}',
+            r'WHEEL_PREFIX="dsm-\$\{DSM_VERSION\}',
             "wheel filename must embed the pinned ${DSM_VERSION}",
         )
 

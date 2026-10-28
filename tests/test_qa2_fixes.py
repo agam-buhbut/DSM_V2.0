@@ -9,6 +9,8 @@ import contextlib
 import datetime
 import logging
 import os
+import shutil
+import subprocess
 from collections.abc import Generator
 from pathlib import Path
 from typing import Any
@@ -39,6 +41,7 @@ from tests.cert_helpers import (
 from tests.test_client_fail_closed import _config as _client_config
 from tests.test_init import _fake_enrollment, _server_flags
 from tests.test_server_dns_fatal import _base_patches, _run_until, _server_config
+from tests.test_units_and_release import _FAKE_CURL, _RECORDER, INSTALL, RELEASE, _sums
 
 
 @contextlib.contextmanager
@@ -798,3 +801,216 @@ def test_the_mtu_warning_starts_above_1360(
         "it every full-size packet is split in two."
     )
     assert lines == ([expected] if warned else [])
+
+
+# --- commit 6: install.sh and release.yml (N1, N2, N3) --------------------------
+
+_TPM_WHEEL = "dsm-0.1.0-cp311-abi3-manylinux_2_35_x86_64.whl"
+_SOFT = "dsm-0.1.0+soft-cp311-abi3-manylinux_2_35_x86_64.whl"
+_DEPS = [
+    "cffi-2.0.0-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+    "cffi-2.0.0-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+    "dnspython-2.8.0-py3-none-any.whl",
+]
+
+
+def _verify_command() -> str:
+    start = INSTALL.index("minisign -V ")
+    return INSTALL[start : INSTALL.index("\n", INSTALL.index("|| die", start))]
+
+
+def test_install_sh_gives_minisign_the_key_itself_not_a_key_file() -> None:
+    assert _verify_command() == (
+        'minisign -V -P "$MINISIGN_PUBKEY" -m "$WORK/SHA256SUMS" \\\n'
+        '  || die "minisign verification FAILED — refusing to continue"'
+    )
+    assert "pubkey.pub" not in INSTALL
+
+
+@pytest.mark.skipif(
+    shutil.which("minisign") is None,
+    reason="needs the real minisign; the release check on the box covers it",
+)
+@pytest.mark.parametrize("case", ["good", "changed list", "wrong key"])
+def test_the_verify_command_with_the_real_minisign(tmp_path: Path, case: str) -> None:
+    keys = {}
+    for name in ("release", "other"):
+        subprocess.run(
+            [
+                "minisign",
+                "-G",
+                "-W",
+                "-p",
+                str(tmp_path / f"{name}.pub"),
+                "-s",
+                str(tmp_path / f"{name}.key"),
+            ],
+            check=True,
+            capture_output=True,
+            timeout=30,
+        )
+        keys[name] = (tmp_path / f"{name}.pub").read_text().splitlines()[-1]
+    work = tmp_path / "work"
+    work.mkdir()
+    sums = work / "SHA256SUMS"
+    sums.write_text(f"{'0' * 64}  {_TPM_WHEEL}\n")
+    subprocess.run(
+        ["minisign", "-S", "-s", str(tmp_path / "release.key"), "-m", str(sums)],
+        check=True,
+        capture_output=True,
+        timeout=30,
+    )
+    if case == "changed list":
+        sums.write_text(f"{'1' * 64}  {_TPM_WHEEL}\n")
+    key = keys["other" if case == "wrong key" else "release"]
+    script = 'die() { echo "install.sh: $*" >&2; exit 1; }\n' + _verify_command()
+
+    done = subprocess.run(
+        ["/bin/sh", "-c", script],
+        env={**os.environ, "WORK": str(work), "MINISIGN_PUBKEY": key},
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+
+    if case == "good":
+        assert done.returncode == 0, done.stderr
+        assert "Signature and comment signature verified" in done.stdout
+    else:
+        assert done.returncode == 1
+        assert "minisign verification FAILED" in done.stderr
+
+
+def _fake_release(tmp_path: Path, served: list[str]) -> tuple[Path, Path, Path]:
+    fakebin = tmp_path / "fakebin"
+    fakebin.mkdir()
+    for name, body in (
+        ("curl", _FAKE_CURL),
+        ("minisign", "#!/bin/sh\nexit 0\n"),
+        ("id", "#!/bin/sh\necho 0\n"),
+        ("uname", "#!/bin/sh\necho x86_64\n"),
+        ("apt-get", "#!/bin/sh\nexit 1\n"),  # the first step past the gate
+        ("install", _RECORDER),
+        ("pip", _RECORDER),
+        ("python3", _RECORDER),
+        ("systemctl", _RECORDER),
+    ):
+        (fakebin / name).write_text(body)
+        (fakebin / name).chmod(0o755)
+    tpm = tmp_path / "tpmrm0"
+    tpm.write_text("")
+    script = tmp_path / "install.sh"
+    script.write_text(INSTALL.replace("/dev/tpmrm0", str(tpm)))
+    release = tmp_path / "served"
+    release.mkdir()
+    for name in served:
+        (release / name).write_text(f"content of {name}\n")
+    _sums(release, served)
+    (release / "SHA256SUMS.minisig").write_text("sig\n")
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    return script, release, logs
+
+
+def _run_install_sh(
+    tmp_path: Path, served: list[str], *args: str
+) -> tuple[subprocess.CompletedProcess[str], list[str], str]:
+    script, release, logs = _fake_release(tmp_path, served)
+    (tmp_path / "tmp").mkdir()
+    done = subprocess.run(
+        ["/bin/sh", str(script), *args],
+        env={
+            "PATH": f"{tmp_path / 'fakebin'}:{os.environ['PATH']}",
+            "TMPDIR": str(tmp_path / "tmp"),
+            "SERVED": str(release),
+            "CURL_FAIL": "",
+            "FAKE_LOG_DIR": str(logs),
+            "DSM_RELEASE_BASE_URL": "https://example.invalid/rel",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    fetched = (logs / "curl.log").read_text().split()
+    calls = (logs / "calls.log").read_text() if (logs / "calls.log").exists() else ""
+    return done, fetched, calls
+
+
+@pytest.mark.parametrize(
+    ("args", "wanted", "other"),
+    [((), _TPM_WHEEL, _SOFT), (("--eval",), _SOFT, _TPM_WHEEL)],
+)
+def test_install_sh_picks_the_manylinux_dsm_wheel_maturin_makes(
+    tmp_path: Path, args: tuple[str, ...], wanted: str, other: str
+) -> None:
+    done, fetched, _ = _run_install_sh(tmp_path, [_TPM_WHEEL, _SOFT, *_DEPS], *args)
+    assert "apt-get update failed" in done.stderr  # past the verified gate
+    assert f"{wanted}: OK" in done.stdout
+    assert wanted in fetched
+    assert other not in fetched
+    assert all(dep in fetched for dep in _DEPS)
+
+
+@pytest.mark.parametrize(
+    "served",
+    [
+        # Two production wheels: which one is meant cannot be told.
+        [_TPM_WHEEL, "dsm-0.1.0-cp311-abi3-manylinux_2_38_x86_64.whl", _SOFT],
+        # The right version and ABI, but not x86_64.
+        ["dsm-0.1.0-cp311-abi3-manylinux_2_35_aarch64.whl", _SOFT],
+        # Another version only (a rolled-back list).
+        ["dsm-0.0.9-cp311-abi3-manylinux_2_35_x86_64.whl", _SOFT],
+    ],
+)
+def test_install_sh_wants_exactly_one_matching_dsm_wheel(
+    tmp_path: Path, served: list[str]
+) -> None:
+    done, fetched, calls = _run_install_sh(tmp_path, [*served, *_DEPS])
+    assert done.returncode == 1
+    assert (
+        "signed SHA256SUMS has no single entry for dsm-0.1.0-cp311-abi3-*_x86_64.whl"
+        in done.stderr
+    )
+    assert not [name for name in fetched if name.endswith(".whl")]
+    assert calls == ""
+
+
+def _job(name: str) -> str:
+    start = RELEASE.index(f"\n  {name}:\n")
+    end = RELEASE.find("\n  ", start + 1)
+    while end != -1 and RELEASE[end + 3] == " ":
+        end = RELEASE.find("\n  ", end + 1)
+    return RELEASE[start : end if end != -1 else len(RELEASE)]
+
+
+@pytest.mark.parametrize("job", ["build-tpm-wheel", "build-soft-wheel", "build-sdist"])
+def test_the_build_jobs_run_on_the_oldest_glibc_runner(job: str) -> None:
+    assert "    runs-on: ubuntu-22.04" in _job(job)
+
+
+def test_the_soft_job_names_its_wheel_plus_soft() -> None:
+    soft = _job("build-soft-wheel")
+    sed = 'sed -i \'s/^version = "\\([^"+]*\\)"$/version = "\\1+soft"/\' pyproject.toml'
+    assert sed in soft
+    assert soft.index(sed) < soft.index("maturin build")
+    assert 'grep -q \'^version = "[^"]*+soft"$\' pyproject.toml' in soft
+    assert "+soft" not in _job("build-tpm-wheel").split("run: |", 1)[1]
+
+
+def test_the_dependency_wheels_come_for_every_supported_python() -> None:
+    publish = _job("sign-and-publish")
+    for version in ("311", "312", "313"):
+        block = (
+            "pip download \\\n"
+            "            --require-hashes \\\n"
+            "            -r requirements.lock \\\n"
+            "            --only-binary=:all: \\\n"
+            f"            --python-version {version} \\\n"
+            "            --dest dist"
+        )
+        assert block in publish, version
+    assert publish.index("--python-version 313") < publish.index(
+        "sha256sum * > SHA256SUMS"
+    )
