@@ -109,7 +109,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   1360 bytes, so at 1400 every full-size packet was split in two, which
   halved top speed. Configs that set `mtu = 1400` keep the old behavior, and
   get a warning at start: it now comes for any `mtu` above 1360 (it came
-  only above 1400).
+  only above 1400), in the normal log format (it was a bare line, logged
+  before logging was set up).
 - A second DSM on a UDP port that is already in use now fails at start with
   a clear error. Before, both could share the port and each got only some
   of the packets, so sessions broke with no error.

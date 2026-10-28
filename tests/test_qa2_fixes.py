@@ -2251,3 +2251,28 @@ async def test_a_client_that_cannot_write_its_config_folder_follows_the_start_ru
         folder.chmod(0o700)
     assert rc == 1
     assert start.events == events
+
+
+# --- final box check: the mtu warning in the normal log format (Nit 1) ----------
+
+
+def test_a_config_warning_before_logging_is_up_has_the_normal_format(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from dsm.core import log as dsm_log
+
+    monkeypatch.setattr(dsm_log, "_configured", False)
+    handlers = list(logging.getLogger("dsm").handlers)
+    path = _write_config(tmp_path, _GOOD_CLIENT + "mtu = 1400\n")
+
+    entry._load_config_or_exit(path)
+
+    err = capsys.readouterr().err
+    assert re.fullmatch(
+        r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d WARNING dsm\.core\.config: configured "
+        r"tun mtu=1400 is above 1360\. Use 1360, the default: above it every "
+        r"full-size packet is split in two\.\n",
+        err,
+    ), err
+    # Only for the load: configure() adds the daemon's handler later.
+    assert logging.getLogger("dsm").handlers == handlers

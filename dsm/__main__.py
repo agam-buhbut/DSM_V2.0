@@ -38,9 +38,12 @@ def _load_config_or_exit(config_path: Path | None, mode: str | None = None) -> C
     """
     with_mode = f" (with --mode {mode})" if mode is not None else ""
     try:
-        config = load(config_path)
-        if mode is not None and mode != config.mode:
-            config = replace(config, mode=mode)
+        # Before logging is set up: a config warning (the mtu) keeps the
+        # normal log format.
+        with dsm_log.until_configured():
+            config = load(config_path)
+            if mode is not None and mode != config.mode:
+                config = replace(config, mode=mode)
         return config
     except ConfigError as e:
         print(f"config: {e}{with_mode}", file=sys.stderr)

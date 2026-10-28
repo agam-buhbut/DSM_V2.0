@@ -3,11 +3,12 @@ packet."""
 
 from __future__ import annotations
 
+import contextlib
 import contextvars
 import logging
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 
 _configured = (
     False  # pylint: disable=invalid-name  # module-private flag, not a constant
@@ -88,13 +89,7 @@ class RepeatLog:
         self._skipped = 0
 
 
-def configure(level: str = "warning") -> None:
-    """Configure logging. Call once at startup."""
-    global _configured
-    if _configured:
-        return
-
-    numeric = getattr(logging, level.upper(), logging.WARNING)
+def _stderr_handler() -> logging.Handler:
     handler = logging.StreamHandler(sys.stderr)
     handler.addFilter(_SessionLabel())
     handler.setFormatter(
@@ -103,7 +98,35 @@ def configure(level: str = "warning") -> None:
             datefmt="%Y-%m-%d %H:%M:%S",
         )
     )
+    return handler
+
+
+def configure(level: str = "warning") -> None:
+    """Configure logging. Call once at startup."""
+    global _configured
+    if _configured:
+        return
+
+    numeric = getattr(logging, level.upper(), logging.WARNING)
     root = logging.getLogger("dsm")
     root.setLevel(numeric)
-    root.addHandler(handler)
+    root.addHandler(_stderr_handler())
     _configured = True
+
+
+@contextlib.contextmanager
+def until_configured() -> Iterator[None]:
+    """Inside, a line logged before :func:`configure` (a warning about the
+    config that holds ``log_level``, while it loads) goes to stderr in the
+    normal format, not as Python's bare last-resort line (QA2 box Nit 1).
+    A no-op once logging is configured."""
+    if _configured:
+        yield
+        return
+    handler = _stderr_handler()
+    root = logging.getLogger("dsm")
+    root.addHandler(handler)
+    try:
+        yield
+    finally:
+        root.removeHandler(handler)
