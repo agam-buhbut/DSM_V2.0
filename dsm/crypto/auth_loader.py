@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import datetime
 import logging
+import stat
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,6 +27,7 @@ from dsm.core import netaudit
 from dsm.core.config import Config
 from dsm.core.path_security import (
     InsecureFilePermissionsError,
+    cannot_read,
     check_user_file_permissions,
 )
 from dsm.crypto.attest_store import AttestStore
@@ -69,10 +71,24 @@ def _check_perms_or_raise(path: Path, label: str) -> None:
         ) from e
 
 
+def _is_file(path: Path) -> bool:
+    """A regular file is there. A path DSM cannot reach is one line, not a
+    traceback (QA2 N5)."""
+    try:
+        return stat.S_ISREG(path.stat().st_mode)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError as e:
+        raise AuthMaterialsError(cannot_read(path, e)) from e
+
+
 def _load_cert_der(cert_file: Path) -> bytes:
     """Read a leaf cert from disk in either PEM or DER form, return DER."""
     _check_perms_or_raise(cert_file, "cert_file")
-    raw = cert_file.read_bytes()
+    try:
+        raw = cert_file.read_bytes()
+    except OSError as e:
+        raise AuthMaterialsError(cannot_read(cert_file, e)) from e
     try:
         cert = DeviceCert.from_pem_or_der(raw)
     except CertError as e:
@@ -119,11 +135,11 @@ def load_cert_materials(
     cert_file = Path(config.cert_file)
     ca_root_file = Path(config.ca_root_file)
 
-    if not cert_file.is_file():
+    if not _is_file(cert_file):
         raise AuthMaterialsError(
             f"cert_file missing at {cert_file}; run `dsm enroll` to " "provision one"
         )
-    if not ca_root_file.is_file():
+    if not _is_file(ca_root_file):
         raise AuthMaterialsError(
             f"ca_root_file missing at {ca_root_file}; copy the pinned "
             "CA root cert into place per deploy/GUIDE.md §2e"
@@ -152,6 +168,8 @@ def load_cert_materials(
         ) from e
     try:
         ca_root = load_ca_root(ca_root_file, expected_sha256=expected_ca_sha256)
+    except OSError as e:
+        raise AuthMaterialsError(cannot_read(ca_root_file, e)) from e
     except CertExpiredError as e:
         # A CA cert outside its dates may be a clock set wrong: a date
         # problem, so the client waits instead of failing open (fix 2).
@@ -210,7 +228,7 @@ def _load_crl(
         netaudit.emit("crl_missing", action="warned")
     if config.crl_file:
         crl_path = Path(config.crl_file)
-        if not crl_path.is_file():
+        if not _is_file(crl_path):
             raise AuthMaterialsError(f"crl_file configured but missing at {crl_path}")
         _check_perms_or_raise(crl_path, "crl_file")
         try:

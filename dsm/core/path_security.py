@@ -12,6 +12,19 @@ class InsecureFilePermissionsError(OSError):
     is readable/writable by anyone beyond the owner."""
 
 
+def cannot_read(path: Path | str, e: OSError) -> str:
+    """One line for a file DSM cannot read (QA2 N5). Under the systemd
+    units root has no CAP_DAC_OVERRIDE, so a folder of another user, or a
+    0700 home folder, is closed to DSM: a permission error says so."""
+    text = f"cannot read {path}: {e.strerror or e}"
+    if isinstance(e, PermissionError):
+        text += (
+            " (the systemd unit runs without CAP_DAC_OVERRIDE: keep DSM's "
+            "files in /opt/mtun, owned by root)"
+        )
+    return text
+
+
 def check_user_file_permissions(path: Path) -> None:
     """Reject a sensitive file that is not uid-owned and 0o0xx mode.
 

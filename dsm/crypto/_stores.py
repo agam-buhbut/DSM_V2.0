@@ -28,6 +28,7 @@ from collections.abc import Callable, Generator
 from pathlib import Path
 
 from dsm.core.passphrase import read_passphrase, wipe_passphrase
+from dsm.core.path_security import cannot_read
 from dsm.crypto.attest_store import AttestStore
 from dsm.crypto.keystore import KeyStore
 
@@ -50,6 +51,13 @@ def _unit_hint(passphrase_env_file: str | None) -> str:
         f"unit: `sudo systemctl reset-failed {unit} && sudo systemctl "
         f"restart {unit}`"
     )
+
+
+def _store_error(e: Exception) -> str:
+    """A key file DSM cannot read says why and what to do (QA2 N5)."""
+    if isinstance(e, PermissionError) and e.filename:
+        return cannot_read(e.filename, e)
+    return str(e)
 
 
 @contextlib.contextmanager
@@ -165,14 +173,14 @@ def load_daemon_stores(
             # a RuntimeError, so they previously escaped as an unhandled
             # traceback out of asyncio.run instead of failing closed. Still
             # narrow — ValueError/TypeError (programming bugs) propagate.
-            log.error("identity store: %s", e)
+            log.error("identity store: %s", _store_error(e))
             return False
         try:
             attest_store.load_with_passphrase(passphrase)
         except (RuntimeError, OSError) as e:
             # DSM-012: see the identity-store handler above — widen to OSError
             # so insecure-perms / read errors honor the return-False contract.
-            log.error("attest store: %s", e)
+            log.error("attest store: %s", _store_error(e))
             keystore.unload()
             return False
     finally:

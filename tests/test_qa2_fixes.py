@@ -5,7 +5,9 @@ live in tmp_path. Nothing here needs root or touches the host."""
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
+import dataclasses
 import datetime
 import logging
 import os
@@ -28,10 +30,12 @@ from dsm.core import config as dsm_config
 from dsm.core import passphrase
 from dsm.core.config import ConfigError, load
 from dsm.core.passphrase import PassphraseError, read_passphrase
-from dsm.crypto._stores import loaded_stores_cli
+from dsm.crypto._stores import load_daemon_stores, loaded_stores_cli
 from dsm.crypto.attest_store import AttestStore
+from dsm.crypto.auth_loader import AuthMaterialsError, load_cert_materials
 from dsm.crypto.enroll import EnrollError, generate_enrollment, import_signed_cert
 from dsm.crypto.keystore import KeyStore
+from dsm.server import run_server
 from tests.cert_helpers import (
     IssuingCA,
     make_leaf_cert,
@@ -1014,3 +1018,104 @@ def test_the_dependency_wheels_come_for_every_supported_python() -> None:
     assert publish.index("--python-version 313") < publish.index(
         "sha256sum * > SHA256SUMS"
     )
+
+
+# --- commit 7: a file the unit cannot read (N5) ---------------------------------
+
+_UNIT_HINT = (
+    "(the systemd unit runs without CAP_DAC_OVERRIDE: keep DSM's files in "
+    "/opt/mtun, owned by root)"
+)
+_ROOT_SKIP = pytest.mark.skipif(
+    os.geteuid() == 0, reason="root can enter any folder, so nothing is closed"
+)
+
+
+@contextlib.contextmanager
+def _closed(folder: Path) -> Generator[None, None, None]:
+    """``folder`` cannot be entered, as a 0700 home folder of another user is
+    for the units (they drop CAP_DAC_OVERRIDE)."""
+    folder.chmod(0o000)
+    try:
+        yield
+    finally:
+        folder.chmod(0o700)
+
+
+def _cert_files(tmp_path: Path, closed_one: str) -> tuple[Path, dict[str, str]]:
+    home = tmp_path / "home"
+    home.mkdir()
+    opt = tmp_path / "opt"
+    opt.mkdir()
+    paths: dict[str, str] = {}
+    for name in ("cert_file", "ca_root_file"):
+        path = (home if name == closed_one else opt) / name
+        path.write_bytes(b"x")
+        path.chmod(0o600)
+        paths[name] = str(path)
+    return home, paths
+
+
+@_ROOT_SKIP
+@pytest.mark.parametrize("closed_one", ["cert_file", "ca_root_file"])
+def test_a_cert_file_dsm_cannot_read_is_one_line(
+    tmp_path: Path, closed_one: str
+) -> None:
+    home, paths = _cert_files(tmp_path, closed_one)
+    config = _client_config(**paths)
+
+    with _closed(home), pytest.raises(AuthMaterialsError) as err:
+        load_cert_materials(config)
+
+    assert str(err.value) == (
+        f"cannot read {paths[closed_one]}: Permission denied {_UNIT_HINT}"
+    )
+
+
+@_ROOT_SKIP
+async def test_the_server_stops_with_one_line_for_a_cert_it_cannot_read(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.ERROR, logger="dsm")
+    home, paths = _cert_files(tmp_path, "cert_file")
+    config = dataclasses.replace(_server_config(), **paths)
+    captured: dict[str, Any] = {}
+
+    with (
+        _base_patches(captured),
+        mock.patch("dsm.server.load_cert_materials", load_cert_materials),
+        _closed(home),
+    ):
+        rc = await asyncio.wait_for(run_server(config), 5.0)
+
+    assert rc == 1
+    assert [r.getMessage() for r in caplog.records] == [
+        "cert auth materials missing or invalid: cannot read "
+        f"{paths['cert_file']}: Permission denied {_UNIT_HINT}"
+    ]
+    assert "host" not in captured  # nothing on the host was set up
+
+
+@_ROOT_SKIP
+def test_a_key_dsm_cannot_read_is_one_line(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.ERROR, logger="dsm")
+    home = tmp_path / "home"
+    home.mkdir()
+    key = home / "identity.key"
+    key.write_bytes(b"x")
+    key.chmod(0o600)
+    passphrase_file = _passphrase_file(tmp_path)
+
+    with _closed(home):
+        ok = load_daemon_stores(
+            KeyStore(str(key)),
+            AttestStore(str(tmp_path / "attest.key")),
+            passphrase_env_file=str(passphrase_file),
+        )
+
+    assert ok is False
+    assert [r.getMessage() for r in caplog.records] == [
+        f"identity store: cannot read {key}: Permission denied {_UNIT_HINT}"
+    ]

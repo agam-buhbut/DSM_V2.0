@@ -369,6 +369,21 @@ $ sudo /usr/bin/python3 -m pip install --break-system-packages \
       --no-deps "$(ls $PWD/rust/tuncore/target/wheels/dsm-0.1.0-*.whl | tail -1)"
 ```
 
+To replace an installed DSM of the same version (every build so far is
+0.1.0), add `--force-reinstall --no-deps` to the wheel install. Without it
+pip says `dsm is already installed with the same version as the provided
+wheel`, updates only the dependencies, and the old code keeps running.
+`--no-deps` leaves the dependencies alone, so run one of the commands above
+first (it brings them to the new wheel's pins), then:
+
+```sh
+$ sudo /usr/bin/python3 -m pip install --break-system-packages \
+      --force-reinstall --no-deps \
+      "$(ls $PWD/rust/tuncore/target/wheels/dsm-0.1.0-*.whl | tail -1)"
+```
+
+A wheel copied to a client (§1a.1) takes the same two flags.
+
 Installing the wheel puts BOTH `import dsm` and `import tuncore` on
 /usr/bin/python3's path, so `python3 -m dsm` resolves from any working
 directory — including under systemd (cwd=/), which is why
@@ -1662,10 +1677,13 @@ not talk to each other, so this is one switch for every box.
    tunnel: connect again on its LAN address); you upgrade it in step 4,
    while it is stopped. Or make sure you have its console.
 2. On a machine with enough memory (not a small laptop), build the new wheel
-   (§1) and copy it to every box (§1a.1). A client set up from the wheel
-   alone also needs the new `deploy/dsm-client.service` from the build host
-   (§1a.1, §3f). A host set up with `install.sh` upgrades by running the
-   new release's `install.sh` instead.
+   (§1) and copy it to every box (§1a.1). A box that has DSM 0.1.0 already
+   keeps the old code unless the wheel install has `--force-reinstall
+   --no-deps`, after the plain install has brought the dependencies up
+   (§1b). A client set up from the wheel alone also needs the new
+   `deploy/dsm-client.service` from the build host (§1a.1, §3f). A host set
+   up with `install.sh` upgrades by running the new release's `install.sh`
+   instead.
 3. Upgrade the server and restart it: `sudo systemctl restart dsm`. Its log
    must show `server listening on UDP port 51820 (wire v2)` (with your port;
    `TCP` if you set `transport = "tcp"`).
