@@ -286,20 +286,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A re-run of `dsm init` on an enrolled host overwrote config.toml before
   it refused; now it refuses first, and a new config replaces the old one
   only once the enrollment worked. A relative `--ca-root` works.
-- `dsm init --ca-root` takes only a CA certificate (PEM). The CRL or a
-  passphrase file given by mistake is refused at once, before anything is
-  written; before, it showed only after the trip to the CA, as a traceback.
-  A bad CA copy at `dsm init --resume` or `dsm enroll --import` is one line.
+- `dsm init --ca-root` takes only a P-384 CA certificate (PEM), as the
+  offline CA makes. The CRL or a passphrase file given by mistake, a leaf
+  cert, a CA outside its dates (it says to check the clock) or a P-256 or
+  RSA CA is refused at once: no key, CSR, config or state is written (an
+  empty install folder may stay, and a re-run into it works). Before, it
+  showed only after the trip to the CA, as a traceback. A bad CA copy at
+  `dsm init --resume` or `dsm enroll --import` is one line.
 - `dsm init` ends with a list of what is still to do (the CRL, the
   allowlist, the passphrase file) instead of "Done".
 - Starting DSM or `dsm cleanup` without root says "use sudo" at once;
   `dsm cleanup` no longer says "complete" after every step failed. An nft
   error on the client's first block is one line, not a traceback.
 - The same for the other commands that need root: `dsm init
-  --install-unit`, `dsm init` on root's install folder, and `dsm
-  show-pubkey` or `dsm enroll` with a config owned by root. Run without sudo,
-  each says "run it with sudo" in one line, before it writes anything,
-  instead of a traceback or "owned by uid 0".
+  --install-unit`, `dsm init` on root's install folder or with a `--ca-root`
+  in it, and `dsm show-pubkey` or `dsm enroll` with a config owned by root,
+  also in root's 0700 folder as GUIDE §2f makes /opt/mtun. Run without sudo,
+  each says to use sudo in one line ("must run as root: use sudo" or "run it
+  with sudo"), before it writes anything, instead of a traceback or "owned
+  by uid 0".
 - Ctrl-C at a prompt of the installed `dsm` command prints "aborted", not a
   traceback; `--mode` that does not fit the config is one config line.
 - `dsm enroll --import` refuses a cert of the wrong type for the host's
@@ -326,7 +331,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   names it.
 - Cert serials are printed in hex, as openssl writes them (`serial = 1000
   (hex)` at `dsm enroll --import`, `server cert serial 1000 (hex) is
-  revoked`), so they match index.txt and newcerts/<serial>.pem.
+  revoked`), so they match index.txt and newcerts/<serial>.pem. CRL numbers
+  too (`loaded CRL crl_number=1000 (hex)`, and the rollback refusal), as
+  ca/crlnumber shows them.
 - "pre-handshake kill switch applied" is said once, at INFO, when the
   client's start-up block goes up; the swaps for a lookup or the time
   daemon's NTP (three in one second for a name) are DEBUG.
@@ -348,7 +355,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the whole `sudo dsm --config ... enroll --import` command and names the
   three files to remove on an enrolled host; a cert made for another device
   says so in plain words. `CN allowlist loaded (1 entry)`. `dsm init` tells
-  a client started by hand to do it at the console, not over SSH.
+  a client started by hand to do it at the console, not over SSH, and says
+  each step that is left once, in its list. A missing or damaged key file
+  is named once (`<path> is damaged: blob too short`), with the way back:
+  at `dsm init --resume`, `sudo dsm init <role> --force`. `dsm init
+  --resume` on an enrolled host says there is nothing to resume.
 - The server's systemd unit (`deploy/dsm.service`) had `ProcSubset=pid`,
   which hides `/proc/sys`. The server writes its network settings there
   when a client connects, so under that unit every client session failed
