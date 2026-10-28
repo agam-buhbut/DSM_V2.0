@@ -1908,3 +1908,70 @@ def test_the_ca_key_rule_is_one_helper_that_validate_chain_uses() -> None:
         with pytest.raises(dsm_cert.CertChainError, match="stop"):
             dsm_cert.validate_chain(leaf, ca.certificate)
     check.assert_called_once_with(ca.certificate)
+
+
+# --- final check: CRL numbers in hex (Nit 3) -------------------------------------
+
+
+def _numbered_crl(tmp_path: Path, ca: IssuingCA, number: int | None) -> Path:
+    now = datetime.datetime.now(datetime.UTC)
+    builder = (
+        x509.CertificateRevocationListBuilder()
+        .issuer_name(ca.certificate.subject)
+        .last_update(now)
+        .next_update(now + datetime.timedelta(days=30))
+    )
+    if number is not None:
+        builder = builder.add_extension(x509.CRLNumber(number), critical=False)
+    path = tmp_path / f"crl-{number}.crl"
+    path.write_bytes(
+        builder.sign(ca.private_key, hashes.SHA384()).public_bytes(Encoding.PEM)
+    )
+    path.chmod(0o600)
+    return path
+
+
+def test_the_loaded_crl_line_gives_its_number_in_hex(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    from dsm.crypto import auth_loader
+
+    caplog.set_level(logging.INFO, logger="dsm.crypto.auth_loader")
+    ca = make_test_ca()
+    config = _client_config(
+        crl_file=str(_numbered_crl(tmp_path, ca, 4096)), config_dir=tmp_path
+    )
+    auth_loader._load_crl(config, ca.certificate)
+    assert "loaded CRL crl_number=1000 (hex)" in [
+        r.getMessage() for r in caplog.records
+    ]
+
+
+@pytest.mark.parametrize(
+    ("number", "text"),
+    [
+        (
+            4098,
+            "CRL crl_number 1002 (hex) is older than the last-accepted 1004 (hex); "
+            "refusing (possible rollback/replay)",
+        ),
+        (
+            None,
+            "CRL has no crl_number but a numbered CRL (1004, hex) was previously "
+            "accepted; refusing to downgrade to an unnumbered CRL (possible "
+            "rollback)",
+        ),
+    ],
+)
+def test_the_rollback_refusal_gives_the_numbers_in_hex(
+    tmp_path: Path, number: int | None, text: str
+) -> None:
+    from dsm.crypto.crl import CRL, CRLRollbackError
+
+    ca = make_test_ca()
+    store = tmp_path / "crl_number.seen"
+    store.write_text("4100\n")
+    crl = CRL.load(_numbered_crl(tmp_path, ca, number), ca.certificate, now=None)
+    with pytest.raises(CRLRollbackError) as err:
+        crl.reject_if_rolled_back(store)
+    assert str(err.value) == text

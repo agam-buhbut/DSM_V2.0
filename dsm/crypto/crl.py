@@ -30,7 +30,7 @@ from cryptography.hazmat.primitives.asymmetric.ec import (
 )
 
 from dsm.core.atomic_io import atomic_write
-from dsm.crypto.cert import check_strong_signature_hash
+from dsm.crypto.cert import check_strong_signature_hash, serial_hex
 
 
 class CRLError(Exception):
@@ -192,15 +192,17 @@ class CRL:
         current = self.crl_number
         if last_seen is not None:
             if current is None:
+                # Hex, as openssl and ca/crlnumber show it.
                 raise CRLRollbackError(
                     "CRL has no crl_number but a numbered CRL "
-                    f"(#{last_seen}) was previously accepted; refusing to "
-                    "downgrade to an unnumbered CRL (possible rollback)"
+                    f"({serial_hex(last_seen)}, hex) was previously accepted; "
+                    "refusing to downgrade to an unnumbered CRL (possible rollback)"
                 )
             if current < last_seen:
                 raise CRLRollbackError(
-                    f"CRL crl_number {current} is older than the last-accepted "
-                    f"{last_seen}; refusing (possible rollback/replay)"
+                    f"CRL crl_number {serial_hex(current)} (hex) is older than the "
+                    f"last-accepted {serial_hex(last_seen)} (hex); refusing "
+                    "(possible rollback/replay)"
                 )
         if current is not None and (last_seen is None or current > last_seen):
             _write_last_crl_number(store_path, current)

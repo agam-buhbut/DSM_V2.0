@@ -1324,7 +1324,8 @@ $ openssl ca -config openssl-ca.cnf \
 $ openssl ca -config openssl-ca.cnf -gencrl -out crl/dsm_ca.crl
 ```
 
-The CRL number goes up by one each time (ca/crlnumber). Carry
+The CRL number goes up by one each time (ca/crlnumber, in hex; DSM logs it
+the same way: `loaded CRL crl_number=1001 (hex)`). Carry
 crl/dsm_ca.crl on a freshly wiped stick to the hosts (when: below), and put
 it at /opt/mtun/dsm_ca.crl. Every host needs one: the server and each client
 (`dsm init` gives every client a `crl_file`). Restart the server to pick it

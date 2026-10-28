@@ -31,7 +31,13 @@ from dsm.core.path_security import (
     check_user_file_permissions,
 )
 from dsm.crypto.attest_store import AttestStore
-from dsm.crypto.cert import CertError, CertExpiredError, DeviceCert, load_ca_root
+from dsm.crypto.cert import (
+    CertError,
+    CertExpiredError,
+    DeviceCert,
+    load_ca_root,
+    serial_hex,
+)
 from dsm.crypto.crl import CRL, CRLError, CRLRollbackError
 from dsm.crypto.keystore import KeyStore
 
@@ -318,7 +324,12 @@ def _load_crl(
             )
         # After the date checks, so a stale CRL under crl_strict, which the
         # client tries again, logs nothing on each try.
-        log.info("loaded CRL crl_number=%s", crl.crl_number)
+        number = crl.crl_number
+        # Hex, as openssl and ca/crlnumber show it.
+        log.info(
+            "loaded CRL crl_number=%s",
+            "none" if number is None else f"{serial_hex(number)} (hex)",
+        )
     return crl
 
 
