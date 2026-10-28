@@ -137,12 +137,13 @@ def load_cert_materials(
 
     if not _is_file(cert_file):
         raise AuthMaterialsError(
-            f"cert_file missing at {cert_file}; run `dsm enroll` to " "provision one"
+            f"cert_file missing at {cert_file}; enroll this host with `sudo dsm "
+            "init` or `sudo dsm enroll --csr-out <csr file>` (deploy/GUIDE.md §3)"
         )
     if not _is_file(ca_root_file):
         raise AuthMaterialsError(
             f"ca_root_file missing at {ca_root_file}; copy the pinned "
-            "CA root cert into place per deploy/GUIDE.md §2e"
+            "CA root cert into place per deploy/GUIDE.md §2f"
         )
 
     cert_der = _load_cert_der(cert_file)

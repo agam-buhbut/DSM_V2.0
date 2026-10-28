@@ -43,6 +43,7 @@ from dsm.core.atomic_io import atomic_write
 from dsm.crypto.attest_store import AttestStore
 from dsm.crypto.cert import (
     CertError,
+    CertExpiredError,
     DeviceCert,
     load_ca_root,
     validate_chain,
@@ -57,6 +58,12 @@ log = logging.getLogger(__name__)
 
 class EnrollError(Exception):
     """Enrollment-time error (CSR build / cert import)."""
+
+
+def _cannot(what: str, e: OSError, path: Path | None = None) -> str:
+    """One line for a file enroll cannot read or write."""
+    where = path if path is not None else e.filename
+    return f"cannot {what} {where}: {e.strerror or e}"
 
 
 def ca_root_reason(e: Exception) -> str:
@@ -305,17 +312,28 @@ def import_signed_cert(
     """
     if role not in (None, "client", "server"):
         raise ValueError(f"role must be 'client' or 'server', got {role!r}")
-    if not cert_input_path.is_file():
-        raise EnrollError(f"cert input not found: {cert_input_path}")
-    if not ca_root_path.is_file():
-        raise EnrollError(f"ca_root not found: {ca_root_path}")
+    try:
+        if not cert_input_path.is_file():
+            raise EnrollError(f"cert input not found: {cert_input_path}")
+        if not ca_root_path.is_file():
+            raise EnrollError(f"ca_root not found: {ca_root_path}")
+        raw = cert_input_path.read_bytes()
+    except OSError as e:
+        raise EnrollError(_cannot("read", e)) from e
 
     try:
-        leaf = DeviceCert.from_pem_or_der(cert_input_path.read_bytes())
+        leaf = DeviceCert.from_pem_or_der(raw)
     except CertError as e:
         raise EnrollError(f"failed to parse cert: {e}") from e
     try:
         ca_root = load_ca_root(ca_root_path)
+    except OSError as e:
+        raise EnrollError(_cannot("read", e, ca_root_path)) from e
+    except CertExpiredError as e:
+        raise EnrollError(
+            f"the CA root {ca_root_path} is outside its dates: {e} (check this "
+            "host's clock)"
+        ) from e
     except (CertError, ValueError) as e:
         # One line at `dsm enroll --import` and `dsm init --resume`, never a
         # traceback (QA2 Major 1).
@@ -364,7 +382,10 @@ def import_signed_cert(
         )
 
     der = leaf.to_der()
-    atomic_write(cert_output_path, der)
+    try:
+        atomic_write(cert_output_path, der)
+    except OSError as e:
+        raise EnrollError(_cannot("write", e, cert_output_path)) from e
     try:
         os.chmod(cert_output_path, 0o600)
     except OSError as e:

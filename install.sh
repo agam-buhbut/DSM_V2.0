@@ -145,8 +145,10 @@ minisign -V -P "$MINISIGN_PUBKEY" -m "$WORK/SHA256SUMS" \
 # with exactly $WHEEL_PREFIX and ends with exactly _x86_64.whl. index() and
 # substr() compare plain text, so the '+' in '+soft' is no regex character;
 # the production prefix never matches the +soft wheel, nor the other way
-# round. Two entries that match, or none, fail closed.
-WHEEL="$(awk -v p="$WHEEL_PREFIX" -v s="_x86_64.whl" 'index($2, p) == 1 && length($2) > length(p) + length(s) && substr($2, length($2) - length(s) + 1) == s && index($2, "/") == 0 {n++; w=$2} END {if (n == 1) print w}' "$WORK/SHA256SUMS")"
+# round. A name with a '/' or a '\' is never taken: the first would leave
+# $WORK, and awk -v would read the second as an escape in the next step.
+# Two entries that match, or none, fail closed.
+WHEEL="$(awk -v p="$WHEEL_PREFIX" -v s="_x86_64.whl" 'index($2, p) == 1 && length($2) > length(p) + length(s) && substr($2, length($2) - length(s) + 1) == s && index($2, "/") == 0 && index($2, "\\") == 0 {n++; w=$2} END {if (n == 1) print w}' "$WORK/SHA256SUMS")"
 [ -n "$WHEEL" ] \
   || die "signed SHA256SUMS has no single entry for ${WHEEL_PREFIX}*_x86_64.whl — refusing (wrong/rolled-back release, unsupported variant, or malformed list)"
 

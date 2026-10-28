@@ -27,7 +27,7 @@ from dsm.core.config import load as config_load
 from dsm.core.passphrase import read_passphrase, wipe_passphrase
 from dsm.crypto._stores import loaded_stores_cli
 from dsm.crypto.attest_store import AttestStore
-from dsm.crypto.cert import CertError, load_ca_root
+from dsm.crypto.cert import CertError, CertExpiredError, load_ca_root
 from dsm.crypto.enroll import (
     EnrollError,
     ca_root_reason,
@@ -232,6 +232,9 @@ def _read_ca_root(src: Path, install_dir: Path) -> tuple[bytes, bool]:
         load_ca_root(src, expected_sha256=hashlib.sha256(data).digest())
     except OSError as e:
         _fail(f"cannot read --ca-root {src}: {e}")
+    except CertExpiredError as e:
+        # A CA cert, but not valid now: the clock may be the cause.
+        _fail(f"--ca-root {src} is outside its dates: {e} (check this host's clock)")
     except (CertError, ValueError) as e:
         _fail(f"--ca-root {src} is not a CA certificate (PEM): {ca_root_reason(e)}")
     return data, in_place
@@ -507,7 +510,10 @@ def _phase_b(role: Literal["client", "server"], args: argparse.Namespace) -> int
     if not args.signed_cert:
         _fail("--signed-cert <path> is required to resume (import the CA cert)")
     config_path = Path(state["config_path"])
-    cfg = config_load(config_path)
+    try:
+        cfg = config_load(config_path)
+    except (ConfigError, ValueError, TypeError, OSError) as e:
+        _fail(f"config: {e}")
 
     keystore = KeyStore(cfg.key_file)
     attest_store = AttestStore(cfg.attest_key_file)

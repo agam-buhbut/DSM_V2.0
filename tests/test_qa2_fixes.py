@@ -23,6 +23,7 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.serialization import Encoding
+from cryptography.x509.oid import NameOID
 
 import dsm.__main__ as entry
 from dsm import init as dsm_init
@@ -43,6 +44,7 @@ from tests.cert_helpers import (
     public_spki_der_from_priv,
 )
 from tests.test_client_fail_closed import _config as _client_config
+from tests.test_client_start_block import _Start
 from tests.test_init import _fake_enrollment, _server_flags
 from tests.test_server_dns_fatal import _base_patches, _run_until, _server_config
 from tests.test_units_and_release import _FAKE_CURL, _RECORDER, INSTALL, RELEASE, _sums
@@ -358,6 +360,13 @@ def _write_config(tmp_path: Path, text: str) -> Path:
 def _looks_owned_by(monkeypatch: pytest.MonkeyPatch, path: Path, uid: int) -> None:
     """Path.stat (and so Path.lstat) reports ``uid`` as the owner of ``path``;
     the user running the test is uid 1000, not root."""
+    _fake_owner(monkeypatch, path, uid)
+    monkeypatch.setattr("dsm.core.path_security.os.getuid", lambda: 1000)
+    monkeypatch.setattr(dsm_config.os, "geteuid", lambda: 1000)
+
+
+def _fake_owner(monkeypatch: pytest.MonkeyPatch, path: Path, uid: int) -> None:
+    """Path.stat (and so Path.lstat) reports ``uid`` as the owner of ``path``."""
     real = Path.stat
 
     def stat(self: Path, *args: Any, **kwargs: Any) -> os.stat_result:
@@ -369,8 +378,6 @@ def _looks_owned_by(monkeypatch: pytest.MonkeyPatch, path: Path, uid: int) -> No
         return os.stat_result(fields)
 
     monkeypatch.setattr(Path, "stat", stat)
-    monkeypatch.setattr("dsm.core.path_security.os.getuid", lambda: 1000)
-    monkeypatch.setattr(dsm_config.os, "geteuid", lambda: 1000)
 
 
 def test_a_root_owned_config_without_sudo_says_use_sudo(
@@ -909,6 +916,7 @@ def _fake_release(tmp_path: Path, served: list[str]) -> tuple[Path, Path, Path]:
     release = tmp_path / "served"
     release.mkdir()
     for name in served:
+        (release / name).parent.mkdir(parents=True, exist_ok=True)
         (release / name).write_text(f"content of {name}\n")
     _sums(release, served)
     (release / "SHA256SUMS.minisig").write_text("sig\n")
@@ -966,6 +974,12 @@ def test_install_sh_picks_the_manylinux_dsm_wheel_maturin_makes(
         ["dsm-0.1.0-cp311-abi3-manylinux_2_35_aarch64.whl", _SOFT],
         # Another version only (a rolled-back list).
         ["dsm-0.0.9-cp311-abi3-manylinux_2_35_x86_64.whl", _SOFT],
+        # A name with a folder in it.
+        ["dsm-0.1.0-cp311-abi3-a/b_x86_64.whl", _SOFT],
+        # The right text, but not at the start.
+        ["evil-dsm-0.1.0-cp311-abi3-x_x86_64.whl", _SOFT],
+        # A backslash, which awk -v would read as an escape.
+        ["dsm-0.1.0-cp311-abi3-a\\b_x86_64.whl", _SOFT],
     ],
 )
 def test_install_sh_wants_exactly_one_matching_dsm_wheel(
@@ -1211,3 +1225,287 @@ def test_init_without_sudo_that_cannot_make_the_install_dir_says_use_sudo(
     assert err.value.code == 1
     assert capsys.readouterr().err.splitlines()[-1] == _sudo_line("create", inst)
     gen.assert_not_called()
+
+
+# --- follow-up 2, commit A ------------------------------------------------------
+
+
+def _resume_with(inst: Path, signed: Path, tmp_path: Path) -> list[str]:
+    return [
+        "server",
+        "--resume",
+        "--install-dir",
+        str(inst),
+        "--signed-cert",
+        str(signed),
+        "--passphrase-env-file",
+        str(tmp_path / "pass"),
+    ]
+
+
+def test_root_on_a_root_owned_install_dir_goes_on(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inst = tmp_path / "inst"
+    inst.mkdir(mode=0o700)
+    flags = _phase_a_flags(tmp_path, inst)
+    _fake_owner(monkeypatch, inst, 0)
+    monkeypatch.setattr(dsm_init.os, "geteuid", lambda: 0)  # so _is_root() is True
+
+    with _enrolls():
+        assert dsm_init.main(flags) == 0
+
+    assert "belongs to root" not in capsys.readouterr().err
+    assert (inst / "config.toml").is_file()
+
+
+def test_root_with_a_root_owned_loose_config_keeps_the_chmod_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _write_config(tmp_path, _GOOD_CLIENT)
+    path.chmod(0o644)
+    _fake_owner(monkeypatch, path, 0)
+    monkeypatch.setattr("dsm.core.path_security.os.getuid", lambda: 0)
+    monkeypatch.setattr(dsm_config.os, "geteuid", lambda: 0)
+
+    with pytest.raises(ConfigError) as err:
+        load(path)
+
+    assert str(err.value) == (
+        f"refusing to load config with insecure permissions: {path} has "
+        f"group/world permissions (mode=644). Run: chmod 600 {path}"
+    )
+
+
+def _ca_pem_with_dates(not_before: datetime.datetime, days: int) -> bytes:
+    """A P-384 CA root, as make_test_ca makes one, valid from ``not_before``
+    for ``days`` days."""
+    priv = ec.generate_private_key(ec.SECP384R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Dated CA")])
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(priv.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(not_before)
+        .not_valid_after(not_before + datetime.timedelta(days=days))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=False,
+                content_commitment=False,
+                key_encipherment=False,
+                data_encipherment=False,
+                key_agreement=False,
+                key_cert_sign=True,
+                crl_sign=True,
+                encipher_only=False,
+                decipher_only=False,
+            ),
+            critical=True,
+        )
+        .sign(private_key=priv, algorithm=hashes.SHA384())
+    )
+    return cert.public_bytes(Encoding.PEM)
+
+
+_NOW = datetime.datetime.now(datetime.UTC)
+_DATED = {
+    "expired": (_NOW - datetime.timedelta(days=800), 365, "CA root expired"),
+    "not yet valid": (_NOW + datetime.timedelta(days=30), 365, "CA root not yet valid"),
+}
+
+
+@pytest.mark.parametrize("dates", list(_DATED))
+def test_init_says_a_ca_root_outside_its_dates_is_a_date_problem(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], dates: str
+) -> None:
+    not_before, days, reason = _DATED[dates]
+    ca = tmp_path / "dated.pem"
+    ca.write_bytes(_ca_pem_with_dates(not_before, days))
+    inst = tmp_path / "inst"
+    flags = _set(_phase_a_flags(tmp_path, inst), "--ca-root", str(ca))
+
+    with _enrolls() as gen, pytest.raises(SystemExit) as err:
+        dsm_init.main(flags)
+
+    assert err.value.code == 2
+    line = capsys.readouterr().err.splitlines()[-1]
+    assert line.startswith(f"dsm init: --ca-root {ca} is outside its dates: {reason} (")
+    assert line.endswith(") (check this host's clock)")
+    gen.assert_not_called()
+
+
+def test_resume_says_a_ca_copy_outside_its_dates_is_a_date_problem(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    inst, signed = _enrolled_install_dir(tmp_path)
+    copy = inst / "dsm_ca_root.pem"
+    not_before, days, reason = _DATED["expired"]
+    copy.write_bytes(_ca_pem_with_dates(not_before, days))
+    capsys.readouterr()
+
+    with (
+        mock.patch.object(dsm_init, "loaded_stores_cli", _unlocked),
+        pytest.raises(SystemExit) as err,
+    ):
+        dsm_init.main(_resume_with(inst, signed, tmp_path))
+
+    assert err.value.code == 2
+    (line,) = capsys.readouterr().err.splitlines()
+    assert line.startswith(
+        f"dsm init: the CA root {copy} is outside its dates: {reason}"
+    )
+    assert line.endswith(") (check this host's clock)")
+
+
+class _RealLoadStart(_Start):
+    """The client start harness, with the real cert-file loader."""
+
+    def _load(self, config: object, **kwargs: Any) -> Any:
+        self.events.append("materials")
+        return load_cert_materials(config, **kwargs)  # type: ignore[arg-type]
+
+
+@_ROOT_SKIP
+@pytest.mark.parametrize(
+    ("stop_keeps_block", "events"),
+    [
+        (False, ["block 10.0.0.1", "materials", "unblock 10.0.0.1"]),
+        (True, ["block 10.0.0.1", "materials"]),
+    ],
+)
+async def test_a_client_with_a_cert_it_cannot_read_follows_the_start_rules(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    stop_keeps_block: bool,
+    events: list[str],
+) -> None:
+    # By hand a setup error takes the block down (owner ruling Q1); under
+    # dsm-client.service (--stop-keeps-block) it stays.
+    caplog.set_level(logging.ERROR, logger="dsm")
+    home, paths = _cert_files(tmp_path, "cert_file")
+    start = _RealLoadStart(tmp_path / "server-endpoint.json")
+
+    with _closed(home):
+        rc = await start.run(stop_keeps_block=stop_keeps_block, **paths)
+
+    assert rc == 1
+    assert start.events == events
+    assert (
+        "cert auth materials missing or invalid: cannot read "
+        f"{paths['cert_file']}: Permission denied {_UNIT_HINT}"
+    ) in [r.getMessage() for r in caplog.records]
+
+
+def test_resume_with_a_config_that_does_not_load_is_one_line(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    inst, signed = _enrolled_install_dir(tmp_path)
+    config = inst / "config.toml"
+    config.write_text(_without_key(config.read_text(), "mode"))
+    capsys.readouterr()
+    argv = _resume_with(inst, signed, tmp_path)
+
+    with pytest.raises(SystemExit) as err:
+        dsm_init.main(argv)
+
+    assert err.value.code == 2
+    assert capsys.readouterr().err == "dsm init: config: missing setting 'mode'\n"
+
+
+@_ROOT_SKIP
+def test_resume_with_a_ca_copy_it_cannot_read_is_one_line(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    inst, signed = _enrolled_install_dir(tmp_path)
+    copy = inst / "dsm_ca_root.pem"
+    capsys.readouterr()
+    argv = _resume_with(inst, signed, tmp_path)
+
+    copy.chmod(0o000)
+    try:
+        with (
+            mock.patch.object(dsm_init, "loaded_stores_cli", _unlocked),
+            pytest.raises(SystemExit) as err,
+        ):
+            dsm_init.main(argv)
+    finally:
+        copy.chmod(0o600)
+
+    assert err.value.code == 2
+    assert capsys.readouterr().err == (
+        f"dsm init: cannot read {copy}: Permission denied\n"
+    )
+
+
+@pytest.mark.parametrize("signed_cert", ["missing", "unreadable"])
+def test_enroll_import_of_a_cert_it_cannot_read_is_one_line(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], signed_cert: str
+) -> None:
+    if signed_cert == "unreadable" and os.geteuid() == 0:
+        pytest.skip("root can read any file")
+    ca = make_test_ca()
+    ca_file = tmp_path / "ca.pem"
+    ca_file.write_bytes(ca.pem)
+    text = _GOOD_CLIENT.replace('"/tmp/ca"', f'"{ca_file}"')
+    config = _write_config(tmp_path, text)
+    signed = tmp_path / "signed.pem"
+    if signed_cert == "unreadable":
+        signed.write_bytes(_leaf_pem(ca))
+        signed.chmod(0o000)
+    expected = (
+        f"enroll: cert input not found: {signed}\n"
+        if signed_cert == "missing"
+        else f"enroll: cannot read {signed}: Permission denied\n"
+    )
+
+    with (
+        mock.patch("dsm.crypto._stores.loaded_stores_cli", _unlocked),
+        pytest.raises(SystemExit) as err,
+    ):
+        entry._run_enroll(
+            config,
+            csr_out=None,
+            import_cert=signed,
+            cn=None,
+            role=None,
+            passphrase_fd=None,
+            passphrase_env_file=None,
+        )
+
+    assert err.value.code == 2
+    assert capsys.readouterr().err == expected
+
+
+@pytest.mark.parametrize(
+    ("missing", "text"),
+    [
+        (
+            "cert_file",
+            "cert_file missing at {path}; enroll this host with `sudo dsm init` "
+            "or `sudo dsm enroll --csr-out <csr file>` (deploy/GUIDE.md §3)",
+        ),
+        (
+            "ca_root_file",
+            "ca_root_file missing at {path}; copy the pinned CA root cert into "
+            "place per deploy/GUIDE.md §2f",
+        ),
+    ],
+)
+def test_a_missing_cert_file_names_the_real_step(
+    tmp_path: Path, missing: str, text: str
+) -> None:
+    paths = {}
+    for name in ("cert_file", "ca_root_file"):
+        path = tmp_path / name
+        if name != missing:
+            path.write_bytes(b"x")
+            path.chmod(0o600)
+        paths[name] = str(path)
+
+    with pytest.raises(AuthMaterialsError) as err:
+        load_cert_materials(_client_config(**paths))
+
+    assert str(err.value) == text.format(path=paths[missing])
