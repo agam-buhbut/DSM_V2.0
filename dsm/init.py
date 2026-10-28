@@ -565,7 +565,8 @@ def _phase_b(role: Literal["client", "server"], args: argparse.Namespace) -> int
         if role == "server" and cfg.allowed_cns_file:
             allow = Path(cfg.allowed_cns_file)
             allow.touch(mode=0o600, exist_ok=True)
-            print(f"Created the allowlist {allow}; add the client CNs there.")
+            # The list below says to add the client CNs.
+            print(f"Created the allowlist {allow}.")
         else:
             print(
                 "Give this CN to the server operator for its allowlist: "
@@ -668,10 +669,10 @@ def _write_unit_passphrase(passphrase: bytearray) -> None:
                 or st.st_uid != os.geteuid()
                 or st.st_nlink != 1
             ):
+                # The list below says to put the passphrase there.
                 print(
                     f"dsm init: {path} is not a plain file of yours, or has more "
-                    "than one name; not written: put the passphrase there by "
-                    "hand (deploy/GUIDE.md §3e)",
+                    "than one name; not written",
                     file=sys.stderr,
                 )
                 return
@@ -692,11 +693,8 @@ def _write_unit_passphrase(passphrase: bytearray) -> None:
             os.close(fd)
     except OSError as e:
         why = "it is a symlink" if e.errno == errno.ELOOP else str(e)
-        print(
-            f"dsm init: could not write {path}: {why}; put the passphrase there "
-            "by hand (deploy/GUIDE.md §3e)",
-            file=sys.stderr,
-        )
+        # The cause only: the list below says to put the passphrase there.
+        print(f"dsm init: could not write {path}: {why}", file=sys.stderr)
         return
     print(f"Wrote the key passphrase to {path} (mode 0600) for the systemd unit.")
 
@@ -736,9 +734,13 @@ def _print_next_steps(role: str, cfg: Config, config_path: Path, unit: bool) -> 
         steps.append(f"Put the key passphrase in {_CRED_FILE} (deploy/GUIDE.md §3e).")
     name = _unit_name(role)
     if unit and not (_SYSTEMD_DIR / f"{name}.service").is_file():
+        # Where to get it too: a wheel has no deploy/ folder.
+        fetch = "--systemd --client" if role == "client" else "--systemd"
         steps.append(
-            f"Copy deploy/{name}.service to /etc/systemd/system/, then: sudo "
-            f"systemctl daemon-reload && sudo systemctl enable {name}"
+            f"Copy {name}.service to /etc/systemd/system/: it is "
+            f"deploy/{name}.service in the DSM source or release (install.sh "
+            f"{fetch} puts it there). Then: sudo systemctl daemon-reload && "
+            f"sudo systemctl enable {name}"
         )
     if unit:
         start = f"sudo systemctl start {_unit_name(role)}"

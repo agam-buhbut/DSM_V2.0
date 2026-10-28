@@ -2034,7 +2034,12 @@ def test_a_wheel_install_gives_the_unit_copy_step_once(
     text = _unit_resume_output(tmp_path, capsys, monkeypatch, unit_in_deploy=False)
     enable = "sudo systemctl daemon-reload && sudo systemctl enable dsm-client"
     assert text.count(enable) == 1, text
-    assert "Copy deploy/dsm-client.service to /etc/systemd/system/" in text
+    # Where the file is: a wheel has no deploy/ folder (review Minor).
+    assert (
+        "Copy dsm-client.service to /etc/systemd/system/: it is "
+        "deploy/dsm-client.service in the DSM source or release (install.sh "
+        "--systemd --client puts it there). Then: " + enable
+    ) in text
 
 
 def test_a_missing_passphrase_file_is_asked_for_once(
@@ -2311,3 +2316,67 @@ def test_the_wheel_check_names_what_it_found(
 
     assert done.returncode == 1
     assert done.stdout.splitlines()[-1].endswith(f"; found: {found}"), done.stdout
+
+
+# --- review of 7063652..8ffb58b: each step once, with where to get the unit ------
+
+
+def test_the_server_resume_names_the_allowlist_once_as_a_step(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    out = _resume_out("server", tmp_path, capsys, unit=False)
+    allow = tmp_path / "inst" / "allowed_cns.txt"
+    assert f"Created the allowlist {allow}.\n" in out
+    assert "add the client CNs there" not in out
+    assert out.count(f"Add each client's CN to {allow}") == 1
+
+
+@pytest.mark.parametrize("key", ["missing", "damaged"])
+def test_resume_with_a_bad_attest_key_names_it_once_and_the_way_back(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], key: str
+) -> None:
+    inst, signed = _enrolled_install_dir(tmp_path)  # the keys are faked: none
+    attest = inst / "attest.key"
+    if key == "damaged":
+        attest.write_bytes(b"short")
+        attest.chmod(0o600)
+    capsys.readouterr()
+
+    # The identity key opens; the attest key is the one that does not.
+    with (
+        mock.patch.object(dsm_init, "KeyStore", mock.MagicMock()),
+        pytest.raises(SystemExit) as err,
+    ):
+        dsm_init.main(_resume_with(inst, signed, tmp_path))
+
+    assert err.value.code == 2
+    expected = (
+        f"{attest} is missing; {_INIT_AGAIN}"
+        if key == "missing"
+        else f"{attest} is damaged: blob too short; {_INIT_AGAIN}"
+    )
+    assert capsys.readouterr().err == expected + "\n"
+
+
+def test_a_failed_passphrase_write_ends_at_the_cause_and_asks_once(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import errno
+
+    real = os.write
+
+    def write(fd: int, data: Any) -> int:
+        if bytes(data).startswith(b"hunter2"):
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return real(fd, data)
+
+    cred = tmp_path / "etc-dsm" / "passphrase"
+    monkeypatch.setattr(os, "write", write)
+    text = _unit_resume_output(tmp_path, capsys, monkeypatch, unit_in_deploy=True)
+
+    assert (
+        f"dsm init: could not write {cred}: [Errno 28] No space left on device\n"
+        in (text)
+    )
+    assert "by hand" not in text
+    assert text.count("Put the key passphrase in") == 1

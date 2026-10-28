@@ -349,7 +349,7 @@ def test_a_failed_write_leaves_no_passphrase_file(
     _resume(cfg_dir, unit=True)
     captured = capsys.readouterr()
     assert not cred.exists()
-    assert "put the passphrase there by hand" in captured.err
+    assert "put the passphrase there by hand" not in captured.err
     assert "Ready." not in captured.out
     assert f"Put the key passphrase in {cred}" in captured.out
 
@@ -535,7 +535,7 @@ def test_a_missing_unit_is_never_ready(
     dsm_init._print_next_steps("server", cfg, cfg_dir / "config.toml", True)
     out = capsys.readouterr().out
     assert "Ready." not in out
-    assert "Copy deploy/dsm.service to /etc/systemd/system/" in out
+    assert "Copy dsm.service to /etc/systemd/system/: it is deploy/dsm.service" in out
     assert "sudo systemctl daemon-reload && sudo systemctl enable dsm" in out
 
 
