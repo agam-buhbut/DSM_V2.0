@@ -148,12 +148,15 @@ def _render_config(
         ca_sha = hashlib.sha256(ca_root.read_bytes()).hexdigest()
     print(f"ca_root_sha256 = {ca_sha}", file=sys.stderr)
     crl_file = install_dir / "dsm_ca.crl"
-    print(
-        f"dsm init: crl_strict is on (fail-closed); the daemon will NOT start "
-        f"until a current CRL is at {crl_file}: copy the CA's CRL there "
-        "(deploy/GUIDE.md §2c, §2f).",
-        file=sys.stderr,
-    )
+    # Only when it is not there yet: README item 2 and GUIDE §2f put it
+    # there before init (QA2 Nit 1).
+    if not (crl_file.is_file() and os.access(crl_file, os.R_OK)):
+        print(
+            f"dsm init: crl_strict is on (fail-closed); the daemon will NOT start "
+            f"until a current CRL is at {crl_file}: copy the CA's CRL there "
+            "(deploy/GUIDE.md §2c, §2f).",
+            file=sys.stderr,
+        )
     # A server does not use server_ip (QA Minor 16), but the config check
     # wants an address there.
     server_ip_line = f"server_ip = {json.dumps(args.server_ip or '0.0.0.0')}"
@@ -687,6 +690,13 @@ def _print_next_steps(role: str, cfg: Config, config_path: Path, unit: bool) -> 
         start = f"sudo systemctl start {_unit_name(role)}"
     else:
         start = f"sudo dsm --config {config_path}"
+        if role == "client":
+            # The client's start-up block goes up before it asks for the
+            # passphrase, so over SSH nobody can type it (QA2 Minor 3).
+            start += (
+                " (at the console, not over SSH: DSM blocks all traffic "
+                "before it asks for the passphrase)"
+            )
     if not steps:
         print(f"Ready. Start it: {start}  (check: deploy/GUIDE.md §6)")
         return
@@ -746,10 +756,10 @@ def _install_unit(role: str = "server") -> None:
         sys.exit(1)
     subprocess.run(["systemctl", "daemon-reload"], check=True)
     if client:
+        # No start line here: the "Still to do" list ends with it (QA2 Nit 2).
         print(
             f"Installed {name}.service. Enable it with: sudo systemctl enable {name}\n"
-            f"{_CLIENT_START_NOTE}\n"
-            f"Then start it with: sudo systemctl start {name}" + fill
+            f"{_CLIENT_START_NOTE}" + fill
         )
     else:
         print(
@@ -816,8 +826,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "--install-unit",
         action="store_true",
         help=(
-            "also install the systemd unit and put the key passphrase in "
-            "/etc/dsm/passphrase"
+            "write /etc/dsm/passphrase and install the systemd unit (from an "
+            "installed wheel it only says how to copy it)"
         ),
     )
     p.add_argument(

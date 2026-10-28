@@ -156,7 +156,7 @@ def test_dsm_init_client_installs_the_client_unit(
     assert f"Put the key passphrase in {tmp_path / 'etc-dsm' / 'passphrase'}" in out
     assert "sudo systemctl enable dsm-client" in out
     assert "enable --now" not in out
-    assert "sudo systemctl start dsm-client" in out
+    assert "sudo systemctl start dsm-client" not in out
     assert "the server has this client's CN" in out
 
 

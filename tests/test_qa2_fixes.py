@@ -631,3 +631,120 @@ def test_a_cert_made_for_another_device_says_so_plainly(tmp_path: Path) -> None:
         "match this host's identity key"
     )
     assert not (tmp_path / "device.crt").exists()
+
+
+# --- commit 3: init's next steps ----------------------------------------------
+
+_CONSOLE = (
+    "(at the console, not over SSH: DSM blocks all traffic before it asks for "
+    "the passphrase)"
+)
+
+
+def _client_flags(tmp_path: Path, inst: Path) -> list[str]:
+    flags = _phase_a_flags(tmp_path, inst)
+    flags[0] = "client"
+    for name in ("--dns-provider", "--dns-pin"):
+        i = flags.index(name)
+        flags = flags[:i] + flags[i + 2 :]
+    return [*flags, "--expected-server-cn", "dsm-x-server"]
+
+
+def _resume_argv(role: str, inst: Path, tmp_path: Path) -> list[str]:
+    signed = tmp_path / "signed.pem"
+    signed.write_bytes(b"-----BEGIN CERTIFICATE-----\n")
+    return [
+        role,
+        "--resume",
+        "--install-dir",
+        str(inst),
+        "--signed-cert",
+        str(signed),
+        "--passphrase-env-file",
+        str(tmp_path / "pass"),
+    ]
+
+
+def _resume_out(
+    role: str, tmp_path: Path, capsys: pytest.CaptureFixture[str], *, unit: bool
+) -> str:
+    inst = tmp_path / "inst"
+    first = (
+        _client_flags(tmp_path, inst)
+        if role == "client"
+        else _phase_a_flags(tmp_path, inst)
+    )
+    with _enrolls():
+        assert dsm_init.main(first + (["--install-unit"] if unit else [])) == 0
+    capsys.readouterr()
+    with (
+        mock.patch.object(dsm_init, "loaded_stores_cli", _unlocked),
+        mock.patch.object(dsm_init, "import_signed_cert"),
+    ):
+        assert dsm_init.main(_resume_argv(role, inst, tmp_path)) == 0
+    return capsys.readouterr().out
+
+
+def test_a_client_started_by_hand_is_told_to_use_the_console(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    out = _resume_out("client", tmp_path, capsys, unit=False)
+    config = tmp_path / "inst" / "config.toml"
+    assert f"Then start it: sudo dsm --config {config} {_CONSOLE}" in out
+
+
+def test_a_server_started_by_hand_gets_no_console_note(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    out = _resume_out("server", tmp_path, capsys, unit=False)
+    assert f"sudo dsm --config {tmp_path / 'inst' / 'config.toml'}" in out
+    assert "at the console" not in out
+
+
+def test_a_client_unit_resume_gives_the_start_line_once(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    deploy = tmp_path / "deploy"
+    deploy.mkdir()
+    (deploy / "dsm-client.service").write_text("client unit\n")
+    (tmp_path / "units").mkdir()
+    monkeypatch.setattr(dsm_init, "_DEPLOY_DIR", deploy)
+    monkeypatch.setattr(dsm_init, "_SYSTEMD_DIR", tmp_path / "units")
+    monkeypatch.setattr(dsm_init, "_CRED_FILE", tmp_path / "etc-dsm" / "passphrase")
+    monkeypatch.setattr(dsm_init, "_is_root", lambda: True)
+    monkeypatch.setattr(dsm_init.subprocess, "run", mock.MagicMock())
+
+    out = _resume_out("client", tmp_path, capsys, unit=True)
+
+    assert out.count("sudo systemctl start dsm-client") == 1
+    assert "Then start it: sudo systemctl start dsm-client" in out
+    assert "Installed dsm-client.service" in out
+
+
+@pytest.mark.parametrize("crl", ["there", "missing", "unreadable"])
+def test_the_crl_line_comes_only_without_a_readable_crl(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], crl: str
+) -> None:
+    if crl == "unreadable" and os.geteuid() == 0:
+        pytest.skip("root can read any file")
+    inst = tmp_path / "inst"
+    inst.mkdir(mode=0o700)
+    if crl != "missing":
+        (inst / "dsm_ca.crl").write_bytes(_crl_pem(make_test_ca()))
+        (inst / "dsm_ca.crl").chmod(0o000 if crl == "unreadable" else 0o600)
+
+    with _enrolls():
+        assert dsm_init.main(_phase_a_flags(tmp_path, inst)) == 0
+
+    said = "the daemon will NOT start until a current CRL" in capsys.readouterr().err
+    assert said is (crl != "there")
+
+
+def test_the_install_unit_help_says_what_it_does() -> None:
+    (action,) = [
+        a for a in dsm_init._build_parser()._actions if a.dest == "install_unit"
+    ]
+    assert action.help == (
+        "write /etc/dsm/passphrase and install the systemd unit (from an "
+        "installed wheel it only says how to copy it)"
+    )
