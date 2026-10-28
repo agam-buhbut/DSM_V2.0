@@ -632,18 +632,17 @@ def _validate_mtu(c: Config) -> None:
     if not (MIN_TUN_MTU <= c.mtu <= MAX_TUN_MTU):
         raise ValueError(f"mtu must be {MIN_TUN_MTU}-{MAX_TUN_MTU}, got {c.mtu}")
 
-    # Wire-overhead sanity warning. DSM adds ~68 bytes of outer
-    # IP+UDP+header+GCM tag+inner header. With Ethernet's 1500-byte MTU,
-    # values above ~1400 risk silent kernel fragmentation or PMTU drops
-    # on PPPoE / VPN-in-VPN paths where the link MTU is below 1500.
-    if c.mtu > 1400:
+    # DSM splits a TUN packet bigger than DEFAULT_TUN_MTU in two, so each
+    # wire datagram stays at 1428 B or less whatever the mtu; above it only
+    # the speed drops, by half. The warning used to start at 1400, the old
+    # default, and its "wire packets ~mtu+68 B" no longer held (QA2 Nit 5).
+    if c.mtu > DEFAULT_TUN_MTU:
         log.warning(
-            "configured tun mtu=%d is above 1400; "
-            "wire packets will be ~%d B which may exceed link MTU on "
-            "PPPoE/tunnel-in-tunnel paths. Use 1360, the default: above it "
+            "configured tun mtu=%d is above %d. Use %d, the default: above it "
             "every full-size packet is split in two.",
             c.mtu,
-            c.mtu + 68,
+            DEFAULT_TUN_MTU,
+            DEFAULT_TUN_MTU,
         )
 
 

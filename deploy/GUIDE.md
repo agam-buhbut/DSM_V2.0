@@ -1099,7 +1099,7 @@ again; ...` and keeps trying (§7i).
 Expected server log lines:
 
 ```
-... CN allowlist loaded (1 entries)
+... CN allowlist loaded (1 entry)
 ... server listening on UDP port 51820 (wire v2)
 ... tunnel 10.8.0.1/24 up; an address for 1 client
 ... DNS blocklist loaded: 72,525 names to block, 0 allowed (files read: 1, lines skipped: 13)

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import contextlib
 import datetime
+import logging
 import os
 from collections.abc import Generator
 from pathlib import Path
@@ -35,7 +36,9 @@ from tests.cert_helpers import (
     make_test_ca,
     public_spki_der_from_priv,
 )
+from tests.test_client_fail_closed import _config as _client_config
 from tests.test_init import _fake_enrollment, _server_flags
+from tests.test_server_dns_fatal import _base_patches, _run_until, _server_config
 
 
 @contextlib.contextmanager
@@ -748,3 +751,50 @@ def test_the_install_unit_help_says_what_it_does() -> None:
         "write /etc/dsm/passphrase and install the systemd unit (from an "
         "installed wheel it only says how to copy it)"
     )
+
+
+# --- commit 4: server messages --------------------------------------------------
+
+
+class _Allowlist:
+    def __init__(self, names: list[str]) -> None:
+        self.order = tuple(names)
+
+    def __len__(self) -> int:
+        return len(self.order)
+
+
+@pytest.mark.parametrize(
+    ("names", "line"),
+    [
+        (["dsm-a-client"], "CN allowlist loaded (1 entry)"),
+        (["dsm-a-client", "dsm-b-client"], "CN allowlist loaded (2 entries)"),
+    ],
+)
+async def test_the_allowlist_line_counts_entry_or_entries(
+    caplog: pytest.LogCaptureFixture, names: list[str], line: str
+) -> None:
+    caplog.set_level(logging.INFO, logger="dsm.server")
+    captured: dict[str, Any] = {}
+    with (
+        _base_patches(captured),
+        mock.patch("dsm.server.CNAllowlist.from_file", return_value=_Allowlist(names)),
+    ):
+        assert await _run_until(_server_config(), captured) == 0
+    assert line in [r.getMessage() for r in caplog.records]
+
+
+@pytest.mark.parametrize(
+    ("mtu", "warned"), [(1360, False), (1361, True), (1400, True), (1500, True)]
+)
+def test_the_mtu_warning_starts_above_1360(
+    caplog: pytest.LogCaptureFixture, mtu: int, warned: bool
+) -> None:
+    caplog.set_level(logging.WARNING, logger="dsm")
+    _client_config(mtu=mtu)
+    lines = [r.getMessage() for r in caplog.records if f"mtu={mtu}" in r.getMessage()]
+    expected = (
+        f"configured tun mtu={mtu} is above 1360. Use 1360, the default: above "
+        "it every full-size packet is split in two."
+    )
+    assert lines == ([expected] if warned else [])

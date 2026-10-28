@@ -605,7 +605,8 @@ async def run_server(
             config.allowed_cns_file,
         )
         return 1
-    log.info("CN allowlist loaded (%d entries)", len(cn_allowlist))
+    count = len(cn_allowlist)
+    log.info("CN allowlist loaded (%d %s)", count, "entry" if count == 1 else "entries")
 
     # Read the passphrase once and unlock both stores.
     from dsm.crypto._stores import load_daemon_stores
