@@ -5,9 +5,10 @@ import ipaddress
 import logging
 import os
 import re
+import stat
 import tomllib
 from collections.abc import Sequence
-from dataclasses import dataclass, field, fields
+from dataclasses import MISSING, dataclass, field, fields
 from pathlib import Path
 from typing import Literal, cast
 from urllib.parse import urlparse
@@ -764,6 +765,33 @@ def _reject_unknown_keys(raw: dict[str, object]) -> None:
     raise ConfigError(f"unknown {word} {', '.join(named)}; see config.example.toml")
 
 
+def _reject_missing_keys(raw: dict[str, object]) -> None:
+    """One line for a required setting that is not there (QA2 Minor 2).
+    Config(**raw) would fail with Python's "missing ... positional argument"
+    text instead. The required ones are the Config fields with no default."""
+    missing = [
+        f.name
+        for f in fields(Config)
+        if f.default is MISSING and f.default_factory is MISSING and f.name not in raw
+    ]
+    if not missing:
+        return
+    word = "setting" if len(missing) == 1 else "settings"
+    text = f"missing {word} {', '.join(repr(key) for key in missing)}"
+    if "server_ip" in missing and raw.get("mode") == "server":
+        it = "it" if len(missing) == 1 else "server_ip"
+        text += f"; a server does not use {it}: any IPv4 address, for example 0.0.0.0"
+    raise ConfigError(text)
+
+
+def _owned_by_root(p: Path) -> bool:
+    try:
+        st = p.lstat()
+    except OSError:
+        return False  # cannot tell: the permission check's own text stays
+    return stat.S_ISREG(st.st_mode) and st.st_uid == 0
+
+
 def load(path: Path | None = None) -> Config:
     """Load and validate config from TOML file.
 
@@ -781,6 +809,10 @@ def load(path: Path | None = None) -> Config:
     try:
         check_user_file_permissions(p)
     except InsecureFilePermissionsError as e:
+        if os.geteuid() != 0 and _owned_by_root(p):
+            # Still refused. The fix is sudo, not a chown to this user
+            # (QA2 Minor 4).
+            raise ConfigError(f"{p} belongs to root: run it with sudo") from e
         # The check's own text already says how to fix it (one chmod).
         raise ConfigError(
             f"refusing to load config with insecure permissions: {e}"
@@ -793,5 +825,6 @@ def load(path: Path | None = None) -> Config:
         raw = tomllib.load(f)
     _reject_removed_keys(raw)
     _reject_unknown_keys(raw)
+    _reject_missing_keys(raw)
     raw.setdefault("config_dir", config_dir)
     return Config(**raw)

@@ -231,6 +231,8 @@ def test_resume_checks_the_cert_against_the_role(cfg_dir: Path) -> None:
 def cred(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     path = tmp_path / "etc-dsm" / "passphrase"
     monkeypatch.setattr(dsm_init, "_CRED_FILE", path)
+    # --install-unit wants root (QA2 Minor 1); here it writes only to tmp_path.
+    monkeypatch.setattr(dsm_init, "_is_root", lambda: True)
     # No unit source here: init prints the manual steps instead. No test
     # reads the host's own /etc/systemd/system.
     monkeypatch.setattr(dsm_init, "_DEPLOY_DIR", tmp_path / "no-deploy")

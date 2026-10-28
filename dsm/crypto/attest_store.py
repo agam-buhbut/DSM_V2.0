@@ -101,8 +101,8 @@ class AttestStore:
         """
         if not self.exists():
             raise RuntimeError(
-                f"attest key file missing at {self._path}; run "
-                "`dsm enroll` to provision one"
+                f"attest key file missing at {self._path}; run `sudo dsm "
+                "enroll --csr-out <csr file>` to make one (deploy/GUIDE.md §3b)"
             )
         return self.load(passphrase)
 

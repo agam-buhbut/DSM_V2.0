@@ -108,8 +108,8 @@ class KeyStore:
         """
         if not self.exists():
             raise RuntimeError(
-                f"identity key file missing at {self._path}; run "
-                "`dsm enroll` to provision one"
+                f"identity key file missing at {self._path}; run `sudo dsm "
+                "enroll --csr-out <csr file>` to make one (deploy/GUIDE.md §3b)"
             )
         pub = self.load(passphrase)
         log.info("identity loaded")

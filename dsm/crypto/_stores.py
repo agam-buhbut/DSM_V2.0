@@ -95,9 +95,7 @@ def loaded_stores_cli(
         # CLI boundary: any unlock failure exits 2
         except Exception as e:  # noqa: BLE001
             print(
-                f"failed to unlock identity at {key_file_label}: "
-                f"{type(e).__name__}: {e}",
-                file=sys.stderr,
+                f"failed to unlock identity at {key_file_label}: {e}", file=sys.stderr
             )
             sys.exit(2)
         try:
@@ -105,8 +103,7 @@ def loaded_stores_cli(
         # CLI boundary: any unlock failure exits 2
         except Exception as e:  # noqa: BLE001
             print(
-                f"failed to unlock attest key at {attest_key_file_label}: "
-                f"{type(e).__name__}: {e}",
+                f"failed to unlock attest key at {attest_key_file_label}: {e}",
                 file=sys.stderr,
             )
             keystore.unload()

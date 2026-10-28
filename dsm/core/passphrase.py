@@ -32,6 +32,12 @@ class PassphraseError(ValueError):
     answers differ. ``str()`` is one line for the user."""
 
 
+NO_SOURCE = (
+    "no passphrase source was given and there is no terminal to ask on (use "
+    "--passphrase-env-file, or run it in a terminal)"
+)
+
+
 def wipe_passphrase(buf: bytearray) -> None:
     """Zero a passphrase ``bytearray`` in place via a single libc memset.
 
@@ -47,8 +53,13 @@ def wipe_passphrase(buf: bytearray) -> None:
 
 def _read_from_tty(prompt: str) -> bytearray:
     if not sys.stdin.isatty():
-        line = sys.stdin.buffer.readline().rstrip(b"\r\n")
-        return bytearray(line)
+        line = sys.stdin.buffer.readline()
+        if not line:
+            # Nothing came in at all: stdin is /dev/null, or `ssh host sudo
+            # dsm ...` ran without -t. Say that, not "must not be empty"
+            # (QA2 Nit 7).
+            raise PassphraseError(NO_SOURCE)
+        return bytearray(line.rstrip(b"\r\n"))
 
     fd = sys.stdin.fileno()
     sys.stderr.write(prompt)
@@ -265,7 +276,8 @@ def read_passphrase(
 
     Raises:
         PassphraseError: a named file is missing, unsafe or empty, the two
-            answers differ, or the passphrase is empty.
+            answers differ, the passphrase is empty, or no source was given
+            and stdin is not a terminal and gives nothing.
         ValueError: ``DSM_PASSPHRASE_FILE`` is set but cannot be read.
     """
     p = _read_noninteractive(passphrase_fd, passphrase_env_file)

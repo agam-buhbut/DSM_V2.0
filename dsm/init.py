@@ -60,6 +60,18 @@ def _fail(msg: str) -> NoReturn:
     sys.exit(2)
 
 
+def _is_root() -> bool:
+    return os.geteuid() == 0
+
+
+def _need_root_for_unit() -> None:
+    """--install-unit writes /etc/dsm/passphrase and the unit: refuse a
+    normal user at the start, before anything is written (QA2 Minor 1)."""
+    if not _is_root():
+        print("dsm init: --install-unit must run as root: use sudo", file=sys.stderr)
+        sys.exit(1)
+
+
 def _tun_present() -> bool:
     return Path("/dev/net/tun").exists()
 
@@ -326,6 +338,8 @@ def _force_remove_enrollment(install_dir: Path, state_path: Path) -> None:
 
 
 def _phase_a(role: str, args: argparse.Namespace) -> int:
+    if getattr(args, "install_unit", False):
+        _need_root_for_unit()
     _require_server_args(role, args)
     _check_preconditions(getattr(args, "tcti", None))
     install_dir = Path(args.install_dir).absolute()
@@ -453,13 +467,15 @@ def _phase_b(role: Literal["client", "server"], args: argparse.Namespace) -> int
             f"state file role {state.get('role')!r} does not match the "
             f"requested role {role!r}; resume with `dsm init {state.get('role')}`"
         )
+    # --install-unit counts at either step: the README gives it to the first
+    # one, and a user may add it to --resume.
+    unit = bool(state.get("install_unit")) or bool(getattr(args, "install_unit", False))
+    if unit:
+        _need_root_for_unit()
     if not args.signed_cert:
         _fail("--signed-cert <path> is required to resume (import the CA cert)")
     config_path = Path(state["config_path"])
     cfg = config_load(config_path)
-    # --install-unit counts at either step: the README gives it to the first
-    # one, and a user may add it to --resume.
-    unit = bool(state.get("install_unit")) or bool(getattr(args, "install_unit", False))
 
     keystore = KeyStore(cfg.key_file)
     attest_store = AttestStore(cfg.attest_key_file)
@@ -721,7 +737,13 @@ def _install_unit(role: str = "server") -> None:
             file=sys.stderr,
         )
         return
-    shutil.copyfile(src, _SYSTEMD_DIR / f"{name}.service")
+    dst = _SYSTEMD_DIR / f"{name}.service"
+    try:
+        shutil.copyfile(src, dst)
+    except OSError as e:
+        # The state file stays, so the same --resume can run again.
+        print(f"dsm init: could not install {dst}: {e.strerror or e}", file=sys.stderr)
+        sys.exit(1)
     subprocess.run(["systemctl", "daemon-reload"], check=True)
     if client:
         print(

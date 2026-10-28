@@ -17,6 +17,7 @@ import argparse
 import asyncio
 import importlib.metadata
 import os
+import shlex
 import sys
 import tomllib
 from dataclasses import replace
@@ -24,7 +25,7 @@ from pathlib import Path
 
 from dsm.core import log as dsm_log
 from dsm.core import netaudit
-from dsm.core.config import Config, ConfigError, load
+from dsm.core.config import CONFIG_PATH, Config, ConfigError, load
 
 
 def _load_config_or_exit(config_path: Path | None, mode: str | None = None) -> Config:
@@ -413,10 +414,11 @@ def _run_enroll(
         print(f"Wrote CSR to {csr_out}")
         print(f"  cn = {result.cn}")
         print(f"  noise_static_pub = {result.noise_static_pub.hex()}")
+        where = shlex.quote(str((config_path or CONFIG_PATH).absolute()))
         print(
             "Walk the CSR via USB to the offline CA per "
             "deploy/GUIDE.md §3c, then run "
-            "`dsm enroll --import <signed.crt>`."
+            f"`sudo dsm --config {where} enroll --import <signed.crt>`."
         )
         return
 

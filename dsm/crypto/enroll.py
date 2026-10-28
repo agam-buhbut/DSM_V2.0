@@ -250,16 +250,14 @@ def generate_enrollment(
     them deliberately if re-enrollment is intended (post-compromise
     rotation walks an explicit checklist; we don't auto-clobber).
     """
+    again = (
+        ": this host is already enrolled. To enroll it again, first remove "
+        "identity.key, attest.key and device.crt by hand (deploy/GUIDE.md §7c)"
+    )
     if keystore.exists():
-        raise EnrollError(
-            f"identity key already exists at {keystore.path}; "
-            "re-enrollment must be explicit (remove the file by hand)"
-        )
+        raise EnrollError(f"identity key already exists at {keystore.path}{again}")
     if attest_store.exists():
-        raise EnrollError(
-            f"attest key already exists at {attest_store.path}; "
-            "re-enrollment must be explicit (remove the file by hand)"
-        )
+        raise EnrollError(f"attest key already exists at {attest_store.path}{again}")
 
     noise_static_pub = keystore.generate(passphrase)
     attest_spki_der = attest_store.generate(passphrase)
@@ -348,10 +346,10 @@ def import_signed_cert(
 
     expected_static = bytes(keystore.identity.public_key)
     if leaf.noise_static_pub != expected_static:
+        # The noiseStaticBinding extension holds another device's key.
         raise EnrollError(
-            "noiseStaticBinding extension does not match local identity "
-            f"(cert={leaf.noise_static_pub.hex()[:16]}…, "
-            f"local={expected_static.hex()[:16]}…)"
+            "this certificate was made for another device: its key does not "
+            "match this host's identity key"
         )
 
     expected_spki = bytes(attest_store.attest_key.public_spki_der())
