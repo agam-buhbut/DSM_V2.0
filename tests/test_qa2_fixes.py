@@ -1509,3 +1509,66 @@ def test_a_missing_cert_file_names_the_real_step(
         load_cert_materials(_client_config(**paths))
 
     assert str(err.value) == text.format(path=paths[missing])
+
+
+# --- follow-up 2, commit B: release.yml ------------------------------------------
+
+
+def test_the_tpm_job_installs_patchelf_for_maturins_repair() -> None:
+    # maturin's repair step vendors libtss2 and needs patchelf (GUIDE §0b);
+    # the soft wheel links nothing to vendor.
+    assert "sudo apt-get install -y libtss2-dev libtss2-tcti-device0 patchelf" in (
+        _job("build-tpm-wheel")
+    )
+
+
+def test_sign_and_publish_runs_on_the_oldest_glibc_runner_too() -> None:
+    # Its pip downloads pick each wheel's platform tag from the runner's glibc.
+    assert "    runs-on: ubuntu-22.04" in _job("sign-and-publish")
+
+
+def _check_wheels_script() -> str:
+    publish = _job("sign-and-publish")
+    start = publish.index("      - name: Check the DSM wheels\n")
+    body = publish[publish.index("        run: |\n", start) :].splitlines()[1:]
+    lines: list[str] = []
+    for line in body:
+        if line and not line.startswith(" " * 10):
+            break
+        lines.append(line[10:])
+    return "\n".join(lines) + "\n"
+
+
+@pytest.mark.parametrize(
+    ("wheels", "ok"),
+    [
+        ([_TPM_WHEEL, _SOFT], True),
+        ([_TPM_WHEEL, "dsm-0.1.0-cp311-abi3-manylinux_2_38_x86_64.whl", _SOFT], False),
+        ([_TPM_WHEEL], False),
+        ([_SOFT], False),
+        ([_TPM_WHEEL, _SOFT, "dsm-0.1.0+soft-cp311-abi3-linux_x86_64.whl"], False),
+    ],
+)
+def test_the_release_stops_unless_dist_has_one_dsm_wheel_of_each_kind(
+    tmp_path: Path, wheels: list[str], ok: bool
+) -> None:
+    publish = _job("sign-and-publish")
+    assert publish.index("name: Check the DSM wheels") < publish.index(
+        "sha256sum * > SHA256SUMS"
+    )
+    (tmp_path / "install.sh").write_text('DSM_VERSION="0.1.0"\n')
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    for name in [*wheels, *_DEPS]:
+        (dist / name).write_text("wheel\n")
+
+    done = subprocess.run(
+        ["/bin/bash", "-e", "-c", _check_wheels_script()],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+
+    assert (done.returncode == 0) is ok, done.stdout + done.stderr

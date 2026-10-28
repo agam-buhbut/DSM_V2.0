@@ -45,10 +45,12 @@ jobs:
           components: rustfmt, clippy
       # TPM lane build deps mirror ci.yml's tpm-attest job: the tss2-esys headers
       # (libtss2-dev) for the build/link, plus the device TCTI runtime object.
+      # patchelf: maturin's repair step, which copies libtss2 into the wheel,
+      # needs it (deploy/GUIDE.md §0b). The soft wheel links nothing to copy.
       - name: Install TSS2 build stack
         run: |
           sudo apt-get update
-          sudo apt-get install -y libtss2-dev libtss2-tcti-device0
+          sudo apt-get install -y libtss2-dev libtss2-tcti-device0 patchelf
       - name: Build TPM (production) wheel
         run: |
           python -m pip install --upgrade pip
@@ -113,7 +115,8 @@ jobs:
 
   sign-and-publish:
     needs: [ build-tpm-wheel, build-soft-wheel, build-sdist ]
-    runs-on: ubuntu-latest
+    # The oldest glibc here (2.35): pip picks the dependency wheels' tags from it.
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
       - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b  # v5.3.0
@@ -173,6 +176,19 @@ jobs:
             --only-binary=:all: \
             --python-version 313 \
             --dest dist
+      # Exactly one DSM wheel of each kind, under the names install.sh picks:
+      # a second one, or none, stops the release before anything is signed.
+      - name: Check the DSM wheels
+        run: |
+          v="$(sed -n 's/^DSM_VERSION="\(.*\)"$/\1/p' install.sh)"
+          [ -n "$v" ] || { echo "no DSM_VERSION in install.sh"; exit 1; }
+          for prefix in "dsm-${v}-cp311-abi3-" "dsm-${v}+soft-cp311-abi3-"; do
+            set -- dist/"${prefix}"*_x86_64.whl
+            if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
+              echo "dist/ must hold exactly one ${prefix}*_x86_64.whl; found: $*"
+              exit 1
+            fi
+          done
       - name: Generate SHA256SUMS over all artifacts
         run: |
           cd dist
