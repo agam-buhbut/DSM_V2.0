@@ -2043,3 +2043,99 @@ def test_a_missing_passphrase_file_is_asked_for_once(
         tmp_path, capsys, monkeypatch, unit_in_deploy=True, write_passphrase=False
     )
     assert text.count("Put the key passphrase in") == 1, text
+
+
+# --- final check: key-file errors at --resume, nothing to resume (Nits 5, 6) -----
+
+_INIT_AGAIN = (
+    "start again with new keys and a new CSR: sudo dsm init server --force "
+    "(with the first step's options)"
+)
+
+
+@pytest.mark.parametrize("key", ["missing", "damaged"])
+def test_resume_with_a_bad_identity_key_names_it_once_and_the_way_back(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], key: str
+) -> None:
+    inst, signed = _enrolled_install_dir(tmp_path)  # the keys are faked: none
+    identity = inst / "identity.key"
+    if key == "damaged":
+        identity.write_bytes(b"short")
+        identity.chmod(0o600)
+    capsys.readouterr()
+
+    with pytest.raises(SystemExit) as err:
+        dsm_init.main(_resume_with(inst, signed, tmp_path))
+
+    assert err.value.code == 2
+    expected = (
+        f"{identity} is missing; {_INIT_AGAIN}"
+        if key == "missing"
+        else f"{identity} is damaged: blob too short; {_INIT_AGAIN}"
+    )
+    assert capsys.readouterr().err == expected + "\n"
+
+
+def test_a_wrong_passphrase_keeps_its_line(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    keystore = mock.MagicMock()
+    keystore.load_with_passphrase.side_effect = RuntimeError(
+        "decryption failed: wrong passphrase or corrupted data"
+    )
+    label = tmp_path / "identity.key"
+    label.write_bytes(b"x" * 64)
+    with pytest.raises(SystemExit):
+        with loaded_stores_cli(
+            keystore,
+            mock.MagicMock(),
+            passphrase_env_file=str(_passphrase_file(tmp_path)),
+            key_file_label=str(label),
+            attest_key_file_label="attest.key",
+        ):
+            pass
+    assert capsys.readouterr().err == (
+        f"failed to unlock identity at {label}: decryption failed: wrong "
+        "passphrase or corrupted data\n"
+    )
+
+
+def test_show_pubkey_names_a_damaged_key(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    key = tmp_path / "k"
+    key.write_bytes(b"short")
+    key.chmod(0o600)
+    config = _write_config(tmp_path, _GOOD_CLIENT.replace('"/tmp/k"', f'"{key}"'))
+
+    with pytest.raises(SystemExit) as err:
+        entry._run_show_pubkey(
+            config,
+            passphrase_fd=None,
+            passphrase_env_file=str(_passphrase_file(tmp_path)),
+        )
+
+    assert err.value.code == 2
+    assert capsys.readouterr().err == (
+        f"show-pubkey: {key} is damaged: blob too short; enroll this host again: "
+        "remove identity.key, attest.key and device.crt, then `sudo dsm enroll "
+        "--csr-out <csr file>` (deploy/GUIDE.md §7c)\n"
+    )
+
+
+def test_resume_on_an_enrolled_host_says_there_is_nothing_to_resume(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    inst = tmp_path / "inst"
+    inst.mkdir(mode=0o700)
+    for name in ("identity.key", "device.crt"):
+        (inst / name).write_bytes(b"x")
+
+    with pytest.raises(SystemExit) as err:
+        dsm_init.main(_resume_with(inst, tmp_path / "signed.pem", tmp_path))
+
+    assert err.value.code == 2
+    assert capsys.readouterr().err == (
+        f"dsm init: this host looks enrolled already ({inst / 'identity.key'} "
+        f"and {inst / 'device.crt'} are there): nothing to resume\n"
+    )

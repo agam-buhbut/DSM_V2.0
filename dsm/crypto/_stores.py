@@ -53,6 +53,37 @@ def _unit_hint(passphrase_env_file: str | None) -> str:
     )
 
 
+ENROLL_AGAIN = (
+    "enroll this host again: remove identity.key, attest.key and device.crt, "
+    "then `sudo dsm enroll --csr-out <csr file>` (deploy/GUIDE.md §7c)"
+)
+# What tuncore says of a key file that is there but holds no key it can
+# read. A wrong passphrase says "decryption failed ..." instead.
+_DAMAGED = (
+    "blob too short",
+    "unsupported sealed-blob version",
+    "decrypted key has wrong length",
+    "DSMT blob",
+)
+
+
+def key_file_error(
+    what: str, path: str, e: Exception, again: str = ENROLL_AGAIN
+) -> str:
+    """One line for a key file that did not unlock, naming it once (QA2).
+    A missing or damaged file gets ``again``, the way back; any other error
+    (a wrong passphrase, a mode the check refuses) keeps its own text."""
+    try:
+        there = Path(path).exists()
+    except OSError:
+        there = True  # cannot tell: the error's own text says more
+    if not there:
+        return f"{path} is missing; {again}"
+    if isinstance(e, RuntimeError) and str(e).startswith(_DAMAGED):
+        return f"{path} is damaged: {e}; {again}"
+    return f"failed to unlock {what} at {path}: {e}"
+
+
 def _store_error(e: Exception) -> str:
     """A key file DSM cannot read says why and what to do (QA2 N5)."""
     if isinstance(e, PermissionError) and e.filename:
@@ -71,6 +102,7 @@ def loaded_stores_cli(
     key_file_label: str,
     attest_key_file_label: str,
     on_unlocked: Callable[[bytearray], None] | None = None,
+    again: str = ENROLL_AGAIN,
 ) -> Generator[None, None, None]:
     """CLI variant: unlock both stores, ``sys.exit(2)`` on failure.
 
@@ -86,6 +118,8 @@ def loaded_stores_cli(
     ``on_unlocked``, when given, is called once with the passphrase after
     both stores opened with it, before it is wiped; it must not keep the
     buffer.
+
+    ``again`` is the way back named for a missing or damaged key file.
     """
     try:
         passphrase = read_passphrase(
@@ -102,16 +136,14 @@ def loaded_stores_cli(
             keystore.load_with_passphrase(passphrase)
         # CLI boundary: any unlock failure exits 2
         except Exception as e:  # noqa: BLE001
-            print(
-                f"failed to unlock identity at {key_file_label}: {e}", file=sys.stderr
-            )
+            print(key_file_error("identity", key_file_label, e, again), file=sys.stderr)
             sys.exit(2)
         try:
             attest_store.load_with_passphrase(passphrase)
         # CLI boundary: any unlock failure exits 2
         except Exception as e:  # noqa: BLE001
             print(
-                f"failed to unlock attest key at {attest_key_file_label}: {e}",
+                key_file_error("attest key", attest_key_file_label, e, again),
                 file=sys.stderr,
             )
             keystore.unload()

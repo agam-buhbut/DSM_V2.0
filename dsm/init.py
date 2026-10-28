@@ -491,6 +491,15 @@ def _phase_b(role: Literal["client", "server"], args: argparse.Namespace) -> int
     state_path = install_dir / _STATE_NAME
     try:
         if not state_path.is_file():
+            identity = install_dir / "identity.key"
+            cert = install_dir / "device.crt"
+            if identity.is_file() and cert.is_file():
+                # The first step would refuse this host, so do not send the
+                # user there (QA2 final check).
+                _fail(
+                    f"this host looks enrolled already ({identity} and {cert} "
+                    "are there): nothing to resume"
+                )
             _fail(
                 f"no init state at {state_path}: run `dsm init {role}` without "
                 "--resume first, with the same --install-dir"
@@ -536,6 +545,10 @@ def _phase_b(role: Literal["client", "server"], args: argparse.Namespace) -> int
             key_file_label=cfg.key_file,
             attest_key_file_label=cfg.attest_key_file,
             on_unlocked=proven.extend if unit else None,
+            again=(
+                "start again with new keys and a new CSR: sudo dsm init "
+                f"{role} --force (with the first step's options)"
+            ),
         ):
             try:
                 import_signed_cert(

@@ -465,6 +465,7 @@ def _run_show_pubkey(
     passphrase_env_file: str | None,
 ) -> None:
     from dsm.core.passphrase import read_passphrase, wipe_passphrase
+    from dsm.crypto._stores import key_file_error
     from dsm.crypto.keystore import KeyStore
 
     config = _load_config_or_exit(config_path)
@@ -489,7 +490,10 @@ def _run_show_pubkey(
             # clean "show-pubkey: <msg>" + exit 2 instead of a raw traceback —
             # the same UX as the missing-file path. Still excludes
             # ValueError/TypeError programming errors.
-            print(f"show-pubkey: {e}", file=sys.stderr)
+            print(
+                f"show-pubkey: {key_file_error('identity', config.key_file, e)}",
+                file=sys.stderr,
+            )
             sys.exit(2)
     finally:
         wipe_passphrase(passphrase)
