@@ -343,7 +343,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Under the systemd units, a cert, CA root, CRL or key path DSM cannot read
   (a home folder, for example: the units drop CAP_DAC_OVERRIDE) is one line
   that says to keep DSM's files in /opt/mtun, owned by root; before, it was
-  a traceback.
+  a traceback. So is a config folder it cannot write in (DSM saves the last
+  CRL number there): still refused, with the hint that the folder must be
+  owned by root.
 - A new passphrase typed at a terminal is asked twice.
 - Plainer messages: an unknown config key names the setting it may mean;
   the allowlist says "not found", where comments go, and warns about a

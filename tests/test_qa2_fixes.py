@@ -2157,3 +2157,97 @@ def test_install_sh_never_runs_pip_without_no_index() -> None:
     for code in pip_lines:
         assert "--no-index" in code, code
     assert "--upgrade pip" not in INSTALL
+
+
+# --- final box check: a config folder DSM cannot write (F1) ---------------------
+
+_WRITE_HINT = (
+    "(the systemd unit runs without CAP_DAC_OVERRIDE: the config folder must "
+    "be owned by root)"
+)
+
+
+def _real_cert_files(tmp_path: Path) -> tuple[Path, dict[str, Any]]:
+    """Cert, CA root (pinned) and a numbered CRL that all load, and a config
+    folder DSM may read but not write."""
+    import hashlib
+
+    ca = make_test_ca()
+    files = tmp_path / "files"
+    files.mkdir()
+    cert = files / "device.crt"
+    cert.write_bytes(_leaf_pem(ca))
+    root = files / "dsm_ca_root.pem"
+    root.write_bytes(ca.pem)
+    for path in (cert, root):
+        path.chmod(0o600)
+    crl = _numbered_crl(files, ca, 4096)
+    folder = tmp_path / "mtun"
+    folder.mkdir()
+    folder.chmod(0o500)  # as root's folder is to the unit: no write
+    return folder, {
+        "cert_file": str(cert),
+        "ca_root_file": str(root),
+        "ca_root_sha256": hashlib.sha256(root.read_bytes()).hexdigest(),
+        "crl_file": str(crl),
+        "config_dir": folder,
+    }
+
+
+@_ROOT_SKIP
+def test_a_config_folder_dsm_cannot_write_is_one_line(tmp_path: Path) -> None:
+    folder, paths = _real_cert_files(tmp_path)
+    try:
+        with pytest.raises(AuthMaterialsError) as err:
+            load_cert_materials(_client_config(**paths))
+    finally:
+        folder.chmod(0o700)
+    assert (
+        str(err.value) == f"cannot write in {folder}: Permission denied {_WRITE_HINT}"
+    )
+    assert not (folder / "crl_number.seen").exists()
+
+
+@_ROOT_SKIP
+async def test_the_server_stops_with_that_line_too(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.ERROR, logger="dsm")
+    folder, paths = _real_cert_files(tmp_path)
+    config = dataclasses.replace(_server_config(), **paths)
+    captured: dict[str, Any] = {}
+    try:
+        with (
+            _base_patches(captured),
+            mock.patch("dsm.server.load_cert_materials", load_cert_materials),
+        ):
+            rc = await asyncio.wait_for(run_server(config), 5.0)
+    finally:
+        folder.chmod(0o700)
+    assert rc == 1
+    assert [r.getMessage() for r in caplog.records] == [
+        "cert auth materials missing or invalid: cannot write in "
+        f"{folder}: Permission denied {_WRITE_HINT}"
+    ]
+    assert "host" not in captured
+
+
+@_ROOT_SKIP
+@pytest.mark.parametrize(
+    ("stop_keeps_block", "events"),
+    [
+        (False, ["block 10.0.0.1", "materials", "unblock 10.0.0.1"]),
+        (True, ["block 10.0.0.1", "materials"]),
+    ],
+)
+async def test_a_client_that_cannot_write_its_config_folder_follows_the_start_rules(
+    tmp_path: Path, stop_keeps_block: bool, events: list[str]
+) -> None:
+    folder, paths = _real_cert_files(tmp_path)
+    start = _RealLoadStart(tmp_path / "server-endpoint.json")
+    try:
+        rc = await start.run(stop_keeps_block=stop_keeps_block, **paths)
+    finally:
+        folder.chmod(0o700)
+    assert rc == 1
+    assert start.events == events

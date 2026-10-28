@@ -28,6 +28,7 @@ from dsm.core.config import Config
 from dsm.core.path_security import (
     InsecureFilePermissionsError,
     cannot_read,
+    cannot_write_in,
     check_user_file_permissions,
 )
 from dsm.crypto.attest_store import AttestStore
@@ -254,6 +255,10 @@ def _load_crl(
         except CRLRollbackError as e:
             netaudit.emit("crl_rollback", path=str(crl_path), action="refused_start")
             raise AuthMaterialsError(f"CRL at {crl_path} rejected: {e}") from e
+        except OSError as e:
+            # The new floor could not be saved: still refused, as the check
+            # needs it, but as one line (QA2 box F1).
+            raise AuthMaterialsError(cannot_write_in(crl_number_store.parent, e)) from e
         _now = datetime.datetime.now(datetime.UTC)
         # DSM-030: a CRL with no nextUpdate is never reported "stale"
         # (is_stale returns False without the field), so it would slip past

@@ -25,6 +25,19 @@ def cannot_read(path: Path | str, e: OSError) -> str:
     return text
 
 
+def cannot_write_in(folder: Path | str, e: OSError) -> str:
+    """One line for a folder DSM cannot write in (QA2 box F1). Under the
+    units root has no CAP_DAC_OVERRIDE, so a config folder owned by another
+    user is closed to it."""
+    text = f"cannot write in {folder}: {e.strerror or e}"
+    if isinstance(e, PermissionError):
+        text += (
+            " (the systemd unit runs without CAP_DAC_OVERRIDE: the config "
+            "folder must be owned by root)"
+        )
+    return text
+
+
 def check_user_file_permissions(path: Path) -> None:
     """Reject a sensitive file that is not uid-owned and 0o0xx mode.
 
