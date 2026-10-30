@@ -160,13 +160,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The top speed does not change. A real packet too big for that size is
   dropped, never sent at its exact size: with `padding_max` below 1400, set
   `mtu` in both configs to the largest size class at or below `padding_max`,
-  minus 40 (DSM warns at start when it does not fit). `padding_min` no
-  longer changes anything over UDP. The start-up path MTU warning now
+  minus 40 (DSM warns at start when it does not fit). `padding_min` now
+  matters over UDP only when no size class lies between it and
+  `padding_max`. The start-up path MTU warning now
   points to `auto_mtu` or to `padding_max` with `mtu`, because a lower `mtu`
   alone no longer makes a datagram smaller. With `pmtu_discover = true`, a
   path that shrinks mid-session now stops every packet, not only the big
   ones, until `auto_mtu` lowers the size, about a second after the first
-  refused packet. Upgrade both ends: each end pads only what it sends, so
+  refused packet. Packets already queued when the size changes are padded
+  again to the new size before they leave, or dropped (with a fake packet
+  in their place) when they do not fit it. Upgrade both ends: each end pads only what it sends, so
   until the server is upgraded the download direction still shows the
   sizes. A server pays this for each client: about 7 GB a day out per
   client that is connected all day and idle.

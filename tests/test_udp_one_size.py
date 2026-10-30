@@ -24,6 +24,7 @@ from dsm.core.fsm import SessionFSM, State
 from dsm.core.protocol import (
     GCM_TAG_SIZE,
     INNER_HEADER_SIZE,
+    INNER_STRUCT,
     OUTER_HEADER_SIZE,
     InnerPacket,
     PacketType,
@@ -38,7 +39,8 @@ from dsm.session import (
     make_send_fn,
     tun_send_loop,
 )
-from dsm.traffic.shaper import TrafficShaper
+from dsm.traffic.scheduler import SendScheduler
+from dsm.traffic.shaper import TrafficShaper, _TooBigForOneSize
 
 # Payload sizes from empty to full size (mtu 1360), across the class edges
 # (88/89 is the 128-class edge).
@@ -79,7 +81,7 @@ def test_the_one_size_is_the_top_of_the_padding_range() -> None:
     assert _real_sizes(shaper, (0, 150, 984)) == {1024}
     assert _chaff_sizes(shaper) == {1024}
     # Too big for the one size: dropped, never sent at its exact size (1040).
-    with pytest.raises(ValueError, match="1024"):
+    with pytest.raises(_TooBigForOneSize, match="1024"):
         shaper.pad_packet(_data(1000))
 
 
@@ -94,7 +96,7 @@ def test_every_udp_packet_takes_the_one_size_or_is_dropped() -> None:
                 need = OUTER_HEADER_SIZE + INNER_HEADER_SIZE + payload + GCM_TAG_SIZE
                 try:
                     padded, target = shaper.pad_packet(_data(payload))
-                except ValueError:
+                except _TooBigForOneSize:
                     assert need > one_size, f"{case}: payload {payload} dropped"
                     continue
                 assert target == one_size, f"{case}: payload {payload}"
@@ -232,6 +234,109 @@ def test_tcp_still_sends_a_payload_too_big_for_the_one_size() -> None:
     shaper = TrafficShaper.from_config(_config("tcp", padding_max=1024))
     sent = asyncio.run(_wire_sizes(shaper, _TCP(), [b"\x45" * n for n in _TUN_SIZES]))
     assert sent == [1400] * 9  # 1500 is two pieces, 3000 is three
+
+
+class _FixedSlots(TrafficShaper):
+    """The real shaper, sizes from the real core, with a poll that hands out
+    ``slots`` slots, so one tick sends everything queued."""
+
+    slots = 0
+
+    def poll(
+        self, now: float, queue_len: int, oldest_wait: float, real_sent: int
+    ) -> tuple[int, float]:
+        return self.slots, now + 1.0
+
+
+def _inner(ptype: PacketType, payload: bytes) -> InnerPacket:
+    return InnerPacket(ptype=ptype, epoch_id=0, payload=payload)
+
+
+def _content(data: bytes) -> tuple[int, bytes]:
+    """(type, payload) from a padded inner plaintext."""
+    ptype, _, length = INNER_STRUCT.unpack_from(data)
+    return ptype, data[INNER_HEADER_SIZE : INNER_HEADER_SIZE + length]
+
+
+def _across_a_ceiling_change(
+    shaper: _FixedSlots, after: int, payloads: tuple[int, ...]
+) -> tuple[list[tuple[bytes, int]], list[tuple[int, bytes]], int]:
+    """Queue data and a link report at the size in use, move the ceiling (as
+    auto_mtu does), queue a control packet, then run one tick with a slot for
+    every packet and two more. Returns what was sent, the (type, payload) of
+    everything queued, and the number of slots."""
+    sent: list[tuple[bytes, int]] = []
+
+    async def send(data: bytes, size: int) -> None:
+        sent.append((data, size))
+
+    async def chaff() -> tuple[bytes, int]:
+        return shaper.make_chaff_padded()
+
+    sched = SendScheduler(send, chaff, shaper=shaper)
+    queued = [_inner(PacketType.DATA, bytes([n % 251]) * n) for n in payloads]
+    for inner in queued:
+        sched.enqueue(*shaper.pad_packet(inner))
+    report = _inner(PacketType.LINK_REPORT, b"r" * 16)
+    sched.set_report(*shaper.pad_packet(report))
+    shaper.set_size_class_ceiling(after)
+    control = _inner(PacketType.PATH_RESPONSE, b"t" * 16)
+    sched.enqueue(*shaper.pad_packet(control), control=True)
+    slots = len(queued) + 4
+    shaper.slots = slots
+    asyncio.run(sched._tick(0.0))
+    every = [(int(i.ptype), i.payload) for i in (*queued, report, control)]
+    return sent, every, slots
+
+
+def test_queued_packets_take_the_new_size_after_a_raise() -> None:
+    # A control packet (padded after the raise) jumping ahead of data padded
+    # before it marked every old-size packet between two new-size ones as
+    # real and queued (review of #55: [1400, 1152 x 6, 1400, 1400, 1400]).
+    shaper = _FixedSlots(128, 1400)
+    shaper.set_size_class_ceiling(1300 - 28)  # the one size is 1152
+    sent, every, slots = _across_a_ceiling_change(
+        shaper, 0xFFFF, (0, 150, 600, 1000, 1112)
+    )
+    assert [size for _, size in sent] == [1400] * slots
+    assert all(len(d) == 1400 - OUTER_HEADER_SIZE - GCM_TAG_SIZE for d, _ in sent)
+    real = [_content(d) for d, _ in sent if _content(d)[0] != PacketType.CHAFF]
+    assert sorted(real) == sorted(every)
+
+
+def test_queued_packets_take_the_new_size_after_a_lower(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A forged ICMP can lower the ceiling at will. Packets queued at the old
+    # size must not leave at it (with DF they would be refused and leave
+    # their slots empty): they take the new size, or chaff takes their slot.
+    caplog.set_level(logging.DEBUG, logger="dsm.traffic.scheduler")
+    shaper = _FixedSlots(128, 1400)
+    sent, every, slots = _across_a_ceiling_change(
+        shaper, 1300 - 28, (150, 600, 1112, 1113, 1360)
+    )
+    assert [size for _, size in sent] == [1152] * slots  # no slot left empty
+    assert all(len(d) == 1152 - OUTER_HEADER_SIZE - GCM_TAG_SIZE for d, _ in sent)
+    real = [_content(d) for d, _ in sent if _content(d)[0] != PacketType.CHAFF]
+    too_big = [(PacketType.DATA, bytes([n % 251]) * n) for n in (1113, 1360)]
+    assert sorted(real) == sorted(x for x in every if x not in too_big)
+    drops = [r for r in caplog.records if "too big for the one size" in r.message]
+    assert drops and all(r.levelno == logging.DEBUG for r in drops)
+
+
+def test_tcp_queued_packets_keep_their_size() -> None:
+    # TCP pads every frame to 1400 at send time, so the scheduler leaves a
+    # packet too big for a narrow padding range as it is.
+    shaper = TrafficShaper.from_config(_config("tcp", padding_max=1024))
+    sent: list[int] = []
+
+    async def send(data: bytes, size: int) -> None:
+        sent.append(size)
+
+    sched = SendScheduler(send, shaper=shaper)
+    sched.enqueue(*shaper.pad_packet(_data(1300)))
+    asyncio.run(sched._send_one(sched._queue[0]))
+    assert sent == [1300 + 40]
 
 
 _PREFIX = "padding_max ="

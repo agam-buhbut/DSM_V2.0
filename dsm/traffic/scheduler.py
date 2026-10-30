@@ -18,6 +18,11 @@ A LINK_REPORT (slow-link auto cap) has a one-packet slot of its own
 (``set_report``): a newer report replaces a waiting one. It is not real
 traffic, so the shaper never sees it: it takes a slot that would carry
 chaff, or a slot ahead of data once it has waited REPORT_OVERDUE_S.
+
+Over UDP every packet leaves at the one size in use when it leaves, not the
+one it was padded for: a queued packet is padded again if auto_mtu moved the
+size ceiling meanwhile, and one too big for the new size is dropped, with
+chaff in its slot.
 """
 
 from __future__ import annotations
@@ -29,12 +34,15 @@ import logging
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, TypeVar
+from typing import TypeVar, cast
 
 from dsm.core.log import RepeatLog
+from dsm.traffic.shaper import TrafficShaper
 
-if TYPE_CHECKING:
-    from dsm.traffic.shaper import TrafficShaper
+# isort: split
+# Its own statement: isort and ruff disagree on an import whose name carries
+# a pyright pragma, and isort would merge this one into the one above.
+from dsm.traffic.shaper import _TooBigForOneSize  # pyright: ignore[reportPrivateUsage]
 
 log = logging.getLogger(__name__)
 
@@ -122,6 +130,7 @@ class SendScheduler:
         # the first, then at most one line per 10 s with a count.
         self._drop_log = RepeatLog(log, logging.WARNING, clock=clock)
         self._control_drop_log = RepeatLog(log, logging.WARNING, clock=clock)
+        self._too_big_log = RepeatLog(log, logging.DEBUG, clock=clock)
         self._failure_logs: dict[tuple[str, type[BaseException]], RepeatLog] = {}
         # Send loop death (see on_failure): set once, never cleared.
         self._failed = False
@@ -255,17 +264,39 @@ class SendScheduler:
         return self._failure_logs[kind]
 
     async def _send_one(self, pkt: _ScheduledPacket) -> None:
-        """Send a single packet, keeping the detached loop alive on error."""
+        """Send a single packet, keeping the detached loop alive on error.
+
+        Over UDP the packet takes the one size in use now: padded again if
+        auto_mtu moved the ceiling since it was queued, else its old size
+        would mark it as queued real data. One too big for the new size is
+        dropped and chaff takes its slot, so the slot does not go out empty.
+        """
         send = pkt.send_via if pkt.send_via is not None else self._send_fn
-        await self._keep_alive(send(pkt.data, pkt.target_size), "send")
+        try:
+            data, size = self._at_one_size(pkt.data, pkt.target_size)
+        except _TooBigForOneSize as e:
+            self._too_big_log.log("dropping a queued packet: %s", e)
+            if self._chaff_allowed():
+                await self._send_chaff()
+            return
+        await self._keep_alive(send(data, size), "send")
+
+    def _at_one_size(self, data: bytes, target_size: int) -> tuple[bytes, int]:
+        # Test stand-ins for the shaper keep no sizes (the cast lets the type
+        # checker accept the check).
+        shaper = cast(object, self._shaper)
+        if not isinstance(shaper, TrafficShaper):
+            return data, target_size
+        return shaper._fit_one_size(data, target_size)  # pylint: disable=protected-access  # pyright: ignore[reportPrivateUsage]  # the shaper's own size rule  # fmt: skip
+
+    def _chaff_allowed(self) -> bool:
+        return self._should_chaff_fn is None or self._should_chaff_fn()
 
     async def _send_report(self) -> None:
         """Send the waiting link report with the scheduler's own send_fn."""
         report, self._report = self._report, None
         if report is not None:
-            await self._keep_alive(
-                self._send_fn(report.data, report.target_size), "send"
-            )
+            await self._send_one(report)
 
     async def _tick(self, now: float) -> None:
         """Fill exactly the slots that are due.
@@ -282,7 +313,7 @@ class SendScheduler:
             now, len(self._control) + len(self._queue), oldest_wait, self._real_sent
         )
         self._real_sent = 0
-        chaff_allowed = self._should_chaff_fn is None or self._should_chaff_fn()
+        chaff_allowed = self._chaff_allowed()
         for _ in range(slots):
             if self._control:
                 await self._send_one(heapq.heappop(self._control))

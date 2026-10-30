@@ -55,6 +55,11 @@ from dsm.traffic.autocap import REPORT_INTERVAL_S, AutoCap, LinkStats
 from dsm.traffic.scheduler import SendScheduler
 from dsm.traffic.shaper import TrafficShaper
 
+# isort: split
+# Its own statement: isort and ruff disagree on an import whose name carries
+# a pyright pragma, and isort would merge this one into the one above.
+from dsm.traffic.shaper import _TooBigForOneSize  # pyright: ignore[reportPrivateUsage]
+
 if TYPE_CHECKING:
     import tuncore
 
@@ -1535,7 +1540,7 @@ async def tun_send_loop(ctx: DataPathContext) -> None:
         # its MTU.
         try:
             padded = [ctx.shaper.pad_packet(inner) for inner in inners]
-        except ValueError as e:
+        except _TooBigForOneSize as e:
             too_big_log.log("dropping a %d-byte TUN packet: %s", len(pkt), e)
             continue
 

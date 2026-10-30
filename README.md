@@ -400,8 +400,9 @@ newest, also across key changes.
   With `padding_max` below 1400, a real packet too big for that size is
   dropped, never sent at its exact size, so `mtu` must fit it (see
   `padding_max` under Configuration, Parameters; DSM warns at start when it
-  does not).
-  `padding_min` no longer changes anything over UDP.
+  does not). `padding_min` matters over UDP only when no size class lies
+  between it and `padding_max`: then every packet takes the smallest class
+  at or above `padding_min`.
 - The padding sits inside the encryption: it fills the encrypted part up to
   the size class. So no unauthenticated padding is left on the wire.
 - In TCP mode every frame is padded to the largest class (1400), so all
@@ -881,13 +882,15 @@ The config file is TOML, at `/opt/mtun/config.toml`.
 - log_level: debug | info | warning | error (default: info). See Logging
   below.
 - padding_min, padding_max: the range of size classes DSM may use
-  (default: 128-1400). Over UDP every packet takes the largest class at or
-  below `padding_max`, so `padding_max` sets the size, and `padding_min` no
-  longer changes anything. If you lower `padding_max`, set `mtu` in both
-  configs to at most that class minus 40 (for example `padding_max = 1024`
-  and `mtu = 984`). Otherwise a real packet too big for the size is dropped,
-  never sent at its exact size, and DSM warns at start (see Padding above).
-  In TCP mode every frame is 1400 bytes whatever these say.
+  (default: 128-1400). Over UDP every packet takes the largest class from
+  `padding_min` to `padding_max`, so `padding_max` sets the size;
+  `padding_min` matters only when no class lies between the two, and then
+  the size is the smallest class at or above it. If you lower `padding_max`,
+  set `mtu` in both configs to at most that class minus 40 (for example
+  `padding_max = 1024` and `mtu = 984`). Otherwise a real packet too big for
+  the size is dropped, never sent at its exact size, and DSM warns at start
+  (see Padding above). In TCP mode every frame is 1400 bytes whatever these
+  say.
 - shaper_tiers_pps: the tier rates in packets per second, lowest first
   (default: [10, 50, 200, 800]; 2 to 8 entries, each 1 to 5000, each higher
   than the one before). The first one is the idle rate. It must be above

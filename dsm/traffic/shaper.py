@@ -13,8 +13,10 @@ This module only builds packet bytes. Every packet, real or chaff, is padded
 to one size: the largest size class in use (1400 bytes unless padding_max or
 the path MTU ceiling lowers it), as TCP mode pads every frame. So a packet's
 size shows nothing about its payload or whether it is real. Over UDP a payload
-too big for that size is dropped, never sent at its exact size; over TCP it
-keeps its exact size here, and the TCP send pads the frame to 1400.
+too big for that size is dropped, never sent at its exact size, and a packet
+padded before the size changed is padded again when it leaves (the
+scheduler calls ``_fit_one_size``); over TCP it keeps its exact size here,
+and the TCP send pads the frame to 1400.
 
 A tier cap (``set_tier_cap``) can hold the rate below the top tier for a
 while; the slow-link auto cap (dsm/traffic/autocap.py) sets it, and
@@ -63,6 +65,11 @@ def _min_outer(payload_len: int) -> int:
     return OUTER_HEADER_SIZE + INNER_HEADER_SIZE + payload_len + GCM_TAG_SIZE
 
 
+class _TooBigForOneSize(ValueError):
+    """Over UDP, a packet does not fit the one size every packet takes; the
+    caller drops it (counted at DEBUG), since its exact size would mark it."""
+
+
 class TrafficShaper:
     """Python side of the tier shaper: builds packet bytes, asks Rust for
     sizes and send slots. Holds no timing state of its own."""
@@ -89,9 +96,10 @@ class TrafficShaper:
             clock(),
         )
         # Over UDP the one size is a hard rule: pad_packet refuses a payload
-        # too big for it. from_config turns this off for TCP, whose send pads
-        # every frame to 1400 anyway (dsm.session.make_send_fn).
-        self._drop_too_big = True
+        # too big for it, and _fit_one_size pads a queued packet again when
+        # the size changed. from_config turns this off for TCP, whose send
+        # pads every frame to 1400 anyway (dsm.session.make_send_fn).
+        self._strict_one_size = True
         # Tier listener (watch_tier) and the tier it saw last.
         self._tier_listener: Callable[[int], None] | None = None
         self._watched_tier = 0
@@ -111,7 +119,7 @@ class TrafficShaper:
             decoy_interval_s=config.shaper_decoy_interval_s,
             linger_s=config.shaper_linger_s,
         )
-        shaper._drop_too_big = config.transport != "tcp"
+        shaper._strict_one_size = config.transport != "tcp"
         return shaper
 
     @property
@@ -181,9 +189,9 @@ class TrafficShaper:
         Returns ``(inner_plaintext_with_padding, target_outer_size)``. Every
         packet, real or chaff, takes the largest class in use, so its size
         says nothing about its payload. Over UDP a payload too big for that
-        class raises ``ValueError``: the caller drops the packet, which must
-        never leave at its exact size. Over TCP it keeps its exact size,
-        since the TCP send pads every frame to 1400.
+        class raises ``_TooBigForOneSize`` (a ``ValueError``): the caller
+        drops the packet, which must never leave at its exact size. Over TCP
+        it keeps its exact size, since the TCP send pads every frame to 1400.
         """
         payload_len = len(inner.payload)
         if payload_len > MAX_INNER_PAYLOAD:
@@ -191,13 +199,39 @@ class TrafficShaper:
         target_outer = self._core.active_classes()[-1]
         need = _min_outer(payload_len)
         if need > target_outer:
-            if self._drop_too_big:
-                raise ValueError(
+            if self._strict_one_size:
+                raise _TooBigForOneSize(
                     f"a {need}-byte packet is too big for the one size "
                     f"{target_outer}"
                 )
             target_outer = need
         return self._serialize_padded(inner, target_outer)
+
+    def _fit_one_size(self, data: bytes, target_size: int) -> tuple[bytes, int]:
+        """``data`` (a padded inner plaintext for ``target_size``) for the one
+        size in use now.
+
+        A packet waits in the scheduler's queue after it was padded. If
+        auto_mtu moved the size ceiling meanwhile, its old size would mark it
+        as queued real data, so over UDP only its random padding tail is cut
+        or grown; the content length comes from the inner header. Raises
+        ``_TooBigForOneSize`` when the content does not fit. Over TCP every
+        frame leaves at 1400 anyway, so nothing changes.
+        """
+        one_size = self._core.active_classes()[-1]
+        if target_size == one_size or not self._strict_one_size:
+            return data, target_size
+        _, _, payload_len = INNER_STRUCT.unpack_from(data)
+        need = _min_outer(payload_len)
+        if need > one_size:
+            raise _TooBigForOneSize(
+                f"a queued {need}-byte packet is too big for the one size "
+                f"{one_size}"
+            )
+        plain_len = one_size - OUTER_HEADER_SIZE - GCM_TAG_SIZE
+        if plain_len <= len(data):
+            return data[:plain_len], one_size
+        return data + os.urandom(plain_len - len(data)), one_size
 
     def pad_chaff_to_class(
         self, inner: InnerPacket, target_outer: int
