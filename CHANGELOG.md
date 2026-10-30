@@ -278,6 +278,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   off, so an older comment claimed more than was done). Copies left behind
   when the key structs are moved are not wiped. The GHASH key inside the
   GCM state, which cannot decrypt, is still not wiped.
+- **Behavior change:** the server no longer sends a client's plain DNS out
+  to the internet. A query sent through the tunnel to a resolver other
+  than 10.8.0.1 (an app with a fixed 8.8.8.8, or a resolv.conf that
+  NetworkManager rewrote mid-session) left the server as plain DNS on port
+  53. Anyone on the server's uplink could read and forge it, and it skipped
+  DoH, padding and the blocklist. Now the server's DNS proxy answers plain
+  UDP DNS sent to any resolver, so the answer comes from DSM, not from the
+  resolver asked. Only A (IPv4 address) lookups get records; other kinds,
+  such as MX, TXT or SRV, get an empty answer, as they already did through
+  10.8.0.1. DNS over TCP port 53 to another resolver is refused at once
+  (nothing listens for TCP on the proxy address). DNS over TLS or QUIC (port
+  853) still passes; it is encrypted, like DoH. An attacker on a client's
+  own network can trigger this by handing out an off-link resolver. This is
+  a server change: update the server.
 - A server or client cert that DSM's crypto library cannot read is now a
   refused handshake. This covers an unknown key, curve or signature type,
   a signature type that is missing its settings, an X.509 version other

@@ -174,8 +174,9 @@ class ResolvConfManager:
                 log.warning(
                     "detected %s — DNS-managing service may overwrite "
                     "/etc/resolv.conf mid-session (M-NET-1). DSM's kill "
-                    "switch will block the resulting plaintext queries; "
-                    "to avoid lost DNS, disable the conflicting service.",
+                    "switch drops plain DNS to a resolver on this machine or "
+                    "network, so DNS may stop working; to avoid lost DNS, "
+                    "disable the conflicting service.",
                     path,
                 )
                 break
@@ -259,8 +260,12 @@ class ResolvConfManager:
         restarted. We log a one-shot warning at apply() so operators
         can disable the conflicting service (`systemctl disable
         systemd-resolved`, `nmcli connection modify ... ipv4.dns-priority
-        -1`) before deploying. The kill switch's port-53 block prevents
-        leaks either way — this warning is about usability, not security.
+        -1`) before deploying. Plain DNS does not leak either way: the kill
+        switch drops it outside the tunnel, and the server sends plain DNS
+        that comes through the tunnel to its own DNS proxy
+        (dsm.net.forwarding; servers before this fix sent it out in clear
+        text). With an up-to-date server this warning is about usability,
+        not security.
         """
         if self._applied:
             return

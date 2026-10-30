@@ -1,9 +1,12 @@
 """Local UDP DNS proxy bound to the VPN's TUN address.
 
-Clients' DNS queries arrive here via the tunnel (their resolv.conf points
-at the TUN IP). Each query is forwarded to the pinned DoH/DoT resolver and
-the answer is returned with a matching transaction ID. No DNS traffic ever
-egresses on a clear-text link.
+Clients' DNS queries arrive here via the tunnel: their resolv.conf points
+at the TUN IP, and the server's NAT table (dsm.net.forwarding) also sends
+here plain UDP DNS that a client sends to any other resolver. Each query is
+forwarded to the pinned DoH/DoT resolver, never in clear text, and the
+answer is returned with a matching transaction ID. The NAT table drops other
+port-53 traffic from the tunnel, so a client's plain DNS never leaves the
+server.
 
 Fail-closed: if the upstream resolver returns no answers, we reply with
 SERVFAIL rather than silently dropping (so the client gets a fast failure

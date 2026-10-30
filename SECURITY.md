@@ -294,6 +294,15 @@ closed as known:
   blocklist cuts ads and trackers; it is not a wall. A list can only make
   names fail, never send them somewhere else, so a bad or hostile list can
   break sites but cannot redirect you.
+- **Plain DNS is answered by the server's proxy.** The server sends plain
+  DNS that a client sends through the tunnel, to any resolver, to its own
+  DNS proxy, so it never leaves the server in clear text. The answer comes
+  from DSM, not from the resolver asked, and only A (IPv4 address) lookups
+  get records. An attacker on the client's own network can trigger this by
+  handing out an off-link resolver (for example in DHCP): the client's
+  lookups then go through the proxy, and other kinds of lookup fail. That
+  is a loss of function, not a leak. DNS over TLS or QUIC (port 853) is
+  encrypted and passes, like DNS over HTTPS.
 
 These are described in the project's threat-model documentation. If you believe
 a property is materially worse than documented — or that one of these can be

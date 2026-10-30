@@ -165,6 +165,12 @@ def test_every_rule_sits_in_its_own_chain() -> None:
         iifname != "mtun0" iifname != "lo" ip saddr 10.8.0.0/24 counter drop
     }
 """,
+        "dns_redirect": """    chain dns_redirect {
+        type nat hook prerouting priority -100; policy accept;
+        iifname "mtun0" ip daddr != 10.8.0.1 udp dport 53 counter dnat ip to 10.8.0.1:53
+        iifname "mtun0" ip daddr != 10.8.0.1 tcp dport 53 counter dnat ip to 10.8.0.1:53
+    }
+""",
         "postrouting": """    chain postrouting {
         type nat hook postrouting priority 100; policy accept;
         iifname "mtun0" oifname != "mtun0" masquerade
@@ -173,6 +179,7 @@ def test_every_rule_sits_in_its_own_chain() -> None:
         "forward": f"""    chain forward {{
         type filter hook forward priority 0; policy accept;
         iifname "mtun0" oifname "mtun0" counter drop
+        iifname "mtun0" meta l4proto {{ tcp, udp }} th dport 53 counter drop
         oifname "mtun0" ct state invalid,untracked counter drop
         iifname "mtun0" ct state new ip saddr {A[0]} ct mark set {_tag(A[1])}
         oifname "mtun0" ip daddr {A[0]} ct mark != {_tag(A[1])} counter drop

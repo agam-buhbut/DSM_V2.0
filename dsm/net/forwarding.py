@@ -110,7 +110,12 @@ class MasqueradeManager:
     * a prerouting drop of any packet with a tunnel source that did not come
       in on the TUN (roadmap 1.4), and a forward drop of packets into the
       TUN that belong to no flow (invalid or untracked), which the flow tags
-      cannot see.
+      cannot see;
+    * plain DNS from a client, to any resolver, goes to the server's own DNS
+      proxy (port 53, UDP and TCP, is sent to ``SERVER_TUN_IP:53``; the proxy
+      is UDP only, so TCP gets a fast reset) and any port-53 traffic from the
+      TUN that would still be forwarded is dropped, so no plain DNS leaves the
+      server. DoT and DoQ (port 853) are encrypted, like DoH, and pass.
 
     Uses its own nftables table so it cleans up independently of the
     rate-limiter or kill-switch tables.
@@ -152,12 +157,21 @@ class MasqueradeManager:
         # interface the kernel picks. "add table" then "delete table" empties
         # a table a crashed run left behind, in the same atomic load: its old
         # flow tags would drop the replies of an address's new holder.
+        # Plain DNS to any other resolver is sent to the DNS proxy instead.
+        # The forward drop catches what is left of port 53: flows from before
+        # this load (NAT is set at a flow's start).
+        dns = SERVER_TUN_IP  # where the server's DNS proxy listens, on port 53
         ruleset = f"""add table inet {self.TABLE}
 delete table inet {self.TABLE}
 table inet {self.TABLE} {{
     chain prerouting {{
         type filter hook prerouting priority -150; policy accept;
         iifname != "{tun}" iifname != "lo" ip saddr {_CLIENTS_NET} counter drop
+    }}
+    chain dns_redirect {{
+        type nat hook prerouting priority -100; policy accept;
+        iifname "{tun}" ip daddr != {dns} udp dport 53 counter dnat ip to {dns}:53
+        iifname "{tun}" ip daddr != {dns} tcp dport 53 counter dnat ip to {dns}:53
     }}
     chain postrouting {{
         type nat hook postrouting priority 100; policy accept;
@@ -166,6 +180,7 @@ table inet {self.TABLE} {{
     chain forward {{
         type filter hook forward priority 0; policy accept;
         iifname "{tun}" oifname "{tun}" counter drop
+        iifname "{tun}" meta l4proto {{ tcp, udp }} th dport 53 counter drop
         oifname "{tun}" ct state invalid,untracked counter drop
 {tags}    }}
 }}

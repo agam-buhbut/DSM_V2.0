@@ -622,7 +622,17 @@ defaults, and each end shapes only what it sends.
 - Name lookups run on the server. A DNS proxy listens on UDP port 53 on the
   server's TUN address. It checks each name against the DNS blocklist
   (below), resolves the rest asynchronously (DoH or DoT, with a cache) and
-  sends the answer back to the client inside the tunnel.
+  sends the answer back to the client inside the tunnel. Plain DNS that a
+  device sends through the tunnel to any other resolver (an app with a
+  fixed 8.8.8.8, a resolv.conf that NetworkManager rewrote, or a resolver
+  on the server's own network) goes to this proxy too, so it never leaves
+  the server in clear text. The answer then comes from this proxy, not from
+  the resolver asked. The proxy resolves only A (IPv4 address) lookups;
+  other kinds, such as MX, TXT or SRV, get an empty answer. DNS over TCP
+  port 53 to another resolver is refused. DNS over TLS or QUIC (port 853) is
+  encrypted and passes, like DNS over HTTPS. If an app needs more than A
+  lookups, point it at a resolver reached over DoH or DoT instead of plain
+  DNS.
 
 ### DNS Blocklist
 
