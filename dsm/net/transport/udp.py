@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import logging
 import socket
 import time
@@ -53,8 +54,8 @@ class UDPTransport:
             maxsize=recv_queue_size,
         )
         self._closed = False
-        # True if bind() enabled kernel PMTUD (IP_PMTUDISC_DO). Consulted
-        # by `get_path_mtu()`.
+        # True once DF is on (bind(pmtu_discover=True) or
+        # enable_pmtu_discover()). Consulted by `get_path_mtu()`.
         self._pmtu_enabled = False
         # Address of the last send(). On the client this is always the server.
         self._last_dest: tuple[str, int] | None = None
@@ -75,6 +76,9 @@ class UDPTransport:
         # sockets this transport had. A junk flood shows here; the
         # slow-link auto cap reads it (dsm/traffic/autocap.py LinkStats).
         self._recv_drops = 0
+        # Datagrams the kernel refused as bigger than the path MTU it knows
+        # (EMSGSIZE, only with DF on). They never left this host.
+        self._too_big = 0
 
     async def bind(
         self,
@@ -90,7 +94,11 @@ class UDPTransport:
         ``get_path_mtu()``). Only effective on Linux.
         """
         loop = asyncio.get_running_loop()
-        protocol = _UDPProtocol(self._recv_queue, on_drop=self._note_recv_drop)
+        protocol = _UDPProtocol(
+            self._recv_queue,
+            on_drop=self._note_recv_drop,
+            on_too_big=self._note_too_big,
+        )
         # No SO_REUSEADDR or SO_REUSEPORT: on Linux either one lets a second
         # instance bind the same UDP port, and the kernel then hands each
         # packet to only one of them, so sessions break with no error. UDP
@@ -113,19 +121,33 @@ class UDPTransport:
             # does not leak; the error still goes up.
             sock.close()
             raise
-        sock = transport.get_extra_info("socket")
-        apply_so_mark(sock)
-        if pmtu_discover and sock is not None:
-            try:
-                sock.setsockopt(socket.IPPROTO_IP, _IP_MTU_DISCOVER, _IP_PMTUDISC_DO)
-                self._pmtu_enabled = True
-                log.debug("UDP PMTUD enabled (IP_PMTUDISC_DO)")
-            except OSError as e:
-                log.warning("failed to enable PMTUD on UDP socket: %s", e)
+        apply_so_mark(transport.get_extra_info("socket"))
         self._transport = transport
+        if pmtu_discover:
+            self.enable_pmtu_discover()
         actual_port = transport.get_extra_info("sockname")[1]
         log.debug("UDP bound to %s:%d", local_addr, actual_port)
         return actual_port
+
+    def enable_pmtu_discover(self) -> None:
+        """Set DF (IP_PMTUDISC_DO) on the socket, and on the ones later
+        rebinds make.
+
+        With DF the kernel refuses a datagram bigger than the path MTU it
+        knows (EMSGSIZE) instead of splitting it, and ``get_path_mtu()``
+        reads that MTU. The client calls this once its handshake is done:
+        handshake frames cannot get smaller, data packets can (auto_mtu).
+        """
+        sock = self._transport.get_extra_info("socket") if self._transport else None
+        if sock is None:
+            return
+        try:
+            sock.setsockopt(socket.IPPROTO_IP, _IP_MTU_DISCOVER, _IP_PMTUDISC_DO)
+        except OSError as e:
+            log.warning("failed to enable PMTUD on UDP socket: %s", e)
+            return
+        self._pmtu_enabled = True
+        log.debug("UDP PMTUD enabled (IP_PMTUDISC_DO)")
 
     def get_path_mtu(self) -> int | None:
         """Query the kernel's current Path MTU toward the last send() address.
@@ -189,7 +211,11 @@ class UDPTransport:
         old_addr = old_sock.getsockname() if old_sock else ("0.0.0.0", 0)
         local_addr = old_addr[0]
 
-        new_protocol = _UDPProtocol(self._recv_queue, on_drop=self._note_recv_drop)
+        new_protocol = _UDPProtocol(
+            self._recv_queue,
+            on_drop=self._note_recv_drop,
+            on_too_big=self._note_too_big,
+        )
         # No SO_REUSEADDR, as in bind(): it would let a local user bind the
         # same port and take the server's packets. Port 0 never needs it.
         new_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -249,6 +275,15 @@ class UDPTransport:
 
     def _note_recv_drop(self) -> None:
         self._recv_drops += 1
+
+    def too_big_drops(self) -> int:
+        """How many datagrams the kernel refused so far, over all sockets
+        this transport had, as bigger than the path MTU it knows (EMSGSIZE).
+        They never left this host."""
+        return self._too_big
+
+    def _note_too_big(self) -> None:
+        self._too_big += 1
 
     async def recv(self, timeout: float | None = None) -> tuple[bytes, tuple[str, int]]:
         if timeout is not None:
@@ -317,9 +352,11 @@ class _UDPProtocol(asyncio.DatagramProtocol):
         *,
         clock: Callable[[], float] = time.monotonic,
         on_drop: Callable[[], None] | None = None,
+        on_too_big: Callable[[], None] | None = None,
     ) -> None:
         self._queue = queue
         self._on_drop = on_drop
+        self._on_too_big = on_too_big
         # Both can repeat once per packet (when the peer is unreachable, every
         # send comes back as an error): log the first, then at most one line
         # per 10 s with a count.
@@ -336,6 +373,10 @@ class _UDPProtocol(asyncio.DatagramProtocol):
             self._drop_log.log("recv queue full, dropping incoming packet")
 
     def error_received(self, exc: Exception) -> None:
+        # asyncio's sendto() reports a refused send here, not by raising.
+        too_big = isinstance(exc, OSError) and exc.errno == errno.EMSGSIZE
+        if too_big and self._on_too_big is not None:
+            self._on_too_big()
         self._error_log.log("UDP error: %s", exc)
 
     def connection_lost(self, exc: Exception | None) -> None:

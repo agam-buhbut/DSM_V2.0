@@ -687,12 +687,43 @@ def _validate_auto_mtu(c: Config) -> None:
     # auto_mtu adapts the TUN MTU from kernel PMTU readings, which are only
     # available when pmtu_discover sets IP_PMTUDISC_DO — get_path_mtu() returns
     # None otherwise. auto_mtu without pmtu_discover is silently inert, so warn
-    # loudly rather than let an operator believe the path is adapting.
+    # loudly rather than let an operator believe the path is adapting. A
+    # server's settings are checked in _validate_server_pmtu.
+    if c.mode != "client":
+        return
     if c.auto_mtu and not c.pmtu_discover:
         log.warning(
             "auto_mtu=true has no effect unless pmtu_discover=true is also set "
             "(kernel PMTU is unavailable without it); the TUN MTU will not "
             "adapt. Set pmtu_discover=true to enable PMTU adaptation."
+        )
+    # The other way round is worse: with DF on and nothing to make packets
+    # smaller, every full-size packet on a smaller path is refused (EMSGSIZE).
+    if c.pmtu_discover and not c.auto_mtu:
+        log.warning(
+            "pmtu_discover = true without auto_mtu = true drops every packet "
+            "on a path smaller than 1428 bytes; turn auto_mtu on or "
+            "pmtu_discover off"
+        )
+
+
+def _validate_server_pmtu(c: Config) -> None:
+    # DF is safe only where DSM can make its packets smaller for the path.
+    # A server cannot, for any one client, so with DF a client behind a
+    # smaller path MTU could not even finish the handshake (#14). The server
+    # leaves DF off whatever the setting says. Only a client runs auto_mtu.
+    if c.mode != "server":
+        return
+    if c.pmtu_discover:
+        log.warning(
+            "pmtu_discover=true is for clients only; the server ignores it and "
+            "never sets the don't-fragment (DF) bit. Remove it from the "
+            "server's config."
+        )
+    if c.auto_mtu:
+        log.warning(
+            "auto_mtu=true is for clients only; the server ignores it and keeps "
+            "its TUN MTU. Remove it from the server's config."
         )
 
 
@@ -719,6 +750,7 @@ _VALIDATORS = (
     _validate_mtu,
     _validate_pmtu_interval,
     _validate_auto_mtu,
+    _validate_server_pmtu,
     _validate_max_inflight_handshakes,
 )
 

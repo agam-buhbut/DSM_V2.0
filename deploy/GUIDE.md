@@ -689,7 +689,7 @@ transport          = "udp"              # UDP recommended; use "tcp" only as fal
                                         # networks that block/mangle UDP (TCP-in-TCP
                                         # causes throughput collapse on TCP traffic)
 mtu                = 1360
-pmtu_discover      = false              # set true on real-WAN deploys
+pmtu_discover      = false              # client only; the server ignores it
 log_level          = "info"
 
 # DoH upstream for client DNS queries tunneled through the server.

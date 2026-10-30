@@ -81,6 +81,9 @@ IP_UDP_OVERHEAD = 28
 # observations are required before raising the TUN MTU back toward
 # config.mtu. Guards against transient PMTU bumps causing flap.
 AUTO_MTU_HYSTERESIS_RISES = 3
+# How often (s) auto_mtu looks, between its checks, whether the kernel refused
+# a datagram as too big; one refusal brings the next check forward to then.
+AUTO_MTU_TOO_BIG_POLL_S = 1.0
 
 
 @dataclass
@@ -967,6 +970,7 @@ def make_auto_cap(
         tiers_pps=config.shaper_tiers_pps,
         start_tier=shaper.tier,
         last_seq=lambda: seq.value,
+        too_big=transport.too_big_drops,
     )
     shaper.watch_tier(autocap.note_tier)
     return LinkStats(queue_drops=transport.recv_drops), autocap
@@ -1227,6 +1231,28 @@ def _fit_tun_mtu(path_mtu: int, mtu: int) -> int:
     return max(AUTO_MTU_FLOOR, min(mtu, fit))
 
 
+async def _wait_next_mtu_check(
+    shutdown: asyncio.Event, transport: UDPTransport, interval: float
+) -> bool:
+    """Wait until auto_mtu's next check: ``interval`` seconds, or sooner, at
+    the next ``AUTO_MTU_TOO_BIG_POLL_S`` step, once the kernel refused a
+    datagram as too big. True when the session is ending."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + interval
+    refused = transport.too_big_drops()
+    while True:
+        left = deadline - loop.time()
+        try:
+            await asyncio.wait_for(
+                shutdown.wait(), timeout=max(0.0, min(AUTO_MTU_TOO_BIG_POLL_S, left))
+            )
+            return True
+        except TimeoutError:
+            pass
+        if loop.time() >= deadline or transport.too_big_drops() != refused:
+            return False
+
+
 async def auto_mtu_loop(
     ctx: DataPathContext,
     transport: UDPTransport | TCPTransport,
@@ -1259,14 +1285,10 @@ async def auto_mtu_loop(
     rises_observed = 0
 
     while not ctx.shutdown.is_set():
-        try:
-            await asyncio.wait_for(
-                ctx.shutdown.wait(),
-                timeout=config.pmtu_check_interval_s,
-            )
+        if await _wait_next_mtu_check(
+            ctx.shutdown, transport, config.pmtu_check_interval_s
+        ):
             return
-        except TimeoutError:
-            pass
 
         path_mtu = transport.get_path_mtu()
         if path_mtu is None:

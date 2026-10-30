@@ -748,9 +748,10 @@ async def run_client(
                 if config.transport == "udp":
                     transport = UDPTransport()
                     try:
+                        # DF comes on after the handshake (see there).
                         await transport.bind(
                             local_port=config.listen_port,
-                            pmtu_discover=config.pmtu_discover,
+                            pmtu_discover=False,
                         )
                     except OSError as e:
                         reason = os.strerror(e.errno) if e.errno else str(e)
@@ -857,6 +858,14 @@ async def run_client(
                 session_keys, _handshake_hash, server_static_pub, tunnel = handshake
 
                 fsm.transition(State.ESTABLISHED)
+
+                if config.pmtu_discover and isinstance(transport, UDPTransport):
+                    # DF only from here on. Every handshake frame is 1428
+                    # bytes on the wire and cannot get smaller, so on a
+                    # smaller path the kernel must split it; with DF every
+                    # resend failed with EMSGSIZE. Data packets get smaller
+                    # instead (auto_mtu).
+                    transport.enable_pmtu_discover()
 
                 if looked_up_name:
                     # A good handshake proves this address for the name. Keep

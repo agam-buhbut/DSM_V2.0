@@ -856,14 +856,18 @@ The config file is TOML, at `/opt/mtun/config.toml`.
   it. A setting below it stops startup with a message that names it.
 - tun_name: TUN device name (default: mtun0)
 - mtu: TUN interface MTU in bytes (default: 1360, allowed 576-1500)
-- pmtu_discover: turn on kernel PMTUD (path MTU discovery) on the UDP socket
-  (default: false). `auto_mtu` needs it, because the kernel only tracks each
-  path's MTU when this is on.
+- pmtu_discover: client only. Turns on kernel PMTUD (path MTU discovery,
+  the DF bit) on the UDP socket once the handshake is done (default:
+  false). `auto_mtu` needs it, because the kernel only tracks each path's
+  MTU when this is on. A server ignores it and logs a warning.
 - auto_mtu: client-side loop that adjusts the TUN MTU (default: false). It
   lowers the MTU when the path MTU drops, and raises it back toward `mtu`
   after 3 steady readings. Recommended for cellular and roaming clients.
+  A server ignores it and logs a warning.
 - pmtu_check_interval_s: how often the auto_mtu loop reads the kernel's path
-  MTU, in seconds (default: 30, allowed (0, 3600]).
+  MTU, in seconds (default: 30, allowed (0, 3600]). A packet the kernel
+  refuses as too big for the path makes it read sooner, within about a
+  second.
 - log_level: debug | info | warning | error (default: info). See Logging
   below.
 - padding_min, padding_max: padding range (default: 128-1400). A narrow

@@ -146,6 +146,7 @@ class AutoCap:
         start_tier: int,
         last_seq: Callable[[], int],
         clock: Callable[[], float] = time.monotonic,
+        too_big: Callable[[], int] = _no_queue_drops,
     ) -> None:
         """
         Args:
@@ -156,12 +157,19 @@ class AutoCap:
             start_tier: the shaper's tier now.
             last_seq: our last used seq (``SequenceCounter.value``).
             clock: monotonic clock for the lift timer.
+            too_big: how many packets the kernel refused so far as too big
+                for the path (EMSGSIZE). They took a seq but never left this
+                host, so a stretch in which this moved is not judged.
         """
         self._shaper = shaper
         self._tiers_pps = tuple(tiers_pps)
         self._top = len(self._tiers_pps) - 1
         self._last_seq = last_seq
         self._clock = clock
+        self._too_big = too_big
+        # Read at each accepted report, like _base, so a change in it covers
+        # the same stretch as the report.
+        self._last_too_big: int | None = None
         # Loss check: (first seq, tier) at every tier change, oldest first,
         # and the last accepted report's (highest_seq, received).
         self._tier_log: list[tuple[int, int]] = [(last_seq() + 1, start_tier)]
@@ -213,11 +221,15 @@ class AutoCap:
             self._ignored.log(_IGNORED_REPORT)
             return
         self._base = (high, received)
+        too_big, last_too_big = self._too_big(), self._last_too_big
+        self._last_too_big = too_big
         if base is not None:
             sent = high - base[0]
             # Late packets can make more arrive than were sent: no loss.
             lost = max(0, sent - (received - base[1]))
-            self._judge(self._tier_of(base[0] + 1, high), sent, lost)
+            # Packets the kernel refused as too big never left: not judged.
+            tier = None if too_big != last_too_big else self._tier_of(base[0] + 1, high)
+            self._judge(tier, sent, lost)
         self._prune(high)
 
     def note_short_report(self) -> None:

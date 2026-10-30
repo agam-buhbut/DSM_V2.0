@@ -160,7 +160,7 @@ log_level = "info"                           # "debug" | "info" | "warning" | "e
 # TUN MTU. Default 1360: the largest that fits in one DSM packet, so no
 # packet is split in two. It also leaves slack for VPN-in-VPN / PPPoE paths.
 mtu = 1360
-# pmtu_discover = false                      # Enable IP_MTU_DISCOVER (sets DF bit)
+# pmtu_discover = false                      # Client only: don't-fragment bit on data packets once connected; auto_mtu needs it
 # auto_mtu = false                           # Track kernel PMTU + adjust TUN MTU; recommend true for cellular/roaming
 # pmtu_check_interval_s = 30.0               # auto_mtu poll cadence (seconds)
 #

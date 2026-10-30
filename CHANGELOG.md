@@ -359,15 +359,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and with `pmtu_discover = true` every packet too big for a smaller path
   was dropped (the log only said "Message too long"). DSM now asks a
   short-lived socket that sends nothing. The start-up "kernel path MTU"
-  line now shows. With `auto_mtu` off, or for up to
-  `pmtu_check_interval_s` after the path gets smaller, big packets are
-  still dropped.
+  line now shows. With `auto_mtu` off, or for about a second after the
+  path gets smaller, big packets are still dropped.
 - With auto_mtu on and a hand-set `mtu` that already fits a smaller path
   (for example mtu 1100 on a path MTU of 1300), auto_mtu now still drops
   the sizes too big for the path. Before, it did so only when it changed
   the TUN MTU, so the packets that drew a size too big for the path (5 to
   11 in 100) were lost. The sizes come back after 3 steady readings of a
   larger path, as the TUN MTU does.
+- With `pmtu_discover = true`, a client on a path whose MTU is below 1428
+  bytes (common on cellular) could never connect: every handshake packet
+  is 1428 bytes and may not be split with DF on, so the kernel refused each
+  resend ("Message too long"). The client now turns DF on only once the
+  handshake is done. With `auto_mtu = false` nothing then makes its packets
+  smaller, so on such a path the big ones are dropped: that pair of
+  settings now logs a warning.
+- A server no longer uses `pmtu_discover`. With it on, clients on a smaller
+  path MTU could not connect, and downloads to them stopped when the path
+  got smaller, because the server cannot make its packets smaller for one
+  client. It now always sends without DF and warns when the setting is on.
+  So the fix for clients on small paths is a server change: upgrade the
+  server. An upgraded client still cannot connect over a small path to an
+  old server that has `pmtu_discover = true`. `auto_mtu` on a server now
+  also says it is for clients only (the old warning told the operator to
+  turn `pmtu_discover` on). The GUIDE's server template no longer says to
+  turn it on.
+- A packet the kernel refuses as too big for the path ("Message too long")
+  now makes `auto_mtu` check the path within a second, not up to
+  `pmtu_check_interval_s` later. The slow-link auto cap no longer counts
+  such packets as lost on the link, which could lower the top tier for
+  minutes.
 - The server unit ran `dsm cleanup` after every stop, restart and failed
   start. That set `net.ipv4.ip_forward` to 0 and turned IPv6 on, so Docker
   or routing on the host broke, and IPv6 came back where you had turned it
