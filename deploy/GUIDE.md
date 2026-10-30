@@ -97,25 +97,29 @@ that repair stage.
 
 ### 0c. Install the Rust toolchain (if you don't already have it)
 
-The official rustup installer is the easiest path — no root, installs
-into ~/.cargo:
+DSM needs rustc 1.88 or newer: the crates locked in
+rust/tuncore/Cargo.lock need it. The official rustup installer is the
+easiest path — no root, installs into ~/.cargo:
 
 ```sh
 $ curl --proto '=https' --tlsv1.3 -sSf https://sh.rustup.rs | sh -s -- -y
 $ source "$HOME/.cargo/env"
-$ rustc --version                 # e.g. rustc 1.82.0 (stable)
+$ rustc --version                 # 1.88 or newer
 ```
 
-On distros that package rustc >= 1.74 you can `sudo apt install rustc
-cargo` instead — but maturin expects a recent cargo, so rustup is
-more reliable.
+Do not use `sudo apt install rustc cargo` on Debian 13: it gives rustc
+1.85, and the build stops with "error: rustc 1.85.1 is not supported by
+the following packages". If cargo ever suggests `cargo update ... --precise`,
+do not run it: it swaps the locked crypto crates for older ones, one with a
+known timing leak (RUSTSEC-2026-0387). Install the Rust version named here
+instead. A distro rustc works only if `rustc --version` says 1.88 or newer.
 
 ### 0d. Pre-flight check
 
 ```sh
 $ python3 --version       # 3.11 or newer
 $ gcc --version           # any recent gcc
-$ rustc --version         # stable channel
+$ rustc --version         # 1.88 or newer
 $ sudo nft --version      # nftables
 $ ls /dev/net/tun         # TUN node present
 $ ip link                 # iproute2 working

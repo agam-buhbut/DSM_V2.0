@@ -20,8 +20,8 @@ development and CI target the above.
 ## Prerequisites
 
 - Python 3.11+ with `python3-venv`.
-- A recent Rust toolchain (`rustup` recommended — distro `cargo` is often too
-  old for maturin).
+- Rust 1.88 or newer (`rustup` recommended: Debian 13's apt `rustc` is 1.85,
+  too old for the locked crates).
 - For the default (TPM) build: `libtss2-dev` (the tss2-esys headers).
   `tss-esapi-sys` ships pregenerated x86_64 bindings, so no `libclang` /
   `bindgen` is needed.

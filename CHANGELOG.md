@@ -737,6 +737,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (deploy/GUIDE.md §1b, §7j); without it pip keeps the old code. The guide
   also says where Stick B is mounted, copies the new CRL in §3d, and names
   the server-only keys a client config leaves out (§3f).
+- Building needs rustc 1.88 or newer, not 1.74 (deploy/GUIDE.md §0c,
+  §0d; CONTRIBUTING.md). Debian 13's apt rustc is 1.85, too old, so use
+  rustup, and do not follow cargo's `cargo update --precise` hint.
+  `rust/tuncore/Cargo.toml` sets `rust-version = "1.88"`, so cargo names
+  that version when it stops. CI fails if a locked crate needs a newer
+  rustc than that.
 
 ## [0.1.0] - not released yet
 

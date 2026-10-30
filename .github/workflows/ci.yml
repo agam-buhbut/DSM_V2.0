@@ -102,6 +102,20 @@ jobs:
           cargo clippy --manifest-path rust/tuncore/Cargo.toml --all-targets
           --no-default-features --features dev-soft-attest --
           -D warnings -W clippy::pedantic -W clippy::unwrap_used
+      - name: locked crates fit rust-version
+        run: |
+          cargo metadata --format-version 1 --locked --all-features \
+            --filter-platform x86_64-unknown-linux-gnu \
+            --manifest-path rust/tuncore/Cargo.toml > "$RUNNER_TEMP/meta.json"
+          python3 - "$RUNNER_TEMP/meta.json" <<'PY'
+          import json, sys
+          pk = json.load(open(sys.argv[1]))["packages"]
+          v = lambda s: tuple(map(int, (s + ".0.0").split(".")[:3]))
+          me = next(p for p in pk if p["name"] == "dsm-tuncore")["rust_version"]
+          bad = [f"{p['name']} {p['version']} needs {p['rust_version']}"
+                 for p in pk if p["rust_version"] and v(p["rust_version"]) > v(me)]
+          sys.exit(f"rust-version {me} is too low: " + "; ".join(bad) if bad else 0)
+          PY
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
       - name: cargo audit
