@@ -148,6 +148,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   blocklist (below).
 
 ### Security
+- **Behavior change:** the client is now blocked from boot. Before,
+  `dsm-client.service` started only once the network was up, and DSM then
+  took 0.15-0.35 s to raise its kill switch, so on every boot other
+  programs could reach the network in the clear first. Now
+  `dsm-client-boot-block.service` loads the start-up kill switch (loopback
+  and DHCP only) before any network comes up, and again when the client
+  unit restarts or starts after a stop; DSM replaces it when it starts. A
+  start error that comes before DSM's own block (a config.toml that does
+  not load, a missing passphrase file) now leaves the host blocked under
+  the unit, SSH too, not open. The client unit pulls the new unit in, so
+  `systemctl enable dsm-client` covers it. To get it, re-run `install.sh
+  --systemd --client`, or copy `deploy/dsm-client.service` and
+  `deploy/dsm-client-boot-block.service` to `/etc/systemd/system/` and run
+  `sudo systemctl daemon-reload`; then `sudo systemctl restart dsm-client`.
 - Over UDP, a start whose third handshake message does not open is no longer free for a stranger: the server waits, as for a stalled start, and that address waits 30 s. Keeping new devices waiting now takes about 31 addresses over UDP (about 125 right after a restart), as over TCP. A faked packet in a real device's handshake before that message does no harm now. Log change: over UDP a bad or stalled start no longer logs `handshake failed (BadMsg3Error)`; it shows as `a handshake attempt exceeded 12s deadline`, and the skip itself logs only at DEBUG.
 - **Behavior change:** the client raises its kill switch before anything at
   start that depends on the clock or the network. Before, a CRL past its
@@ -161,12 +175,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   client also checks its own cert's dates. A client or a server whose
   clock is synchronized keeps going on a stale CRL, with a warning; with a
   clock that is not synchronized, a server still refuses to start on it.
-- Some client start errors still come before the kill switch is up, so
-  DSM raises no block for them, also under the unit: a missing
-  `/etc/dsm/passphrase`, a `config.toml` that does not load, an
+- Some client start errors still come before DSM's own kill switch is up:
+  a missing `/etc/dsm/passphrase`, a `config.toml` that does not load, an
   evaluation build without `allow_soft_attest`, nft refusing the first
-  table, and an install that cannot run DSM at all. After a boot the host
-  is then open; a block an earlier run kept stays (deploy/GUIDE.md §7i).
+  table, and an install that cannot run DSM at all. Under the unit the
+  boot block (`dsm-client-boot-block.service`) now holds for them; on a
+  run by hand the host stays open (deploy/GUIDE.md §7i).
 - **Behavior change:** under `dsm-client.service` every start error after
   the block is up now keeps it up and exits 1: a wrong or empty passphrase,
   a missing or bad cert, CA or CRL file, a read-only resolv.conf. Before,

@@ -218,7 +218,7 @@ done
 # and `sha256sum -c`, as for the wheels above.
 if [ "$SYSTEMD" = 1 ] && [ "$EVAL" = 0 ]; then
   if [ "$CLIENT" = 1 ]; then
-    UNIT_FILES="dsm-client.service"
+    UNIT_FILES="dsm-client.service dsm-client-boot-block.service"
   else
     UNIT_FILES="dsm.service dsm-blocklist-update.sh dsm-blocklist-update.service dsm-blocklist-update.timer"
   fi
@@ -327,8 +327,13 @@ if [ "$EVAL" = 0 ]; then
     if [ -n "$UNIT_SRC" ]; then
       install -m 0644 "$UNIT_SRC" /etc/systemd/system/dsm-client.service \
         || die "could not install dsm-client.service"
+      # The block that holds from boot until DSM starts. The client unit
+      # pulls it in, so it is enabled with it.
+      install -m 0644 "$(dirname "$UNIT_SRC")/dsm-client-boot-block.service" \
+        /etc/systemd/system/dsm-client-boot-block.service \
+        || die "could not install dsm-client-boot-block.service"
       systemctl daemon-reload || die "systemctl daemon-reload failed"
-      echo "Installed dsm-client.service. Enable it with: sudo systemctl enable dsm-client" >&2
+      echo "Installed dsm-client.service and dsm-client-boot-block.service. Enable it with: sudo systemctl enable dsm-client" >&2
       echo "Give --install-unit to the first dsm init command: it writes the file this unit reads at start (deploy/GUIDE.md §3e)." >&2
       echo "Start it only after the server has this client's CN (deploy/GUIDE.md §4); until then it blocks all traffic, SSH too. Then: sudo systemctl start dsm-client" >&2
     else

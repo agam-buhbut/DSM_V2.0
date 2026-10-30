@@ -150,6 +150,7 @@ jobs:
           # them against the signed SHA256SUMS: a curl | sh install has no
           # deploy/ folder.
           cp deploy/dsm.service deploy/dsm-client.service \
+             deploy/dsm-client-boot-block.service \
              deploy/dsm-blocklist-update.sh deploy/dsm-blocklist-update.service \
              deploy/dsm-blocklist-update.timer dist/
       # Vendor the RUNTIME dependency wheels into the SAME dir as the DSM wheel

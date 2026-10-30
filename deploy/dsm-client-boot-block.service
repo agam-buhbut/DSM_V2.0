@@ -1,0 +1,64 @@
+[Unit]
+Description=DSM VPN client: block all traffic from boot until DSM starts
+Documentation=file:///opt/dsm-repo/deploy/GUIDE.md
+# Loads the client's start-up kill switch before any network comes up, so
+# nothing leaves the host in the clear between boot and DSM's start (and
+# a start error that comes before DSM's own block leaves this one up).
+# Only dsm-client.service pulls it in (its Wants=): enabling or disabling
+# the client unit does the same to this one, and a server never runs it.
+# DSM's first start replaces this table in one nft commit, so the host is
+# never open between. There is no ExecStop: the block comes down only the
+# way DSM's own does (systemctl stop dsm-client, dsm cleanup).
+DefaultDependencies=no
+Before=network-pre.target
+Wants=network-pre.target
+# The distro's nftables.service may flush the whole ruleset: load after it.
+After=nftables.service
+# A stop or restart of dsm-client stops or restarts this too, so every new
+# start of the client loads the block again before DSM runs.
+PartOf=dsm-client.service
+
+[Service]
+Type=oneshot
+# It stays active once the rules are loaded, so a `systemctl start
+# dsm-client` on a running client does not run it again under a live
+# session.
+RemainAfterExit=yes
+# DSM's full kill switch (dsm_killswitch) exists only while a tunnel is up.
+# Then this unit skips itself, so a start on a live client never swaps the
+# live table for this one; a skipped condition is not a failure. At boot
+# and after a stop that table is gone, so the block loads.
+ExecCondition=/bin/sh -c '! /usr/sbin/nft list table inet dsm_killswitch >/dev/null 2>&1'
+# The rules are DSM's start-up kill switch with no openings: loopback and
+# DHCP only, no server (dsm/net/_templates/pre_handshake.conf; a test keeps
+# the two the same). DSM adds the server when it starts. systemd passes
+# the lines below to nft on stdin, one per line.
+StandardInput=data
+ExecStart=/usr/sbin/nft -f -
+StandardInputText=add table inet dsm_killswitch_pre
+StandardInputText=delete table inet dsm_killswitch_pre
+StandardInputText=add table inet dsm_killswitch
+StandardInputText=delete table inet dsm_killswitch
+StandardInputText=add table inet dsm_dns_leak
+StandardInputText=delete table inet dsm_dns_leak
+StandardInputText=table inet dsm_killswitch_pre {
+StandardInputText=chain output {
+StandardInputText=type filter hook output priority 0; policy drop;
+StandardInputText=oif "lo" accept
+StandardInputText=meta nfproto ipv4 udp dport 67 udp sport 68 accept
+StandardInputText=oif != "lo" meta nfproto ipv6 counter drop
+StandardInputText=counter drop
+StandardInputText=}
+StandardInputText=chain input {
+StandardInputText=type filter hook input priority 0; policy drop;
+StandardInputText=iif "lo" accept
+StandardInputText=meta nfproto ipv4 udp sport 67 udp dport 68 accept
+StandardInputText=ct state established,related meta mark 0x1 accept
+StandardInputText=iif != "lo" meta nfproto ipv6 counter drop
+StandardInputText=icmp type destination-unreachable icmp code frag-needed accept
+StandardInputText=counter drop
+StandardInputText=}
+StandardInputText=chain forward {
+StandardInputText=type filter hook forward priority 0; policy drop;
+StandardInputText=}
+StandardInputText=}

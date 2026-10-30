@@ -30,6 +30,8 @@ Companion files in this directory:
 - `deploy/dsm.service` — the server's systemd unit.
 - `deploy/dsm-client.service` — the client's systemd unit (§3f). Never put
   `dsm.service` on a client.
+- `deploy/dsm-client-boot-block.service` — the client's block from boot
+  until DSM starts (§3f). `dsm-client.service` pulls it in.
 - `deploy/dsm-blocklist-update.sh`, `.service`, `.timer` — the daily DNS
   block list download for the server (§7h).
 
@@ -299,10 +301,10 @@ the client, then `pip install` it there.
 On the BUILD host:
 
 ```sh
-# Build as above (§1a), then copy the wheel to the client, and the
-# client unit with it (the wheel has no deploy/ folder; §3f installs it):
+# Build as above (§1a), then copy the wheel to the client, and the two
+# client units with it (the wheel has no deploy/ folder; §3f installs them):
 $ scp rust/tuncore/target/wheels/dsm-0.1.0-*.whl user@client:/tmp/
-$ scp deploy/dsm-client.service user@client:/tmp/
+$ scp deploy/dsm-client.service deploy/dsm-client-boot-block.service user@client:/tmp/
 ```
 
 On the CLIENT (after copying the wheel):
@@ -969,10 +971,12 @@ $ sudo dsm --config /opt/mtun/config.toml \
 ```
 
 Stash the passphrase as in 3e (i) or (ii). For (ii) a client uses its own
-unit, never `deploy/dsm.service` (that one runs DSM as a server):
+unit, never `deploy/dsm.service` (that one runs DSM as a server), and the
+unit's boot block (`dsm-client-boot-block.service`: it blocks all traffic
+from boot until DSM starts):
 
 ```sh
-$ sudo cp deploy/dsm-client.service /etc/systemd/system/dsm-client.service
+$ sudo cp deploy/dsm-client.service deploy/dsm-client-boot-block.service /etc/systemd/system/
 $ sudo systemctl daemon-reload
 $ sudo systemctl enable dsm-client
 ```
@@ -982,7 +986,7 @@ folder: install the copy you brought from the build host instead of the
 `cp` line:
 
 ```sh
-$ sudo install -m 0644 /tmp/dsm-client.service /etc/systemd/system/dsm-client.service
+$ sudo install -m 0644 /tmp/dsm-client.service /tmp/dsm-client-boot-block.service /etc/systemd/system/
 ```
 
 Do not start it yet: the server must know this client first (§4), and
@@ -993,8 +997,8 @@ So does a start that the network or the clock holds up: a server name that
 does not resolve, a CRL past its next update while the clock is not
 synchronized, a cert outside its dates (§7i). Under `dsm-client.service`
 every start error after the block is up keeps it too, a wrong or empty
-passphrase file included; a few errors come before the block and raise
-none (§7i).
+passphrase file included; a few errors come before DSM's own block; the
+boot block (`dsm-client-boot-block.service`) holds for them (§7i).
 
 **Headless client** (no screen or keyboard, reached only over SSH): such a
 block cuts your SSH session. A date or a lookup problem clears by itself
@@ -1006,14 +1010,14 @@ Before you enable the unit, make sure you can reach the console (a screen
 and keyboard, a serial line, or the hypervisor's console). Keep the CRL
 fresh and the clock right.
 
-`install.sh --systemd --client` installs this unit. `sudo dsm init client
---install-unit` does not copy a unit from an installed DSM (the wheel has
-no deploy/ folder): after install.sh it says the unit is already there;
-otherwise it tells you to copy `deploy/dsm-client.service` yourself, as
-above. Either way, its `--resume` writes `/etc/dsm/passphrase` when that
-file is missing or empty. Unlike the server's, the client unit takes the
-kill switch down only after a stop you ask for (`systemctl stop`); see
-§7i.
+`install.sh --systemd --client` installs these two units. `sudo dsm init
+client --install-unit` does not copy a unit from an installed DSM (the
+wheel has no deploy/ folder): after install.sh it says the unit is already
+there; otherwise it tells you to copy `deploy/dsm-client.service` and
+`deploy/dsm-client-boot-block.service` yourself, as above. Either way,
+its `--resume` writes `/etc/dsm/passphrase` when that file is missing or
+empty. Unlike the server's, the client unit takes the kill switch down
+only after a stop you ask for (`systemctl stop`); see §7i.
 
 Record the client's CN — you need it for §4.
 
@@ -1172,7 +1176,23 @@ $ sudo nft list tables | grep '^table inet dsm_'
 #   table inet dsm_dns_leak          (DNS/DoT/DoH/mDNS/LLMNR blocked off-tunnel)
 # Client-side, while it connects or reconnects, expect only:
 #   table inet dsm_killswitch_pre    (only loopback, DHCP and the server)
+# At boot until DSM starts, or after an error before DSM's own block: the
+# same table without the server.
 ```
+
+On a client under the unit, check that the boot block is up too:
+
+```sh
+$ systemctl is-active dsm-client-boot-block   # expect "active"
+```
+
+`inactive` with "could not be found" in `systemctl status
+dsm-client-boot-block` means the boot unit file was never copied (§3f):
+until it is, an error before DSM's own block leaves the host open.
+`failed` means it could not load; `systemctl status dsm-client-boot-block`
+says why. It also shows `inactive` when it was started while a tunnel
+was up and skipped itself, so as not to replace the live kill switch;
+`sudo systemctl restart dsm-client` loads it again.
 
 DNS goes through the tunnel and resolves on the server via DoH:
 
@@ -1589,10 +1609,15 @@ crash, a start error or a signal sent straight to it) leaves it up; run
   a later reconnect keep the block, and DSM tries again.
 - **Errors before the block.** Some errors stop DSM before it can raise
   its kill switch, so DSM raises no block of its own, under the unit too.
-  After a boot the host then uses the internet without the VPN while DSM
-  is down. After a `systemctl restart`, a crash or a signal, the start-up
-  block of the earlier run stays up instead (SSH too): `sudo dsm cleanup`
-  removes it. What you see:
+  Under the unit, `dsm-client-boot-block.service` loads the start-up kill
+  switch (loopback and DHCP only) at boot, and again when the unit
+  restarts or starts after a stop, so the boot block stays up instead
+  (SSH too); on a run by hand the host is open. `sudo dsm cleanup`
+  removes the block. Under the unit the host is open only when
+  nft itself is missing or broken, when the boot unit file is not
+  installed (§6 shows how to check), or after `sudo dsm cleanup` followed
+  by a plain `systemctl start` (the boot block still counts as up, so it
+  does not run again; use `restart`). What you see:
   - `/etc/dsm/passphrase` is missing: systemd does not start DSM at all.
     `systemctl status dsm-client` shows `status=243/CREDENTIALS`, and the
     journal shows `Failed to set up credentials`.
@@ -1608,9 +1633,9 @@ crash, a start error or a signal sent straight to it) leaves it up; run
     Python traceback before `client starting`), for example after a Python
     upgrade.
 
-  systemd tries again and gives up after 5 starts in 10 minutes; the host
-  stays as it was (open, or blocked by the earlier run's table) all that
-  time. DSM has no block of its own for these cases. They are setup
+  systemd tries again and gives up after 5 starts in 10 minutes; the boot
+  block stays up all that time (SSH too); on a run by hand the host is
+  open. DSM has no block of its own for these cases. They are setup
   mistakes, and each shows on the first start, so check them before you
   enable the unit on a headless host: `sudo dsm init ... --install-unit`
   writes the passphrase file, and one run by hand at the console (§5)
@@ -1697,9 +1722,9 @@ not talk to each other, so this is one switch for every box.
    keeps the old code unless the wheel install has `--force-reinstall
    --no-deps`, after the plain install has brought the dependencies up
    (§1b). A client set up from the wheel alone also needs the new
-   `deploy/dsm-client.service` from the build host (§1a.1, §3f). A host set
-   up with `install.sh` upgrades by running the new release's `install.sh`
-   instead.
+   `deploy/dsm-client.service` and `deploy/dsm-client-boot-block.service`
+   from the build host (§1a.1, §3f). A host set up with `install.sh`
+   upgrades by running the new release's `install.sh` instead.
 3. Upgrade the server and restart it: `sudo systemctl restart dsm`. Its log
    must show `server listening on UDP port 51820 (wire v2)` (with your port;
    `TCP` if you set `transport = "tcp"`).
@@ -2434,18 +2459,19 @@ start the systemd unit.
 nft refused the client's first table, so DSM stops before it does
 anything (exit 1). Check that nftables is installed (`sudo nft list
 ruleset`) and that DSM runs as root. With "Operation not permitted" it ran
-without root or without CAP_NET_ADMIN. DSM raises no block in this case,
-also under the unit: after a boot the host uses the internet without the
-VPN until DSM runs, and a block an earlier run left stays (§7i).
+without root or without CAP_NET_ADMIN. DSM raises no block of its own;
+under the unit the boot block stays up, SSH too (§7i). If nft itself is
+missing or broken, the boot block did not load either (`systemctl status
+dsm-client-boot-block` shows it failed), and the host is open.
 
 ### "active device-attestation backend is software-based (dev-soft-attest): ... Refusing to start."
 
 This DSM was built for testing: its attestation key is not held by
-hardware. DSM stops before its kill switch is up, so it raises no block,
-also under the unit; a block an earlier run left stays (§7i). Use a
-tuncore built with a hardware
-attest backend. On a lab host only, set `allow_soft_attest = true` in
-config.toml (`dsm init` writes it on such a build, with a comment).
+hardware. DSM stops before its kill switch is up, so DSM raises no block
+of its own; under the unit the boot block stays up, SSH too (§7i). Use a
+tuncore built with a hardware attest backend. On a lab host only, set
+`allow_soft_attest = true` in config.toml (`dsm init` writes it on such a
+build, with a comment).
 
 ### "cannot unlock the keys: passphrase must not be empty: ... is empty" (or "passphrase file ... not found")
 
@@ -2462,16 +2488,16 @@ Run: chmod 600 ...`.
 ### systemd: "Failed to set up credentials" (status 243/CREDENTIALS)
 
 `/etc/dsm/passphrase` is missing, so systemd does not start DSM at all.
-No kill switch comes up from this start: the host uses the internet
-without the VPN until DSM runs (a block an earlier run left stays). Make
-the file (§3e), then `sudo systemctl reset-failed dsm-client && sudo
-systemctl start dsm-client` (or `dsm`). `sudo dsm init ... --install-unit`
-writes it for you.
+DSM raises no block of its own; under the unit the boot block stays up,
+SSH too (§7i). Make the file (§3e), then `sudo systemctl reset-failed
+dsm-client && sudo systemctl start dsm-client` (or `dsm`). `sudo dsm init
+... --install-unit` writes it for you.
 
 ### systemd: "status=203/EXEC"
 
 systemd could not run `/usr/local/bin/dsm`: it is missing, or it points
-into a broken venv. DSM did not run, so it raised no block (§7i). Check
+into a broken venv. DSM did not run, so DSM raises no block of its own;
+under the unit the boot block stays up, SSH too (§7i). Check
 `ls -l /usr/local/bin/dsm` (§1c), then install again: §1b, or run
 `install.sh` again on a host set up with it. Then `sudo systemctl
 reset-failed dsm-client && sudo systemctl start dsm-client` (or `dsm`).
@@ -2479,8 +2505,9 @@ reset-failed dsm-client && sudo systemctl start dsm-client` (or `dsm`).
 ### "tuncore is missing ATTEST_BACKEND_IS_SOFTWARE: the extension predates the Phase-0 attestation gate. ..."
 
 The installed tuncore is from an old build. DSM stops before its kill
-switch is up, so it raises no block (§7i). Build the wheel again from the
-repo root (§1a) and install it with `--force-reinstall` (as in the
+switch is up, so DSM raises no block of its own; under the unit the boot
+block stays up, SSH too (§7i). Build the wheel again from the repo root
+(§1a) and install it with `--force-reinstall` (as in the
 TypeError entry below), or run `install.sh` again on a host set up with it.
 
 ### "DSM could not start (see the error above), and the kill switch stays up ..."
@@ -3118,7 +3145,8 @@ $ sudo dsm cleanup     # first: puts back /etc/resolv.conf from /var/lib/dsm and
 $ sudo rm -rf /opt/mtun /etc/dsm /run/dsm /var/lib/dsm
 $ sudo /usr/bin/python3 -m pip uninstall --break-system-packages dsm   # if pip-installed
 $ sudo rm -rf /opt/dsm /usr/local/bin/dsm                    # if install.sh installed it
-$ sudo rm -f /etc/systemd/system/dsm.service /etc/systemd/system/dsm-client.service
+$ sudo rm -f /etc/systemd/system/dsm.service /etc/systemd/system/dsm-client.service \
+      /etc/systemd/system/dsm-client-boot-block.service
 $ sudo rm /etc/systemd/system/dsm-blocklist-update.service \
       /etc/systemd/system/dsm-blocklist-update.timer \
       /usr/local/sbin/dsm-blocklist-update
@@ -3167,6 +3195,7 @@ $ for iface in $(ls /sys/class/net); do
 /etc/systemd/system/dsm-blocklist-update.{service,timer}  # daily download
 /etc/systemd/system/dsm.service       # (optional) server unit
 /etc/systemd/system/dsm-client.service  # (optional) client unit
+/etc/systemd/system/dsm-client-boot-block.service  # (with the client unit) the block from boot until DSM starts
 ```
 
 ## 14. CLI Reference

@@ -112,22 +112,26 @@ closed as known:
   it to them on your next round, before their copy runs out. A new
   CRL lasts 395 days and a cert 365, so a cert runs out a month before the
   CRL made with it, and the two never run out on the same day.
-- **Client start errors before the kill switch.** Some errors stop the
-  client before its kill switch is up, so DSM raises no block for them,
-  also under `dsm-client.service`, while systemd tries again and gives up.
-  After a boot the host then uses the internet without the VPN while DSM
-  is down; after a `systemctl restart`, a crash or a signal, the earlier
-  run's start-up block stays (`sudo dsm cleanup` removes it). They are a
-  missing `/etc/dsm/passphrase` (systemd does not start DSM: status
-  243/CREDENTIALS), a `config.toml` that does not load, an evaluation
-  build without `allow_soft_attest`, nft refusing the first table, and any
-  failure to run DSM at all (no `/usr/local/bin/dsm` or a broken venv:
-  status 203/EXEC; a tuncore without the attest gate; an install that
-  fails on import). Each shows in the journal on the first start. `dsm
-  init --install-unit` writes the passphrase file; check the rest with one
-  run by hand at the console (not over SSH: the block comes up before the
-  passphrase prompt and freezes the session) before you enable the unit on
-  a headless host (deploy/GUIDE.md §7i).
+- **Client start errors before DSM's own kill switch.** Some errors stop
+  the client before DSM raises its own kill switch. Under
+  `dsm-client.service`, `dsm-client-boot-block.service` loads the start-up
+  kill switch (loopback and DHCP only) at boot, and again when the unit
+  restarts or starts after a stop. So these errors leave the host blocked
+  while systemd tries again and gives up (SSH too; `sudo dsm cleanup`
+  removes the block). They leave it open only on a run by hand, when nft
+  itself is missing or broken, when the boot unit file is not installed,
+  or after `sudo dsm cleanup` followed by a plain `systemctl start` (the
+  boot block still counts as up, so it does not run again; use `restart`
+  instead). They are a missing `/etc/dsm/passphrase` (systemd does not
+  start DSM: status 243/CREDENTIALS), a `config.toml` that does not load,
+  an evaluation build without `allow_soft_attest`, nft refusing the first
+  table, and any failure to run DSM at all (no `/usr/local/bin/dsm` or a
+  broken venv: status 203/EXEC; a tuncore without the attest gate; an
+  install that fails on import). Each shows in the journal on the first
+  start. `dsm init --install-unit` writes the passphrase file; check the
+  rest with one run by hand at the console (not over SSH: the block comes
+  up before the passphrase prompt and freezes the session) before you
+  enable the unit on a headless host (deploy/GUIDE.md §7i).
 - **Traffic-analysis limits.** DSM's tier shaper sends packets at a steady
   rate that only changes in a few fixed steps, so a watcher sees which step
   you are on, not your real traffic. It does not hide everything: the step

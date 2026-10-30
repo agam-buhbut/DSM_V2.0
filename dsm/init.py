@@ -735,13 +735,19 @@ def _print_next_steps(role: str, cfg: Config, config_path: Path, unit: bool) -> 
     if unit and not _cred_file_ready():
         steps.append(f"Put the key passphrase in {_CRED_FILE} (deploy/GUIDE.md §3e).")
     name = _unit_name(role)
-    if unit and not (_SYSTEMD_DIR / f"{name}.service").is_file():
-        # Where to get it too: a wheel has no deploy/ folder.
+    missing = [f for f in _unit_files(role) if not (_SYSTEMD_DIR / f).is_file()]
+    if unit and missing:
+        # Where to get them too: a wheel has no deploy/ folder.
         fetch = "--systemd --client" if role == "client" else "--systemd"
+        where, it = (
+            (f"it is deploy/{missing[0]}", "it")
+            if len(missing) == 1
+            else ("they are in deploy/", "them")
+        )
         steps.append(
-            f"Copy {name}.service to /etc/systemd/system/: it is "
-            f"deploy/{name}.service in the DSM source or release (install.sh "
-            f"{fetch} puts it there). Then: sudo systemctl daemon-reload && "
+            f"Copy {' and '.join(missing)} to /etc/systemd/system/: {where} "
+            f"in the DSM source or release (install.sh {fetch} puts {it} "
+            f"there). Then: sudo systemctl daemon-reload && "
             f"sudo systemctl enable {name}"
         )
     elif unit:
@@ -778,8 +784,15 @@ def _unit_name(role: str) -> str:
     return "dsm-client" if role == "client" else "dsm"
 
 
+def _unit_files(role: str) -> tuple[str, ...]:
+    """The unit files ``role`` installs. A client also gets the block that
+    holds from boot until DSM starts; its unit pulls that one in."""
+    name = f"{_unit_name(role)}.service"
+    return (name, "dsm-client-boot-block.service") if role == "client" else (name,)
+
+
 def _install_unit(role: str = "server") -> None:
-    """Install the unit, and say only what was done. Each step that is left
+    """Install the units, and say only what was done. Each step that is left
     (the passphrase file, copying a unit a wheel lacks, waiting for the
     server, the start) is said once, in _print_next_steps' list (QA2)."""
     name = _unit_name(role)
@@ -798,14 +811,21 @@ def _install_unit(role: str = "server") -> None:
                 "has no deploy/ folder): the list below says how to add it."
             )
         return
-    try:
-        shutil.copyfile(src, dst)
-    except OSError as e:
-        # The state file stays, so the same --resume can run again.
-        print(f"dsm init: could not install {dst}: {e.strerror or e}", file=sys.stderr)
-        sys.exit(1)
+    # A file deploy/ lacks is named in _print_next_steps' list instead.
+    installed = [f for f in _unit_files(role) if (_DEPLOY_DIR / f).is_file()]
+    for unit_file in installed:
+        dst = _SYSTEMD_DIR / unit_file
+        try:
+            shutil.copyfile(_DEPLOY_DIR / unit_file, dst)
+        except OSError as e:
+            # The state file stays, so the same --resume can run again.
+            print(
+                f"dsm init: could not install {dst}: {e.strerror or e}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
     subprocess.run(["systemctl", "daemon-reload"], check=True)
-    print(f"Installed {name}.service.")
+    print(f"Installed {' and '.join(installed)}.")
 
 
 def _build_parser() -> argparse.ArgumentParser:

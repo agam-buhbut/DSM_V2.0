@@ -4,14 +4,17 @@ Description=DSM VPN client
 # DSM as a server, whatever the config says.
 Documentation=file:///opt/dsm-repo/deploy/GUIDE.md
 Documentation=file:///opt/dsm-repo/README.md
-After=network-online.target
-Wants=network-online.target
+# dsm-client-boot-block.service raises the start-up block at boot, before
+# the network; DSM replaces it when it starts.
+After=network-online.target dsm-client-boot-block.service
+Wants=network-online.target dsm-client-boot-block.service
 
 # StartLimit* is only honored in [Unit]. If DSM keeps failing at start,
 # systemd stops trying after 5 starts in 10 minutes. After a crash, or a
 # start error once the block is up, the kill switch stays up even then (see
 # ExecStopPost), so the host stays blocked, not open. A few errors come
-# before the block (deploy/GUIDE.md §7i): after a boot the host is then open.
+# before DSM's own block (deploy/GUIDE.md §7i): the boot block
+# (dsm-client-boot-block.service) is up for them.
 StartLimitIntervalSec=10min
 StartLimitBurst=5
 
@@ -69,12 +72,13 @@ ExecStopPost=/bin/sh -c 'if [ "$$SERVICE_RESULT" = success ]; then queued=$$(sys
 
 # DSM exits when stopped (0), on a start error (1) or on a crash. With
 # --stop-keeps-block each of these keeps the start-up kill switch up, except
-# the few errors that come before it is raised (deploy/GUIDE.md §7i). A date
-# problem or a server name that does not resolve does not end DSM: it keeps
-# the block and tries again. Restart=always brings DSM back; the new start
-# replaces the old kill switch in one nft commit, so the host is never open
-# between. After 5 failed starts in 10 minutes systemd stops trying and the
-# block stays: run `sudo systemctl reset-failed dsm-client` before a restart.
+# the few errors that come before it is raised (deploy/GUIDE.md §7i); for
+# those the boot block stays up. A date problem or a server name that does
+# not resolve does not end DSM: it keeps the block and tries again.
+# Restart=always brings DSM back; the new start replaces the old kill switch
+# in one nft commit, so the host is never open between. After 5 failed
+# starts in 10 minutes systemd stops trying and the block stays: run
+# `sudo systemctl reset-failed dsm-client` before a restart.
 Restart=always
 RestartSec=5s
 

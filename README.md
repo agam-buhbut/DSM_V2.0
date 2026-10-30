@@ -48,7 +48,8 @@ Before you start:
 #    `--systemd` to also install the server unit (dsm.service) and the daily
 #    DNS block list download, and to fetch the default block list once. On
 #    a client, add `--systemd --client` instead: that installs the client
-#    unit (dsm-client.service) and no block list.
+#    units (dsm-client.service and dsm-client-boot-block.service, the block
+#    from boot until DSM starts) and no block list.
 curl -fsSL https://github.com/agam-buhbut/DSM_V2.0/releases/download/v0.1.0/install.sh | sudo sh -s -- --systemd
 
 # 2. Write the config, copy in the CA root, make the keys and a CSR. Only
@@ -597,14 +598,18 @@ defaults, and each end shapes only what it sends.
   exits 1). Under `dsm-client.service` a setup error keeps it, because
   nobody may be at the host: fix the problem, then `sudo systemctl
   reset-failed dsm-client && sudo systemctl restart dsm-client`, or run
-  `sudo systemctl stop dsm-client` and `sudo dsm cleanup`. A few errors
-  come before the kill switch and so raise no block, also under the unit:
-  a missing `/etc/dsm/passphrase` (systemd does not start DSM), a
+  `sudo systemctl stop dsm-client` and `sudo dsm cleanup`. Under the unit
+  the host is blocked from boot, too: `dsm-client-boot-block.service`
+  loads the start-up kill switch (loopback and DHCP only) before any
+  network comes up, and again when the unit restarts or starts after a
+  stop, and DSM replaces it when it starts. So the few errors that stop
+  DSM before its own kill switch (a missing `/etc/dsm/passphrase`, a
   config.toml that does not load, an evaluation build without
-  `allow_soft_attest`, nft refusing the first table, and an install that
-  cannot run DSM at all (SECURITY.md, deploy/GUIDE.md §7i). A `systemctl
-  stop` sent while DSM waits to restart also leaves it up; run `sudo dsm
-  cleanup`. If DSM stops
+  `allow_soft_attest`, nft refusing DSM's table, an install that cannot
+  run DSM at all) leave the host blocked under the unit, SSH too. On a run
+  by hand they still raise no block (SECURITY.md, deploy/GUIDE.md §7i). A
+  `systemctl stop` sent while DSM waits to restart also leaves it up; run
+  `sudo dsm cleanup`. If DSM stops
   on an error (a crash), the kill switch stays up; the next start replaces
   it. While the tunnel is down you have no internet, and a hotel or
   airport Wi-Fi login page cannot load: stop DSM, log in, then start it
@@ -904,7 +909,8 @@ checking that it works. It also covers routine tasks and debugging by
 symptom. The same directory holds `openssl-ca.cnf` (the OpenSSL config for
 the offline CA), `dsm.service` (the server's systemd unit),
 `dsm-client.service` (the client's unit; never put dsm.service on a
-client), and
+client), `dsm-client-boot-block.service` (the client's block from boot
+until DSM starts; dsm-client.service pulls it in), and
 `dsm-blocklist-update.sh` with its `.service` and `.timer` (the daily DNS
 block list download).
 

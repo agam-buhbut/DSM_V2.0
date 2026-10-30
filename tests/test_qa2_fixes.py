@@ -2041,9 +2041,9 @@ def test_a_wheel_install_gives_the_unit_copy_step_once(
     assert text.count(enable) == 1, text
     # Where the file is: a wheel has no deploy/ folder (review Minor).
     assert (
-        "Copy dsm-client.service to /etc/systemd/system/: it is "
-        "deploy/dsm-client.service in the DSM source or release (install.sh "
-        "--systemd --client puts it there). Then: " + enable
+        "Copy dsm-client.service and dsm-client-boot-block.service to "
+        "/etc/systemd/system/: they are in deploy/ in the DSM source or release "
+        "(install.sh --systemd --client puts them there). Then: " + enable
     ) in text
 
 
