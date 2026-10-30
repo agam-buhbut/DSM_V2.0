@@ -288,6 +288,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   offline until someone started DSM by hand. On the server each such try
   was an ERROR traceback. Such a cert in `cert_file` or at
   `dsm enroll --import` now gives one line too.
+- The server's flood limit now forgets an address 10 s after its last
+  new connection. Before, it kept every address it had seen. After
+  65,535 of them (a flood with faked addresses, scanners over a long
+  uptime, or a program on the server sending from many 127.x
+  addresses), it dropped every new client, and every client that moved
+  to a new address, until DSM restarted. Programs on the server itself
+  no longer go through this limit. Starting the server also replaces a
+  limit table that a killed run left behind. Someone who fakes more
+  than 65,535 addresses within 10 s still keeps new clients out while
+  that lasts, and a UDP session can drop at its next key change then;
+  before, an address already in the table kept getting in (SECURITY.md).
 
 ### Fixed
 - Over UDP, a lost or late third handshake message no longer makes the server drop the attempt. Before, the server read the client's next frame in its place and failed, and the client waited about 19 s before it tried again. Now the server skips a frame that does not open as that message and waits for the client's resend, about 6 s later. Over TCP a bad third message still ends the attempt.

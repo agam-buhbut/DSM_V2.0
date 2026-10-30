@@ -201,6 +201,19 @@ closed as known:
   30 s. Right after a restart every device is new. Known addresses are
   never barred.
 
+  In front of all this, the kernel lets each source address start 5
+  connections a second (10 at once). It keeps a slot for each address
+  until 10 s after its last new connection, and it has 65,535 slots.
+  Someone who can fake source addresses and sends from more than 65,535
+  of them within 10 s (about 6,600 small packets a second) fills the
+  slots. While that lasts, and for about 11 s after, no new device can
+  start, and a device that moves to a new address cannot come back.
+  A device on UDP also moves to a new source port after a key change
+  it starts (every 1 to 12 minutes). The kernel counts that as a new
+  connection, so the session can drop then, and it stays down until
+  the flood stops. Sessions over TCP keep working. Programs on the
+  server itself are not counted.
+
   (A flood of raw packets that fills the kernel's socket buffer is a
   separate risk; see "Several clients on one server".)
 - **Several clients on one server.** One Python event loop serves every

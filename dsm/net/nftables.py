@@ -323,8 +323,10 @@ class NFTablesManager:
 class ServerRateLimitManager:
     """Server-side handshake-flood rate limiter via nftables.
 
-    Drops new connections on the listen port over 20/s (burst 40);
-    established flows are unaffected. Best-effort.
+    Drops new connections on the listen port over 5/s per source address
+    (burst 10). A source's slot expires 10 s after its last new connection.
+    Established flows and loopback are not limited. Fail-closed: ``apply``
+    raises when nft fails, so the server does not start unprotected.
     """
 
     def __init__(self, listen_port: int) -> None:

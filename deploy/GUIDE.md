@@ -2355,6 +2355,10 @@ prints "ok".
 - This client's CN is past the 253rd name of the allowlist: the server logs
   `client_cn=... has no tunnel address (its allowlist line is past the first
   253); refused` (WARNING, §11).
+- If new devices cannot connect and the server log shows nothing, run
+  `sudo nft list table inet dsm_server_ratelimit`. A fast-rising counter on
+  the `ct state new counter drop` line means a flood of faked addresses has
+  filled the table. It clears about 10 s after the flood stops.
 
 ### "handshake failed: could not read the server's reply. The server may run a different DSM wire version ..."
 
