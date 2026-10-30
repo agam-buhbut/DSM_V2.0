@@ -379,6 +379,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mtu allows. Paths of 1428 bytes or more are not changed.
 
 ### Fixed
+- DSM now runs on a CPU without AES-NI. Every build turned on the AES-NI,
+  SSSE3 and SSE4.1 instructions, so on a CPU or VM without them (such as
+  QEMU's default `qemu64` model, or an older Pentium or Celeron) DSM was
+  killed with "illegal instruction" (systemd showed `status=4/ILL`) and no
+  error of its own, and on a client the kill switch then left the host with
+  no network. Now DSM checks the CPU once: it uses AES-NI when the CPU has
+  it, and a slower software AES that is just as safe when it does not. A
+  wheel built or copied before this change still has the old flags: rebuild
+  it, or copy a new one, on any machine that may lack AES-NI.
 - A TUN `mtu` below 1280 no longer stops DSM right after the handshake
   with the kill switch left up ("TUN configure failed: sysctl -w
   net.ipv6.conf.<tun>.disable_ipv6=0"). Linux takes IPv6 off a device
