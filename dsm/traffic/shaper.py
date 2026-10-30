@@ -1,17 +1,20 @@
 """Traffic shaping: packet sizes, padding and chaff, driven by the Rust core.
 
 The tier shaper core (``tuncore.Shaper``, rust/tuncore/src/shaper.rs) decides
-WHEN packets leave and HOW BIG they are. Packets leave at a steady rate that
-only changes in a few fixed steps ("tiers"); real packets take free slots and
-chaff fills the rest. Apart from decoys, the rate steps up when real packets
-have waited too long or have filled nearly all of the tier for a few seconds,
-and it steps down slowly; decoys imitate real busy periods; every session
-picks its own secret timing values, which Python cannot read.
+WHEN packets leave and which size classes are in use. Packets leave at a
+steady rate that only changes in a few fixed steps ("tiers"); real packets
+take free slots and chaff fills the rest. Apart from decoys, the rate steps
+up when real packets have waited too long or have filled nearly all of the
+tier for a few seconds, and it steps down slowly; decoys imitate real busy
+periods; every session picks its own secret timing values, which Python
+cannot read.
 
-This module only builds packet bytes. Real and chaff packets get their size
-from the same fixed, published size mix (``SIZE_CLASS_WEIGHTS``): a real
-packet's class is bumped up to fit its payload, a chaff packet's class gets a
-one-class nudge up or down. No size state carries over between packets.
+This module only builds packet bytes. Every packet, real or chaff, is padded
+to one size: the largest size class in use (1400 bytes unless padding_max or
+the path MTU ceiling lowers it), as TCP mode pads every frame. So a packet's
+size shows nothing about its payload or whether it is real. Over UDP a payload
+too big for that size is dropped, never sent at its exact size; over TCP it
+keeps its exact size here, and the TCP send pads the frame to 1400.
 
 A tier cap (``set_tier_cap``) can hold the rate below the top tier for a
 while; the slow-link auto cap (dsm/traffic/autocap.py) sets it, and
@@ -45,12 +48,6 @@ from dsm.core.protocol import (
 
 if TYPE_CHECKING:
     from dsm.core.config import Config
-
-# Chaff size nudge: a draw below UP_P moves one class up. A draw from UP_P up
-# to just below DOWN_P moves one class down. The Rust core owns the values;
-# the names stay here for the size tests.
-_CHAFF_SIZE_PERTURB_UP_P: float = tuncore.CHAFF_PERTURB_UP_P
-_CHAFF_SIZE_PERTURB_DOWN_P: float = tuncore.CHAFF_PERTURB_DOWN_P
 
 # set_size_class_ceiling crosses the FFI as a u16.
 _MAX_U16 = 0xFFFF
@@ -91,6 +88,10 @@ class TrafficShaper:
             padding_max,
             clock(),
         )
+        # Over UDP the one size is a hard rule: pad_packet refuses a payload
+        # too big for it. from_config turns this off for TCP, whose send pads
+        # every frame to 1400 anyway (dsm.session.make_send_fn).
+        self._drop_too_big = True
         # Tier listener (watch_tier) and the tier it saw last.
         self._tier_listener: Callable[[int], None] | None = None
         self._watched_tier = 0
@@ -101,7 +102,7 @@ class TrafficShaper:
     ) -> TrafficShaper:
         """Build the shaper from config. Client and server both use this, so
         both ends shape what they send from the same settings."""
-        return cls(
+        shaper = cls(
             config.padding_min,
             config.padding_max,
             clock=clock,
@@ -110,6 +111,8 @@ class TrafficShaper:
             decoy_interval_s=config.shaper_decoy_interval_s,
             linger_s=config.shaper_linger_s,
         )
+        shaper._drop_too_big = config.transport != "tcp"
+        return shaper
 
     @property
     def _active_classes(self) -> tuple[int, ...]:
@@ -169,20 +172,31 @@ class TrafficShaper:
         self._core.set_size_class_ceiling(min(max(max_outer, 0), _MAX_U16))
 
     def _sample_chaff_wire_class(self) -> int:
-        """Chaff size class: a fixed-mix draw plus the one-class nudge."""
-        return self._core.chaff_size_class()
+        """Chaff size class: the largest class in use, like every packet."""
+        return self._core.active_classes()[-1]
 
     def pad_packet(self, inner: InnerPacket) -> tuple[bytes, int]:
         """Serialize and pad a REAL inner packet.
 
-        Returns ``(inner_plaintext_with_padding, target_outer_size)``. The
-        core draws the class from the fixed mix and bumps it up to fit the
-        payload: padding only ever grows a packet.
+        Returns ``(inner_plaintext_with_padding, target_outer_size)``. Every
+        packet, real or chaff, takes the largest class in use, so its size
+        says nothing about its payload. Over UDP a payload too big for that
+        class raises ``ValueError``: the caller drops the packet, which must
+        never leave at its exact size. Over TCP it keeps its exact size,
+        since the TCP send pads every frame to 1400.
         """
         payload_len = len(inner.payload)
         if payload_len > MAX_INNER_PAYLOAD:
             raise ValueError(f"payload too large: {payload_len} > {MAX_INNER_PAYLOAD}")
-        target_outer = self._core.real_size_class(payload_len)
+        target_outer = self._core.active_classes()[-1]
+        need = _min_outer(payload_len)
+        if need > target_outer:
+            if self._drop_too_big:
+                raise ValueError(
+                    f"a {need}-byte packet is too big for the one size "
+                    f"{target_outer}"
+                )
+            target_outer = need
         return self._serialize_padded(inner, target_outer)
 
     def pad_chaff_to_class(
@@ -200,8 +214,8 @@ class TrafficShaper:
         return self._serialize_padded(inner, target_outer)
 
     def make_chaff_padded(self, epoch_id: int = 0) -> tuple[bytes, int]:
-        """Build a padded chaff packet from ONE size draw, used for both the
-        payload budget and the wire size."""
+        """Build a padded chaff packet at the one size every packet takes,
+        used for both the payload budget and the wire size."""
         size_class = self._sample_chaff_wire_class()
         chaff = self._chaff_for_class(epoch_id, size_class)
         return self._serialize_padded(chaff, size_class)

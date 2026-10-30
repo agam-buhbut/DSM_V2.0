@@ -149,24 +149,20 @@ class TestSizeClassCeilingLiveAdjustment(unittest.TestCase):
                 )
 
     def test_chaff_prior_renormalized_over_narrowed_set(self) -> None:
-        """The fixed chaff prior must be rebuilt over the new active set.
-
-        Beyond "no size exceeds the ceiling", Task 2.3 requires the chaff
-        sampler to draw from the published prior *renormalized over the active
-        subset*. After lowering, the chaff support must be EXACTLY the surviving
-        classes (every one of them reachable, none beyond the cap) — proving the
-        prior was rebuilt rather than merely clamped.
+        """After lowering, chaff takes EXACTLY the largest surviving class
+        (finding #55: every packet takes the largest class in use), proving
+        the one size was rebuilt from the new active set, not kept at 1400.
         """
         shaper = TrafficShaper(PADDING_MIN, PADDING_MAX)
         shaper.set_size_class_ceiling(LOWERED_CEILING)
 
-        expected = {sc for sc in SIZE_CLASSES if PADDING_MIN <= sc <= LOWERED_CEILING}
+        surviving = [sc for sc in SIZE_CLASSES if PADDING_MIN <= sc <= LOWERED_CEILING]
         observed = _real_chaff_sizes(shaper, _TRIALS)
         self.assertEqual(
             observed,
-            expected,
-            "chaff support after lowering must equal the surviving classes "
-            f"{sorted(expected)}, got {sorted(observed)}",
+            {surviving[-1]},
+            "chaff after lowering must take the largest surviving class "
+            f"{surviving[-1]}, got {sorted(observed)}",
         )
 
     def test_raising_ceiling_back_restores_wider_support(self) -> None:

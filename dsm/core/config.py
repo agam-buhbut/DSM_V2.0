@@ -67,6 +67,9 @@ MIN_TUN_MTU = 576
 AUTO_MTU_FLOOR = 472
 MAX_TUN_MTU = 1500
 DEFAULT_TUN_MTU = 1360
+# The size-class overhead above: a full TUN packet of mtu bytes needs an
+# mtu + 40 size class.
+_SIZE_CLASS_OVERHEAD = 40
 
 # Tier shaper defaults and limits. dsm.traffic.shaper uses the same defaults,
 # and the Rust core (rust/tuncore/src/shaper.rs) checks the same limits.
@@ -727,6 +730,44 @@ def _validate_server_pmtu(c: Config) -> None:
         )
 
 
+def _validate_udp_one_size(c: Config) -> None:
+    # Over UDP every packet takes one size: the largest size class at or below
+    # padding_max (a path MTU ceiling can lower it more at run time). A packet
+    # too big for it is dropped, never sent at its exact size, so warn when a
+    # full-size packet cannot fit. Above mtu 1360 DSM splits a packet into
+    # pieces that fill 1400 at most. TCP pads every frame to 1400 anyway.
+    # Only a warning: configs that loaded before must still start.
+    if c.transport != "udp":
+        return
+    # Lazy: dsm.core.protocol loads the Rust core, which nothing else in
+    # this module needs.
+    from dsm.core.protocol import SIZE_CLASSES
+
+    one_size = max(
+        (size for size in SIZE_CLASSES if size <= c.padding_max),
+        default=SIZE_CLASSES[0],
+    )
+    need = min(c.mtu + _SIZE_CLASS_OVERHEAD, SIZE_CLASSES[-1])
+    if need <= one_size:
+        return
+    fit = min(size for size in SIZE_CLASSES if size >= need)
+    fix_mtu = one_size - _SIZE_CLASS_OVERHEAD
+    if fix_mtu >= MIN_TUN_MTU:
+        fix = f"Set mtu = {fix_mtu} in both configs, or padding_max = {fit}."
+    else:
+        fix = f"Raise padding_max to at least {fit}."
+    log.warning(
+        "padding_max = %d: over UDP every packet takes one size, the largest "
+        "size class at or below padding_max, here %d bytes. A full-size packet "
+        "(mtu %d) needs %d, so full-size packets will be dropped. %s",
+        c.padding_max,
+        one_size,
+        c.mtu,
+        need,
+        fix,
+    )
+
+
 # Section order is observable — Config(...) reports the FIRST error
 # encountered, so reordering changes which message a test sees. Keep
 # this sequence stable.
@@ -751,6 +792,7 @@ _VALIDATORS = (
     _validate_pmtu_interval,
     _validate_auto_mtu,
     _validate_server_pmtu,
+    _validate_udp_one_size,
     _validate_max_inflight_handshakes,
 )
 

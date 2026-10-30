@@ -25,7 +25,7 @@ from cryptography.x509.oid import ExtendedKeyUsageOID
 
 from dsm.core import netaudit
 from dsm.core.atomic_io import atomic_write
-from dsm.core.config import Config
+from dsm.core.config import DEFAULT_TUN_MTU, MIN_TUN_MTU, Config
 from dsm.core.fsm import SessionFSM, State
 from dsm.core.log import RepeatLog
 from dsm.core.path_security import check_user_file_permissions
@@ -342,6 +342,33 @@ class _Reconnect:
         delay = _backoff_s(self._waits)
         self._waits += 1
         return delay
+
+
+def _log_path_mtu(config: Config, path_mtu: int) -> None:
+    """Log the kernel's path MTU, and warn when ``mtu`` does not fit it while
+    auto_mtu is off."""
+    # The TUN MTU auto_mtu would set on this path.
+    usable = _fit_tun_mtu(path_mtu, config.mtu)
+    log.info("kernel path MTU = %d (usable inner %d)", path_mtu, usable)
+    if usable >= config.mtu or config.auto_mtu:
+        return
+    # Every packet takes one size (the largest class up to padding_max), so a
+    # lower mtu alone no longer makes a datagram smaller. The fix by hand is
+    # the largest class the path holds as padding_max and that class minus 40
+    # as mtu, when a config takes that mtu.
+    fix_mtu = min(usable, DEFAULT_TUN_MTU)
+    by_hand = ""
+    if fix_mtu >= MIN_TUN_MTU:
+        by_hand = f", or set padding_max = {fix_mtu + 40} and mtu = {fix_mtu}"
+        by_hand += " in both configs"
+    log.warning(
+        "configured tun mtu=%d exceeds usable inner %d (path MTU %d); turn on "
+        "auto_mtu with pmtu_discover%s",
+        config.mtu,
+        usable,
+        path_mtu,
+        by_hand,
+    )
 
 
 async def _wait_or_stop(shutdown: asyncio.Event, delay: float) -> bool:
@@ -985,22 +1012,7 @@ async def run_client(
                 if isinstance(transport, UDPTransport):
                     path_mtu = transport.get_path_mtu()
                     if path_mtu is not None:
-                        # The TUN MTU auto_mtu would set on this path.
-                        usable = _fit_tun_mtu(path_mtu, config.mtu)
-                        log.info(
-                            "kernel path MTU = %d (usable inner %d)",
-                            path_mtu,
-                            usable,
-                        )
-                        if usable < config.mtu and not config.auto_mtu:
-                            log.warning(
-                                "configured tun mtu=%d exceeds usable inner %d "
-                                "(path MTU %d); enable `auto_mtu` or lower "
-                                "`mtu` in config to avoid fragmentation",
-                                config.mtu,
-                                usable,
-                                path_mtu,
-                            )
+                        _log_path_mtu(config, path_mtu)
 
                 seq = SequenceCounter()
                 replay = tuncore.ReplayWindow()

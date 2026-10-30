@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, cast
 from dsm.core import netaudit
 from dsm.core.config import AUTO_MTU_FLOOR, Config
 from dsm.core.fsm import SessionFSM, State
+from dsm.core.log import RepeatLog
 from dsm.core.protocol import (
     GCM_TAG_SIZE,
     OUTER_HEADER_SIZE,
@@ -203,7 +204,10 @@ def make_send_fn(  # pylint: disable=unused-argument  # `liveness` kept for call
     """
 
     # For TCP, always use max size class so the length-prefix is constant,
-    # preventing passive traffic analysis via frame sizes.
+    # preventing passive traffic analysis via frame sizes. TCP's one size is
+    # always 1400 (SIZE_CLASSES[-1]); UDP's is the shaper's largest class in
+    # use, which padding_max and the path MTU ceiling can lower
+    # (TrafficShaper.pad_packet). Do not merge the two.
     tcp_fixed_size = SIZE_CLASSES[-1] if isinstance(transport, TCPTransport) else 0
     # The plaintext we hand to AEAD must be sized so that the final wire
     # packet (OUTER_HEADER_SIZE + ciphertext_with_GCM_tag) equals
@@ -308,7 +312,7 @@ def make_addr_send_fn(
 
     The packet is sealed exactly as in ``make_send_fn`` — only the
     destination resolution differs — so the probe is indistinguishable on
-    the wire from any other size-128 control packet. TCP has a single
+    the wire from any other packet. TCP has a single
     connection (no per-packet addr), so the ``addr`` argument is ignored and
     ``transport.send`` is used directly; in practice path validation is a
     UDP-roaming concern.
@@ -1220,8 +1224,9 @@ def _fit_tun_mtu(path_mtu: int, mtu: int) -> int:
     alone it needs more than any class left and goes out at its exact size,
     which chaff never uses (finding #8). At the largest class (path 1428 or
     more), fragmenting keeps every piece in a class, so the path alone sets
-    the size. ``padding_min`` and ``padding_max`` are ignored on purpose: a
-    narrowed padding range keeps its documented exact-size limit.
+    the size. ``padding_min`` and ``padding_max`` are ignored on purpose:
+    config load warns when ``mtu`` is too big for ``padding_max``, and a
+    packet too big for the one size is dropped (``tun_send_loop``).
     """
     ceiling = path_mtu - IP_UDP_OVERHEAD
     fit = path_mtu - WIRE_OVERHEAD
@@ -1415,8 +1420,10 @@ async def tun_send_loop(ctx: DataPathContext) -> None:
     than ``MAX_INNER_PAYLOAD`` are split into FRAGMENT inner packets
     (receiver reassembles via ``ReassemblyBuffer``); packets beyond the
     16-fragment cap are dropped with a warning rather than crashing the
-    send loop.
+    send loop. Over UDP a packet too big for the one size every packet takes
+    is dropped too (counted in a DEBUG line).
     """
+    too_big_log = RepeatLog(log, logging.DEBUG)
     while not ctx.shutdown.is_set():
         if ctx.session_keys.needs_rotation() and not ctx.rekey.in_progress:
             # Do NOT set in_progress=True before calling initiate_rekey.
@@ -1519,6 +1526,19 @@ async def tun_send_loop(ctx: DataPathContext) -> None:
             log.warning("dropping oversized TUN packet (%d bytes): %s", len(pkt), e)
             continue
 
+        # pad_packet gives every packet, real or chaff, the largest active
+        # class, so the size on the wire never depends on the payload. Over
+        # UDP a piece too big for that class must not leave at its exact
+        # size: drop the whole TUN packet, since its other pieces are of no
+        # use alone. That happens with a padding_max too small for mtu (config
+        # load warns) or with packets the TUN queued before auto_mtu lowered
+        # its MTU.
+        try:
+            padded = [ctx.shaper.pad_packet(inner) for inner in inners]
+        except ValueError as e:
+            too_big_log.log("dropping a %d-byte TUN packet: %s", len(pkt), e)
+            continue
+
         # Real packets join the scheduler queue and leave in the tier
         # shaper's free slots, so the wire rate follows the tier, not the
         # real traffic; the fragments of an oversized TUN packet simply
@@ -1526,11 +1546,5 @@ async def tun_send_loop(ctx: DataPathContext) -> None:
         # Mark a real-data send so the keepalive loop's
         # 15s-idle check doesn't get bumped by chaff.
         ctx.liveness.last_real_send_time = time.monotonic()
-        for inner in inners:
-            padded, target_size = ctx.shaper.pad_packet(inner)
-            # Real-packet sizes are no longer fed
-            # back into any distribution. pad_packet draws the target class
-            # from the FIXED published prior (the same one chaff uses) and
-            # bumps up to fit the payload, so the real-traffic size histogram
-            # cannot collapse onto one dominant class.
-            ctx.scheduler.enqueue(padded, target_size)
+        for data, target_size in padded:
+            ctx.scheduler.enqueue(data, target_size)

@@ -390,23 +390,29 @@ newest, also across key changes.
 
 ### Padding
 
-- With the default settings, every packet is padded to one of 11 sizes
-  (size classes): 128, 256, 384, 512, 640, 768, 896, 1024, 1152, 1280 or
-  1400 bytes. `padding_min` and `padding_max` can narrow this list.
-  `auto_mtu` drops sizes that are too big for the path, and lowers the TUN
-  MTU so a full-size packet still fills a size that is left. With a narrow
-  padding range, a real packet too big for every size left is sent at its
-  exact size.
+- Over UDP, every packet after the handshake, real or fake, is padded to
+  one size: the largest size class in use. By default that is 1400 bytes
+  (1428 on the wire with the IP and UDP headers), the size TCP mode uses for
+  every frame. The classes are 128, 256, 384, 512, 640, 768, 896, 1024,
+  1152, 1280 and 1400 bytes. `padding_max` and `auto_mtu` can make the
+  largest size in use smaller, and then every packet takes that size.
+  `auto_mtu` also lowers the TUN MTU so a full-size packet still fits it.
+  With `padding_max` below 1400, a real packet too big for that size is
+  dropped, never sent at its exact size, so `mtu` must fit it (see
+  `padding_max` under Configuration, Parameters; DSM warns at start when it
+  does not).
+  `padding_min` no longer changes anything over UDP.
 - The padding sits inside the encryption: it fills the encrypted part up to
   the size class. So no unauthenticated padding is left on the wire.
 - In TCP mode every frame is padded to the largest class (1400), so all
   frames have the same size on the wire.
-- Real and fake packets draw their size from the same fixed, published mix
-  (`SIZE_CLASS_WEIGHTS`), never from your live traffic. Every DSM user has
-  the same mix. So the sizes on the wire tend to look the same for everyone,
-  instead of showing which apps you use. Small and mixed-size traffic
-  follows the mix closely, because a small packet almost never needs a
-  bigger size than the one drawn.
+- So a packet's size says nothing about what it carries or whether it is
+  real. Older versions drew each size from a fixed mix and raised a real
+  packet's size until it fit. Every full-size real packet was then 1400
+  bytes, but only about 1 in 20 fake packets was, so counting 1400-byte
+  packets showed how much you really sent each second, when you stopped,
+  and short bursts. That is gone. It costs data: fake packets are now all
+  full size (see What it costs).
 
 ### How DSM hides your traffic
 
@@ -463,7 +469,8 @@ exactly the same steps as real use. A third to two thirds of the time it
 pauses a few seconds between steps, as a download does while it fills each
 tier (each session picks how often, and roughly how long). Then it stays
 busy for a while and comes down slowly, just like real use. So a watcher
-cannot tell which short busy periods were real. A decoy's busy stretch
+who sees only one direction of your link cannot tell which short busy
+periods were real (see What it does not hide). A decoy's busy stretch
 lasts 1 to 6 minutes on average, so a much longer busy period is almost
 surely real. By default a decoy comes about every 2 hours on average (each
 session picks its own average, between 1 and 4 hours).
@@ -477,41 +484,41 @@ they go to the top and how they pause. It picks new values every 10 to 40
 minutes. So reading this code does not tell a watcher the numbers your
 session uses.
 
-**Sizes.** Real and fake packets are padded to sizes from the same fixed
-list (128 to 1400 bytes), using the same fixed mix in which smaller sizes
-are more common. A real packet is bumped up to the next size that fits it.
-A fake packet's size is moved one step up or down now and then. Your past
-packets never change the mix. (Older versions picked real sizes from a
-running average of your own traffic. Within tens of packets, most real
-packets ended up at one size, your most common one, which gave it away.
-That is gone.)
+**Sizes.** Every packet, real or fake, has the same size: the largest
+size in use, 1400 bytes by default, as in TCP mode. So the sizes on the
+wire carry no sign of your traffic. (Older versions picked sizes from a
+fixed mix, and before that from a running average of your own traffic.
+Both let a watcher pick out real packets by size. That is gone.)
 
 **What it costs** (per direction; padding only, not counting your real
 traffic):
 
 | Situation | Cost |
 |---|---|
-| Connected all day, no use, decoys on | about 3 GB a day |
-| Connected all day, about 20 bursts of real use | about 6 GB a day |
-| Each decoy | about 0.2 GB (the climb, the busy stretch, the slow step-down and the wait before idle) |
-| After using the top tier | the top tier for 1 to 5 minutes, then a few minutes per lower tier, then 5 to 30 minutes at tier 1 (about 0.15 GB) |
-| A download or stream that fills a tier | it climbs a tier and pays that tier's padding while it runs: at the top tier up to about 1.8 GB an hour, less the places your own traffic takes |
+| Connected all day, no use, decoys on | about 7 GB a day |
+| Connected all day, about 20 bursts of real use | about 14 GB a day |
+| Each decoy | about 0.5 GB (the climb, the busy stretch, the slow step-down and the wait before idle) |
+| After using the top tier | the top tier for 1 to 5 minutes, then a few minutes per lower tier, then 5 to 30 minutes at tier 1 (about 0.35 GB) |
+| A download or stream that fills a tier | it climbs a tier and pays that tier's padding while it runs: at the top tier up to about 4 to 5 GB an hour, less the places your own traffic takes |
 | Top speed | about 7 to 10 Mbit/s at the default `mtu = 1360` (less for a smaller `mtu`). One DSM packet carries at most 1360 bytes, so with a larger `mtu` each full-size packet is split in two, which halves it to about 3.6 to 5.4 Mbit/s |
 | When a burst starts | about 0.5 to 1.5 seconds of extra wait while the pace steps up. A download that paces itself to the speed it gets (TCP) needs about 2 to 5 seconds per tier instead |
 
 **Slow links.** At the default top tier DSM sends up to about 11 Mbit/s in
-each direction. If the link is slower than that, DSM floods it: packets are
-lost, key changes can be lost too, and the tunnel can stall or drop. DSM
-now notices this on its own. About once a second each end tells the other
-how many packets arrived. When 5% or more of what one end sent was lost for
-two seconds in a row, at tier 2 or higher, that end lowers its top tier one
-step at once and logs a line like
+each direction, whenever it is at that tier, decoys included. If the link
+is slower than that, DSM floods it: packets are lost, key changes can be
+lost too, and the tunnel can stall or drop. DSM now notices this on its
+own. About once a second each end tells the other how many packets
+arrived. When 5% or more of what one end sent was lost for two seconds in
+a row, at tier 2 or higher, that end lowers its top tier one step at once
+and logs a line like
 `auto cap: lost 12% at tier 3 (800/s); top tier now 2 (200/s), next try in 5 min`.
-After 5 minutes it allows the higher step again. If the loss comes back, it
-waits twice as long the next time, up to an hour. It never goes below tier
-1, and every new connection starts with no limit. If packets are still
-lost after auto cap has already dropped to tier 1, it logs a warning at
-most every 10 minutes:
+Such a line can show up while you are not using the tunnel at all: decoys
+reach the top tier too, and fill it as fully as a download does. That is
+expected. After 5 minutes it allows the higher step again. If the loss
+comes back, it waits twice as long the next time, up to an hour. It never
+goes below tier 1, and every new connection starts with no limit. If
+packets are still lost after auto cap has already dropped to tier 1, it
+logs a warning at most every 10 minutes:
 `auto cap: link too slow even for tier 1 (about 12% lost); lower shaper_tiers_pps by hand`.
 It needs this version at
 the other end too (an older end sends no reports, so nothing changes), and
@@ -535,7 +542,9 @@ server:
 - short bursts that fit in the current tier;
 - when you stop: the slow step-down and the wait before idle blur it by
   minutes;
-- whether a short busy period was real: decoys look the same.
+- whether a short busy period was real, to a watcher who sees only one
+  direction: decoys climb and come down like real use, with the same packet
+  size.
 
 **What it does not hide:**
 
@@ -555,14 +564,15 @@ server:
   internet traffic. Your real busy periods line up with what your server
   sends out, so they can filter out decoys and the wait before idle. With
   one user per server, all of the server's outgoing traffic is you;
+- whether a busy period was real, to a watcher who sees both directions of
+  your link (anyone on your Wi-Fi or at your provider does): a real download
+  makes your device send replies, so the other direction climbs too. A
+  decoy runs in one direction only;
 - when your device is off;
 - the start of a connection: the handshake (the first exchange that sets up
   the keys) has a fixed, recognizable pattern before any cover traffic runs.
   Hiding it is left to research after v1;
-- in TCP mode, the TCP connection itself (its setup and teardown);
-- the exact amount of data: the tiers pace packets, not bytes, and big real
-  packets (for example during a large download) push more packets into the
-  largest size, because padding can only make a packet bigger.
+- in TCP mode, the TCP connection itself (its setup and teardown).
 
 The tiers, the wait limit, decoys and the wait before idle are set in
 `config.example.toml`, which also lists the costs. Both ends ship the same
@@ -870,9 +880,14 @@ The config file is TOML, at `/opt/mtun/config.toml`.
   second.
 - log_level: debug | info | warning | error (default: info). See Logging
   below.
-- padding_min, padding_max: padding range (default: 128-1400). A narrow
-  range leaves fewer sizes, and a real packet too big for every size left
-  is sent at its exact size (see Padding above).
+- padding_min, padding_max: the range of size classes DSM may use
+  (default: 128-1400). Over UDP every packet takes the largest class at or
+  below `padding_max`, so `padding_max` sets the size, and `padding_min` no
+  longer changes anything. If you lower `padding_max`, set `mtu` in both
+  configs to at most that class minus 40 (for example `padding_max = 1024`
+  and `mtu = 984`). Otherwise a real packet too big for the size is dropped,
+  never sent at its exact size, and DSM warns at start (see Padding above).
+  In TCP mode every frame is 1400 bytes whatever these say.
 - shaper_tiers_pps: the tier rates in packets per second, lowest first
   (default: [10, 50, 200, 800]; 2 to 8 entries, each 1 to 5000, each higher
   than the one before). The first one is the idle rate. It must be above

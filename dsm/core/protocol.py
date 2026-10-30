@@ -48,7 +48,9 @@ MAX_INNER_PAYLOAD = 1500
 
 # Packet size classes for padding (bytes) and their draw weights (a typical
 # web-traffic mix: smaller packets likelier). The Rust shaper core owns the
-# one copy; these names re-export it for the rest of dsm.
+# one copy; these names re-export it for the rest of dsm. The data path no
+# longer draws from the weights: every packet takes the largest active class
+# (dsm/traffic/shaper.py).
 SIZE_CLASSES: tuple[int, ...] = tuncore.SIZE_CLASSES
 SIZE_CLASS_WEIGHTS: tuple[int, ...] = tuncore.SIZE_CLASS_WEIGHTS
 

@@ -121,8 +121,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Control messages (key changes and address checks) wait in their own small
   queue that is sent before any data. A full data queue can no longer hold
   them up for seconds or drop them, which could break a key change.
-- More cover traffic by default: about 3 GB a day per direction when
-  connected all day with decoys on, about 6 GB with some real use.
+- More cover traffic by default: about 7 GB a day per direction when
+  connected all day with decoys on, about 14 GB with some real use.
   `config.example.toml` lists the costs.
 - The first tier must be fast enough for the latency budget:
   `shaper_tiers_pps[0]` must be above 4.25 divided by the budget in seconds
@@ -148,6 +148,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   blocklist (below).
 
 ### Security
+- Over UDP, packet sizes no longer show your real traffic. A real packet's
+  size used to be drawn from a fixed mix and then raised until it fit, so
+  every full-size packet was 1400 bytes, while only about 1 in 20 fake
+  packets was. Counting 1400-byte packets showed how much you sent each
+  second, when you stopped (within about a second, while the rate stayed up
+  for minutes) and short bursts, despite holds, linger and decoys. Now every
+  packet, real or fake, is padded to the largest size in use, as TCP mode
+  already did. This costs about 2.4 times the padding data: about 7 GB a day
+  per direction, connected all day with decoys on, instead of about 3 GB.
+  The top speed does not change. A real packet too big for that size is
+  dropped, never sent at its exact size: with `padding_max` below 1400, set
+  `mtu` in both configs to the largest size class at or below `padding_max`,
+  minus 40 (DSM warns at start when it does not fit). `padding_min` no
+  longer changes anything over UDP. The start-up path MTU warning now
+  points to `auto_mtu` or to `padding_max` with `mtu`, because a lower `mtu`
+  alone no longer makes a datagram smaller. With `pmtu_discover = true`, a
+  path that shrinks mid-session now stops every packet, not only the big
+  ones, until `auto_mtu` lowers the size, about a second after the first
+  refused packet. Upgrade both ends: each end pads only what it sends, so
+  until the server is upgraded the download direction still shows the
+  sizes. A server pays this for each client: about 7 GB a day out per
+  client that is connected all day and idle.
 - **Behavior change:** the client is now blocked from boot. Before,
   `dsm-client.service` started only once the network was up, and DSM then
   took 0.15-0.35 s to raise its kill switch, so on every boot other

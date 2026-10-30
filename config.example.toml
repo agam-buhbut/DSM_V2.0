@@ -183,6 +183,12 @@ mtu = 1360
 # debug_net = false
 
 # Traffic shaping
+# Over UDP every packet, real or fake, is padded to the largest size class at
+# or below padding_max (1400 by default), so padding_min no longer changes
+# anything there. If you lower padding_max, set mtu in both configs to at most
+# that class minus 40 (padding_max = 1024 needs mtu = 984). Otherwise a real
+# packet too big for the size is dropped, because its exact size would mark
+# it as real; DSM warns at start. TCP frames are always 1400 bytes.
 padding_min = 128
 padding_max = 1400
 
@@ -203,14 +209,14 @@ padding_max = 1400
 # ship the same defaults; each end shapes only what it sends.
 #
 # What it costs, per direction (padding only, not your real traffic):
-#   * connected all day, no use, decoys on: about 3 GB a day
-#   * connected all day with about 20 bursts of real use: about 6 GB a day
-#   * each decoy: about 0.2 GB (climb, busy stretch, slow step-down, linger)
+#   * connected all day, no use, decoys on: about 7 GB a day
+#   * connected all day with about 20 bursts of real use: about 14 GB a day
+#   * each decoy: about 0.5 GB (climb, busy stretch, slow step-down, linger)
 #   * after using the top tier: the top for 1-5 minutes, then a few minutes
-#     per lower tier, then 5-30 minutes at tier 1 (about 0.15 GB)
+#     per lower tier, then 5-30 minutes at tier 1 (about 0.35 GB)
 #   * a download or stream that fills a tier climbs a tier and pays that
-#     tier's padding while it runs: at the top up to about 1.8 GB an hour,
-#     less the places your own traffic takes
+#     tier's padding while it runs: at the top up to about 4 to 5 GB an
+#     hour, less the places your own traffic takes
 #   * top speed (800 packets/s at the default top tier): about 7-10 Mbit/s
 #     at the default mtu = 1360 (less for a smaller mtu). Above 1360 each
 #     full-size packet is split in two, which halves it to about 3.6-5.4

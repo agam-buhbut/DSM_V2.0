@@ -2212,16 +2212,40 @@ hostname is the convenient choice for a home server on a changing IP.
 `auto_mtu` + `pmtu_discover` matter on cellular, where the path MTU is
 small and oversized packets are often silently black-holed — the client
 tracks the kernel PMTU and lowers the TUN MTU to fit (the "auto_mtu:
-lowered tun mtu ..." line in §5).
+lowered tun mtu ..." line in §5). Every packet has one size, so when the
+path shrinks during a session every packet is refused for a moment, not
+only the big ones, until auto_mtu lowers the size: about a second after
+the first refused packet.
 
 Data use: the tier shaper sends fake packets and padding the whole time
 the tunnel is up, even when you are not using it. Connected all day with
-decoys on, this extra traffic alone is about 3 GB a day in each direction.
-Real use adds more of it: about 6 GB a day with about 20 bursts of use, on
+decoys on, this extra traffic alone is about 7 GB a day in each direction.
+Real use adds more of it: about 14 GB a day with about 20 bursts of use, on
 top of your real traffic. The settings that control it are
 `shaper_tiers_pps`, `shaper_latency_budget_ms`, `shaper_decoy_interval_s`,
 `shaper_linger_s` and `shaper_auto_cap`; `config.example.toml` lists the
 costs.
+
+To use less data, change one of these in both configs. The figures are per
+direction for a day connected with no use, against the default 7 GB; they
+come from simulated days on the real shaper, and a real day varies with the
+random decoys:
+
+- `padding_max = 1024` with `mtu = 984`: about 5 GB. Top speed drops by
+  about a quarter.
+- `padding_max = 768` with `mtu = 728`: about 4 GB. Top speed drops by
+  about half.
+- `shaper_tiers_pps = [10, 50, 200, 400]`: about 5 GB. Top speed halves.
+- `shaper_decoy_interval_s = 14400` (decoys half as often): about 4 GB.
+  There are half as many fake busy periods to hide your real ones among.
+- `shaper_decoy_interval_s = 0` (no decoys): about 1.6 GB. Then every busy
+  period on your link is real use, which a watcher can see.
+
+An `mtu` below 1280 is fine: DSM carries no IPv6 through the tunnel. Any
+value other than the default makes your link look less like other DSM
+users' links. Each end pads only what it sends, so the download direction
+follows the server's settings, and the server's `padding_max` sets the size
+for all of its clients.
 
 ### 10d. UDP-blocked networks (some cellular / captive Wi-Fi)
 
@@ -2624,8 +2648,11 @@ Otherwise delete it. The warning stops once the old file is gone.
 
 - Path MTU issue. Check the startup log for:
   `"configured tun mtu=1400 exceeds usable inner NNN"`
-  Lower `mtu` in both configs until the warning is gone, OR set
-  `auto_mtu = true` + `pmtu_discover = true` on the client.
+  Set `auto_mtu = true` + `pmtu_discover = true` on the client, OR set
+  `padding_max` to a size class no larger than the path MTU minus 28, and
+  `mtu` to that class minus 40, in both configs (the warning gives both
+  numbers). Lowering `mtu` alone no longer helps: every packet is padded to
+  the one size, the largest size class at or below `padding_max`.
 - The tier shaper adds wait by design. When a burst starts, packets
   wait about 0.5 to 1.5 seconds while the rate steps up (a download that
   paces itself to the speed it gets, as TCP does, needs about 2 to 5
@@ -2637,18 +2664,21 @@ Otherwise delete it. The warning stops once the old file is gone.
   test that hides less, lower `shaper_latency_budget_ms` and raise
   `shaper_tiers_pps` in both configs. A lower budget needs a faster first
   tier: it must stay above 4.25 divided by the budget in seconds. On a
-  slow link, lowering padding_max also cuts the padding bytes. Do that for
-  a quick test only, because it hides much less: a real packet too big for
-  the largest allowed size is sent at its exact size, which no fake packet
-  ever has, and that size shows how big the packet really is.
+  slow link, lowering padding_max also cuts the padding bytes. Set mtu in
+  both configs to at most the largest size class at or below padding_max,
+  minus 40, at the same time (padding_max = 1024 needs mtu = 984).
+  Otherwise every real packet too big for that size is dropped, never sent
+  at its exact size, and DSM warns at start. Either way the top speed goes
+  down.
 
 ### Tunnel stalls or drops during big downloads (slow link)
 
 At the default top tier (800 packets/s) DSM sends up to about 11 Mbit/s in
 each direction. On a slower link it floods the link: packets are lost, key
-changes can be lost too, and the tunnel stalls or drops, mostly during big
-downloads. DSM now lowers its own top tier when that happens. Look for
-`auto cap:` lines in the log (`journalctl -u dsm | grep 'auto cap'` on
+changes can be lost too, and the tunnel stalls or drops, during big
+downloads, and also during decoys that reach the top tier, because fake
+packets are full size too. DSM now lowers its own top tier when that
+happens. Look for `auto cap:` lines in the log (`journalctl -u dsm | grep 'auto cap'` on
 the server, `-u dsm-client` on a client). A
 line like this means it worked:
 `auto cap: lost 12% at tier 3 (800/s); top tier now 2 (200/s), next try in 5 min`.
