@@ -350,6 +350,47 @@ class TestAutoMtuCeilingWithHandSetMtu(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(shaper._active_classes[-1], 1400)
 
 
+class TestAutoMtuCeilingWhenSetMtuFails(unittest.IsolatedAsyncioTestCase):
+    """A TUN MTU that cannot be lowered must not keep the old size too. With
+    DF on, every datagram at the old size is refused. A packet too big for
+    the new size is dropped, never sent at its exact size, so the lower
+    size leaks nothing, and small packets keep flowing."""
+
+    async def test_the_ceiling_drops_when_set_mtu_fails(self) -> None:
+        config = _make_config(pmtu_check_interval_s=0.01)  # mtu 1360
+        shaper = TrafficShaper.from_config(config)
+        tries: list[int] = []
+        tried_twice = asyncio.Event()
+
+        def refuse(mtu: int) -> None:
+            tries.append(mtu)
+            if len(tries) == 2:
+                tried_twice.set()
+            raise OSError("RTNETLINK answers: Operation not permitted")
+
+        tun = MagicMock()
+        tun.set_mtu = MagicMock(side_effect=refuse)
+        ctx = _StubCtx(tun=tun, shutdown=asyncio.Event(), shaper=shaper)
+        transport = _make_udp_transport_with_pmtus(_scripted(1300, 1300))
+        ceilings: list[int] = []
+        set_ceiling = shaper.set_size_class_ceiling
+
+        def record(max_outer: int) -> None:
+            ceilings.append(max_outer)
+            set_ceiling(max_outer)
+
+        with patch.object(shaper, "set_size_class_ceiling", side_effect=record):
+            task = asyncio.create_task(auto_mtu_loop(ctx, transport, config))
+            # The loop handles the second reading in full before it waits.
+            await asyncio.wait_for(tried_twice.wait(), timeout=2.0)
+            ctx.shutdown.set()
+            await asyncio.wait_for(task, timeout=2.0)
+        # The TUN MTU is tried again at each reading; the size goes down once.
+        self.assertEqual(tries, [1112, 1112])
+        self.assertEqual(ceilings, [1272])  # path 1300 - IP/UDP 28
+        self.assertEqual(shaper._active_classes[-1], 1152)
+
+
 class TestAutoMtuConfigValidation(unittest.TestCase):
     def test_pmtu_check_interval_lower_bound(self) -> None:
         with self.assertRaises(ValueError):

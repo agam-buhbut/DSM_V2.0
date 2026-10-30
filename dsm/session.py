@@ -1226,12 +1226,12 @@ def _fit_tun_mtu(path_mtu: int, mtu: int) -> int:
 
     Below the largest size class the path drops classes, so a full-size TUN
     packet must fill the largest class left exactly. Sized to the path
-    alone it needs more than any class left and goes out at its exact size,
-    which chaff never uses (finding #8). At the largest class (path 1428 or
-    more), fragmenting keeps every piece in a class, so the path alone sets
-    the size. ``padding_min`` and ``padding_max`` are ignored on purpose:
-    config load warns when ``mtu`` is too big for ``padding_max``, and a
-    packet too big for the one size is dropped (``tun_send_loop``).
+    alone it would need more than any class left, and over UDP a packet too
+    big for the one size is dropped (``tun_send_loop``), never sent at its
+    exact size (finding #8). At the largest class (path 1428 or more),
+    fragmenting keeps every piece in a class, so the path alone sets the
+    size. ``padding_min`` and ``padding_max`` are ignored on purpose: config
+    load warns when ``mtu`` is too big for ``padding_max``.
     """
     ceiling = path_mtu - IP_UDP_OVERHEAD
     fit = path_mtu - WIRE_OVERHEAD
@@ -1276,7 +1276,9 @@ async def auto_mtu_loop(
     larger usable MTU to avoid flap on transient PMTU bumps. Bounded
     below by ``AUTO_MTU_FLOOR`` and above by ``config.mtu``. The size
     ceiling (path MTU minus IP + UDP, at most ``padding_max``) follows the
-    same rules, also when a hand-set ``mtu`` keeps the TUN MTU as it is.
+    same rules, also when a hand-set ``mtu`` keeps the TUN MTU as it is. On
+    a lower it also goes down when ``set_mtu`` fails; on a raise it does
+    not.
 
     No-ops when:
       * ``config.auto_mtu`` is False
@@ -1316,11 +1318,25 @@ async def auto_mtu_loop(
             # set_mtu backends raise varied OS-level errors
             except Exception as e:  # noqa: BLE001
                 log.warning("auto_mtu: set_mtu(%d) failed: %s", usable, e)
+                # Lower the size anyway: with DF on, every datagram at the
+                # old size is refused. A packet too big for the new size is
+                # dropped, never sent at its exact size, so small packets
+                # keep flowing. The next reading tries set_mtu again.
+                if outer < ceiling:
+                    ctx.shaper.set_size_class_ceiling(outer)
+                    log.info(
+                        "auto_mtu: lowered size ceiling %d -> %d, tun mtu "
+                        "stays %d (kernel pmtu=%d)",
+                        ceiling,
+                        outer,
+                        current,
+                        path_mtu,
+                    )
+                    ceiling = outer
+                rises_observed = 0
                 continue
-            # Also clamp the shaper's size-class ceiling so padded
-            # / chaff outer packets fit the constrained path. Only after
-            # set_mtu worked: a lower ceiling under the old TUN MTU would
-            # send full-size packets at their exact size.
+            # Also clamp the shaper's size-class ceiling so padded / chaff
+            # outer packets fit the constrained path.
             ctx.shaper.set_size_class_ceiling(outer)
             log.info(
                 "auto_mtu: lowered tun mtu %d -> %d (kernel pmtu=%d)",
@@ -1536,8 +1552,8 @@ async def tun_send_loop(ctx: DataPathContext) -> None:
         # UDP a piece too big for that class must not leave at its exact
         # size: drop the whole TUN packet, since its other pieces are of no
         # use alone. That happens with a padding_max too small for mtu (config
-        # load warns) or with packets the TUN queued before auto_mtu lowered
-        # its MTU.
+        # load warns), with packets the TUN queued before auto_mtu lowered
+        # its MTU, or when auto_mtu could not lower the TUN MTU.
         try:
             padded = [ctx.shaper.pad_packet(inner) for inner in inners]
         except _TooBigForOneSize as e:
