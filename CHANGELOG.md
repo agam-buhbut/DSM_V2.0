@@ -297,6 +297,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   version first starts. If a host already refuses the new CA's CRL this way,
   check its CA root and `ca_root_sha256`, then remove
   `/opt/mtun/crl_number*.seen` once.
+- `attest_tpm_tcti` now reaches the client and server, not only
+  `dsm enroll`. Before, a key made on a TPM that /dev/tpmrm0 does not
+  reach (a second chip, a host with only /dev/tpm0, or swtpm) passed
+  start-up, but every handshake failed. When it is set, it also wins over
+  a TCTI or TPM2TOOLS_TCTI in the environment, so enroll and the daemons
+  always use the same TPM.
 - `dsm init --install-unit` made an empty `/etc/dsm/passphrase`, so the
   unit's first start failed with a traceback. Now `--resume` writes the
   passphrase that has just unlocked the keys there, and an empty or

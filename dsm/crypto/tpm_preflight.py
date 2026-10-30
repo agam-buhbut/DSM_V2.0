@@ -9,6 +9,7 @@ backend (there is no TPM to reach).
 from __future__ import annotations
 
 import logging
+import os
 
 log = logging.getLogger(__name__)
 
@@ -19,6 +20,23 @@ class TpmPreflightError(Exception):
     Carries an operator-actionable message (missing device node, wrong
     group/permissions, non-empty Owner auth, or an unreachable TCTI).
     """
+
+
+def apply_configured_tcti(tcti: str | None) -> None:
+    """Point the Rust TPM backend at the TPM that ``attest_tpm_tcti`` names.
+
+    The backend reads ``TPM2TOOLS_TCTI`` first, then ``TCTI``. Setting both
+    makes the config win over whatever the shell holds, so enroll and the
+    daemons use the same TPM. If ``tcti`` is unset, the environment is left
+    alone. The soft backend ignores the value. Call it before any thread
+    starts (``setenv`` is not thread-safe).
+
+    Args:
+        tcti: ``config.attest_tpm_tcti``, or ``None``.
+    """
+    if tcti:
+        os.environ["TPM2TOOLS_TCTI"] = tcti
+        os.environ["TCTI"] = tcti
 
 
 def preflight_tpm(tcti: str | None) -> None:

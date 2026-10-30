@@ -77,6 +77,10 @@ attest_key_file = "/opt/mtun/attest.key"
 # device takes one user at a time, so DSM opens it for each signature.
 #   attest_tpm_tcti = "device:/dev/tpmrm0"     # explicit hardware TPM
 #   attest_tpm_tcti = "swtpm:host=127.0.0.1,port=2321"  # hermetic test TPM
+# swtpm: and mssim: reach the TPM over a network port. They are for tests
+# only. DSM's TPM session is not sent in clear, but a program that takes
+# that port first can pose as the TPM and test passphrase guesses offline,
+# very fast.
 # attest_tpm_tcti =
 
 # Certificate revocation (CRL)

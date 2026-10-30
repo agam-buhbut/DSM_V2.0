@@ -26,6 +26,7 @@ from pathlib import Path
 from dsm.core import log as dsm_log
 from dsm.core import netaudit
 from dsm.core.config import CONFIG_PATH, Config, ConfigError, load
+from dsm.crypto.tpm_preflight import apply_configured_tcti
 
 
 def _load_config_or_exit(config_path: Path | None, mode: str | None = None) -> Config:
@@ -251,6 +252,7 @@ def _main() -> None:
 
     _need_root("DSM")
     config = _load_config_or_exit(args.config, mode=args.mode)
+    apply_configured_tcti(config.attest_tpm_tcti)
 
     dsm_log.configure(config.log_level)
 
@@ -308,13 +310,7 @@ def _run_enroll(
     keystore = KeyStore(config.key_file)
     attest_store = AttestStore(config.attest_key_file)
 
-    # Thread the configured TCTI to the Rust attest backend, which reads it
-    # from the environment. setdefault so an explicit TCTI already in the
-    # environment (e.g. a test harness pointing at swtpm) still wins. No-op on
-    # the soft backend, which ignores the TCTI entirely.
-    tcti = getattr(config, "attest_tpm_tcti", None)
-    if tcti:
-        os.environ.setdefault("TCTI", tcti)
+    apply_configured_tcti(config.attest_tpm_tcti)
 
     if csr_out is not None:
         effective_role = role or config.mode

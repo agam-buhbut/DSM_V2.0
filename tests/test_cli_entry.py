@@ -8,8 +8,10 @@ read. Config files live in tmp_path.
 from __future__ import annotations
 
 import contextlib
+import os
 import re
 from collections.abc import Generator
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -17,6 +19,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 import dsm.__main__ as entry
+from tests.test_client_fail_closed import _config
+from tests.test_lifecycle import _server_config
 
 _CLIENT_TOML = (
     'mode = "client"\nserver_ip = "10.0.0.1"\nserver_port = 51820\n'
@@ -218,3 +222,79 @@ def test_main_hands_mode_to_the_config_check(
     # QA Minor 4(b): main() applied --mode after the load, a traceback.
     assert _run(["--mode", "server", "--config", str(client_config)], euid=0) == 2
     assert capsys.readouterr().err.rstrip().endswith("(with --mode server)")
+
+
+_TCTI = "swtpm:host=127.0.0.1,port=2321"
+# What a root shell may hold for tpm2-tools: the default chip.
+_SHELL_TCTI = {"TPM2TOOLS_TCTI": "device:/dev/tpmrm0", "TCTI": "device:/dev/tpmrm0"}
+
+
+def _tcti_env() -> tuple[str | None, str | None]:
+    """The two env vars the Rust TPM backend reads, in its order."""
+    return os.environ.get("TPM2TOOLS_TCTI"), os.environ.get("TCTI")
+
+
+def _tcti_env_of_daemon(mode: str, tcti: str | None) -> tuple[str | None, str | None]:
+    seen: list[tuple[str | None, str | None]] = []
+    config = _server_config() if mode == "server" else _config()
+    with (
+        patch.object(entry.os, "geteuid", return_value=0),
+        patch.object(entry.sys, "argv", ["dsm", "--mode", mode]),
+        patch.object(
+            entry,
+            "_load_config_or_exit",
+            return_value=replace(config, attest_tpm_tcti=tcti),
+        ),
+        patch("dsm.core.log.configure"),
+        patch("dsm.core.netaudit.configure"),
+        # Called before asyncio.run, so it sees the env the stores load under.
+        patch(
+            f"dsm.{mode}.run_{mode}",
+            new_callable=MagicMock,
+            side_effect=lambda *_a, **_k: seen.append(_tcti_env()),
+        ),
+        patch.object(entry.asyncio, "run", return_value=0),
+        pytest.raises(SystemExit),
+    ):
+        entry.main()
+    return seen[0]
+
+
+@pytest.mark.parametrize("shell", [{}, _SHELL_TCTI], ids=["no-env", "env-tpmrm0"])
+@pytest.mark.parametrize("mode", ["client", "server"])
+def test_the_daemons_get_the_tpm_the_config_names(
+    mode: str, shell: dict[str, str]
+) -> None:
+    with patch.dict(os.environ):
+        os.environ.pop("TPM2TOOLS_TCTI", None)
+        os.environ.pop("TCTI", None)
+        os.environ.update(shell)
+        assert _tcti_env_of_daemon(mode, _TCTI) == (_TCTI, _TCTI)
+
+
+@pytest.mark.parametrize("mode", ["client", "server"])
+def test_a_daemon_with_no_tpm_in_the_config_leaves_the_env(mode: str) -> None:
+    with patch.dict(os.environ, {"TCTI": _TCTI}):
+        os.environ.pop("TPM2TOOLS_TCTI", None)
+        assert _tcti_env_of_daemon(mode, None) == (None, _TCTI)
+
+
+def test_enroll_makes_the_key_on_the_tpm_the_config_names(
+    client_config: Path, tmp_path: Path
+) -> None:
+    client_config.write_text(
+        client_config.read_text() + f'attest_tpm_tcti = "{_TCTI}"\n'
+    )
+    with patch.dict(os.environ, _SHELL_TCTI):
+        with pytest.raises(SystemExit):
+            # A CSR folder that does not exist stops enroll before any key work.
+            entry._run_enroll(
+                client_config,
+                csr_out=tmp_path / "no-such-dir" / "x.csr",
+                import_cert=None,
+                cn=None,
+                role="client",
+                passphrase_fd=None,
+                passphrase_env_file=None,
+            )
+        assert _tcti_env() == (_TCTI, _TCTI)
