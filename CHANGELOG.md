@@ -328,6 +328,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   than 65,535 addresses within 10 s still keeps new clients out while
   that lasts, and a UDP session can drop at its next key change then;
   before, an address already in the table kept getting in (SECURITY.md).
+- The docs no longer let another user on the same host run code as root
+  through /tmp. GUIDE §1c ran root's Python in /tmp, and Python run with
+  `-c`, `-m` or `-` loads modules from the current folder first, so a
+  `dsm.py` someone left there ran as root. Every `sudo python3` line in
+  the docs now has `-I`, which leaves the current folder out. The build
+  venvs (GUIDE §1a and §11, and the TPM lane in CONTRIBUTING.md) had fixed
+  /tmp names that another user could make first and fill with their own
+  pip; they are now in your home folder. The wheel and unit copied to a
+  client (§1a.1, §3f) go to a private `~/dsm-work` folder, the CSR goes to
+  /opt/mtun (§3b), and a signed cert is imported straight from the stick
+  (§3d). Traces and logs that hold client addresses (§9e-§9g, §11) go to
+  `~/dsm-work` too, not to /tmp, where every user could read them. If you
+  followed the old steps on a host where other people have accounts, and
+  you do not trust them all, their code may already have run as root
+  there, and on each client that got a wheel built there. Building again
+  does not undo that: set those hosts up again from a clean install, with
+  the new steps.
 
 ### Fixed
 - The server unit ran `dsm cleanup` after every stop, restart and failed

@@ -263,13 +263,14 @@ Soft wheel (dev/test): pass `--no-default-features --features
 dev-soft-attest` to the maturin commands below to build the software
 attest backend (no TPM, no libtss2-dev). It imports identically but is
 not hardware-bound. The rest of this section assumes the default TPM
-wheel.
+wheel. Make the venv in your home folder, not in /tmp: another user can
+make a /tmp folder of that name first and put their own python and pip in it.
 
 ```sh
-$ python3 -m venv /tmp/dsm-build-venv
-$ /tmp/dsm-build-venv/bin/pip install --upgrade pip maturin
+$ python3 -m venv ~/dsm-build-venv
+$ ~/dsm-build-venv/bin/pip install --upgrade pip maturin
 
-$ /tmp/dsm-build-venv/bin/maturin build --release
+$ ~/dsm-build-venv/bin/maturin build --release
 # maturin writes the wheel under the Cargo target dir, i.e.
 # rust/tuncore/target/wheels/ (NOT <repo>/target/wheels/):
 $ ls rust/tuncore/target/wheels/            # confirm dsm-0.1.0-*.whl appeared
@@ -289,7 +290,7 @@ package (`dsm/net/_templates/`). No manual copy of `nftables/*.conf`
 into site-packages is needed — a plain `pip install <wheel>` is
 sufficient for the daemon to start.
 
-You can `rm -rf /tmp/dsm-build-venv` at the end of section 1.
+You can `rm -rf ~/dsm-build-venv` at the end of section 1.
 
 ### 1a.1 Constrained client: build once, copy the wheel
 
@@ -302,9 +303,12 @@ On the BUILD host:
 
 ```sh
 # Build as above (§1a), then copy the wheel to the client, and the two
-# client units with it (the wheel has no deploy/ folder; §3f installs them):
-$ scp rust/tuncore/target/wheels/dsm-0.1.0-*.whl user@client:/tmp/
-$ scp deploy/dsm-client.service deploy/dsm-client-boot-block.service user@client:/tmp/
+# client units with it (the wheel has no deploy/ folder; §3f installs them).
+# They go to a folder only you can open, not /tmp, where another user
+# could make a file of the same name first:
+$ ssh user@client 'install -d -m 0700 dsm-work'
+$ scp rust/tuncore/target/wheels/dsm-0.1.0-*.whl user@client:dsm-work/
+$ scp deploy/dsm-client.service deploy/dsm-client-boot-block.service user@client:dsm-work/
 ```
 
 On the CLIENT (after copying the wheel):
@@ -318,8 +322,8 @@ $ sudo apt install -y \
 # python3-pip: Debian's ensurepip is disabled; install python3-pip via apt.
 # On Debian 12 drop the t64 suffix from the two libtss2 names.
 
-$ sudo /usr/bin/python3 -m pip install --break-system-packages \
-      /tmp/dsm-0.1.0-*.whl
+$ sudo /usr/bin/python3 -I -m pip install --break-system-packages \
+      ~/dsm-work/dsm-0.1.0-*.whl
 ```
 
 Important caveats:
@@ -344,7 +348,7 @@ cryptography>=50.0.0,<51 and dnspython>=2.6,<3.0). Do NOT install
 pin them so a surprise major release can't be pulled in:
 
 ```sh
-$ sudo /usr/bin/python3 -m pip install --break-system-packages \
+$ sudo /usr/bin/python3 -I -m pip install --break-system-packages \
       "$(ls $PWD/rust/tuncore/target/wheels/dsm-0.1.0-*.whl | tail -1)"
 ```
 
@@ -363,9 +367,9 @@ Pre-install those exact versions, then add the wheel without letting
 pip re-resolve the transitive set:
 
 ```sh
-$ sudo /usr/bin/python3 -m pip install --break-system-packages \
+$ sudo /usr/bin/python3 -I -m pip install --break-system-packages \
       -r requirements.lock
-$ sudo /usr/bin/python3 -m pip install --break-system-packages \
+$ sudo /usr/bin/python3 -I -m pip install --break-system-packages \
       --no-deps "$(ls $PWD/rust/tuncore/target/wheels/dsm-0.1.0-*.whl | tail -1)"
 ```
 
@@ -377,7 +381,7 @@ wheel`, updates only the dependencies, and the old code keeps running.
 first (it brings them to the new wheel's pins), then:
 
 ```sh
-$ sudo /usr/bin/python3 -m pip install --break-system-packages \
+$ sudo /usr/bin/python3 -I -m pip install --break-system-packages \
       --force-reinstall --no-deps \
       "$(ls $PWD/rust/tuncore/target/wheels/dsm-0.1.0-*.whl | tail -1)"
 ```
@@ -395,14 +399,18 @@ SSL object before the qname crosses the wire.
 
 ### 1c. Verify the install
 
-Run this command from a directory outside the repo (e.g.
-/tmp) — running from the repo root would let cwd-on-sys.path mask a
-bad install. It confirms root's Python sees every import dsm needs,
-including the `dsm` package itself out of the installed wheel:
+This runs in `/`, with `-I`; the ( ) keep your shell in the repo for §1d.
+Python run with `-c` or `-m` looks in the
+current folder first, so the repo's own dsm/ folder could hide a bad
+install, and in a shared folder such as /tmp another user's dsm.py
+would run as root. `-I` keeps the current folder out; every
+`sudo python3` line in this guide has it for that reason. The check
+confirms root's Python sees every import dsm needs, including the `dsm`
+package itself out of the installed wheel:
 
 ```sh
-$ cd /tmp && sudo /usr/bin/python3 -c \
-      "import dsm, tuncore, dns, cryptography; print('all 4 imports ok')"
+$ (cd / && sudo /usr/bin/python3 -I -c \
+      "import dsm, tuncore, dns, cryptography; print('all 4 imports ok')")
 ```
 
 You must see "all 4 imports ok" before continuing. If any import
@@ -429,7 +437,7 @@ exercised); the TPM lane is separate.
 Soft lane (no TPM needed — the broad gate):
 
 ```sh
-$ sudo /usr/bin/python3 -m pip install --break-system-packages \
+$ sudo /usr/bin/python3 -I -m pip install --break-system-packages \
       pytest pytest-asyncio
 $ python3 -m pytest tests/ -q                # full Python suite
   # NB: this needs the SOFT wheel installed (ATTEST_BACKEND_IS_SOFTWARE
@@ -707,7 +715,7 @@ with `config: malformed TOML: ...`; check it now (sudo: only root can read
 the file):
 
 ```sh
-$ sudo python3 -c "import tomllib; tomllib.load(open('/opt/mtun/config.toml','rb')); print('ok')"
+$ sudo python3 -I -c "import tomllib; tomllib.load(open('/opt/mtun/config.toml','rb')); print('ok')"
 ```
 
 Must print "ok". If you instead see TOMLDecodeError, see §11's TOML
@@ -742,7 +750,7 @@ roughly yearly). Plan to re-fetch and re-deploy on a cadence.
 
 ```sh
 $ sudo dsm --config /opt/mtun/config.toml \
-      enroll --csr-out /tmp/dsm-csr-server.der --role server
+      enroll --csr-out /opt/mtun/dsm-csr-server.der --role server
 ```
 
 On the default TPM backend this runs a TPM preflight first (it fails
@@ -772,7 +780,7 @@ The command writes:
 /opt/mtun/identity.key   mode 0o600  (Argon2id-wrapped X25519)
 /opt/mtun/attest.key     mode 0o600  (TPM-bound DSMT context blob —
                                       NOT a key; see the backup note)
-/tmp/dsm-csr-server.der  the CSR
+/opt/mtun/dsm-csr-server.der  mode 0o600  (the CSR)
 ```
 
 And prints:
@@ -794,8 +802,14 @@ disk gets nothing, which is the point.
 
 ### 3c. Server: walk CSR to CA, sign, walk cert back
 
-Walk /tmp/dsm-csr-server.der to the CA laptop on freshly-wiped
-Stick B. On the laptop:
+Copy the CSR to freshly-wiped Stick B, mounted at /mnt/transport as in
+§2f, and walk the stick to the CA laptop:
+
+```sh
+$ sudo cp /opt/mtun/dsm-csr-server.der /mnt/transport/
+```
+
+On the laptop:
 
 ```sh
 $ cd ca
@@ -830,17 +844,15 @@ $ cp certs/dsm-cert-server.pem crl/dsm_ca.crl /mnt/transport/
 
 ### 3d. Server: import the signed cert
 
-Walk Stick B back to the server and copy the signed cert off it to the
-import path BEFORE importing (this is the cross-machine bridge — §3c wrote
-the cert on the CA laptop's Stick B, not on the server). Copy the new CRL
-from §3c step 3 into place too, mode 0600, as in §2f:
+Walk Stick B back to the server, mount it at /mnt/transport (§2f), and
+import the signed cert straight from the stick. Copy the new CRL from §3c
+step 3 into place too, mode 0600, as in §2f:
 
 ```sh
-$ sudo cp /mnt/transport/dsm-cert-server.pem /tmp/dsm-cert-server.pem
 $ sudo install -m 0600 -o root -g root /mnt/transport/dsm_ca.crl \
       /opt/mtun/dsm_ca.crl
 $ sudo dsm --config /opt/mtun/config.toml \
-      enroll --import /tmp/dsm-cert-server.pem
+      enroll --import /mnt/transport/dsm-cert-server.pem
 ```
 
 dsm verifies:
@@ -954,20 +966,21 @@ Then:
 
 ```sh
 $ sudo dsm --config /opt/mtun/config.toml \
-      enroll --csr-out /tmp/dsm-csr-client.der --role client
+      enroll --csr-out /opt/mtun/dsm-csr-client.der --role client
 ```
 
-Walk to CA, sign exactly as in §3c but with `-extensions dsm_client_leaf`
+Copy `/opt/mtun/dsm-csr-client.der` to Stick B as in §3c, walk it to the
+CA, and sign exactly as in §3c but with
+`-in /mnt/transport/dsm-csr-client.der`, `-extensions dsm_client_leaf`
 (NOT dsm_server_leaf) and `-out certs/<client CN>.pem` (keep `-notext`).
 Name the file after the CN that enroll printed, for example
 `certs/dsm-XXXXXXXX-client.pem`, so a second client's cert does not
-overwrite the first one's. Copy it to Stick B, walk back, then bridge it off
-the stick and import:
+overwrite the first one's. Copy it to Stick B, walk back, mount the stick,
+and import it straight from there:
 
 ```sh
-$ sudo cp /mnt/transport/<client CN>.pem /tmp/dsm-cert-client.pem
 $ sudo dsm --config /opt/mtun/config.toml \
-      enroll --import /tmp/dsm-cert-client.pem
+      enroll --import /mnt/transport/<client CN>.pem
 ```
 
 Stash the passphrase as in 3e (i) or (ii). For (ii) a client uses its own
@@ -986,7 +999,7 @@ folder: install the copy you brought from the build host instead of the
 `cp` line:
 
 ```sh
-$ sudo install -m 0644 /tmp/dsm-client.service /tmp/dsm-client-boot-block.service /etc/systemd/system/
+$ sudo install -m 0644 ~/dsm-work/dsm-client.service ~/dsm-work/dsm-client-boot-block.service /etc/systemd/system/
 ```
 
 Do not start it yet: the server must know this client first (§4), and
@@ -1293,11 +1306,11 @@ through the tunnel: connect again on the client's LAN address.
 $ sudo systemctl stop dsm
 $ sudo rm /opt/mtun/identity.key /opt/mtun/attest.key /opt/mtun/device.crt
 $ sudo dsm --config /opt/mtun/config.toml \
-      enroll --csr-out /tmp/dsm-csr-server.der --role server
-# Note the printed CN. Walk CSR to CA, sign with dsm_server_leaf,
-# walk back:
+      enroll --csr-out /opt/mtun/dsm-csr-server.der --role server
+# Note the printed CN. Copy the CSR to Stick B and sign it with
+# dsm_server_leaf as in §3c; walk back and mount the stick (§3d):
 $ sudo dsm --config /opt/mtun/config.toml \
-      enroll --import /tmp/dsm-cert-server.pem
+      enroll --import /mnt/transport/dsm-cert-server.pem
 $ sudo systemctl start dsm
 ```
 
@@ -1806,10 +1819,10 @@ daemon refuses to start without it.
 
 ```sh
 $ sudo dsm --config /opt/mtun/config.toml \
-      enroll --csr-out /tmp/dsm-csr-server.der --role server
+      enroll --csr-out /opt/mtun/dsm-csr-server.der --role server
 # Walk to CA, sign with dsm_server_leaf, walk back, then:
 $ sudo dsm --config /opt/mtun/config.toml \
-      enroll --import /tmp/dsm-cert-server.pem
+      enroll --import /mnt/transport/dsm-cert-server.pem
 ```
 
 Stash the passphrase per §3e. Create the empty allowlist:
@@ -1980,16 +1993,18 @@ catching cellular's smaller path MTU.
 ### 9e. Acceptance test sequence
 
 Seven Phase-2 acceptance criteria as runnable commands. Run on the
-CLIENT unless noted. Capture results.
+CLIENT unless noted. Capture results in `~/dsm-work`, a folder only you
+can open, not in /tmp, where every user on the host can read them.
 
 9e.1 — 30-minute session
 
 ```sh
+$ install -d -m 0700 ~/dsm-work
 $ for i in $(seq 1 30); do
       curl -sS -o /dev/null -w "[%{time_total}s] %{http_code} via %{remote_ip}\n" \
           https://www.cloudflare.com/cdn-cgi/trace
       sleep 60
-  done | tee /tmp/dsm-30min.log
+  done | tee ~/dsm-work/dsm-30min.log
 ```
 
 PASS: 30 lines, all HTTP 200, remote_ip matches the server's
@@ -2084,20 +2099,22 @@ $ sudo systemctl stop dsm
 # 2. Run dsm under strace through one full handshake + ~30 s of
 #    real traffic. DO THIS WITH THE CELLULAR CLIENT CONNECTING
 #    FROM ITS REAL ISP, not a loopback — some syscalls (e.g. PMTU
-#    sockopts) only fire on real paths.
+#    sockopts) only fire on real paths. The trace holds the clients'
+#    real addresses, so it goes to a folder only you can open.
+$ install -d -m 0700 ~/dsm-work
 $ sudo strace -f -e trace=%file,%network,%process \
-      -o /tmp/dsm-strace.log \
+      -o ~/dsm-work/dsm-strace.log \
       timeout 60 dsm --mode server \
       --passphrase-env-file /etc/dsm/passphrase
 
 # 3. Pull the unique syscall names actually used.
-$ awk -F'(' '/^[0-9]+ +[a-z_]+\(/ {print $1}' /tmp/dsm-strace.log \
-      | awk '{print $NF}' | sort -u > /tmp/dsm-syscalls.txt
-$ wc -l /tmp/dsm-syscalls.txt
-$ cat /tmp/dsm-syscalls.txt
+$ awk -F'(' '/^[0-9]+ +[a-z_]+\(/ {print $1}' ~/dsm-work/dsm-strace.log \
+      | awk '{print $NF}' | sort -u > ~/dsm-work/dsm-syscalls.txt
+$ wc -l ~/dsm-work/dsm-syscalls.txt
+$ cat ~/dsm-work/dsm-syscalls.txt
 ```
 
-Convert /tmp/dsm-syscalls.txt into a SystemCallFilter= allowlist in
+Convert ~/dsm-work/dsm-syscalls.txt into a SystemCallFilter= allowlist in
 deploy/dsm.service. Without the audit a too-tight filter will SIGSYS
 the daemon mid-handshake.
 
@@ -2117,10 +2134,10 @@ unit.
 - ip rule + ip route show table 100   (both boxes)
 - The Cloudflare trace output from §9e.2
 - sudo systemd-analyze security dsm
-- /tmp/dsm-strace.log and /tmp/dsm-syscalls.txt from §9f
+- ~/dsm-work/dsm-strace.log and ~/dsm-work/dsm-syscalls.txt from §9f
 - With --debug-net enabled: the JSON event stream from
-  `sudo journalctl -u dsm -o cat | grep dsm.netaudit > /tmp/demo.jsonl` on
-  the server, and the same with `-u dsm-client` on the client
+  `sudo journalctl -u dsm -o cat | grep dsm.netaudit > ~/dsm-work/demo.jsonl`
+  (make the folder first, as in §9f) on the server, and the same with `-u dsm-client` on the client
 
 ## 10. Running Over the Internet (Remote Client)
 
@@ -2276,13 +2293,14 @@ _deconfigure, rekey_epoch, liveness_fire, shutdown_signal,
 auto_mtu_change, auto_cap_change, crl_missing/stale). Capture with:
 
 ```sh
-$ sudo journalctl -u dsm -o cat | grep dsm.netaudit > /tmp/audit.jsonl          # server
-$ sudo journalctl -u dsm-client -o cat | grep dsm.netaudit > /tmp/audit.jsonl   # client
+$ install -d -m 0700 ~/dsm-work      # the events hold client addresses
+$ sudo journalctl -u dsm -o cat | grep dsm.netaudit > ~/dsm-work/audit.jsonl          # server
+$ sudo journalctl -u dsm-client -o cat | grep dsm.netaudit > ~/dsm-work/audit.jsonl   # client
 ```
 
 A client run by hand prints the events in its terminal instead.
 
-### TOML triage: "config: malformed TOML: ...", or TOMLDecodeError from `sudo python3 -c "import tomllib; ..."`
+### TOML triage: "config: malformed TOML: ...", or TOMLDecodeError from `sudo python3 -I -c "import tomllib; ..."`
 
 (1) Missing quotes around a STRING value:
 
@@ -3131,8 +3149,8 @@ didn't reinstall the wheel. Rebuild FROM THE REPO ROOT and
 force-reinstall:
 
 ```sh
-$ /tmp/dsm-build-venv/bin/maturin build --release
-$ sudo /usr/bin/python3 -m pip install --break-system-packages \
+$ ~/dsm-build-venv/bin/maturin build --release
+$ sudo /usr/bin/python3 -I -m pip install --break-system-packages \
       --force-reinstall \
       "$(ls $PWD/rust/tuncore/target/wheels/dsm-0.1.0-*.whl | tail -1)"
 ```
@@ -3145,7 +3163,7 @@ $ sudo systemctl disable --now dsm-blocklist-update.timer   # server
 $ sudo systemctl disable --now dsm-client                   # client
 $ sudo dsm cleanup     # first: puts back /etc/resolv.conf from /var/lib/dsm and removes DSM's tables (it also sets net.ipv4.ip_forward=0)
 $ sudo rm -rf /opt/mtun /etc/dsm /run/dsm /var/lib/dsm
-$ sudo /usr/bin/python3 -m pip uninstall --break-system-packages dsm   # if pip-installed
+$ sudo /usr/bin/python3 -I -m pip uninstall --break-system-packages dsm   # if pip-installed
 $ sudo rm -rf /opt/dsm /usr/local/bin/dsm                    # if install.sh installed it
 $ sudo rm -f /etc/systemd/system/dsm.service /etc/systemd/system/dsm-client.service \
       /etc/systemd/system/dsm-client-boot-block.service
@@ -3178,6 +3196,7 @@ $ for iface in $(ls /sys/class/net); do
                                       # tpm-attest) / Argon2id-wrapped ECDSA
                                       # P-256 key (dev-soft-attest build)
 /opt/mtun/device.crt                  # CA-signed leaf cert (mode 0o600)
+/opt/mtun/dsm-csr-{server,client}.der # the CSR from enroll (§3b, §3f)
 /opt/mtun/dsm_ca_root.pem             # pinned CA root cert (mode 0o600)
 /opt/mtun/dsm_ca.crl                  # the CA's CRL: every host needs it (crl_strict);
                                       # carry a new one before it runs out (§7e)

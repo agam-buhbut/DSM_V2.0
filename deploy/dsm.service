@@ -180,7 +180,7 @@ UMask=0077
 # Per-unit /tmp + /var/tmp namespaces. dsm.service never reads other
 # services' temp files; PrivateTmp gives us a fresh tmpfs that's torn
 # down on stop. (Note: this only applies to the daemon — `dsm enroll`
-# is run by the operator directly and writes its CSR to the host /tmp.)
+# is run by the operator directly and writes its CSR where --csr-out says.)
 PrivateTmp=true
 
 # Hide other processes in /proc. dsm doesn't scan /proc for siblings.

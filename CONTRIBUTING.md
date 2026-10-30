@@ -82,10 +82,10 @@ sudo apt install -y swtpm swtpm-tools libtss2-dev libtss2-tcti-swtpm0
 
 # Build the real backend in an ISOLATED venv so it never clobbers your
 # soft-build working venv (CI keeps these lanes strictly separate):
-python3 -m venv /tmp/dsm-tpm-venv
-/tmp/dsm-tpm-venv/bin/pip install --upgrade pip maturin pytest pytest-asyncio dnspython
-/tmp/dsm-tpm-venv/bin/maturin develop --no-default-features --features tpm-attest
-/tmp/dsm-tpm-venv/bin/pytest tests/ -q
+python3 -m venv ~/dsm-tpm-venv
+~/dsm-tpm-venv/bin/pip install --upgrade pip maturin pytest pytest-asyncio dnspython
+~/dsm-tpm-venv/bin/maturin develop --no-default-features --features tpm-attest
+~/dsm-tpm-venv/bin/pytest tests/ -q
 ```
 
 ### Rust tests
