@@ -277,6 +277,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   off, so an older comment claimed more than was done). Copies left behind
   when the key structs are moved are not wiped. The GHASH key inside the
   GCM state, which cannot decrypt, is still not wiped.
+- A server or client cert that DSM's crypto library cannot read is now a
+  refused handshake. This covers an unknown key, curve or signature type,
+  a signature type that is missing its settings, an X.509 version other
+  than 1 or 3, and a name field of the wrong type. Before, one such reply
+  to the client's first message, from anyone on the path, stopped the
+  client with a traceback and the kill switch up. After five of these in
+  10 minutes, systemd stopped starting it again, so the host stayed
+  offline until someone started DSM by hand. On the server each such try
+  was an ERROR traceback. Such a cert in `cert_file` or at
+  `dsm enroll --import` now gives one line too.
 
 ### Fixed
 - `dsm init --install-unit` made an empty `/etc/dsm/passphrase`, so the

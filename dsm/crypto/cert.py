@@ -29,7 +29,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from cryptography import x509
-from cryptography.exceptions import InvalidSignature
+from cryptography.exceptions import InvalidSignature, UnsupportedAlgorithm
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.ec import (
@@ -150,7 +150,10 @@ class DeviceCert:
             _ = self.cert.not_valid_after_utc
             _ = self.cert.public_key()
             _ = self.cert.tbs_certificate_bytes
-        except ValueError as e:
+        # Not only ValueError: an unknown key type or curve OID gives
+        # UnsupportedAlgorithm, and a name attribute of a type its OID does
+        # not allow (a CN typed BIT STRING) gives TypeError.
+        except (ValueError, TypeError, UnsupportedAlgorithm) as e:
             raise CertError(
                 f"cert structurally invalid (lazy field decode failed): {e}"
             ) from e
@@ -159,7 +162,7 @@ class DeviceCert:
     def from_der(cls, der: bytes) -> DeviceCert:
         try:
             cert = x509.load_der_x509_certificate(bytes(der))
-        except ValueError as e:
+        except (ValueError, x509.InvalidVersion) as e:
             raise CertError(f"failed to parse cert DER: {e}") from e
         return cls(cert)
 
@@ -167,7 +170,7 @@ class DeviceCert:
     def from_pem(cls, pem: bytes) -> DeviceCert:
         try:
             cert = x509.load_pem_x509_certificate(bytes(pem))
-        except ValueError as e:
+        except (ValueError, x509.InvalidVersion) as e:
             raise CertError(f"failed to parse cert PEM: {e}") from e
         return cls(cert)
 
@@ -361,8 +364,8 @@ def validate_chain(
     valid. Does NOT check CRL or CN policy — caller applies those.
 
     Raises:
-        CertChainError on issuer-mismatch, bad signature, or wrong
-            issuer pubkey type.
+        CertChainError on issuer-mismatch, bad signature, an unknown or
+            unusable signature algorithm, or wrong issuer pubkey type.
         CertExpiredError on validity-period failures.
         CertBindingError if the binding extension is missing/malformed.
     """
@@ -379,7 +382,12 @@ def validate_chain(
     # cryptography's verify is constant-time on the MAC comparison; the
     # chain-walk shape (single hop) is fixed here.
     ca_pub = check_ca_key(ca_root)
-    sig_alg = leaf.cert.signature_hash_algorithm
+    # An unknown signature OID gives UnsupportedAlgorithm; RSA-PSS with no
+    # parameters gives ValueError. Both come from bytes the peer sent.
+    try:
+        sig_alg = leaf.cert.signature_hash_algorithm
+    except (ValueError, UnsupportedAlgorithm) as e:
+        raise CertChainError(f"leaf cert signature algorithm unusable: {e}") from e
     if sig_alg is None:
         raise CertChainError("leaf cert has no signature hash algorithm")
     check_strong_signature_hash(sig_alg, "leaf cert")
