@@ -997,8 +997,8 @@ So does a start that the network or the clock holds up: a server name that
 does not resolve, a CRL past its next update while the clock is not
 synchronized, a cert outside its dates (§7i). Under `dsm-client.service`
 every start error after the block is up keeps it too, a wrong or empty
-passphrase file included; a few errors come before DSM's own block; the
-boot block (`dsm-client-boot-block.service`) holds for them (§7i).
+passphrase file included; a few errors come before DSM's own block; a
+block holds for them (§7i).
 
 **Headless client** (no screen or keyboard, reached only over SSH): such a
 block cuts your SSH session. A date or a lookup problem clears by itself
@@ -1180,17 +1180,21 @@ $ sudo nft list tables | grep '^table inet dsm_'
 # same table without the server.
 ```
 
-On a client under the unit, check that the boot block is installed too:
+On a client under the unit, check that the boot block is installed and
+that the client unit pulls it in:
 
 ```sh
 $ systemctl show -p LoadState --value dsm-client-boot-block   # expect "loaded"
+$ systemctl show -p Wants --value dsm-client                  # must list dsm-client-boot-block.service
 ```
 
-`not-found` means the boot unit file was never copied (§3f): until it is,
-an error before DSM's own block leaves the host open. `systemctl
-is-active dsm-client-boot-block` prints `inactive` after a restart: that
-is a normal skip, as DSM's own table was still up. `failed` there means
-it could not load; `systemctl status dsm-client-boot-block` says why.
+`not-found` means the boot unit file was never copied, and a Wants list
+without it means an old `dsm-client.service` (§3f: copy the new one, then
+`sudo systemctl daemon-reload`). Until then an error before DSM's own
+block leaves the host open. The boot block is normally `inactive`: a
+oneshot that does not stay up once it has run. `failed` from `systemctl
+is-active dsm-client-boot-block` means it could not load; `systemctl
+status dsm-client-boot-block` says why.
 
 DNS goes through the tunnel and resolves on the server via DoH:
 
@@ -1611,12 +1615,11 @@ crash, a start error or a signal sent straight to it) leaves it up; run
   switch (loopback and DHCP only) at boot, and again when the unit
   starts after a stop (on a restart the earlier run's start-up table is
   still up and holds instead), so a block stays up (SSH too); on a run
-  by hand the host is open. `sudo dsm cleanup`
-  removes the block. Under the unit the host is open only when
-  nft itself is missing or broken, when the boot unit file is not
-  installed (§6 shows how to check), or after `sudo dsm cleanup` followed
-  by a plain `systemctl start` (the boot block still counts as up, so it
-  does not run again; use `restart`). What you see:
+  by hand the host is open. `sudo dsm cleanup` removes the block; every
+  start of the unit runs the boot block, so a plain `systemctl start`
+  after it loads the block again (`restart` does too). Under the unit the
+  host is open only when nft itself is missing or broken, or when the
+  boot unit file is not installed (§6 shows how to check). What you see:
   - `/etc/dsm/passphrase` is missing: systemd does not start DSM at all.
     `systemctl status dsm-client` shows `status=243/CREDENTIALS`, and the
     journal shows `Failed to set up credentials`.

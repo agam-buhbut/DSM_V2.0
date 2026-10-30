@@ -179,9 +179,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Some client start errors still come before DSM's own kill switch is up:
   a missing `/etc/dsm/passphrase`, a `config.toml` that does not load, an
   evaluation build without `allow_soft_attest`, nft refusing the first
-  table, and an install that cannot run DSM at all. Under the unit the
-  boot block (`dsm-client-boot-block.service`) now holds for them; on a
-  run by hand the host stays open (deploy/GUIDE.md §7i).
+  table, and an install that cannot run DSM at all. Under the unit a
+  block now holds for them; on a run by hand the host stays open
+  (deploy/GUIDE.md §7i).
 - **Behavior change:** under `dsm-client.service` every start error after
   the block is up now keeps it up and exits 1: a wrong or empty passphrase,
   a missing or bad cert, CA or CRL file, a read-only resolv.conf. Before,

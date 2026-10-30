@@ -13,8 +13,8 @@ Wants=network-online.target dsm-client-boot-block.service
 # systemd stops trying after 5 starts in 10 minutes. After a crash, or a
 # start error once the block is up, the kill switch stays up even then (see
 # ExecStopPost), so the host stays blocked, not open. A few errors come
-# before DSM's own block (deploy/GUIDE.md §7i): the boot block
-# (dsm-client-boot-block.service) is up for them.
+# before DSM's own block (deploy/GUIDE.md §7i): a block holds for them
+# (dsm-client-boot-block.service).
 StartLimitIntervalSec=10min
 StartLimitBurst=5
 

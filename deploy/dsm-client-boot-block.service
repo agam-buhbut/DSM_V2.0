@@ -16,24 +16,24 @@ Before=network-pre.target
 Wants=network-pre.target
 # The distro's nftables.service may flush the whole ruleset: load after it.
 After=nftables.service
-# A stop or restart of dsm-client stops or restarts this too. After a stop
-# it loads the block again before DSM runs; after a restart the earlier
-# run's table is still up, so it skips itself (ExecCondition below).
+# Every start of dsm-client runs this first (its Wants= and After=), and a
+# stop or restart of dsm-client reaches this too.
 PartOf=dsm-client.service
 
 [Service]
 Type=oneshot
-# It stays active once the rules are loaded, so a `systemctl start
-# dsm-client` on a running client does not run it again under a live
-# session.
-RemainAfterExit=yes
+# It does not stay up once nft is done, so every start of dsm-client runs
+# it again; the check below keeps that from touching a live session.
+RemainAfterExit=no
 # Any DSM kill switch table up (dsm_killswitch while a tunnel is up,
 # dsm_killswitch_pre while DSM connects or after its last run) is a block
 # already: then this unit skips itself, so it never swaps DSM's live table
 # and its server opening for this one; a skipped condition is not a
 # failure. It loads only when no DSM table is up: at boot, and after a
-# clean stop or `dsm cleanup`.
-ExecCondition=/bin/sh -c '! /usr/sbin/nft list table inet dsm_killswitch >/dev/null 2>&1 && ! /usr/sbin/nft list table inet dsm_killswitch_pre >/dev/null 2>&1'
+# clean stop or `dsm cleanup`. One `nft list tables` call, so it sees one
+# consistent set even while DSM swaps one table for the other. `$$` is how
+# a unit file writes a literal `$`.
+ExecCondition=/bin/sh -c '! /usr/sbin/nft list tables 2>/dev/null | grep -qE "^table inet dsm_killswitch(_pre)?$$"'
 # The rules are DSM's start-up kill switch with no openings: loopback and
 # DHCP only, no server (dsm/net/_templates/pre_handshake.conf; a test keeps
 # the two the same). DSM adds the server when it starts. systemd passes

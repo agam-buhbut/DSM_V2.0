@@ -120,10 +120,10 @@ closed as known:
   still up and holds instead). So these errors leave the host blocked
   while systemd tries again and gives up (SSH too; `sudo dsm cleanup`
   removes the block). They leave it open only on a run by hand, when nft
-  itself is missing or broken, when the boot unit file is not installed,
-  or after `sudo dsm cleanup` followed by a plain `systemctl start` (the
-  boot block still counts as up, so it does not run again; use `restart`
-  instead). They are a missing `/etc/dsm/passphrase` (systemd does not
+  itself is missing or broken, or when the boot unit file is not
+  installed. Every start of the unit runs the boot block, so after `sudo
+  dsm cleanup` a plain `systemctl start` loads the block again (`restart`
+  does too). They are a missing `/etc/dsm/passphrase` (systemd does not
   start DSM: status 243/CREDENTIALS), a `config.toml` that does not load,
   an evaluation build without `allow_soft_attest`, nft refusing the first
   table, and any failure to run DSM at all (no `/usr/local/bin/dsm` or a

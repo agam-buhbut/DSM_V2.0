@@ -814,13 +814,13 @@ def _install_unit(role: str = "server") -> None:
     # A file deploy/ lacks is named in _print_next_steps' list instead.
     installed = [f for f in _unit_files(role) if (_DEPLOY_DIR / f).is_file()]
     for unit_file in installed:
-        dst = _SYSTEMD_DIR / unit_file
+        unit_dst = _SYSTEMD_DIR / unit_file
         try:
-            shutil.copyfile(_DEPLOY_DIR / unit_file, dst)
+            shutil.copyfile(_DEPLOY_DIR / unit_file, unit_dst)
         except OSError as e:
             # The state file stays, so the same --resume can run again.
             print(
-                f"dsm init: could not install {dst}: {e.strerror or e}",
+                f"dsm init: could not install {unit_dst}: {e.strerror or e}",
                 file=sys.stderr,
             )
             sys.exit(1)

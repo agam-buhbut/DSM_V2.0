@@ -9,6 +9,7 @@ skipped where nft, ip or unprivileged namespaces are missing.
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -76,7 +77,7 @@ def test_the_boot_block_runs_before_any_network() -> None:
         "After=nftables.service",
         "PartOf=dsm-client.service",
         "Type=oneshot",
-        "RemainAfterExit=yes",
+        "RemainAfterExit=no",
         "StandardInput=data",
         "ExecStart=/usr/sbin/nft -f -",
     ):
@@ -88,10 +89,11 @@ def test_the_boot_block_runs_before_any_network() -> None:
 
 
 def test_the_boot_block_skips_itself_while_any_dsm_table_is_up() -> None:
+    # One `nft list tables`, so it sees one consistent set; `$$` is how a
+    # unit file writes a literal `$`.
     assert (
-        "ExecCondition=/bin/sh -c '! /usr/sbin/nft list table inet dsm_killswitch"
-        " >/dev/null 2>&1 && ! /usr/sbin/nft list table inet dsm_killswitch_pre"
-        " >/dev/null 2>&1'"
+        "ExecCondition=/bin/sh -c '! /usr/sbin/nft list tables 2>/dev/null"
+        ' | grep -qE "^table inet dsm_killswitch(_pre)?$$"\''
     ) in _code(BOOT_UNIT)
 
 
@@ -211,4 +213,49 @@ def test_the_kernel_blocks_all_but_loopback_until_dsm_replaces_the_table() -> No
         # DSM's own start-up table took the boot block's place, in one commit.
         "table inet dsm_killswitch_pre",
         "2",
+    ]
+
+
+def _exec_condition() -> list[str]:
+    """The unit's ExecCondition= command as systemd runs it: split as in the
+    unit file, `$$` turned into `$`, and nft where this host has it."""
+    (value,) = [
+        line.removeprefix("ExecCondition=")
+        for line in _code(BOOT_UNIT)
+        if line.startswith("ExecCondition=")
+    ]
+    assert _NFT  # the kernel test skips without it
+    return [
+        word.replace("$$", "$").replace("/usr/sbin/nft", _NFT)
+        for word in shlex.split(value)
+    ]
+
+
+# $1 nft, $2 ip (unused), then the unit's ExecCondition command. Each state
+# has one table up, or none; the command's exit status follows.
+_CONDITION = r"""
+nft=$1; shift 2
+for table in none dsm_killswitch_pre dsm_killswitch dsm_dns_leak; do
+  "$nft" flush ruleset || exit 1
+  [ "$table" = none ] || "$nft" add table inet "$table" || exit 1
+  "$@"
+  echo "$table $?"
+done
+"""
+
+
+@pytest.mark.skipif(not (_NFT and _IP and _UNSHARE), reason="nft, ip or unshare absent")
+def test_the_skip_check_loads_the_block_only_when_no_dsm_kill_switch_is_up() -> None:
+    probe = _in_namespace('"$1" list ruleset')
+    if probe.returncode != 0:
+        pytest.skip(f"no nft in a user+net namespace: {probe.stderr}")
+    proc = _in_namespace(_CONDITION, *_exec_condition())
+    assert proc.returncode == 0, proc.stderr
+    # 0 runs the unit (the block loads); 1 is in systemd's skip range
+    # (1-254), so the unit skips itself without failing.
+    assert proc.stdout.splitlines() == [
+        "none 0",
+        "dsm_killswitch_pre 1",
+        "dsm_killswitch 1",
+        "dsm_dns_leak 0",
     ]
