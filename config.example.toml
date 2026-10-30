@@ -185,12 +185,14 @@ mtu = 1360
 # Traffic shaping
 # Over UDP every packet, real or fake, is padded to one size: the largest
 # size class from padding_min to padding_max (1400 by default). padding_min
-# matters only when no class lies between the two: then the size is the
-# smallest class at or above padding_min. If you lower padding_max, set mtu
-# in both configs to at most that class minus 40 (padding_max = 1024 needs
-# mtu = 984). Otherwise a real packet too big for the size is dropped,
-# because its exact size would mark it as real; DSM warns at start. TCP
-# frames are always 1400 bytes.
+# matters only when no class lies between the two (or between padding_min
+# and the lower size auto_mtu set for the path): then the size is the
+# smallest class at or above padding_min, even when that is bigger than the
+# path, and with pmtu_discover on every packet is then lost. If you lower
+# padding_max, set mtu in both configs to at most that class minus 40
+# (padding_max = 1024 needs mtu = 984). Otherwise a real packet too big for
+# the size is dropped, because its exact size would mark it as real; DSM
+# warns at start. TCP frames are always 1400 bytes.
 padding_min = 128
 padding_max = 1400
 

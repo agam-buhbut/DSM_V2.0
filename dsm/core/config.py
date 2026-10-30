@@ -702,18 +702,20 @@ def _one_size(padding_max: int) -> int:
 
 
 def _validate_auto_mtu(c: Config) -> None:
-    # auto_mtu adapts the TUN MTU from kernel PMTU readings, which are only
-    # available when pmtu_discover sets IP_PMTUDISC_DO — get_path_mtu() returns
-    # None otherwise. auto_mtu without pmtu_discover is silently inert, so warn
-    # loudly rather than let an operator believe the path is adapting. A
-    # server's settings are checked in _validate_server_pmtu.
+    # auto_mtu adapts the TUN MTU from kernel PMTU readings. The kernel always
+    # tracks the path MTU, but DSM reads it only when pmtu_discover is on —
+    # get_path_mtu() returns None otherwise. auto_mtu without pmtu_discover is
+    # silently inert, so warn loudly rather than let an operator believe the
+    # path is adapting. A server's settings are checked in
+    # _validate_server_pmtu.
     if c.mode != "client":
         return
     if c.auto_mtu and not c.pmtu_discover:
         log.warning(
             "auto_mtu=true has no effect unless pmtu_discover=true is also set "
-            "(kernel PMTU is unavailable without it); the TUN MTU will not "
-            "adapt. Set pmtu_discover=true to enable PMTU adaptation."
+            "(the kernel always tracks the path MTU, but DSM reads it only with "
+            "pmtu_discover on); the TUN MTU will not adapt. Set "
+            "pmtu_discover=true to enable PMTU adaptation."
         )
     # The other way round is worse: with DF on and nothing to make packets
     # smaller, every packet on a smaller path is refused (EMSGSIZE), since
