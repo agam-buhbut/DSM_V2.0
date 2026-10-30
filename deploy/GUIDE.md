@@ -1005,7 +1005,7 @@ block cuts your SSH session. A date or a lookup problem clears by itself
 once it is gone. A start error does not: systemd gives up after 5 starts,
 the block stays, and the next boot raises it again (the unit is enabled).
 From the console, `sudo dsm cleanup` frees the host; after the fix, `sudo
-systemctl reset-failed dsm-client && sudo systemctl start dsm-client`.
+systemctl reset-failed dsm-client && sudo systemctl restart dsm-client`.
 Before you enable the unit, make sure you can reach the console (a screen
 and keyboard, a serial line, or the hypervisor's console). Keep the CRL
 fresh and the clock right.
@@ -2490,7 +2490,7 @@ Run: chmod 600 ...`.
 `/etc/dsm/passphrase` is missing, so systemd does not start DSM at all.
 DSM raises no block of its own; under the unit the boot block stays up,
 SSH too (§7i). Make the file (§3e), then `sudo systemctl reset-failed
-dsm-client && sudo systemctl start dsm-client` (or `dsm`). `sudo dsm init
+dsm-client && sudo systemctl restart dsm-client` (or `dsm`). `sudo dsm init
 ... --install-unit` writes it for you.
 
 ### systemd: "status=203/EXEC"
@@ -2500,7 +2500,7 @@ into a broken venv. DSM did not run, so DSM raises no block of its own;
 under the unit the boot block stays up, SSH too (§7i). Check
 `ls -l /usr/local/bin/dsm` (§1c), then install again: §1b, or run
 `install.sh` again on a host set up with it. Then `sudo systemctl
-reset-failed dsm-client && sudo systemctl start dsm-client` (or `dsm`).
+reset-failed dsm-client && sudo systemctl restart dsm-client` (or `dsm`).
 
 ### "tuncore is missing ATTEST_BACKEND_IS_SOFTWARE: the extension predates the Phase-0 attestation gate. ..."
 

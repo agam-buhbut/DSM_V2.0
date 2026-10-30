@@ -10,12 +10,15 @@ Documentation=file:///opt/dsm-repo/deploy/GUIDE.md
 # never open between. There is no ExecStop: the block comes down only the
 # way DSM's own does (systemctl stop dsm-client, dsm cleanup).
 DefaultDependencies=no
+# A oneshot nft load must never trip the start limit when the client restarts.
+StartLimitIntervalSec=0
 Before=network-pre.target
 Wants=network-pre.target
 # The distro's nftables.service may flush the whole ruleset: load after it.
 After=nftables.service
-# A stop or restart of dsm-client stops or restarts this too, so every new
-# start of the client loads the block again before DSM runs.
+# A stop or restart of dsm-client stops or restarts this too. After a stop
+# it loads the block again before DSM runs; after a restart the earlier
+# run's table is still up, so it skips itself (ExecCondition below).
 PartOf=dsm-client.service
 
 [Service]
@@ -24,11 +27,13 @@ Type=oneshot
 # dsm-client` on a running client does not run it again under a live
 # session.
 RemainAfterExit=yes
-# DSM's full kill switch (dsm_killswitch) exists only while a tunnel is up.
-# Then this unit skips itself, so a start on a live client never swaps the
-# live table for this one; a skipped condition is not a failure. At boot
-# and after a stop that table is gone, so the block loads.
-ExecCondition=/bin/sh -c '! /usr/sbin/nft list table inet dsm_killswitch >/dev/null 2>&1'
+# Any DSM kill switch table up (dsm_killswitch while a tunnel is up,
+# dsm_killswitch_pre while DSM connects or after its last run) is a block
+# already: then this unit skips itself, so it never swaps DSM's live table
+# and its server opening for this one; a skipped condition is not a
+# failure. It loads only when no DSM table is up: at boot, and after a
+# clean stop or `dsm cleanup`.
+ExecCondition=/bin/sh -c '! /usr/sbin/nft list table inet dsm_killswitch >/dev/null 2>&1 && ! /usr/sbin/nft list table inet dsm_killswitch_pre >/dev/null 2>&1'
 # The rules are DSM's start-up kill switch with no openings: loopback and
 # DHCP only, no server (dsm/net/_templates/pre_handshake.conf; a test keeps
 # the two the same). DSM adds the server when it starts. systemd passes

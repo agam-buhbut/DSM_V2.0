@@ -70,6 +70,7 @@ def test_the_boot_block_runs_before_any_network() -> None:
     code = _code(BOOT_UNIT)
     for line in (
         "DefaultDependencies=no",
+        "StartLimitIntervalSec=0",
         "Before=network-pre.target",
         "Wants=network-pre.target",
         "After=nftables.service",
@@ -86,9 +87,10 @@ def test_the_boot_block_runs_before_any_network() -> None:
     assert "[Install]" not in code
 
 
-def test_the_boot_block_skips_itself_while_a_tunnel_is_up() -> None:
+def test_the_boot_block_skips_itself_while_any_dsm_table_is_up() -> None:
     assert (
         "ExecCondition=/bin/sh -c '! /usr/sbin/nft list table inet dsm_killswitch"
+        " >/dev/null 2>&1 && ! /usr/sbin/nft list table inet dsm_killswitch_pre"
         " >/dev/null 2>&1'"
     ) in _code(BOOT_UNIT)
 
