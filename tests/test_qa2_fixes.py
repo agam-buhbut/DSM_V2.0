@@ -2215,7 +2215,7 @@ def test_a_config_folder_dsm_cannot_write_is_one_line(tmp_path: Path) -> None:
     assert (
         str(err.value) == f"cannot write in {folder}: Permission denied {_WRITE_HINT}"
     )
-    assert not (folder / "crl_number.seen").exists()
+    assert not list(folder.glob("crl_number*.seen"))
 
 
 @_ROOT_SKIP

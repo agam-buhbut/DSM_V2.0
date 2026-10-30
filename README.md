@@ -806,8 +806,8 @@ The config file is TOML, at `/opt/mtun/config.toml`.
   a client keeps its kill switch up and waits, and a server does not
   start. When false, no crl_file at all, a stale CRL, or a CRL with no
   next update only logs a WARNING. A crl_file that is set but missing,
-  badly signed or older than the last one still stops DSM. A CRL that
-  loads still refuses the certs it lists; with no CRL at all, revoked
+  badly signed or older than the last one from the same CA still stops DSM.
+  A CRL that loads still refuses the certs it lists; with no CRL at all, revoked
   certificates are accepted. To run without a CRL (lab and dev use only),
   set crl_strict = false and remove the crl_file line.
 - expected_server_cn: client only; the subject CN accepted on the server

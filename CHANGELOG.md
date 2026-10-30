@@ -289,6 +289,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `dsm enroll --import` now gives one line too.
 
 ### Fixed
+- After a new CA (deploy/GUIDE.md §7f), a host takes the new CA's first CRL.
+  DSM kept one last CRL number for all CAs, so the new CA's CRL 1000 was
+  refused as a rollback and DSM did not start. It now keeps one per CA key,
+  in `/opt/mtun/crl_number.<id>.seen`, and an older CRL from the same CA is
+  still refused. The old `crl_number.seen` counts for the CA pinned when this
+  version first starts. If a host already refuses the new CA's CRL this way,
+  check its CA root and `ca_root_sha256`, then remove
+  `/opt/mtun/crl_number*.seen` once.
 - `dsm init --install-unit` made an empty `/etc/dsm/passphrase`, so the
   unit's first start failed with a traceback. Now `--resume` writes the
   passphrase that has just unlocked the keys there, and an empty or

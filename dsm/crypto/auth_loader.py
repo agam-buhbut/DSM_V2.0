@@ -11,6 +11,7 @@ stays in the role's own runtime module.
 from __future__ import annotations
 
 import datetime
+import hashlib
 import logging
 import stat
 from collections.abc import Callable
@@ -200,6 +201,32 @@ def load_cert_materials(
     return CertAuthMaterials(cert_der=cert_der, ca_root=ca_root, crl=crl)
 
 
+def _crl_floor_file(config_dir: Path, ca_root: x509.Certificate) -> Path:
+    """Where the last CRL number taken from this CA is kept.
+
+    One file per CA key: CRL numbers count up per CA, and a new CA starts
+    again at 1000 (deploy/GUIDE.md §2a, §7f). Keyed on the key, not the
+    cert or its file: a root renewed with the same key still verifies the
+    old CRLs, so it must keep their floor.
+    """
+    spki = ca_root.public_key().public_bytes(
+        Encoding.DER, PublicFormat.SubjectPublicKeyInfo
+    )
+    return config_dir / f"crl_number.{hashlib.sha256(spki).hexdigest()[:16]}.seen"
+
+
+def _adopt_old_floor(store: Path) -> None:
+    """Move a floor from before it was kept per CA to the CA pinned now.
+
+    It does not say which CA it came from, so it counts for this one: a
+    rollback is still refused. Moved, not copied, so the next CA does not
+    take it too.
+    """
+    old = store.with_name("crl_number.seen")
+    if not store.exists() and old.exists():
+        old.replace(store)
+
+
 def _load_crl(
     config: Config,
     ca_root: x509.Certificate,
@@ -248,9 +275,10 @@ def _load_crl(
             raise AuthMaterialsError(f"CRL at {crl_path} failed validation: {e}") from e
         # DSM-B1: reject a genuinely-signed but older CRL replayed to
         # un-revoke a cert. The last-accepted crl_number is persisted under
-        # the config dir and must never regress.
-        crl_number_store = config.config_dir / "crl_number.seen"
+        # the config dir, one file per CA key, and must never regress.
+        crl_number_store = _crl_floor_file(config.config_dir, ca_root)
         try:
+            _adopt_old_floor(crl_number_store)
             crl.reject_if_rolled_back(crl_number_store)
         except CRLRollbackError as e:
             netaudit.emit("crl_rollback", path=str(crl_path), action="refused_start")

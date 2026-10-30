@@ -1367,10 +1367,10 @@ When a CRL is past its next update (with `crl_strict`, the default):
 In both cases carry the new CRL soon: a cert revoked after the old CRL was
 made is not in it.
 
-A CRL your CA did not sign, or one older than the last one a host took, is
-always refused, and so is a `crl_file` that is set but missing: that always
-stops DSM, whatever `crl_strict` says. To run without a CRL (lab or dev
-only), set `crl_strict = false` and remove the `crl_file` line from
+A CRL your CA did not sign, or one older than the last one a host took from
+that CA, is always refused, and so is a `crl_file` that is set but missing:
+that always stops DSM, whatever `crl_strict` says. To run without a CRL (lab
+or dev only), set `crl_strict = false` and remove the `crl_file` line from
 config.toml. DSM then accepts revoked certs, and says so in one WARNING at
 start.
 
@@ -1379,6 +1379,10 @@ start.
 1. Bootstrap a new CA per §2.
 2. Walk the new root cert + CRL to every dsm host (§2f).
 3. Re-enroll every device per §3.
+
+Each host counts CRL numbers per CA key, so it takes the new CA's first CRL
+(number 1000) even when the old CA's count was higher. An older CRL from the
+same CA is still refused.
 
 ### 7g. Disaster recovery — device identity / attest key compromise, or a lost/cleared TPM
 
@@ -3132,6 +3136,8 @@ $ for iface in $(ls /sys/class/net); do
 /opt/mtun/dsm_ca_root.pem             # pinned CA root cert (mode 0o600)
 /opt/mtun/dsm_ca.crl                  # the CA's CRL: every host needs it (crl_strict);
                                       # carry a new one before it runs out (§7e)
+/opt/mtun/crl_number.<id>.seen        # written by DSM: the last CRL number this
+                                      # host took from one CA (one file per CA key)
 /opt/mtun/allowed_cns.txt             # server only: one CN per line (0o600)
 /etc/dsm/passphrase                   # non-interactive passphrase source (0o600)
 /run/dsm/ipv6_state.json              # per-iface IPv6 state snapshot
