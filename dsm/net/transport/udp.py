@@ -56,6 +56,8 @@ class UDPTransport:
         # True if bind() enabled kernel PMTUD (IP_PMTUDISC_DO). Consulted
         # by `get_path_mtu()`.
         self._pmtu_enabled = False
+        # Address of the last send(). On the client this is always the server.
+        self._last_dest: tuple[str, int] | None = None
         # Serialize send() vs rebind_to_fresh_port() so a
         # concurrent rebind cannot race the chaff/scheduler sendto.
         # Uncontended on the steady-state path.
@@ -126,23 +128,20 @@ class UDPTransport:
         return actual_port
 
     def get_path_mtu(self) -> int | None:
-        """Query the kernel's current Path MTU for this socket.
+        """Query the kernel's current Path MTU toward the last send() address.
 
         Returns ``None`` if PMTUD was not enabled, the socket isn't open,
-        or the kernel doesn't have a PMTU estimate yet (no packets sent
-        or no ICMP replies received). The returned value is the raw
-        IP_MTU — VPN wire-level overhead (IP+UDP+outer header+GCM tag)
-        must still be subtracted to get the usable inner payload budget.
+        nothing was sent yet, or the probe could not be made or marked.
+        Before any ICMP "frag needed" arrives, the reading is the outgoing
+        link's MTU. The value is the raw IP_MTU: VPN wire-level overhead
+        (IP+UDP+outer header+GCM tag) must still be subtracted to get the
+        usable inner payload budget.
         """
         if self._transport is None or not self._pmtu_enabled:
             return None
-        sock = self._transport.get_extra_info("socket")
-        if sock is None:
+        if self._last_dest is None:
             return None
-        try:
-            return sock.getsockopt(socket.IPPROTO_IP, _IP_MTU)
-        except OSError:
-            return None
+        return _route_mtu(self._last_dest)
 
     async def send(self, data: bytes, addr: tuple[str, int]) -> None:
         """Send a datagram to the specified address.
@@ -160,6 +159,7 @@ class UDPTransport:
                 raise RuntimeError("transport not bound")
             if len(data) > MAX_DATAGRAM:
                 raise ValueError(f"datagram too large: {len(data)} > {MAX_DATAGRAM}")
+            self._last_dest = addr
             self._transport.sendto(data, addr)
 
     async def rebind_to_fresh_port(self) -> int:
@@ -275,6 +275,22 @@ class UDPTransport:
     async def aclose(self) -> None:
         """Async close (UDP has no pending writes, delegates to sync close)."""
         self.close()
+
+
+def _route_mtu(addr: tuple[str, int]) -> int | None:
+    # IP_MTU needs a connected socket; DSM's stays unconnected (connect() would
+    # pin its source address). connect() on UDP sends nothing, and the kernel
+    # keeps a learned path MTU per destination, so a throwaway socket sees it.
+    # Mark it like DSM's packets, BEFORE connect: unmarked, a client's route
+    # lookup goes through the TUN and reads the TUN's own MTU. That would walk
+    # auto_mtu down to 576, so no mark means no reading.
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            apply_so_mark(probe)
+            probe.connect(addr)
+            return probe.getsockopt(socket.IPPROTO_IP, _IP_MTU)
+    except OSError:
+        return None
 
 
 def _ask_kernel_buffer(sock: socket.socket, size: int) -> None:

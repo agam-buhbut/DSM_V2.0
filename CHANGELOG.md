@@ -354,6 +354,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mtu allows. Paths of 1428 bytes or more are not changed.
 
 ### Fixed
+- `auto_mtu` works now. DSM could never read the kernel's path MTU,
+  because its UDP socket is not connected. So the TUN MTU never came down,
+  and with `pmtu_discover = true` every packet too big for a smaller path
+  was dropped (the log only said "Message too long"). DSM now asks a
+  short-lived socket that sends nothing. The start-up "kernel path MTU"
+  line now shows. With `auto_mtu` off, or for up to
+  `pmtu_check_interval_s` after the path gets smaller, big packets are
+  still dropped.
 - With auto_mtu on and a hand-set `mtu` that already fits a smaller path
   (for example mtu 1100 on a path MTU of 1300), auto_mtu now still drops
   the sizes too big for the path. Before, it did so only when it changed
