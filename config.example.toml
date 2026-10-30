@@ -188,9 +188,9 @@ mtu = 1360
 # matters only when no class lies between the two: then the size is the
 # smallest class at or above padding_min. If you lower padding_max, set mtu
 # in both configs to at most that class minus 40 (padding_max = 1024 needs
-# mtu = 984). Otherwise a real
-# packet too big for the size is dropped, because its exact size would mark
-# it as real; DSM warns at start. TCP frames are always 1400 bytes.
+# mtu = 984). Otherwise a real packet too big for the size is dropped,
+# because its exact size would mark it as real; DSM warns at start. TCP
+# frames are always 1400 bytes.
 padding_min = 128
 padding_max = 1400
 

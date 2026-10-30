@@ -73,7 +73,7 @@ ExecStopPost=/bin/sh -c 'if [ "$$SERVICE_RESULT" = success ]; then queued=$$(sys
 # DSM exits when stopped (0), on a start error (1) or on a crash. With
 # --stop-keeps-block each of these keeps the start-up kill switch up, except
 # the few errors that come before it is raised (deploy/GUIDE.md §7i); for
-# those the boot block stays up. A date problem or a server name that does
+# those a block stays up. A date problem or a server name that does
 # not resolve does not end DSM: it keeps the block and tries again.
 # Restart=always brings DSM back; the new start replaces the old kill switch
 # in one nft commit, so the host is never open between. After 5 failed

@@ -318,7 +318,7 @@ def _route_mtu(addr: tuple[str, int]) -> int | None:
     # keeps a learned path MTU per destination, so a throwaway socket sees it.
     # Mark it like DSM's packets, BEFORE connect: unmarked, a client's route
     # lookup goes through the TUN and reads the TUN's own MTU. That would walk
-    # auto_mtu down to 576, so no mark means no reading.
+    # auto_mtu down to 472 (AUTO_MTU_FLOOR), so no mark means no reading.
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
             apply_so_mark(probe)

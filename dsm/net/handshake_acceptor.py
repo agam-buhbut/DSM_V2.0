@@ -50,8 +50,10 @@ session per CN, and each CN's takeover allowance) is handed to
   §3.7 E3). Without a gate (tests only) nothing is pushed out.
 * A stranger's start that proved its address (a valid mac2, or a TCP
   connection) and then ended without a session bars that address for 30 s
-  (spec §3.7 E2), except a UDP start whose msg3 did not open, and a push-out
-  victim whose msg2 left less than ``_REPLY_ALLOWANCE_S`` ago.
+  (spec §3.7 E2), except a push-out victim whose msg2 left less than
+  ``_REPLY_ALLOWANCE_S`` ago. Over UDP a frame that does not open as msg3
+  is skipped, so a start that proved its address and then stalls is barred
+  at the per-attempt deadline, like any other stall.
 
 Handoff: the frames still in a passing client's inbox go with it
 (``AcceptedClient.held``). Nothing awaits between its bootstrap reply and
@@ -541,8 +543,10 @@ async def _run_attempt(
     ``record`` is the attempt's record. Over TCP it is marked as signing
     once the first frame passed, until msg2 has left (UDP's view does that
     for UDP), and it loses its ``proved`` bit when the shared limits refuse
-    the first frame, which is not the address's doing. Over UDP it loses
-    that bit when msg3 does not open (spec §3.7 E2).
+    the first frame, which is not the address's doing. Over UDP a frame
+    that does not open as msg3 is skipped, so a start that proved its
+    address and then stalls keeps the bit and is barred at the deadline
+    (spec §3.7 E2).
     """
     from cryptography.x509.oid import ExtendedKeyUsageOID
 
@@ -648,11 +652,10 @@ async def _run_attempt(
                 and isinstance(conn, _PerPeerUDPView)
                 and record is not None
             ):
-                # The real UDP handshake no longer raises BadMsg3Error: it
-                # skips a frame that does not open as msg3 (a lost or late
-                # msg3, or a spoofed datagram, looks the same). This branch
-                # is kept for a transport that still raises it; it bars
-                # nothing (spec §3.7 E2).
+                # Unreachable over UDP: the real UDP handshake no longer
+                # raises BadMsg3Error, it skips a frame that does not open as
+                # msg3 (a lost or late msg3, or a spoofed datagram, looks the
+                # same). Kept until a later change removes it with its test.
                 record.proved = False
             # The INFO/WARNING line names a proven CN and why, and has no
             # address. The DEBUG detail line below, on only at log_level

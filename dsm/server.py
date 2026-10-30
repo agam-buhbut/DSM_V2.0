@@ -706,8 +706,9 @@ async def run_server(
             # it (spec §2.6).
             udp = UDPTransport(recv_queue_size=SERVER_RECV_QUEUE_PACKETS)
             try:
-                # Never DF here (config warns): the server cannot make its
-                # packets smaller for one client's path.
+                # Never force DF here (config warns); the kernel's default
+                # applies. The server cannot make its packets smaller for one
+                # client's path.
                 await udp.bind(local_port=config.listen_port, pmtu_discover=False)
             except OSError as e:
                 reason = os.strerror(e.errno) if e.errno else str(e)

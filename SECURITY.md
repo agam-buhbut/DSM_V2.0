@@ -138,8 +138,11 @@ closed as known:
   you are on, not your real traffic. It does not hide everything: the step
   itself shows roughly how much you send; someone who watches both your
   connection and your server's internet side can line up your real busy
-  periods; and in TCP mode the TCP connection itself stays visible. Perfect
-  hiding from someone who can watch the whole internet is not promised.
+  periods; someone who watches both directions of your own link (anyone on
+  your Wi-Fi or at your provider) can tell most decoys from real downloads,
+  because a decoy runs in one direction only; and in TCP mode the TCP
+  connection itself stays visible. Perfect hiding from someone who can
+  watch the whole internet is not promised.
 - **The handshake gate is a filter, not a lock (wire v2).** The server
   answers a first handshake message only if it carries a short code (called
   mac1) that shows the sender knows the CA certificate and the server's name.
@@ -157,7 +160,7 @@ closed as known:
   the server's name can make new devices wait. Over UDP they can do it
   even from faked source addresses, by keeping the cookie budget empty
   while the server is busy, or from about 31 real addresses. Over TCP it
-  takes about 31 real addresses too, because there every failed or stalled
+  takes about 31 real addresses too: either way every failed or stalled
   start costs its address 30 s.
   Over TCP, someone with nothing at all can make new devices wait too,
   but needs about 170 addresses, for the same reason.
@@ -188,18 +191,18 @@ closed as known:
   signs only once that frame arrives.
 
   Over UDP, a frame that does not open as msg3 (the final handshake
-  message) is skipped and the server keeps waiting. So a faked packet
-  that lands before a real device's msg3 does no harm, and a msg3 that
-  was lost or came late is read from the device's resend. A faked packet
-  that lands just after a real device's msg3 still ends that attempt and
-  costs the address 30 s: the device sends its next frame right behind
-  msg3, so that gap is tiny. To hit it, or to fill the device's inbox of
-  8 frames, an attacker must keep sending from the device's address, so
-  keeping a device out by faking its address costs a steady flood, not
-  one packet. Over TCP a bad msg3 still ends the start and costs 30 s.
-  A bad msg3 is now just a stall, and a stall costs 30 s, which is why UDP
-  and TCP take about the same number of addresses (about 31, and about
-  125 right after a restart).
+  message) is skipped and the server keeps waiting. So a faked packet that
+  lands before a real device's msg3 does no harm, and a msg3 that was lost
+  or came late is read from the device's resend. A faked packet that lands
+  just after a real device's msg3 still ends that attempt and costs the
+  address 30 s: the device sends its next frame right behind msg3, so that
+  gap is tiny. To hit it, or to fill the server's 8-frame inbox for that
+  device, an attacker must keep sending from the device's address, so
+  keeping a device out by faking its address costs a steady flood, not one
+  packet. Over TCP a bad msg3 still ends the start and costs 30 s. A bad
+  msg3 is now just a stall, and a stall costs 30 s, which is why UDP and
+  TCP take about the same number of addresses (about 31, and about 125
+  right after a restart).
 
   One cost of this: when every slot is full, a new device whose msg3 was
   lost can be pushed out after 1.5 s, and its address is then barred for

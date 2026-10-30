@@ -242,12 +242,15 @@ the file is unchanged.
 The MTU is the largest packet a link can carry.
 
 - The TUN MTU can be set: default 1360, allowed 576-1500.
-- Optional: the kernel's Path MTU Discovery on the UDP socket
-  (IP_PMTUDISC_DO). It sets the DF (don't fragment) bit and records ICMP
-  "frag needed" replies.
-- At session start the client logs the path MTU the kernel found. It warns
-  if the configured TUN MTU is bigger than the usable inner budget (the room
-  left for data inside one packet).
+- Optional `pmtu_discover` (client only): once the handshake is done, the
+  client sets the DF (don't fragment) bit on its UDP data packets
+  (IP_PMTUDISC_DO) and reads the path MTU the kernel learned from ICMP
+  "frag needed" replies. The handshake itself never forces DF.
+- With `pmtu_discover` on, the client logs at session start the path MTU
+  the kernel found (the line is not logged without it). While `auto_mtu` is
+  off, it warns if the configured TUN MTU is bigger than the usable inner
+  budget (the room left for data inside one packet), or if every datagram
+  is bigger than the path.
 - Optional `auto_mtu` (client only): a background loop reads the kernel's
   path MTU every `pmtu_check_interval_s` (default 30 s) and adjusts the TUN
   MTU. It picks the TUN MTU so a full-size packet fills the largest size
@@ -401,8 +404,10 @@ newest, also across key changes.
   dropped, never sent at its exact size, so `mtu` must fit it (see
   `padding_max` under Configuration, Parameters; DSM warns at start when it
   does not). `padding_min` matters over UDP only when no size class lies
-  between it and `padding_max`: then every packet takes the smallest class
-  at or above `padding_min`.
+  between it and `padding_max` (or the lower size `auto_mtu` set for the
+  path): then every packet takes the smallest class at or above
+  `padding_min`, even when that is bigger than the path, and with
+  `pmtu_discover` on every packet is then lost.
 - The padding sits inside the encryption: it fills the encrypted part up to
   the size class. So no unauthenticated padding is left on the wire.
 - In TCP mode every frame is padded to the largest class (1400), so all
@@ -869,8 +874,9 @@ The config file is TOML, at `/opt/mtun/config.toml`.
 - mtu: TUN interface MTU in bytes (default: 1360, allowed 576-1500)
 - pmtu_discover: client only. Turns on kernel PMTUD (path MTU discovery,
   the DF bit) on the UDP socket once the handshake is done (default:
-  false). `auto_mtu` needs it, because the kernel only tracks each path's
-  MTU when this is on. A server ignores it and logs a warning.
+  false). `auto_mtu` needs it: the kernel always tracks each path's MTU,
+  but DSM reads it only when this is on. A server ignores it and logs a
+  warning.
 - auto_mtu: client-side loop that adjusts the TUN MTU (default: false). It
   lowers the MTU when the path MTU drops, and raises it back toward `mtu`
   after 3 steady readings. Recommended for cellular and roaming clients.
@@ -881,16 +887,18 @@ The config file is TOML, at `/opt/mtun/config.toml`.
   second.
 - log_level: debug | info | warning | error (default: info). See Logging
   below.
-- padding_min, padding_max: the range of size classes DSM may use
-  (default: 128-1400). Over UDP every packet takes the largest class from
+- padding_min, padding_max: the range of size classes DSM may use (default:
+  128-1400). Over UDP every packet takes the largest class from
   `padding_min` to `padding_max`, so `padding_max` sets the size;
-  `padding_min` matters only when no class lies between the two, and then
-  the size is the smallest class at or above it. If you lower `padding_max`,
-  set `mtu` in both configs to at most that class minus 40 (for example
-  `padding_max = 1024` and `mtu = 984`). Otherwise a real packet too big for
-  the size is dropped, never sent at its exact size, and DSM warns at start
-  (see Padding above). In TCP mode every frame is 1400 bytes whatever these
-  say.
+  `padding_min` matters only when no class lies between the two (or between
+  `padding_min` and the lower size `auto_mtu` set for the path), and then
+  the size is the smallest class at or above it, even when that is bigger
+  than the path: with `pmtu_discover` on, every packet is then lost. If you
+  lower `padding_max`, set `mtu` in both configs to at most that class minus
+  40 (for example `padding_max = 1024` and `mtu = 984`). Otherwise a real
+  packet too big for the size is dropped, never sent at its exact size, and
+  DSM warns at start (see Padding above). In TCP mode every frame is 1400
+  bytes whatever these say.
 - shaper_tiers_pps: the tier rates in packets per second, lowest first
   (default: [10, 50, 200, 800]; 2 to 8 entries, each 1 to 5000, each higher
   than the one before). The first one is the idle rate. It must be above

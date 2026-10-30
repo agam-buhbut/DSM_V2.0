@@ -108,7 +108,7 @@ $ rustc --version                 # 1.88 or newer
 ```
 
 Do not use `sudo apt install rustc cargo` on Debian 13: it gives rustc
-1.85, and the build stops with "error: rustc 1.85.1 is not supported by
+1.85, and the build stops with "error: rustc 1.85.0 is not supported by
 the following packages". If cargo ever suggests `cargo update ... --precise`,
 do not run it: it swaps the locked crypto crates for older ones, one with a
 known timing leak (RUSTSEC-2026-0387). Install the Rust version named here
@@ -1652,7 +1652,7 @@ crash, a start error or a signal sent straight to it) leaves it up; run
     Python traceback before `client starting`), for example after a Python
     upgrade.
 
-  systemd tries again and gives up after 5 starts in 10 minutes; the boot
+  systemd tries again and gives up after 5 starts in 10 minutes; a
   block stays up all that time (SSH too); on a run by hand the host is
   open. DSM has no block of its own for these cases. They are setup
   mistakes, and each shows on the first start, so check them before you
@@ -2413,8 +2413,10 @@ prints "ok".
   $ sudo ss -ulnp | grep 51820
   ```
 
-- Firewall between you and the server dropping DF packets (less
-  likely with default pmtu_discover=false).
+- Firewall between you and the server dropping packets with the DF
+  (don't fragment) bit. `pmtu_discover` does not change this for the
+  handshake: the kernel sets DF by default on every packet that fits the
+  path.
 - On cellular: the link was down when the handshake started. Each
   retry adds 5 s of timeout + (1, 2) s of backoff (3 attempts; the
   third raises without sleeping) — about 18 s per try. After a failed
@@ -2508,7 +2510,7 @@ nft refused the client's first table, so DSM stops before it does
 anything (exit 1). Check that nftables is installed (`sudo nft list
 ruleset`) and that DSM runs as root. With "Operation not permitted" it ran
 without root or without CAP_NET_ADMIN. DSM raises no block of its own;
-under the unit the boot block stays up, SSH too (§7i). If nft itself is
+under the unit a block stays up, SSH too (§7i). If nft itself is
 missing or broken, the boot block did not load either (`systemctl status
 dsm-client-boot-block` shows it failed), and the host is open.
 
@@ -2516,7 +2518,7 @@ dsm-client-boot-block` shows it failed), and the host is open.
 
 This DSM was built for testing: its attestation key is not held by
 hardware. DSM stops before its kill switch is up, so DSM raises no block
-of its own; under the unit the boot block stays up, SSH too (§7i). Use a
+of its own; under the unit a block stays up, SSH too (§7i). Use a
 tuncore built with a hardware attest backend. On a lab host only, set
 `allow_soft_attest = true` in config.toml (`dsm init` writes it on such a
 build, with a comment).
@@ -2536,7 +2538,7 @@ Run: chmod 600 ...`.
 ### systemd: "Failed to set up credentials" (status 243/CREDENTIALS)
 
 `/etc/dsm/passphrase` is missing, so systemd does not start DSM at all.
-DSM raises no block of its own; under the unit the boot block stays up,
+DSM raises no block of its own; under the unit a block stays up,
 SSH too (§7i). Make the file (§3e), then `sudo systemctl reset-failed
 dsm-client && sudo systemctl restart dsm-client` (or `dsm`). `sudo dsm init
 ... --install-unit` writes it for you.
@@ -2545,7 +2547,7 @@ dsm-client && sudo systemctl restart dsm-client` (or `dsm`). `sudo dsm init
 
 systemd could not run `/usr/local/bin/dsm`: it is missing, or it points
 into a broken venv. DSM did not run, so DSM raises no block of its own;
-under the unit the boot block stays up, SSH too (§7i). Check
+under the unit a block stays up, SSH too (§7i). Check
 `ls -l /usr/local/bin/dsm` (§1c), then install again: §1b, or run
 `install.sh` again on a host set up with it. Then `sudo systemctl
 reset-failed dsm-client && sudo systemctl restart dsm-client` (or `dsm`).
@@ -2553,7 +2555,7 @@ reset-failed dsm-client && sudo systemctl restart dsm-client` (or `dsm`).
 ### "tuncore is missing ATTEST_BACKEND_IS_SOFTWARE: the extension predates the Phase-0 attestation gate. ..."
 
 The installed tuncore is from an old build. DSM stops before its kill
-switch is up, so DSM raises no block of its own; under the unit the boot
+switch is up, so DSM raises no block of its own; under the unit a
 block stays up, SSH too (§7i). Build the wheel again from the repo root
 (§1a) and install it with `--force-reinstall` (as in the
 TypeError entry below), or run `install.sh` again on a host set up with it.

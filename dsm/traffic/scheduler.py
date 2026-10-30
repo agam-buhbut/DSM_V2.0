@@ -287,7 +287,10 @@ class SendScheduler:
         shaper = cast(object, self._shaper)
         if not isinstance(shaper, TrafficShaper):
             return data, target_size
-        return shaper._fit_one_size(data, target_size)  # pylint: disable=protected-access  # pyright: ignore[reportPrivateUsage]  # the shaper's own size rule  # fmt: skip
+        # The shaper's own size rule.
+        # pylint: disable-next=protected-access
+        fit_one_size = shaper._fit_one_size  # pyright: ignore[reportPrivateUsage]
+        return fit_one_size(data, target_size)
 
     def _chaff_allowed(self) -> bool:
         return self._should_chaff_fn is None or self._should_chaff_fn()

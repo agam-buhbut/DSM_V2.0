@@ -106,7 +106,8 @@ class _SessionUDPView(UDPTransport):
         return self._real.recv_drops() + self._others_drops() + self._drops
 
     def too_big_drops(self) -> int:
-        """The socket's; 0, as the server never sets DF."""
+        """The socket's; 0, as the server never forces DF, so the kernel
+        never refuses a datagram as too big."""
         return self._real.too_big_drops()
 
     def close(self) -> None:

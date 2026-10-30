@@ -162,17 +162,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `mtu` in both configs to the largest size class at or below `padding_max`,
   minus 40 (DSM warns at start when it does not fit). `padding_min` now
   matters over UDP only when no size class lies between it and
-  `padding_max`. The start-up path MTU warning now
-  points to `auto_mtu` or to `padding_max` with `mtu`, because a lower `mtu`
-  alone no longer makes a datagram smaller. With `pmtu_discover = true`, a
-  path that shrinks mid-session now stops every packet, not only the big
-  ones, until `auto_mtu` lowers the size, about a second after the first
-  refused packet. Packets already queued when the size changes are padded
-  again to the new size before they leave, or dropped (with a fake packet
-  in their place) when they do not fit it. Upgrade both ends: each end pads only what it sends, so
-  until the server is upgraded the download direction still shows the
-  sizes. A server pays this for each client: about 7 GB a day out per
-  client that is connected all day and idle.
+  `padding_max`. The start-up path MTU warning now points to `auto_mtu` or
+  to `padding_max` with `mtu`, because a lower `mtu` alone no longer makes a
+  datagram smaller. It also warns when `mtu` fits the path but every
+  datagram (the one size plus 28 bytes) is bigger than the path. With
+  `pmtu_discover = true`, a path that shrinks mid-session now stops every
+  packet, not only the big ones, until `auto_mtu` lowers the size, about a
+  second after the first refused packet. Packets already queued when the
+  size changes are padded again to the new size before they leave, or
+  dropped (with a fake packet in their place) when they do not fit it.
+  Upgrade both ends: each end pads only what it sends, so until the server
+  is upgraded the download direction still shows the sizes. A server pays
+  this for each client: about 7 GB a day out per client that is connected
+  all day and idle.
 - **Behavior change:** the client is now blocked from boot. Before,
   `dsm-client.service` started only once the network was up, and DSM then
   took 0.15-0.35 s to raise its kill switch, so on every boot other
@@ -188,7 +190,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   --systemd --client`, or copy `deploy/dsm-client.service` and
   `deploy/dsm-client-boot-block.service` to `/etc/systemd/system/` and run
   `sudo systemctl daemon-reload`; then `sudo systemctl restart dsm-client`.
-- Over UDP, a start whose third handshake message does not open is no longer free for a stranger: the server waits, as for a stalled start, and that address waits 30 s. Keeping new devices waiting now takes about 31 addresses over UDP (about 125 right after a restart), as over TCP. A faked packet in a real device's handshake before that message does no harm now. Log change: over UDP a bad or stalled start no longer logs `handshake failed (BadMsg3Error)`; it shows as `a handshake attempt exceeded 12s deadline`, and the skip itself logs only at DEBUG.
+- Over UDP, a start whose third handshake message does not open is no longer
+  free for a stranger: the server waits, as for a stalled start, and that
+  address waits 30 s. Keeping new devices waiting now takes about 31
+  addresses over UDP (about 125 right after a restart), as over TCP. A faked
+  packet in a real device's handshake before that message does no harm now.
+  Log change: over UDP a bad or stalled start no longer logs
+  `handshake failed (BadMsg3Error)`; it shows as
+  `a handshake attempt exceeded 12s deadline`, and the skip itself logs only
+  at DEBUG.
 - **Behavior change:** the client raises its kill switch before anything at
   start that depends on the clock or the network. Before, a CRL past its
   next update, a CA cert outside its dates, or a server name the network
@@ -373,10 +383,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - With auto_mtu on, a full-size packet no longer leaves at an exact size
   that fake packets never have. auto_mtu now sets the TUN MTU so a full
   packet fills the largest size class that fits the path: path MTU 1300
-  gives 1112, not 1232. On such a path this costs about 10% of the speed.
-  So that this holds on every path the kernel can learn, even one set by a
+  gives 1112, not 1232. On such a path this costs about 10% of the speed. So
+  that this holds on every path the kernel can learn, even one set by a
   forged ICMP message, auto_mtu can now go down to 472, below the 576 that
-  mtu allows. Paths of 1428 bytes or more are not changed.
+  mtu allows. Paths of 1428 bytes or more are not changed. With a hand-set
+  `mtu` that already fits a smaller path, auto_mtu still lowers the packet
+  size to fit the path, and raises it again after 3 steady readings of a
+  larger path.
 
 ### Fixed
 - DSM now runs on a CPU without AES-NI. Every build turned on the AES-NI,
@@ -393,36 +406,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   net.ipv6.conf.<tun>.disable_ipv6=0"). Linux takes IPv6 off a device
   whose MTU is below 1280, so DSM no longer tries to turn it on for the
   TUN there. DSM carries no IPv6 through the tunnel, so nothing is lost.
-- `auto_mtu` works now. DSM could never read the kernel's path MTU,
-  because its UDP socket is not connected. So the TUN MTU never came down,
-  and with `pmtu_discover = true` every packet too big for a smaller path
-  was dropped (the log only said "Message too long"). DSM now asks a
-  short-lived socket that sends nothing. The start-up "kernel path MTU"
-  line now shows. With `auto_mtu` off, or for about a second after the
-  path gets smaller, big packets are still dropped.
-- With auto_mtu on and a hand-set `mtu` that already fits a smaller path
-  (for example mtu 1100 on a path MTU of 1300), auto_mtu now still drops
-  the sizes too big for the path. Before, it did so only when it changed
-  the TUN MTU, so the packets that drew a size too big for the path (5 to
-  11 in 100) were lost. The sizes come back after 3 steady readings of a
-  larger path, as the TUN MTU does.
+- `auto_mtu` works now. DSM could never read the kernel's path MTU, because
+  its UDP socket is not connected. So the TUN MTU never came down, and with
+  `pmtu_discover = true` every packet too big for a smaller path was dropped
+  (the log only said "Message too long"). DSM now asks a short-lived socket
+  that sends nothing. The start-up "kernel path MTU" line now shows. With
+  `auto_mtu` off, or for about a second after the path gets smaller, every
+  packet is still dropped on a path too small for the one size all UDP
+  packets now have. When the TUN MTU cannot be changed, `auto_mtu` still
+  lowers that size, so small packets keep flowing.
 - With `pmtu_discover = true`, a client on a path whose MTU is below 1428
-  bytes (common on cellular) could never connect: every handshake packet
-  is 1428 bytes and may not be split with DF on, so the kernel refused each
+  bytes (common on cellular) could never connect: every handshake packet is
+  1428 bytes and may not be split with DF on, so the kernel refused each
   resend ("Message too long"). The client now turns DF on only once the
   handshake is done. With `auto_mtu = false` nothing then makes its packets
-  smaller, so on such a path the big ones are dropped: that pair of
-  settings now logs a warning.
+  smaller, so on such a path every packet is dropped (over UDP all have one
+  size): that pair of settings now logs a warning over UDP.
 - A server no longer uses `pmtu_discover`. With it on, clients on a smaller
   path MTU could not connect, and downloads to them stopped when the path
   got smaller, because the server cannot make its packets smaller for one
-  client. It now always sends without DF and warns when the setting is on.
-  So the fix for clients on small paths is a server change: upgrade the
-  server. An upgraded client still cannot connect over a small path to an
-  old server that has `pmtu_discover = true`. `auto_mtu` on a server now
-  also says it is for clients only (the old warning told the operator to
-  turn `pmtu_discover` on). The GUIDE's server template no longer says to
-  turn it on.
+  client. It now never forces the don't-fragment (DF) bit (the kernel's
+  default applies) and warns when the setting is on. So the fix for clients
+  on small paths is a server change: upgrade the server. An upgraded client
+  still cannot connect over a small path to an old server that has
+  `pmtu_discover = true`. `auto_mtu` on a server now also says it is for
+  clients only (the old warning told the operator to turn `pmtu_discover`
+  on). The GUIDE's server template no longer says to turn it on.
 - A packet the kernel refuses as too big for the path ("Message too long")
   now makes `auto_mtu` check the path within a second, not up to
   `pmtu_check_interval_s` later. The slow-link auto cap no longer counts
@@ -436,7 +445,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   After a stop or a start error, the values DSM found stay. To get it,
   re-run `install.sh --systemd`, or copy the new `deploy/dsm.service` to
   `/etc/systemd/system/` and run `sudo systemctl daemon-reload`.
-- Over UDP, a lost or late third handshake message no longer makes the server drop the attempt. Before, the server read the client's next frame in its place and failed, and the client waited about 19 s before it tried again. Now the server skips a frame that does not open as that message and waits for the client's resend, about 6 s later. Over TCP a bad third message still ends the attempt.
+- Over UDP, a lost or late third handshake message no longer makes the
+  server drop the attempt. Before, the server read the client's next frame
+  in its place and failed, and the client waited about 19 s before it tried
+  again. Now the server skips a frame that does not open as that message and
+  waits for the client's resend, about 6 s later. Over TCP a bad third
+  message still ends the attempt.
 - After a new CA (deploy/GUIDE.md §7f), a host takes the new CA's first CRL.
   DSM kept one last CRL number for all CAs, so the new CA's CRL 1000 was
   refused as a rollback and DSM did not start. It now keeps one per CA key,
