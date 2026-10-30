@@ -154,6 +154,34 @@ def test_pmtu_discover_without_auto_mtu_warns(
     assert _DF_WITHOUT_AUTO_MTU not in [r.getMessage() for r in caplog.records]
 
 
+def _df_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.getMessage().startswith("pmtu_discover = true without auto_mtu")
+    ]
+
+
+def test_pmtu_discover_without_auto_mtu_does_not_warn_over_tcp(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # TCP mode does not use pmtu_discover: the kernel's TCP fits its
+    # segments to the path itself, so nothing is refused there.
+    caplog.set_level(logging.WARNING, logger="dsm.core.config")
+    _client_config(transport="tcp", auto_mtu=False)
+    assert _df_warnings(caplog) == []
+
+
+def test_pmtu_discover_without_auto_mtu_names_the_datagram_size(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Every datagram is the one size plus 28: 1024 + 28 with padding_max 1024.
+    caplog.set_level(logging.WARNING, logger="dsm.core.config")
+    _client_config(auto_mtu=False, padding_max=1024, mtu=984)
+    (line,) = _df_warnings(caplog)
+    assert "drops every packet on a path smaller than 1052 bytes" in line
+
+
 class TestClientHandshakeWithoutDf(_ClientBindCase):
     async def test_the_handshake_runs_without_df(self) -> None:
         seen: list[int] = []

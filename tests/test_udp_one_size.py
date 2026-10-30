@@ -292,7 +292,7 @@ def _across_a_ceiling_change(
 def test_queued_packets_take_the_new_size_after_a_raise() -> None:
     # A control packet (padded after the raise) jumping ahead of data padded
     # before it marked every old-size packet between two new-size ones as
-    # real and queued (review of #55: [1400, 1152 x 6, 1400, 1400, 1400]).
+    # real and queued (review of #55: [1400, 1152 x 6, 1400, 1400]).
     shaper = _FixedSlots(128, 1400)
     shaper.set_size_class_ceiling(1300 - 28)  # the one size is 1152
     sent, every, slots = _across_a_ceiling_change(
@@ -451,4 +451,32 @@ def test_no_start_up_hint_when_mtu_fits_or_auto_mtu_is_on(
 ) -> None:
     caplog.set_level(logging.WARNING, logger="dsm.client")
     _log_path_mtu(_config("udp", auto_mtu=auto_mtu), path_mtu)
+    assert _hints(caplog) == []
+
+
+def test_the_start_up_hint_warns_when_every_datagram_is_too_big(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A hand-set mtu that fits the path does not make a datagram smaller:
+    # every packet still takes the one size, 1400 + 28 = 1428 > 1300, so
+    # with DF on the kernel refuses every one.
+    caplog.set_level(logging.WARNING, logger="dsm.client")
+    config = _config("udp", mtu=1100, pmtu_discover=True)
+    _log_path_mtu(config, 1300)
+    (line,) = _hints(caplog)
+    assert "every datagram" in line
+    assert "bigger than the path MTU 1300" in line
+    assert line.endswith(
+        "turn on auto_mtu with pmtu_discover, or set padding_max = 1152 and "
+        "mtu = 1112 in both configs"
+    )
+
+
+@pytest.mark.parametrize(("mtu", "padding_max"), [(1100, 1152), (984, 1024)])
+def test_no_start_up_hint_when_the_one_size_fits_the_path(
+    caplog: pytest.LogCaptureFixture, mtu: int, padding_max: int
+) -> None:
+    caplog.set_level(logging.WARNING, logger="dsm.client")
+    config = _config("udp", mtu=mtu, padding_max=padding_max, pmtu_discover=True)
+    _log_path_mtu(config, 1300)
     assert _hints(caplog) == []

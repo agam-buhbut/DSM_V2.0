@@ -30,7 +30,7 @@ from dsm.core.fsm import SessionFSM, State
 from dsm.core.log import RepeatLog
 from dsm.core.path_security import check_user_file_permissions
 from dsm.core.preflight import check_clock_sync, ntp_synchronized
-from dsm.core.protocol import WIRE_VERSION, ReassemblyBuffer
+from dsm.core.protocol import SIZE_CLASSES, WIRE_VERSION, ReassemblyBuffer
 from dsm.core.rand import csprng_float
 from dsm.crypto.attest_store import AttestStore
 from dsm.crypto.auth_loader import (
@@ -54,6 +54,7 @@ from dsm.net.transport.tcp import FramingError, TCPTransport
 from dsm.net.transport.udp import UDPTransport
 from dsm.net.tunnel import SrcValidMarkEnabler, TunDevice
 from dsm.session import (
+    IP_UDP_OVERHEAD,
     DataPathContext,
     LivenessState,
     RekeyState,
@@ -345,27 +346,45 @@ class _Reconnect:
 
 
 def _log_path_mtu(config: Config, path_mtu: int) -> None:
-    """Log the kernel's path MTU, and warn when ``mtu`` does not fit it while
-    auto_mtu is off."""
+    """Log the kernel's path MTU, and warn while auto_mtu is off when ``mtu``
+    or the one size every datagram takes does not fit it."""
     # The TUN MTU auto_mtu would set on this path.
     usable = _fit_tun_mtu(path_mtu, config.mtu)
     log.info("kernel path MTU = %d (usable inner %d)", path_mtu, usable)
-    if usable >= config.mtu or config.auto_mtu:
+    if config.auto_mtu:
         return
     # Every packet takes one size (the largest class up to padding_max), so a
-    # lower mtu alone no longer makes a datagram smaller. The fix by hand is
-    # the largest class the path holds as padding_max and that class minus 40
-    # as mtu, when a config takes that mtu.
-    fix_mtu = min(usable, DEFAULT_TUN_MTU)
+    # lower mtu alone no longer makes a datagram smaller.
+    one_size = max(
+        (size for size in SIZE_CLASSES if size <= config.padding_max),
+        default=SIZE_CLASSES[0],
+    )
+    datagram = one_size + IP_UDP_OVERHEAD
+    if usable >= config.mtu and datagram <= path_mtu:
+        return
+    # The fix by hand is the largest class the path holds as padding_max and
+    # that class minus 40 as mtu, when a config takes that mtu.
+    fix_mtu = _fit_tun_mtu(path_mtu, DEFAULT_TUN_MTU)
     by_hand = ""
     if fix_mtu >= MIN_TUN_MTU:
         by_hand = f", or set padding_max = {fix_mtu + 40} and mtu = {fix_mtu}"
         by_hand += " in both configs"
+    if usable < config.mtu:
+        log.warning(
+            "configured tun mtu=%d exceeds usable inner %d (path MTU %d); turn "
+            "on auto_mtu with pmtu_discover%s",
+            config.mtu,
+            usable,
+            path_mtu,
+            by_hand,
+        )
+        return
     log.warning(
-        "configured tun mtu=%d exceeds usable inner %d (path MTU %d); turn on "
-        "auto_mtu with pmtu_discover%s",
-        config.mtu,
-        usable,
+        "every datagram is %d bytes (the one size %d plus 28), bigger than the "
+        "path MTU %d, so the kernel refuses them all; turn on auto_mtu with "
+        "pmtu_discover%s",
+        datagram,
+        one_size,
         path_mtu,
         by_hand,
     )

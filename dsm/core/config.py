@@ -70,6 +70,8 @@ DEFAULT_TUN_MTU = 1360
 # The size-class overhead above: a full TUN packet of mtu bytes needs an
 # mtu + 40 size class.
 _SIZE_CLASS_OVERHEAD = 40
+# The link overhead above: a datagram is its size class plus 28 bytes.
+_IP_UDP_OVERHEAD = 28
 
 # Tier shaper defaults and limits. dsm.traffic.shaper uses the same defaults,
 # and the Rust core (rust/tuncore/src/shaper.rs) checks the same limits.
@@ -686,6 +688,19 @@ def _validate_pmtu_interval(c: Config) -> None:
         )
 
 
+def _one_size(padding_max: int) -> int:
+    """The one size every UDP packet takes: the largest size class at or
+    below ``padding_max`` (a path MTU ceiling can lower it at run time)."""
+    # Lazy: dsm.core.protocol loads the Rust core, which nothing else in
+    # this module needs.
+    from dsm.core.protocol import SIZE_CLASSES
+
+    return max(
+        (size for size in SIZE_CLASSES if size <= padding_max),
+        default=SIZE_CLASSES[0],
+    )
+
+
 def _validate_auto_mtu(c: Config) -> None:
     # auto_mtu adapts the TUN MTU from kernel PMTU readings, which are only
     # available when pmtu_discover sets IP_PMTUDISC_DO — get_path_mtu() returns
@@ -701,27 +716,31 @@ def _validate_auto_mtu(c: Config) -> None:
             "adapt. Set pmtu_discover=true to enable PMTU adaptation."
         )
     # The other way round is worse: with DF on and nothing to make packets
-    # smaller, every full-size packet on a smaller path is refused (EMSGSIZE).
-    if c.pmtu_discover and not c.auto_mtu:
+    # smaller, every packet on a smaller path is refused (EMSGSIZE), since
+    # over UDP all take one size. TCP mode does not use pmtu_discover: the
+    # kernel's TCP fits its segments to the path itself.
+    if c.transport == "udp" and c.pmtu_discover and not c.auto_mtu:
         log.warning(
             "pmtu_discover = true without auto_mtu = true drops every packet "
-            "on a path smaller than 1428 bytes; turn auto_mtu on or "
-            "pmtu_discover off"
+            "on a path smaller than %d bytes; turn auto_mtu on or "
+            "pmtu_discover off",
+            _one_size(c.padding_max) + _IP_UDP_OVERHEAD,
         )
 
 
 def _validate_server_pmtu(c: Config) -> None:
-    # DF is safe only where DSM can make its packets smaller for the path.
-    # A server cannot, for any one client, so with DF a client behind a
-    # smaller path MTU could not even finish the handshake (#14). The server
-    # leaves DF off whatever the setting says. Only a client runs auto_mtu.
+    # Forcing DF is safe only where DSM can make its packets smaller for the
+    # path. A server cannot, for any one client, so with DF forced a client
+    # behind a smaller path MTU could not even finish the handshake (#14).
+    # The server never forces DF, whatever the setting says; the kernel's
+    # default applies. Only a client runs auto_mtu.
     if c.mode != "server":
         return
     if c.pmtu_discover:
         log.warning(
             "pmtu_discover=true is for clients only; the server ignores it and "
-            "never sets the don't-fragment (DF) bit. Remove it from the "
-            "server's config."
+            "never forces the don't-fragment (DF) bit; the kernel's default "
+            "applies. Remove it from the server's config."
         )
     if c.auto_mtu:
         log.warning(
@@ -743,10 +762,7 @@ def _validate_udp_one_size(c: Config) -> None:
     # this module needs.
     from dsm.core.protocol import SIZE_CLASSES
 
-    one_size = max(
-        (size for size in SIZE_CLASSES if size <= c.padding_max),
-        default=SIZE_CLASSES[0],
-    )
+    one_size = _one_size(c.padding_max)
     need = min(c.mtu + _SIZE_CLASS_OVERHEAD, SIZE_CLASSES[-1])
     if need <= one_size:
         return
