@@ -42,6 +42,9 @@ IFF_NO_PI = 0x1000  # No packet info header
 # The client's "local network stays local" rule, checked before the
 # priority-10 not-fwmark rule. Shared with crash cleanup (dsm.net.cleanup).
 LAN_RULE_ARGS = ["table", "main", "suppress_prefixlength", "0", "priority", "9"]
+# The IPv6 minimum MTU. While a device's MTU is below it, Linux removes the
+# device's IPv6, and its net.ipv6.conf.<dev> knobs with it.
+_IPV6_MIN_MTU = 1280
 
 
 def _run_commands(cmds: list[list[str]], *, strict: bool = True) -> None:
@@ -385,8 +388,12 @@ class TunDevice:
             # The nftables rules also block IPv6, but disabling at sysctl level
             # prevents any IPv6 traffic from being generated in the first place.
             ["sysctl", "-w", "net.ipv6.conf.all.disable_ipv6=1"],
-            ["sysctl", "-w", f"net.ipv6.conf.{self._name}.disable_ipv6=0"],
         ]
+        if mtu >= _IPV6_MIN_MTU:
+            # Below it the kernel has already removed the TUN's IPv6, and
+            # this knob with it, so there is nothing to turn on. DSM carries
+            # no IPv6 inside the tunnel (check_from_client drops it).
+            cmds.append(["sysctl", "-w", f"net.ipv6.conf.{self._name}.disable_ipv6=0"])
         if not server_mode:
             # Client full-tunnel policy route: send all traffic through TUN
             # except VPN's own marked traffic. The server skips this — see

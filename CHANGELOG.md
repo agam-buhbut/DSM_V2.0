@@ -354,6 +354,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mtu allows. Paths of 1428 bytes or more are not changed.
 
 ### Fixed
+- A TUN `mtu` below 1280 no longer stops DSM right after the handshake
+  with the kill switch left up ("TUN configure failed: sysctl -w
+  net.ipv6.conf.<tun>.disable_ipv6=0"). Linux takes IPv6 off a device
+  whose MTU is below 1280, so DSM no longer tries to turn it on for the
+  TUN there. DSM carries no IPv6 through the tunnel, so nothing is lost.
 - `auto_mtu` works now. DSM could never read the kernel's path MTU,
   because its UDP socket is not connected. So the TUN MTU never came down,
   and with `pmtu_discover = true` every packet too big for a smaller path
