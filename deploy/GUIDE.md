@@ -2634,7 +2634,7 @@ On a clean exit the client puts `src_valid_mark` back to the value it found
 at start. It also saves the old value in `/run/dsm/src_valid_mark.orig`.
 If the client crashes, run `sudo dsm cleanup`: it puts the saved value back
 and then deletes the file. (The server's systemd unit runs `dsm cleanup`
-on every stop. On a client nothing runs it after a crash, by hand or under
+after a crash. On a client nothing runs it after a crash, by hand or under
 dsm-client.service, because it would take the kill switch down; run it
 yourself when you want the host back without DSM.)
 If a file from a crash is still there when the client starts, the client

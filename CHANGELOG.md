@@ -315,6 +315,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before, an address already in the table kept getting in (SECURITY.md).
 
 ### Fixed
+- The server unit ran `dsm cleanup` after every stop, restart and failed
+  start. That set `net.ipv4.ip_forward` to 0 and turned IPv6 on, so Docker
+  or routing on the host broke, and IPv6 came back where you had turned it
+  off (services on :: could then be reached past an IPv4-only firewall).
+  Now it runs only after a crash (DSM killed, or a stop that timed out).
+  After a stop or a start error, the values DSM found stay. To get it,
+  re-run `install.sh --systemd`, or copy the new `deploy/dsm.service` to
+  `/etc/systemd/system/` and run `sudo systemctl daemon-reload`.
 - Over UDP, a lost or late third handshake message no longer makes the server drop the attempt. Before, the server read the client's next frame in its place and failed, and the client waited about 19 s before it tried again. Now the server skips a frame that does not open as that message and waits for the client's resend, about 6 s later. Over TCP a bad third message still ends the attempt.
 - After a new CA (deploy/GUIDE.md §7f), a host takes the new CA's first CRL.
   DSM kept one last CRL number for all CAs, so the new CA's CRL 1000 was

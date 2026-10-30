@@ -74,12 +74,14 @@ ExecStart=/usr/local/bin/dsm --mode server \
 KillSignal=SIGTERM
 TimeoutStopSec=15
 
-# Crash-safe cleanup. ExecStopPost runs on BOTH clean and crash
-# stops (SIGKILL/OOM that bypass the in-process AsyncExitStack unwind), so
-# the host never stays with the kill switch up, a dead resolv.conf, a stale
-# table-100 route / ip rule, or modified sysctls. Idempotent — safe to run
-# when there is nothing to clean.
-ExecStopPost=/usr/local/bin/dsm cleanup
+# Crash-only cleanup. `dsm cleanup` is coarse: it sets ip_forward to 0 and
+# IPv6 on (not the values DSM found) and flushes route table 100. So it runs
+# only when DSM did not exit by itself: SIGKILL, OOM, a stop that timed out,
+# a core dump, a stop in the first seconds of a start (before DSM sets its
+# signal handlers), or an end systemd cannot name. After a stop, a restart, a
+# start error or a Python error, DSM has already put the host back exactly.
+# `$$` passes a literal `$` to the shell.
+ExecStopPost=/bin/sh -c '[ "$$EXIT_CODE" = exited ] || exec /usr/local/bin/dsm cleanup'
 
 Restart=on-failure
 RestartSec=10s
