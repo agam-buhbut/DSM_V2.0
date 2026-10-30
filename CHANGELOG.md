@@ -148,6 +148,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   blocklist (below).
 
 ### Security
+- Over UDP, a start whose third handshake message does not open is no longer free for a stranger: the server waits, as for a stalled start, and that address waits 30 s. Keeping new devices waiting now takes about 31 addresses over UDP (about 125 right after a restart), as over TCP. A faked packet in a real device's handshake before that message does no harm now. Log change: over UDP a bad or stalled start no longer logs `handshake failed (BadMsg3Error)`; it shows as `a handshake attempt exceeded 12s deadline`, and the skip itself logs only at DEBUG.
 - **Behavior change:** the client raises its kill switch before anything at
   start that depends on the clock or the network. Before, a CRL past its
   next update, a CA cert outside its dates, or a server name the network
@@ -289,6 +290,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `dsm enroll --import` now gives one line too.
 
 ### Fixed
+- Over UDP, a lost or late third handshake message no longer makes the server drop the attempt. Before, the server read the client's next frame in its place and failed, and the client waited about 19 s before it tried again. Now the server skips a frame that does not open as that message and waits for the client's resend, about 6 s later. Over TCP a bad third message still ends the attempt.
 - After a new CA (deploy/GUIDE.md §7f), a host takes the new CA's first CRL.
   DSM kept one last CRL number for all CAs, so the new CA's CRL 1000 was
   refused as a rollback and DSM did not start. It now keeps one per CA key,

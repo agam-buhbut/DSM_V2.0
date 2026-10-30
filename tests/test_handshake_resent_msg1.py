@@ -15,7 +15,6 @@ from cryptography.x509.oid import ExtendedKeyUsageOID
 from dsm.crypto.cert_allowlist import CNAllowlist
 from dsm.crypto.handshake import (
     HANDSHAKE_FRAME_SIZE,
-    HandshakeError,
     client_handshake,
     server_handshake,
 )
@@ -152,12 +151,17 @@ async def test_a_resent_msg1_during_the_bootstrap_wait_is_ignored(pki: _Pki) -> 
     assert len(server_end.sent) == 2
 
 
-async def test_any_other_frame_in_place_of_msg3_still_fails(pki: _Pki) -> None:
-    """Review Focus 5: only a true copy of msg1 is skipped."""
+async def test_a_frame_that_does_not_open_as_msg3_is_skipped(pki: _Pki) -> None:
+    """Over UDP a frame that does not open as msg3 is skipped too, and msg2
+    is not sent again for it."""
     client_end, server_end = _link()
     client_end.inject_after = {0: os.urandom(HANDSHAKE_FRAME_SIZE)}
-    _client_task, server_task, _pending = await _run_pair(pki, client_end, server_end)
-    assert isinstance(server_task.exception(), HandshakeError)
+    client_task, server_task, pending = await _run_pair(pki, client_end, server_end)
+    assert pending == set()
+    server_task.result()
+    client_task.result()
+    assert len(client_end.sent) == 3  # msg1, msg3, bootstrap frame: no resend
+    assert len(server_end.sent) == 2  # msg2 once, then the bootstrap reply
 
 
 def test_only_a_full_size_copy_of_msg1_counts_as_a_resend() -> None:

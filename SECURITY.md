@@ -151,9 +151,9 @@ closed as known:
 - **Start limits (handshakes).** Someone who has the CA certificate and
   the server's name can make new devices wait. Over UDP they can do it
   even from faked source addresses, by keeping the cookie budget empty
-  while the server is busy, or from about 4 real addresses. Over TCP it
-  takes about 31 real addresses, because there every failed start costs
-  its address 30 s.
+  while the server is busy, or from about 31 real addresses. Over TCP it
+  takes about 31 real addresses too, because there every failed or stalled
+  start costs its address 30 s.
   Over TCP, someone with nothing at all can make new devices wait too,
   but needs about 170 addresses, for the same reason.
 
@@ -161,7 +161,7 @@ closed as known:
   so every device counts as new until it connects once. While such an
   attack runs then, it does not just slow devices down: it can keep every
   device out, until the attack stops and one device gets in. Over UDP
-  that takes about 16 addresses, or no real address at all by keeping
+  that takes about 125 addresses, or no real address at all by keeping
   the cookie budget empty. Over TCP it takes about 125 addresses with
   the certificate and the name, or about 170 with nothing at all.
 
@@ -176,24 +176,30 @@ closed as known:
   When all slots are busy, a stalled handshake attempt can lose its slot
   to a new one; this is called being pushed out.
 
-  The 30 s penalty has two exceptions, by design. Over UDP, a start whose
-  final handshake message (msg3) does not open costs its address nothing,
-  because a faked packet slipped into a real device's handshake looks
-  the same. A faked packet that lands just after a real device's msg3
-  still costs that address 30 s; the device sends its next frame right
-  behind msg3, so that gap is tiny. Over TCP, someone who is not on the
-  path cannot slip a packet into another's connection, so there a bad
-  msg3 costs 30 s like any other failed start. And a start pushed out
+  The 30 s penalty has one exception, by design: a start pushed out
   less than 1.29 s after the server's reply left costs nothing, because
   it was waiting on the server's TPM, not stalling. Over TCP the 1.29 s
   also covers a client that held its first frame back, since the server
   signs only once that frame arrives.
 
-  So someone who can send a valid first message (the CA certificate and
-  the server's name) and ends every start with a bad msg3 never pays the
-  penalty over UDP: that is why the UDP numbers above are so small
-  (about 4, and about 16 right after a restart). Over TCP they pay it,
-  so there it takes about 31 (about 125).
+  Over UDP, a frame that does not open as msg3 (the final handshake
+  message) is skipped and the server keeps waiting. So a faked packet
+  that lands before a real device's msg3 does no harm, and a msg3 that
+  was lost or came late is read from the device's resend. A faked packet
+  that lands just after a real device's msg3 still ends that attempt and
+  costs the address 30 s: the device sends its next frame right behind
+  msg3, so that gap is tiny. To hit it, or to fill the device's inbox of
+  8 frames, an attacker must keep sending from the device's address, so
+  keeping a device out by faking its address costs a steady flood, not
+  one packet. Over TCP a bad msg3 still ends the start and costs 30 s.
+  A bad msg3 is now just a stall, and a stall costs 30 s, which is why UDP
+  and TCP take about the same number of addresses (about 31, and about
+  125 right after a restart).
+
+  One cost of this: when every slot is full, a new device whose msg3 was
+  lost can be pushed out after 1.5 s, and its address is then barred for
+  30 s. Right after a restart every device is new. Known addresses are
+  never barred.
 
   (A flood of raw packets that fills the kernel's socket buffer is a
   separate risk; see "Several clients on one server".)

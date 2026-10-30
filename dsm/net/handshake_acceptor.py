@@ -648,10 +648,11 @@ async def _run_attempt(
                 and isinstance(conn, _PerPeerUDPView)
                 and record is not None
             ):
-                # Over UDP a spoofed datagram in this attempt looks the same:
-                # no penalty, so it cannot bar a real client (spec §3.7 E2).
-                # Nobody off the path can slip a frame into a TCP connection,
-                # so there it pays like any failure (owner, 2026-10-24).
+                # The real UDP handshake no longer raises BadMsg3Error: it
+                # skips a frame that does not open as msg3 (a lost or late
+                # msg3, or a spoofed datagram, looks the same). This branch
+                # is kept for a transport that still raises it; it bars
+                # nothing (spec §3.7 E2).
                 record.proved = False
             # The INFO/WARNING line names a proven CN and why, and has no
             # address. The DEBUG detail line below, on only at log_level

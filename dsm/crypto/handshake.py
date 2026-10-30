@@ -67,6 +67,7 @@ log = logging.getLogger(__name__)
 # resending the same message does so across retries too.
 _skip_log = RepeatLog(log, logging.DEBUG)
 _late_cookie_log = RepeatLog(log, logging.DEBUG)
+_bad_msg3_log = RepeatLog(log, logging.DEBUG)
 
 HANDSHAKE_TIMEOUT = 5.0
 MAX_RETRIES = 3
@@ -159,9 +160,9 @@ class ClientRefusedError(HandshakeError):
 
 
 class BadMsg3Error(HandshakeError):
-    """The client's msg3 did not open. Over UDP a spoofed datagram in a real
-    client's attempt looks the same, so there the acceptor does not bar the
-    address for it (multi-client spec §3.7 E2)."""
+    """The client's msg3 did not open over TCP. Over UDP such a frame is
+    skipped and the wait goes on (msg3 can be lost or late there, and a
+    spoofed datagram looks the same)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -645,7 +646,7 @@ async def server_handshake(
 
     Raises:
         HandshakeError on transport/protocol failure.
-        BadMsg3Error (a HandshakeError) when msg3 does not open.
+        BadMsg3Error (a HandshakeError) when msg3 does not open over TCP.
         CertAuthError / CNNotAllowedError / CertRevokedError on cert
             policy failure.
         ClientRefusedError when ``admit_client`` refuses the client.
@@ -699,16 +700,36 @@ async def server_handshake(
     async def _retransmit_msg2() -> None:
         await _send(transport, msg2, addr)
 
-    msg3, msg3_addr = await _recv_with_retry(
-        transport, retransmit=_retransmit_msg2, skip=_resent_msg1
-    )
-    _pin_source(transport, msg3_addr, addr, "msg3")
-
+    # Over UDP, msg3 can be lost or come after the bootstrap frame, and a
+    # spoofed datagram looks the same. Noise fails such a frame at its first
+    # AEAD check and keeps its state, so it is skipped and the wait goes on.
+    # Over TCP nothing is lost or reordered, so a bad msg3 ends the start.
     binding_hash_for_msg3 = bytes(responder.get_handshake_hash())
-    client_static_raw, client_attest_payload = _translate_noise_errors(
-        "read msg3", lambda: responder.read_message_3(msg3), error=BadMsg3Error
+    opened: list[tuple[bytes, bytes]] = []
+
+    async def _open_msg3(frame: bytes, frame_addr: tuple[str, int] | None) -> bool:
+        _pin_source(transport, frame_addr, addr, "msg3")
+        try:
+            static, payload = _translate_noise_errors(
+                "read msg3",
+                lambda: responder.read_message_3(frame),
+                error=BadMsg3Error,
+            )
+        except BadMsg3Error:
+            if not isinstance(transport, UDPTransport):
+                raise
+            _bad_msg3_log.log("handshake: skipped a frame that did not open as msg3")
+            return True
+        opened.append((bytes(static), bytes(payload)))
+        return False
+
+    msg3, _ = await _recv_with_retry(
+        transport,
+        retransmit=_retransmit_msg2,
+        skip=_resent_msg1,
+        handle=_open_msg3,
     )
-    client_static = bytes(client_static_raw)
+    client_static, client_attest_payload = opened[0]
 
     try:
         client_cert = verify_attest_payload(
@@ -864,7 +885,8 @@ async def _recv_one_skipping(
     """Like ``_recv_one``, but drops frames for which ``skip`` returns True
     and shows the rest to ``handle`` first: a frame it returns True for was
     dealt with (a cookie reply: answered with a resend, or, once msg2 is in,
-    dropped) and the wait goes on.
+    dropped, or, over UDP, a frame that did not open as msg3) and the wait
+    goes on.
 
     Neither restarts the wait: it still ends ``timeout`` seconds after it
     began. Raises ``TimeoutError`` like ``_recv_one``.

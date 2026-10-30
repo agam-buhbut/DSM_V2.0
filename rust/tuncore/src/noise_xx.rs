@@ -517,6 +517,35 @@ mod tests {
         assert_eq!(pt, b"hello client");
     }
 
+    /// Pins the snow 0.9.x behavior the UDP msg3 skip relies on: a frame that
+    /// fails the first AEAD check (the encrypted s) leaves the responder
+    /// whole, so the real msg3 still opens afterwards.
+    #[test]
+    fn responder_reads_msg3_after_a_frame_that_does_not_open() {
+        let client_secret = gen_keypair();
+        let server_secret = gen_keypair();
+        let mut initiator = NoiseInitiator::new(&client_secret).unwrap();
+        let mut responder = NoiseResponder::new(&server_secret).unwrap();
+
+        let msg1 = initiator.write_message_1().unwrap();
+        responder.read_message_1(&msg1).unwrap();
+        let msg2 = responder.write_message_2(&random_attest_payload()).unwrap();
+        initiator.read_message_2(&msg2).unwrap();
+        let client_payload = random_attest_payload();
+        let msg3 = initiator.write_message_3(&client_payload).unwrap();
+
+        let hash_before = responder.get_handshake_hash();
+        let mut junk = vec![0u8; HANDSHAKE_PAD_SIZE];
+        OsRng.fill_bytes(&mut junk);
+        assert!(responder.read_message_3(&junk).is_err());
+        assert_eq!(responder.get_handshake_hash(), hash_before);
+
+        let (client_static, recovered) = responder.read_message_3(&msg3).unwrap();
+        assert_eq!(recovered, client_payload);
+        let expected = PublicKey::from(&StaticSecret::from(client_secret));
+        assert_eq!(client_static, expected.as_bytes());
+    }
+
     #[test]
     fn test_all_messages_same_size() {
         let k1 = gen_keypair();
