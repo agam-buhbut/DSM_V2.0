@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, cast
 
 from dsm.core import netaudit
-from dsm.core.config import MIN_TUN_MTU, Config
+from dsm.core.config import AUTO_MTU_FLOOR, Config
 from dsm.core.fsm import SessionFSM, State
 from dsm.core.protocol import (
     GCM_TAG_SIZE,
@@ -1208,17 +1208,39 @@ async def run_data_loops(
         fsm.transition(State.IDLE)
 
 
+def _fit_tun_mtu(path_mtu: int, mtu: int) -> int:
+    """TUN MTU for a kernel path MTU, at most ``mtu``.
+
+    Below the largest size class the path drops classes, so a full-size TUN
+    packet must fill the largest class left exactly. Sized to the path
+    alone it needs more than any class left and goes out at its exact size,
+    which chaff never uses (finding #8). At the largest class (path 1428 or
+    more), fragmenting keeps every piece in a class, so the path alone sets
+    the size. ``padding_min`` and ``padding_max`` are ignored on purpose: a
+    narrowed padding range keeps its documented exact-size limit.
+    """
+    ceiling = path_mtu - IP_UDP_OVERHEAD
+    fit = path_mtu - WIRE_OVERHEAD
+    if ceiling < SIZE_CLASSES[-1]:
+        top = max((c for c in SIZE_CLASSES if c <= ceiling), default=SIZE_CLASSES[0])
+        fit = top - (WIRE_OVERHEAD - IP_UDP_OVERHEAD)
+    return max(AUTO_MTU_FLOOR, min(mtu, fit))
+
+
 async def auto_mtu_loop(
     ctx: DataPathContext,
     transport: UDPTransport | TCPTransport,
     config: Config,
 ) -> None:
-    """Track kernel-discovered path MTU; adjust the TUN MTU to match.
+    """Track kernel-discovered path MTU; adjust the TUN MTU and the
+    shaper's size ceiling to match.
 
     Lower-on-drop is immediate; raise-toward ``config.mtu`` is gated on
     ``AUTO_MTU_HYSTERESIS_RISES`` consecutive observations of a stable
     larger usable MTU to avoid flap on transient PMTU bumps. Bounded
-    below by ``MIN_TUN_MTU`` and above by ``config.mtu``.
+    below by ``AUTO_MTU_FLOOR`` and above by ``config.mtu``. The size
+    ceiling (path MTU minus IP + UDP, at most ``padding_max``) follows the
+    same rules, also when a hand-set ``mtu`` keeps the TUN MTU as it is.
 
     No-ops when:
       * ``config.auto_mtu`` is False
@@ -1231,6 +1253,9 @@ async def auto_mtu_loop(
         return
 
     current = config.mtu
+    # The shaper starts with every class up to padding_max and never goes
+    # above it, so that is its ceiling until a reading lowers it.
+    ceiling = config.padding_max
     rises_observed = 0
 
     while not ctx.shutdown.is_set():
@@ -1247,7 +1272,11 @@ async def auto_mtu_loop(
         if path_mtu is None:
             continue
 
-        usable = max(MIN_TUN_MTU, min(config.mtu, path_mtu - WIRE_OVERHEAD))
+        usable = _fit_tun_mtu(path_mtu, config.mtu)
+        # The outer DSM packet rides inside IP(20)+UDP(8), so the size-class
+        # ceiling is path_mtu - IP_UDP_OVERHEAD. Capped at padding_max, which
+        # the shaper never goes above, so a wide path is not a rise.
+        outer = min(path_mtu - IP_UDP_OVERHEAD, config.padding_max)
 
         if usable < current:
             try:
@@ -1257,10 +1286,10 @@ async def auto_mtu_loop(
                 log.warning("auto_mtu: set_mtu(%d) failed: %s", usable, e)
                 continue
             # Also clamp the shaper's size-class ceiling so padded
-            # / chaff outer packets fit the constrained path. The outer DSM
-            # packet rides inside IP(20)+UDP(8), so the size-class ceiling is
-            # path_mtu - IP_UDP_OVERHEAD.
-            ctx.shaper.set_size_class_ceiling(path_mtu - IP_UDP_OVERHEAD)
+            # / chaff outer packets fit the constrained path. Only after
+            # set_mtu worked: a lower ceiling under the old TUN MTU would
+            # send full-size packets at their exact size.
+            ctx.shaper.set_size_class_ceiling(outer)
             log.info(
                 "auto_mtu: lowered tun mtu %d -> %d (kernel pmtu=%d)",
                 current,
@@ -1275,10 +1304,40 @@ async def auto_mtu_loop(
                 kernel_pmtu=path_mtu,
             )
             current = usable
+            ceiling = outer
             rises_observed = 0
-        elif usable > current:
+        elif outer < ceiling:
+            # The TUN MTU already fits (a hand-set mtu, or a path that shrank
+            # by less than one class), but the classes too big for the path
+            # must still go: with DF set, every packet drawn in one is dropped.
+            ctx.shaper.set_size_class_ceiling(outer)
+            log.info(
+                "auto_mtu: lowered size ceiling %d -> %d, tun mtu stays %d "
+                "(kernel pmtu=%d)",
+                ceiling,
+                outer,
+                current,
+                path_mtu,
+            )
+            ceiling = outer
+            rises_observed = 0
+        elif usable > current or outer > ceiling:
             rises_observed += 1
             if rises_observed >= AUTO_MTU_HYSTERESIS_RISES:
+                if usable == current:
+                    ctx.shaper.set_size_class_ceiling(outer)
+                    log.info(
+                        "auto_mtu: raised size ceiling %d -> %d after %d stable "
+                        "observations, tun mtu stays %d (kernel pmtu=%d)",
+                        ceiling,
+                        outer,
+                        rises_observed,
+                        current,
+                        path_mtu,
+                    )
+                    ceiling = outer
+                    rises_observed = 0
+                    continue
                 try:
                     ctx.tun.set_mtu(usable)
                 # set_mtu backends raise varied OS-level errors
@@ -1289,7 +1348,7 @@ async def auto_mtu_loop(
                 # Track the recovered path on the shaper too. The
                 # ceiling is bounded above by padding_max, so this restores the
                 # size-class set toward the full budget as the path heals.
-                ctx.shaper.set_size_class_ceiling(path_mtu - IP_UDP_OVERHEAD)
+                ctx.shaper.set_size_class_ceiling(outer)
                 log.info(
                     "auto_mtu: raised tun mtu %d -> %d after %d stable "
                     "observations (kernel pmtu=%d)",
@@ -1307,6 +1366,7 @@ async def auto_mtu_loop(
                     stable_observations=rises_observed,
                 )
                 current = usable
+                ceiling = outer
                 rises_observed = 0
         else:
             rises_observed = 0

@@ -345,8 +345,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   there, and on each client that got a wheel built there. Building again
   does not undo that: set those hosts up again from a clean install, with
   the new steps.
+- With auto_mtu on, a full-size packet no longer leaves at an exact size
+  that fake packets never have. auto_mtu now sets the TUN MTU so a full
+  packet fills the largest size class that fits the path: path MTU 1300
+  gives 1112, not 1232. On such a path this costs about 10% of the speed.
+  So that this holds on every path the kernel can learn, even one set by a
+  forged ICMP message, auto_mtu can now go down to 472, below the 576 that
+  mtu allows. Paths of 1428 bytes or more are not changed.
 
 ### Fixed
+- With auto_mtu on and a hand-set `mtu` that already fits a smaller path
+  (for example mtu 1100 on a path MTU of 1300), auto_mtu now still drops
+  the sizes too big for the path. Before, it did so only when it changed
+  the TUN MTU, so the packets that drew a size too big for the path (5 to
+  11 in 100) were lost. The sizes come back after 3 steady readings of a
+  larger path, as the TUN MTU does.
 - The server unit ran `dsm cleanup` after every stop, restart and failed
   start. That set `net.ipv4.ip_forward` to 0 and turned IPv6 on, so Docker
   or routing on the host broke, and IPv6 came back where you had turned it

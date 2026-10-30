@@ -1131,8 +1131,8 @@ Expected client log lines (log_level = "info"), in order, within ~5 s:
 ... handshake complete (client) — server_cn=dsm-XXXXXXXX-server
 ... TUN mtun0 configured: 10.8.0.2/24 mtu=1360
 ... tunnel established
-... kernel path MTU = 1500 (usable inner 1432)
-... auto_mtu: lowered tun mtu 1360 -> 1232 (kernel pmtu=1300)
+... kernel path MTU = 1500 (usable inner 1360)
+... auto_mtu: lowered tun mtu 1360 -> 1112 (kernel pmtu=1300)
                                                ↑ only when
                                                  auto_mtu=true AND the
                                                  path actually needs it

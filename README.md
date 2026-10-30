@@ -250,9 +250,12 @@ The MTU is the largest packet a link can carry.
   left for data inside one packet).
 - Optional `auto_mtu` (client only): a background loop reads the kernel's
   path MTU every `pmtu_check_interval_s` (default 30 s) and adjusts the TUN
-  MTU. It lowers the MTU at once when the path MTU drops. It raises it back
-  toward `mtu` only after 3 steady readings in a row, so a short bump cannot
-  make it flip back and forth. Recommended for cellular and roaming clients.
+  MTU. It picks the TUN MTU so a full-size packet fills the largest size
+  that fits the path (path MTU 1300 gives 1112). It can go as low as 472,
+  below the 576 that mtu allows. It lowers the MTU at once when the path
+  MTU drops. It raises it back toward `mtu` only after 3 steady readings in
+  a row, so a short bump cannot make it flip back and forth. Recommended
+  for cellular and roaming clients.
 
 ## Cryptography
 
@@ -389,9 +392,11 @@ newest, also across key changes.
 
 - With the default settings, every packet is padded to one of 11 sizes
   (size classes): 128, 256, 384, 512, 640, 768, 896, 1024, 1152, 1280 or
-  1400 bytes. `padding_min` and `padding_max` can narrow this list, and
-  `auto_mtu` drops sizes that are too big for the path. A real packet too
-  big for every size left is sent at its exact size.
+  1400 bytes. `padding_min` and `padding_max` can narrow this list.
+  `auto_mtu` drops sizes that are too big for the path, and lowers the TUN
+  MTU so a full-size packet still fills a size that is left. With a narrow
+  padding range, a real packet too big for every size left is sent at its
+  exact size.
 - The padding sits inside the encryption: it fills the encrypted part up to
   the size class. So no unauthenticated padding is left on the wire.
 - In TCP mode every frame is padded to the largest class (1400), so all

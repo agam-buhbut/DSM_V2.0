@@ -63,6 +63,13 @@ from dsm.session import (
     make_send_fn,
     setup_signal_handlers,
 )
+
+# isort: split
+# Its own statement: isort and ruff disagree on an import whose name carries
+# a pyright pragma, and isort would merge this one into the one above.
+from dsm.session import _fit_tun_mtu  # pyright: ignore[reportPrivateUsage]
+
+# isort: split
 from dsm.traffic.scheduler import SendScheduler
 from dsm.traffic.shaper import TrafficShaper, make_chaff_packet
 
@@ -969,10 +976,8 @@ async def run_client(
                 if isinstance(transport, UDPTransport):
                     path_mtu = transport.get_path_mtu()
                     if path_mtu is not None:
-                        # See dsm.session.WIRE_OVERHEAD for the breakdown.
-                        from dsm.session import WIRE_OVERHEAD
-
-                        usable = path_mtu - WIRE_OVERHEAD
+                        # The TUN MTU auto_mtu would set on this path.
+                        usable = _fit_tun_mtu(path_mtu, config.mtu)
                         log.info(
                             "kernel path MTU = %d (usable inner %d)",
                             path_mtu,

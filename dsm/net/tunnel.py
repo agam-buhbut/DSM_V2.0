@@ -448,12 +448,12 @@ class TunDevice:
 
         Used by the auto-MTU adapter to track kernel-discovered path MTU
         drift across the lifetime of a session. Clamps to
-        ``[MIN_TUN_MTU, MAX_TUN_MTU]`` so a kernel-reported PMTU of 0 (or
+        ``[AUTO_MTU_FLOOR, MAX_TUN_MTU]`` so a kernel-reported PMTU of 0 (or
         any other out-of-range value) cannot corrupt the device.
         """
-        from dsm.core.config import MAX_TUN_MTU, MIN_TUN_MTU
+        from dsm.core.config import AUTO_MTU_FLOOR, MAX_TUN_MTU
 
-        clamped = max(MIN_TUN_MTU, min(MAX_TUN_MTU, int(mtu)))
+        clamped = max(AUTO_MTU_FLOOR, min(MAX_TUN_MTU, int(mtu)))
         _run_commands([["ip", "link", "set", self._name, "mtu", str(clamped)]])
 
     def deconfigure(self) -> None:

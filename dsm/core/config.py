@@ -60,6 +60,11 @@ WARN_INFLIGHT_HANDSHAKES = 1024
 # also leaves slack for VPN-in-VPN / PPPoE paths; auto_mtu lowers it (and the
 # shaper ceiling) on constrained links (Phase 1.7).
 MIN_TUN_MTU = 576
+# Lowest TUN MTU auto_mtu sets: the 512-byte class minus 40. The kernel never
+# learns a path MTU below 552 from an ICMP reply (net.ipv4.route.min_pmtu),
+# and 552 - 28 still holds the 512 class, so no ICMP reply, real or forged,
+# can leave a full-size packet bigger than every size class left.
+AUTO_MTU_FLOOR = 472
 MAX_TUN_MTU = 1500
 DEFAULT_TUN_MTU = 1360
 

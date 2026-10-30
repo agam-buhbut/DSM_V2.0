@@ -17,15 +17,15 @@ import unittest
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
-from dsm.core.config import MIN_TUN_MTU, Config
+from dsm.core.config import Config
+from dsm.core.protocol import fragment_ip_packet
 from dsm.net.transport.tcp import TCPTransport
 from dsm.net.transport.udp import UDPTransport
-from dsm.session import (
-    WIRE_OVERHEAD,
-    auto_mtu_loop,
-)
+from dsm.net.tunnel import TunDevice
+from dsm.session import auto_mtu_loop
+from dsm.traffic.shaper import TrafficShaper
 
 
 def _make_config(**overrides: Any) -> Config:
@@ -114,12 +114,12 @@ async def _run_loop_for(
 
 class TestAutoMtuLoop(unittest.IsolatedAsyncioTestCase):
     async def test_lowers_on_pmtu_drop(self) -> None:
-        # config.mtu = 1400; first PMTU read = 1300 → usable = 1232.
-        # Loop should lower TUN MTU to 1232 on first tick.
+        # config.mtu = 1400; first PMTU read = 1300 → classes up to 1272
+        # leave 1152 the largest, so the TUN MTU drops to 1152 - 40 = 1112.
         config = _make_config(mtu=1400, pmtu_check_interval_s=0.01)
         transport = _make_udp_transport_with_pmtus(_scripted(1300))
         _, calls = await _run_loop_for(config, transport, ticks=2)
-        self.assertEqual(calls, [1300 - WIRE_OVERHEAD])
+        self.assertEqual(calls, [1112])
 
     async def test_no_change_when_pmtu_above_config(self) -> None:
         # PMTU is 1600; usable = 1532, clamped to ceiling 1400 = config.mtu.
@@ -138,26 +138,26 @@ class TestAutoMtuLoop(unittest.IsolatedAsyncioTestCase):
         )
         _, calls = await _run_loop_for(config, transport, ticks=4)
         # Only the initial lower; the 2 raises haven't reached threshold.
-        self.assertEqual(calls, [1100 - WIRE_OVERHEAD])
+        self.assertEqual(calls, [984])
 
     async def test_hysteresis_three_stable_rises_raise(self) -> None:
         config = _make_config(mtu=1400, pmtu_check_interval_s=0.01)
-        # First: lower to 1100-68=1032. Then 3 consecutive 1300 readings
-        # → after the 3rd, raise to 1300-68=1232.
+        # First: lower to 1024-40=984 (path 1100). Then 3 consecutive 1300
+        # readings → after the 3rd, raise to 1152-40=1112.
         transport = _make_udp_transport_with_pmtus(_scripted(1100, 1300, 1300, 1300))
         _, calls = await _run_loop_for(config, transport, ticks=5)
         self.assertEqual(
             calls,
-            [1100 - WIRE_OVERHEAD, 1300 - WIRE_OVERHEAD],
+            [984, 1112],
         )
 
     async def test_floor_clamp_min_tun_mtu(self) -> None:
-        # PMTU - WIRE_OVERHEAD would be < MIN_TUN_MTU → clamp to MIN_TUN_MTU.
+        # The fitted TUN MTU would be < AUTO_MTU_FLOOR → clamp to it.
         config = _make_config(mtu=1400, pmtu_check_interval_s=0.01)
-        # 600 - 68 = 532 < MIN_TUN_MTU (576) → clamp to 576.
-        transport = _make_udp_transport_with_pmtus(_scripted(600))
+        # Largest class <= 472 is 384; 384 - 40 = 344 < 472 → clamp to 472.
+        transport = _make_udp_transport_with_pmtus(_scripted(500))
         _, calls = await _run_loop_for(config, transport, ticks=2)
-        self.assertEqual(calls, [MIN_TUN_MTU])
+        self.assertEqual(calls, [472])
 
     async def test_ceiling_clamp_config_mtu(self) -> None:
         # After lowering and stabilizing high, never raise above config.mtu.
@@ -166,11 +166,11 @@ class TestAutoMtuLoop(unittest.IsolatedAsyncioTestCase):
             _scripted(1100, 9000, 9000, 9000, 9000, 9000)  # absurd PMTU
         )
         _, calls = await _run_loop_for(config, transport, ticks=7)
-        # First lower to 1032. After 3 rises at the ceiling, raise to 1400.
+        # First lower to 984. After 3 rises at the ceiling, raise to 1400.
         # No further raises because we're at the ceiling already.
         self.assertEqual(
             calls,
-            [1100 - WIRE_OVERHEAD, config.mtu],
+            [984, config.mtu],
         )
 
     async def test_disabled_returns_immediately(self) -> None:
@@ -194,7 +194,7 @@ class TestAutoMtuLoop(unittest.IsolatedAsyncioTestCase):
     async def test_no_thrash_on_oscillation_around_boundary(self) -> None:
         # PMTU oscillates ±20 around 1300. Lowering on each drop would
         # call set_mtu repeatedly; the design's "lower only when usable
-        # < current" rule should prevent that — once we drop to 1232,
+        # < current" rule should prevent that — once we drop to 1112,
         # subsequent reads at 1320 are RISES (need hysteresis), not
         # further drops.
         config = _make_config(mtu=1400, pmtu_check_interval_s=0.01)
@@ -202,12 +202,12 @@ class TestAutoMtuLoop(unittest.IsolatedAsyncioTestCase):
             _scripted(1300, 1320, 1280, 1320, 1280, 1320)
         )
         _, calls = await _run_loop_for(config, transport, ticks=7)
-        # First lower at 1300 → 1232. Then 1320 is a rise (rises=1).
-        # 1280 < current (1232)? 1280 - 68 = 1212; 1212 < 1232 → ANOTHER LOWER.
-        # 1320 → rise (rises=1, was reset by the new lower).
-        # 1280 → 1212 < 1212? equal → else, no change, rises=0.
+        # First lower at 1300 → 1112. Then 1320 (class 1280 fits, 1240) is a
+        # rise (rises=1). 1280 (class 1152 fits) → 1112, equal: the TUN MTU
+        # stays and only the size ceiling drops (1272 → 1252), rises=0.
+        # 1320 → rise (rises=1). 1280 → nothing changes, rises=0.
         # 1320 → rise (rises=1).
-        # End state: at most 2 set_mtu calls (no infinite thrash).
+        # End state: one set_mtu call (no infinite thrash).
         self.assertLessEqual(len(calls), 3)
         # Both calls should be lowers (no rises landed — never reached 3 stable).
         for c in calls:
@@ -227,6 +227,127 @@ class TestAutoMtuLoop(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0.05)
         shutdown.set()
         await asyncio.wait_for(task, timeout=1.0)
+
+
+async def _calls_until_first_set_mtu(
+    config: Config, shaper: TrafficShaper, path_mtu: int
+) -> list[int]:
+    """Run auto_mtu_loop on one path-MTU reading until it calls set_mtu."""
+    calls: list[int] = []
+    lowered = asyncio.Event()
+
+    def record(mtu: int) -> None:
+        calls.append(mtu)
+        lowered.set()
+
+    tun = MagicMock()
+    tun.set_mtu = MagicMock(side_effect=record)
+    ctx = _StubCtx(tun=tun, shutdown=asyncio.Event(), shaper=shaper)
+    transport = _make_udp_transport_with_pmtus(_scripted(path_mtu))
+    task = asyncio.create_task(auto_mtu_loop(ctx, transport, config))
+    await asyncio.wait_for(lowered.wait(), timeout=2.0)
+    ctx.shutdown.set()
+    await asyncio.wait_for(task, timeout=2.0)
+    return calls
+
+
+class TestAutoMtuFullPacketFitsAClass(unittest.IsolatedAsyncioTestCase):
+    """Finding #8: after auto_mtu lowers the TUN MTU, a full-size TUN packet
+    must leave in one of the size classes chaff also uses, never at the
+    exact-size fallback that marks it as real."""
+
+    async def test_full_size_packet_lands_in_an_active_class(self) -> None:
+        # (kernel path MTU, TUN MTU auto_mtu must pick): the largest class
+        # that fits the path (path - 28) minus 40. 650 and 552 are paths a
+        # forged ICMP "frag needed" can set (the kernel floor is 552).
+        cases = ((1300, 1112), (1420, 1240), (1100, 984), (650, 472), (552, 472))
+        for path_mtu, want_tun in cases:
+            with self.subTest(path_mtu=path_mtu):
+                config = _make_config(pmtu_check_interval_s=0.01)  # mtu 1360
+                shaper = TrafficShaper.from_config(config)
+                calls = await _calls_until_first_set_mtu(config, shaper, path_mtu)
+                self.assertEqual(len(calls), 1)
+                active = shaper._active_classes
+                for inner in fragment_ip_packet(b"\x45" * calls[0], 0, 1):
+                    self.assertIn(shaper.pad_packet(inner)[1], active)
+                self.assertEqual(calls[0], want_tun)
+
+
+class TestTunSetMtuFloor(unittest.TestCase):
+    def test_set_mtu_keeps_auto_mtu_floor(self) -> None:
+        # The real device must take the value auto_mtu picked, not 576.
+        with patch("dsm.net.tunnel._run_commands") as run:
+            TunDevice("mtun-test").set_mtu(472)
+            TunDevice("mtun-test").set_mtu(0)
+        mtus = [c.args[0][0][-1] for c in run.call_args_list]
+        self.assertEqual(mtus, ["472", "472"])
+
+
+async def _run_on_readings(
+    config: Config, shaper: TrafficShaper, *path_mtus: int
+) -> tuple[MagicMock, list[int]]:
+    """Run auto_mtu_loop until it has acted on every reading in ``path_mtus``.
+
+    Returns the TUN mock and the size ceilings the loop set on ``shaper``
+    (the real shaper still applies each one).
+    """
+    readings = iter(path_mtus)
+    done = asyncio.Event()
+
+    def next_reading() -> int | None:
+        value = next(readings, None)
+        if value is None:
+            # The loop acts on a reading before it asks for the next one.
+            done.set()
+        return value
+
+    transport = UDPTransport()
+    transport.get_path_mtu = next_reading  # type: ignore[method-assign]
+    ceilings: list[int] = []
+    set_ceiling = shaper.set_size_class_ceiling
+
+    def record(max_outer: int) -> None:
+        ceilings.append(max_outer)
+        set_ceiling(max_outer)
+
+    tun = MagicMock()
+    ctx = _StubCtx(tun=tun, shutdown=asyncio.Event(), shaper=shaper)
+    with patch.object(shaper, "set_size_class_ceiling", side_effect=record):
+        task = asyncio.create_task(auto_mtu_loop(ctx, transport, config))
+        await asyncio.wait_for(done.wait(), timeout=2.0)
+        ctx.shutdown.set()
+        await asyncio.wait_for(task, timeout=2.0)
+    return tun, ceilings
+
+
+class TestAutoMtuCeilingWithHandSetMtu(unittest.IsolatedAsyncioTestCase):
+    """A hand-set mtu below the fit keeps its TUN MTU on a smaller path, but
+    the size ceiling must still drop. Otherwise the classes too big for the
+    path stay in use, and every packet drawn there is lost (DF is set)."""
+
+    async def test_ceiling_drops_without_a_tun_change(self) -> None:
+        for mtu in (1100, 1000):
+            with self.subTest(mtu=mtu):
+                config = _make_config(mtu=mtu, pmtu_check_interval_s=0.01)
+                shaper = TrafficShaper.from_config(config)
+                tun, ceilings = await _run_on_readings(config, shaper, 1300)
+                tun.set_mtu.assert_not_called()
+                self.assertEqual(ceilings, [1272])  # path 1300 - IP/UDP 28
+                self.assertEqual(shaper._active_classes[-1], 1152)
+
+    async def test_ceiling_rises_only_after_three_steady_readings(self) -> None:
+        config = _make_config(mtu=1100, pmtu_check_interval_s=0.01)
+        shaper = TrafficShaper.from_config(config)
+        _, ceilings = await _run_on_readings(config, shaper, 1300, 1500, 1500)
+        self.assertEqual(ceilings, [1272])
+        self.assertEqual(shaper._active_classes[-1], 1152)
+
+        shaper = TrafficShaper.from_config(config)
+        tun, ceilings = await _run_on_readings(config, shaper, 1300, 1500, 1500, 1500)
+        tun.set_mtu.assert_not_called()
+        # Back to padding_max (1400): the shaper never goes above it anyway.
+        self.assertEqual(ceilings, [1272, 1400])
+        self.assertEqual(shaper._active_classes[-1], 1400)
 
 
 class TestAutoMtuConfigValidation(unittest.TestCase):
