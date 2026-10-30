@@ -507,13 +507,20 @@ async def client_handshake(
     # Message 3: -> s, se [+ client attest payload]
     # Snapshot binding hash *before* write_message_3 advances Noise state.
     binding_hash_for_msg3 = bytes(initiator.get_handshake_hash())
-    our_attest_payload = build_attest_payload(
-        attest_key=attest_key,
-        cert_der=cert_der,
-        handshake_hash=binding_hash_for_msg3,
-        our_static_pub=our_static_pub,
-        our_role=PeerRole.INITIATOR,
-    )
+    try:
+        our_attest_payload = build_attest_payload(
+            attest_key=attest_key,
+            cert_der=cert_der,
+            handshake_hash=binding_hash_for_msg3,
+            our_static_pub=our_static_pub,
+            our_role=PeerRole.INITIATOR,
+        )
+    except RuntimeError as e:
+        # The sign is the only part that gives a RuntimeError: tuncore's
+        # for every TPM fault. The start-up sign showed this key loads, so
+        # this fault can pass (a lockout another TPM user caused, a TPM
+        # resource manager restart): a failed try, which keeps the block.
+        raise HandshakeError(f"this host's attest key could not sign: {e}") from e
     msg3 = initiator.write_message_3(our_attest_payload)
     await _send(transport, msg3, server_addr)
 

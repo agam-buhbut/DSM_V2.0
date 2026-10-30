@@ -1397,7 +1397,10 @@ TPM cleared / replaced / failed (no compromise):  the attest.key DSMT
 blob only loads on the TPM that made it, so a cleared or swapped TPM
 makes the existing attest key unrecoverable even if attest.key is
 intact. Re-enroll per §3 (new attest key in the new TPM → new CSR →
-new signed cert) and revoke the old cert per §7e.
+new signed cert) and revoke the old cert per §7e. DSM finds this when it
+starts: it signs once with the attest key, and if the TPM cannot use the
+key, it logs one line, `cert/identity consistency check failed: the
+attest key in ... cannot sign on TPM ...`, and exits 1.
 
 ### 7h. DNS blocklist (server)
 
@@ -1560,11 +1563,19 @@ crash, a start error or a signal sent straight to it) leaves it up; run
   packets for the old session reach it during its handshake and spoil it,
   and it waits for the old session to time out (about 65 s). Over TCP the
   client connects from a new port each time.
+- **The TPM refuses a sign after a good start** (another program put the
+  TPM in dictionary-attack lockout, or the TPM resource manager
+  restarted): the log shows `handshake failed: this host's attest key
+  could not sign: ...`. DSM keeps the kill switch and tries again, as when
+  the tunnel drops, so it comes back by itself once the TPM works again.
+  If the line says `integrity check failed`, the TPM was cleared or
+  replaced while DSM ran, and retrying cannot fix it: see §7g.
 - **Setup errors at the first start** (a wrong or empty passphrase, a
   missing or bad cert, CA or CRL file, a wrong `ca_root_sha256`, keys and
-  a cert that do not match, a UDP `listen_port` in use, a read-only
-  `/etc/resolv.conf`): on a run by hand DSM removes the kill switch and
-  exits 1, as before: you are there. Under `dsm-client.service` it keeps
+  a cert that do not match, an attest key the TPM cannot use (§7g), a UDP
+  `listen_port` in use, a read-only `/etc/resolv.conf`): on a run by hand
+  DSM removes the kill switch and exits 1, as before: you are there.
+  Under `dsm-client.service` it keeps
   the kill switch and exits 1, because nobody may be at the host. The log
   shows the error, then `DSM could not start (see the error above), and the
   kill switch stays up ...`. systemd tries again every 5 s and gives up

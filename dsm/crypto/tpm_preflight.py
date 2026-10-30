@@ -39,6 +39,21 @@ def apply_configured_tcti(tcti: str | None) -> None:
         os.environ["TCTI"] = tcti
 
 
+def tcti_in_use() -> str:
+    """The TCTI the Rust TPM backend will use, found as it finds it.
+
+    It reads ``TPM2TOOLS_TCTI`` first, then ``TCTI`` (``resolve_tcti`` in
+    device_attest_tpm.rs); an empty value is skipped. With neither set it
+    uses ``device:/dev/tpmrm0``. For error messages, so they name the TPM
+    that was really tried.
+    """
+    return (
+        os.environ.get("TPM2TOOLS_TCTI")
+        or os.environ.get("TCTI")
+        or "device:/dev/tpmrm0"
+    )
+
+
 def preflight_tpm(tcti: str | None) -> None:
     """Confirm the TPM responds before provisioning the attest key.
 

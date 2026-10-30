@@ -303,6 +303,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   start-up, but every handshake failed. When it is set, it also wins over
   a TCTI or TPM2TOOLS_TCTI in the environment, so enroll and the daemons
   always use the same TPM.
+  If your config has `attest_tpm_tcti` and DSM worked before, the daemons
+  were ignoring that line and using /dev/tpmrm0. After this update they use
+  it: check that it names the TPM you enrolled on, or delete it.
+- An attest key the TPM cannot use (the TPM was cleared or replaced, or
+  DSM reaches another TPM) now stops the client and the server at start,
+  with one line that names the key file and the TPM and says to enroll
+  again (deploy/GUIDE.md §7g). Before, both started and looked fine, then
+  every handshake failed: the server logged a traceback for each try, and
+  the client stopped with a traceback.
+- When this host's TPM refuses a sign during a client handshake after a
+  good start (another program put it in dictionary-attack lockout, or the
+  TPM resource manager restarted), the client now keeps the kill switch
+  and tries again, so it comes back once the TPM works. Before, it
+  stopped with a traceback, and after 5 such starts systemd gave up, so
+  the host stayed blocked after the TPM was fine again.
 - `dsm init --install-unit` made an empty `/etc/dsm/passphrase`, so the
   unit's first start failed with a traceback. Now `--resume` writes the
   passphrase that has just unlocked the keys there, and an empty or

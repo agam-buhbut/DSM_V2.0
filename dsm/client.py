@@ -428,11 +428,12 @@ async def run_client(
     Returns:
         0 when the user stops DSM, 1 on a setup error a retry cannot fix (a
         missing or bad cert, CA or CRL file, keys or a passphrase that do not
-        unlock them, or a UDP port in use or a read-only resolv.conf at the
-        first try; with ``stop_keeps_block`` a port in use is retried
-        instead). Without ``stop_keeps_block`` both take the kill switch
-        down. An unexpected error goes up with the kill switch still up
-        (fail closed); the next start replaces it.
+        unlock them, an attest key the TPM cannot use, or a UDP port in use
+        or a read-only resolv.conf at the first try; with
+        ``stop_keeps_block`` a port in use is retried instead). Without
+        ``stop_keeps_block`` both take the kill switch down. An unexpected
+        error goes up with the kill switch still up (fail closed); the next
+        start replaces it.
     """
     import tuncore
     from dsm.core.hardening import harden_and_gate
@@ -680,7 +681,8 @@ async def run_client(
         stack.callback(attest_store.unload)
 
         # With both stores unlocked, confirm the loaded cert was issued for
-        # THIS device's keys. Catches the cert_file substitution failure mode
+        # THIS device's keys, and that the attest key signs. Catches the
+        # cert_file substitution failure mode, and a key the TPM cannot load,
         # at startup with a clear error, rather than at the server's
         # AttestBindingMismatchError much later in the handshake. On failure
         # the stack unwinds: it unloads the stores, and the kill switch goes
@@ -811,6 +813,8 @@ async def run_client(
                     # is a subclass of HandshakeError. All of them come from
                     # the network (someone on the path can send a bad or
                     # revoked cert), so they keep the block and DSM retries.
+                    # So does a sign this host's TPM refused: the start-up
+                    # sign showed the key loads, so the fault can pass.
                     if isinstance(e, CNMismatchError):
                         prefix = "server CN check failed"
                     elif isinstance(e, CertRevokedError):

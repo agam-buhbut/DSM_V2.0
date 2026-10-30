@@ -622,9 +622,10 @@ async def run_server(
         return 1
 
     # With both stores unlocked, confirm the loaded cert was issued for
-    # THIS device's keys. Catches the cert_file substitution failure mode
-    # at startup with a clear error, rather than at first peer's
-    # AttestBindingMismatchError much later.
+    # THIS device's keys, and that the attest key signs. Catches the
+    # cert_file substitution failure mode, and a key the TPM cannot load, at
+    # startup with a clear error, rather than at first peer's
+    # AttestBindingMismatchError much later, or a traceback per handshake.
     try:
         verify_cert_matches_identity(materials.cert_der, keystore, attest_store)
     except AuthMaterialsError as e:

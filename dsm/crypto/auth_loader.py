@@ -42,6 +42,7 @@ from dsm.crypto.cert import (
 )
 from dsm.crypto.crl import CRL, CRLError, CRLRollbackError
 from dsm.crypto.keystore import KeyStore
+from dsm.crypto.tpm_preflight import tcti_in_use
 
 log = logging.getLogger(__name__)
 
@@ -366,6 +367,11 @@ def _load_crl(
     return crl
 
 
+# Signed once at start and thrown away. Neither a handshake binding (it
+# starts with BINDING_DOMAIN) nor a CSR (DER) can start like this.
+_START_SIGN_MSG = b"DSM-START-SIGN-CHECK\x00"
+
+
 def verify_cert_matches_identity(
     cert_der: bytes,
     keystore: KeyStore,
@@ -382,7 +388,16 @@ def verify_cert_matches_identity(
     ``AttestBindingMismatchError`` / ``AttestSignatureError`` boundary,
     with no clear local symptom.
 
-    Raises ``AuthMaterialsError`` on mismatch.
+    Last, the attest key signs once. On the TPM build that sign is the TPM's
+    first load of the key, so a key from a cleared or another TPM stops the
+    start here, not at every handshake. It comes after the two checks above
+    on purpose: they show both keys come from one enrollment, so from one
+    passphrase, and the identity store has already taken that passphrase.
+    So the sign never sends the TPM a wrong one, which its dictionary-attack
+    lockout would count.
+
+    Raises ``AuthMaterialsError`` on mismatch, or when the attest key
+    cannot sign.
     """
     cert = DeviceCert.from_der(cert_der)
 
@@ -406,3 +421,16 @@ def verify_cert_matches_identity(
             "attest key — cert was issued for a different ECDSA pubkey. "
             "Re-enroll, or restore the matching cert from backup."
         )
+
+    attest_key = attest_store.attest_key
+    try:
+        attest_key.sign(_START_SIGN_MSG)
+    except RuntimeError as e:
+        # tuncore gives a RuntimeError for every TPM fault.
+        raise AuthMaterialsError(
+            f"the attest key in {attest_store.path} cannot sign on TPM "
+            f"{tcti_in_use()}: {e}. If the TPM was cleared or replaced, enroll "
+            "this host again (deploy/GUIDE.md §7g); if the key was made on "
+            "another TPM, set attest_tpm_tcti to that one; if the error says "
+            "lockout, start DSM again once the TPM lockout ends."
+        ) from e
