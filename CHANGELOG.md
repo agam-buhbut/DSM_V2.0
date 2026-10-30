@@ -153,8 +153,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   took 0.15-0.35 s to raise its kill switch, so on every boot other
   programs could reach the network in the clear first. Now
   `dsm-client-boot-block.service` loads the start-up kill switch (loopback
-  and DHCP only) before any network comes up, and again when the client
-  unit restarts or starts after a stop; DSM replaces it when it starts. A
+  and DHCP only) before any network comes up, and again when the unit
+  starts after a stop (on a restart the earlier run's start-up table is
+  still up and holds instead); DSM replaces it when it starts. A
   start error that comes before DSM's own block (a config.toml that does
   not load, a missing passphrase file) now leaves the host blocked under
   the unit, SSH too, not open. The client unit pulls the new unit in, so

@@ -601,9 +601,10 @@ defaults, and each end shapes only what it sends.
   `sudo systemctl stop dsm-client` and `sudo dsm cleanup`. Under the unit
   the host is blocked from boot, too: `dsm-client-boot-block.service`
   loads the start-up kill switch (loopback and DHCP only) before any
-  network comes up, and again when the unit restarts or starts after a
-  stop, and DSM replaces it when it starts. So the few errors that stop
-  DSM before its own kill switch (a missing `/etc/dsm/passphrase`, a
+  network comes up, and again when the unit starts after a stop (on a
+  restart the earlier run's start-up table is still up and holds
+  instead), and DSM replaces it when it starts. So the few errors that
+  stop DSM before its own kill switch (a missing `/etc/dsm/passphrase`, a
   config.toml that does not load, an evaluation build without
   `allow_soft_attest`, nft refusing DSM's table, an install that cannot
   run DSM at all) leave the host blocked under the unit, SSH too. On a run

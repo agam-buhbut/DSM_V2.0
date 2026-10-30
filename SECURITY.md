@@ -116,7 +116,8 @@ closed as known:
   the client before DSM raises its own kill switch. Under
   `dsm-client.service`, `dsm-client-boot-block.service` loads the start-up
   kill switch (loopback and DHCP only) at boot, and again when the unit
-  restarts or starts after a stop. So these errors leave the host blocked
+  starts after a stop (on a restart the earlier run's start-up table is
+  still up and holds instead). So these errors leave the host blocked
   while systemd tries again and gives up (SSH too; `sudo dsm cleanup`
   removes the block). They leave it open only on a run by hand, when nft
   itself is missing or broken, when the boot unit file is not installed,

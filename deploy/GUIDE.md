@@ -1180,19 +1180,17 @@ $ sudo nft list tables | grep '^table inet dsm_'
 # same table without the server.
 ```
 
-On a client under the unit, check that the boot block is up too:
+On a client under the unit, check that the boot block is installed too:
 
 ```sh
-$ systemctl is-active dsm-client-boot-block   # expect "active"
+$ systemctl show -p LoadState --value dsm-client-boot-block   # expect "loaded"
 ```
 
-`inactive` with "could not be found" in `systemctl status
-dsm-client-boot-block` means the boot unit file was never copied (§3f):
-until it is, an error before DSM's own block leaves the host open.
-`failed` means it could not load; `systemctl status dsm-client-boot-block`
-says why. It also shows `inactive` when it was started while a tunnel
-was up and skipped itself, so as not to replace the live kill switch;
-`sudo systemctl restart dsm-client` loads it again.
+`not-found` means the boot unit file was never copied (§3f): until it is,
+an error before DSM's own block leaves the host open. `systemctl
+is-active dsm-client-boot-block` prints `inactive` after a restart: that
+is a normal skip, as DSM's own table was still up. `failed` there means
+it could not load; `systemctl status dsm-client-boot-block` says why.
 
 DNS goes through the tunnel and resolves on the server via DoH:
 
@@ -1611,8 +1609,9 @@ crash, a start error or a signal sent straight to it) leaves it up; run
   its kill switch, so DSM raises no block of its own, under the unit too.
   Under the unit, `dsm-client-boot-block.service` loads the start-up kill
   switch (loopback and DHCP only) at boot, and again when the unit
-  restarts or starts after a stop, so the boot block stays up instead
-  (SSH too); on a run by hand the host is open. `sudo dsm cleanup`
+  starts after a stop (on a restart the earlier run's start-up table is
+  still up and holds instead), so a block stays up (SSH too); on a run
+  by hand the host is open. `sudo dsm cleanup`
   removes the block. Under the unit the host is open only when
   nft itself is missing or broken, when the boot unit file is not
   installed (§6 shows how to check), or after `sudo dsm cleanup` followed
