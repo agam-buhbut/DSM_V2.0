@@ -1399,8 +1399,8 @@ makes the existing attest key unrecoverable even if attest.key is
 intact. Re-enroll per §3 (new attest key in the new TPM → new CSR →
 new signed cert) and revoke the old cert per §7e. DSM finds this when it
 starts: it signs once with the attest key, and if the TPM cannot use the
-key, it logs one line, `cert/identity consistency check failed: the
-attest key in ... cannot sign on TPM ...`, and exits 1.
+key, it logs one line, `this host's TPM cannot use its attest key ...`, and
+exits 1.
 
 ### 7h. DNS blocklist (server)
 

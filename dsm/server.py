@@ -19,6 +19,7 @@ from dsm.core.preflight import check_clock_sync, ntp_synchronized
 from dsm.core.protocol import WIRE_VERSION, PacketType, ReassemblyBuffer
 from dsm.crypto.attest_store import AttestStore
 from dsm.crypto.auth_loader import (
+    AttestKeyUnusableError,
     AuthMaterialsError,
     load_cert_materials,
     verify_cert_matches_identity,
@@ -628,6 +629,11 @@ async def run_server(
     # AttestBindingMismatchError much later, or a traceback per handshake.
     try:
         verify_cert_matches_identity(materials.cert_der, keystore, attest_store)
+    except AttestKeyUnusableError as e:
+        log.error("%s", e)
+        attest_store.unload()
+        keystore.unload()
+        return 1
     except AuthMaterialsError as e:
         log.error("cert/identity consistency check failed: %s", e)
         attest_store.unload()

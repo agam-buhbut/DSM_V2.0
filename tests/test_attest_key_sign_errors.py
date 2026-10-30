@@ -10,6 +10,7 @@ so no TPM is needed. Nothing waits on the wall clock.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from pathlib import Path
 from typing import cast
@@ -20,7 +21,11 @@ from cryptography.x509.oid import ExtendedKeyUsageOID
 
 import tuncore
 from dsm.crypto.attest_store import AttestStore
-from dsm.crypto.auth_loader import AuthMaterialsError, verify_cert_matches_identity
+from dsm.crypto.auth_loader import (
+    AttestKeyUnusableError,
+    AuthMaterialsError,
+    verify_cert_matches_identity,
+)
 from dsm.crypto.cert_allowlist import CNAllowlist
 from dsm.crypto.handshake import (
     CertAuthError,
@@ -30,6 +35,7 @@ from dsm.crypto.handshake import (
 )
 from dsm.crypto.keystore import KeyStore
 from dsm.crypto.tpm_preflight import tcti_in_use
+from dsm.server import run_server
 from tests.cert_helpers import (
     CLIENT_AUTH_OID,
     SERVER_AUTH_OID,
@@ -37,7 +43,9 @@ from tests.cert_helpers import (
     make_enrolled_device,
     make_test_ca,
 )
+from tests.test_client_fail_closed import _Run
 from tests.test_handshake_resent_msg1 import _SERVER, _link
+from tests.test_server_dns_fatal import _base_patches, _server_config
 
 # What tuncore raised on the box for a key the TPM could not load (#53).
 _INTEGRITY = "TPM error: integrity check failed (associated with parameter number 1)"
@@ -93,7 +101,10 @@ def test_an_attest_key_the_tpm_cannot_load_stops_the_start(
             verify_cert_matches_identity(device.cert_der, keystore, attest_store)
     assert key.sign.call_count == 1
     message = str(info.value)
-    assert f"the attest key in {_KEY_FILE} cannot sign on TPM {named}: " in message
+    assert message.startswith(
+        f"this host's TPM cannot use its attest key {_KEY_FILE} (TCTI {named}): "
+    )
+    assert isinstance(info.value, AttestKeyUnusableError)
     assert _INTEGRITY in message
     assert "deploy/GUIDE.md §7g" in message
     assert isinstance(info.value.__cause__, RuntimeError)
@@ -202,3 +213,52 @@ async def test_a_sign_the_tpm_refuses_in_a_client_handshake_is_a_handshake_error
     assert isinstance(info.value.__cause__, RuntimeError)
     assert refusing.signs == 1
     assert len(client_end.sent) == 1  # msg1 only: no msg3 went out
+
+
+_UNUSABLE = AttestKeyUnusableError(
+    "this host's TPM cannot use its attest key /opt/mtun/attest.key "
+    f"(TCTI {_SWTPM}): {_INTEGRITY}. If the TPM was cleared, enroll again."
+)
+
+
+def _tpm_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
+    lines = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    assert len(lines) == 1
+    assert lines[0].startswith("this host's TPM cannot use its attest key")
+    assert "consistency check failed" not in lines[0]
+    return lines
+
+
+def test_the_unusable_key_error_is_an_auth_materials_error() -> None:
+    assert issubclass(AttestKeyUnusableError, AuthMaterialsError)
+
+
+async def test_the_server_logs_an_unusable_attest_key_without_the_cert_prefix(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.ERROR, logger="dsm")
+    with (
+        _base_patches({}),
+        patch("dsm.server.verify_cert_matches_identity", side_effect=_UNUSABLE),
+    ):
+        rc = await asyncio.wait_for(run_server(_server_config()), 5.0)
+    assert rc == 1
+    _tpm_lines(caplog)
+
+
+async def test_the_client_logs_an_unusable_attest_key_without_the_cert_prefix(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.ERROR, logger="dsm")
+    real_patch = patch
+
+    def _patch_verify(target: str, *args: object, **kwargs: object) -> object:
+        # _Run builds its own patches inside run(); only this one differs.
+        if target == "dsm.client.verify_cert_matches_identity":
+            kwargs["side_effect"] = _UNUSABLE
+        return real_patch(target, *args, **kwargs)
+
+    with patch("tests.test_client_fail_closed.patch", _patch_verify):
+        rc = await _Run().run()
+    assert rc == 1
+    _tpm_lines(caplog)

@@ -51,6 +51,10 @@ class AuthMaterialsError(Exception):
     """A required auth material file is missing, malformed, or fails policy."""
 
 
+class AttestKeyUnusableError(AuthMaterialsError):
+    """The TPM cannot use the attest key (a cleared or other TPM)."""
+
+
 class AuthMaterialsTimeError(AuthMaterialsError):
     """The materials are sound but their dates do not cover now: a CRL past
     its next update, or a cert not yet valid or run out. A fresh file or a
@@ -427,9 +431,10 @@ def verify_cert_matches_identity(
         attest_key.sign(_START_SIGN_MSG)
     except RuntimeError as e:
         # tuncore gives a RuntimeError for every TPM fault.
-        raise AuthMaterialsError(
-            f"the attest key in {attest_store.path} cannot sign on TPM "
-            f"{tcti_in_use()}: {e}. If the TPM was cleared or replaced, enroll "
+        raise AttestKeyUnusableError(
+            "this host's TPM cannot use its attest key "
+            f"{attest_store.path} (TCTI {tcti_in_use()}): {e}. If the TPM "
+            "was cleared or replaced, enroll "
             "this host again (deploy/GUIDE.md §7g); if the key was made on "
             "another TPM, set attest_tpm_tcti to that one; if the error says "
             "lockout, start DSM again once the TPM lockout ends."
